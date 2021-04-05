@@ -24,9 +24,8 @@ pipeline {
 				    "CXXFLAGS=-O2 -pipe -fstack-protector-strong -fno-strict-aliasing" \
 				    LIBPATH=/usr/local/lib \
 				    LINKFLAGS=-fstack-protector-strong \
-				    PKGCONFIGDIR= \
 				    PREFIX=/usr/local \
-				    destdir=/wrkdirs/usr/ports/databases/mongodb49/work/stage \
+				    MONGO_VERSION=5.0.0-ronaldklop \
 				    install-core""")
 			}
 		}
