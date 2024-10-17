@@ -27,16 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <sstream>
 #include <string>
 
+#include <wiredtiger.h>
+
 #include "mongo/base/string_data.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo {
@@ -53,7 +56,7 @@ public:
         string config = ss.str();
         _fastClockSource = std::make_unique<SystemClockSource>();
         int ret = wiredtiger_open(dbpath.toString().c_str(), nullptr, config.c_str(), &_conn);
-        ASSERT_OK(wtRCToStatus(ret));
+        ASSERT_OK(wtRCToStatus(ret, nullptr));
         ASSERT(_conn);
     }
     ~WiredTigerConnection() {
@@ -111,6 +114,103 @@ TEST(WiredTigerSessionCacheTest, CheckSessionCacheCleanup) {
     // Expire sessions that have been idle for 2 millisecs
     sessionCache->closeExpiredIdleSessions(2);
     ASSERT_EQUALS(sessionCache->getIdleSessionsCount(), 0U);
+}
+
+TEST(WiredTigerSessionCacheTest, ReleaseCursorDuringShutdown) {
+    WiredTigerSessionCacheHarnessHelper harnessHelper("");
+    WiredTigerSessionCache* sessionCache = harnessHelper.getSessionCache();
+    UniqueWiredTigerSession session = sessionCache->getSession();
+    // Simulates the cursor already being deleted during shutdown.
+    WT_CURSOR* cursor = nullptr;
+
+    sessionCache->shuttingDown();
+    ASSERT(sessionCache->isShuttingDown());
+
+    auto tableIdWeDontCareAbout = WiredTigerSession::genTableId();
+    // Skips actually trying to release the cursor to avoid the segmentation fault.
+    session->releaseCursor(tableIdWeDontCareAbout, cursor, "");
+}
+
+// Test that, if a recovery unit reconfigures its session, the session will have its configuration
+// reset to default values before it is released to the session cache where it can be used by
+// another recovery unit.
+TEST(WiredTigerSessionCacheTest, resetConfigurationBeforeReleasingSessionToCache) {
+    WiredTigerSessionCacheHarnessHelper harnessHelper("");
+    WiredTigerSessionCache* sessionCache = harnessHelper.getSessionCache();
+    WiredTigerOplogManager oplogManager;
+
+    // Assert that we start off with no sessions in the session cache.
+    ASSERT_EQ(sessionCache->getIdleSessionsCount(), 0U);
+    {
+        WiredTigerRecoveryUnit recoveryUnit(sessionCache, &oplogManager);
+        // Set cache max wait time to be a non-default value.
+        recoveryUnit.setCacheMaxWaitTimeout(Milliseconds{100});
+
+        WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+        // Set ignore_cache_size to be true
+        session->reconfigure("ignore_cache_size=true", "ignore_cache_size=false");
+        // Set isolation level to be read-uncomitted (by default it is snapshot)
+        session->reconfigure("isolation=read-uncommitted", "isolation=snapshot");
+        // Set cache_cursors to be false
+        session->reconfigure("cache_cursors=false", "cache_cursors=true");
+        auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+        // Check that all the expected undo config strings are present.
+        ASSERT_EQ(undoConfigStringsSet.size(), 4);
+        ASSERT(undoConfigStringsSet.find("cache_max_wait_ms=0") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("isolation=snapshot") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("cache_cursors=true") != undoConfigStringsSet.end());
+    };
+    // Destructing the recovery unit should put the session used by the recovery unit back into the
+    // session cache.
+    ASSERT_EQ(sessionCache->getIdleSessionsCount(), 1U);
+    {
+        WiredTigerRecoveryUnit recoveryUnit(sessionCache, &oplogManager);
+        WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+        // Assert that before it was released back into the session cache, the set of undo config
+        // strings was cleared, which should indicate that the changes to the default settings of
+        // the session were undone.
+        ASSERT_EQ(session->getUndoConfigStrings().size(), 0);
+    }
+}
+
+// Test that, if a recovery unit sets a non-default configuration value for its session and then
+// reconfigures it back to the default value, that we do not store the undo config string (because
+// we do not need to take any action to restore the session to its default configuration).
+TEST(WiredTigerSessionCacheTest, resetConfigurationToDefault) {
+    WiredTigerSessionCacheHarnessHelper harnessHelper("");
+    WiredTigerSessionCache* sessionCache = harnessHelper.getSessionCache();
+    WiredTigerOplogManager oplogManager;
+
+    WiredTigerRecoveryUnit recoveryUnit(sessionCache, &oplogManager);
+    // Set cache max wait time to be a non-default value.
+    recoveryUnit.setCacheMaxWaitTimeout(Milliseconds{100});
+
+    WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+    // Set ignore_cache_size to be true
+    session->reconfigure("ignore_cache_size=true", "ignore_cache_size=false");
+    // Set isolation level to be read-uncomitted (by default it is snapshot)
+    session->reconfigure("isolation=read-uncommitted", "isolation=snapshot");
+    // Set cache_cursors to be false
+    session->reconfigure("cache_cursors=false", "cache_cursors=true");
+    auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+    // Check that all the expected undo config strings are present.
+    ASSERT_EQ(undoConfigStringsSet.size(), 4);
+    ASSERT(undoConfigStringsSet.find("cache_max_wait_ms=0") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("isolation=snapshot") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("cache_cursors=true") != undoConfigStringsSet.end());
+
+    // Set all values back to their defaults.
+    recoveryUnit.setCacheMaxWaitTimeout(Milliseconds{0});
+    session->reconfigure("ignore_cache_size=false", "ignore_cache_size=false");
+    session->reconfigure("isolation=snapshot", "isolation=snapshot");
+    session->reconfigure("cache_cursors=true", "cache_cursors=true");
+
+    // Check that we do not store any undo config strings.
+    ASSERT_EQ(session->getUndoConfigStrings().size(), 0);
 }
 
 }  // namespace mongo

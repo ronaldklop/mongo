@@ -29,11 +29,14 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -51,7 +54,7 @@ namespace mongo {
  * @throws AssertionException if parsing fails.  The message included with
  * this assertion includes the character offset where parsing failed.
  */
-BSONObj fromjson(const std::string& str);
+BSONObj fromjson(StringData str);
 
 /** @param len will be size of JSON object in text chars. */
 BSONObj fromjson(const char* str, int* len = nullptr);
@@ -94,12 +97,16 @@ std::string tojson(const BSONObj& obj,
                    JsonStringFormat format = ExtendedCanonicalV2_0_0,
                    bool pretty = false);
 
+class JParseUtil;
+
 /**
  * Parser class.  A BSONObj is constructed incrementally by passing a
  * BSONObjBuilder to the recursive parsing methods.  The grammar for the
  * element parsed is described before each function.
  */
 class JParse {
+    friend class JParseUtil;
+
 public:
     explicit JParse(StringData str);
 
@@ -319,6 +326,12 @@ private:
     Status objectId(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * UUID :
+     *     UUID( <36 character [<hex>, '-'] std::string> )
+     */
+    Status uuid(StringData fieldName, BSONObjBuilder& builder);
+
+    /*
      * NUMBERLONG :
      *     NumberLong( <number> )
      */
@@ -502,6 +515,20 @@ private:
     bool isBase64String(StringData) const;
 
     /**
+     * Assumes there is a parse error at the current offset, appends a snippet of text from around
+     * the bad input to 'errorBuffer'.
+     */
+    void addBadInputSnippet(std::ostringstream& errorBuffer) const;
+
+    /**
+     * Assumes there is a parse error at the current offset, appends the full input, then a newline,
+     * then another line with a "^" character just below the offset of the problem. For example:
+     * {$and: [{a: {$eq: 2}, {b: {$eq: 3}}]}
+     *                       ^
+     */
+    void indicateOffsetPosition(std::ostringstream& errorBuffer) const;
+
+    /**
      * @return FailedToParse status with the given message and some
      * additional context information
      */
@@ -514,8 +541,12 @@ private:
     StatusWith<Date_t> parseDate();
 
 public:
-    inline int offset() {
+    inline int offset() const {
         return (_input - _buf);
+    }
+
+    inline int length() const {
+        return (_input_end - _buf);
     }
 
 private:

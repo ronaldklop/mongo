@@ -29,8 +29,23 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/platform/atomic_word.h"
 
@@ -46,10 +61,15 @@ class SkippedRecordTracker {
     SkippedRecordTracker(const SkippedRecordTracker&) = delete;
 
 public:
-    explicit SkippedRecordTracker(IndexCatalogEntry* indexCatalogEntry);
-    SkippedRecordTracker(OperationContext* opCtx,
-                         IndexCatalogEntry* indexCatalogEntry,
-                         boost::optional<StringData> ident);
+    enum class RetrySkippedRecordMode {
+        // Retry key generation but do not update the index or remove the records from the tracker.
+        kKeyGeneration,
+        // Retry key generation and update the index with the new keys, removing the retried records
+        // from the tracker.
+        kKeyGenerationAndInsertion
+    };
+
+    SkippedRecordTracker(OperationContext* opCtx, boost::optional<StringData> ident);
 
     /**
      * Records a RecordId that was unable to be indexed due to a key generation error. At the
@@ -59,11 +79,10 @@ public:
     void record(OperationContext* opCtx, const RecordId& recordId);
 
     /**
-     * Deletes or keeps the temporary table managed by this tracker. This call is required, and is
-     * a no-op when the table is empty or has not yet been initialized.
+     * Keeps the temporary table managed by this tracker. This is a no-op when the table is empty or
+     * has not yet been initialized.
      */
-    void finalizeTemporaryTable(OperationContext* opCtx,
-                                TemporaryRecordStore::FinalizationAction action);
+    void keepTemporaryTable();
 
     /**
      * Returns true if the temporary table is empty.
@@ -71,24 +90,33 @@ public:
     bool areAllRecordsApplied(OperationContext* opCtx) const;
 
     /**
-     * Attempts to generates keys for each skipped record and insert into the index. Returns OK if
-     * all records were either indexed or no longer exist.
+     * By default, attempts to generate keys for each skipped record and insert into the index.
+     * Returns OK if all records were either indexed or no longer exist.
+     *
+     * The behaviour can be modified by specifying a RetrySkippedRecordMode.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const IndexCatalogEntry* indexCatalogEntry,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     boost::optional<std::string> getTableIdent() const {
         return _skippedRecordsTable ? boost::make_optional(_skippedRecordsTable->rs()->getIdent())
                                     : boost::none;
     }
 
-private:
-    IndexCatalogEntry* _indexCatalogEntry;
+    boost::optional<MultikeyPaths> getMultikeyPaths() const {
+        return _multikeyPaths;
+    }
 
-    // This temporary record store is owned by the duplicate key tracker and should be dropped or
-    // kept along with it with a call to finalizeTemporaryTable().
+private:
+    // This temporary record store is owned by the duplicate key tracker.
     std::unique_ptr<TemporaryRecordStore> _skippedRecordsTable;
 
     AtomicWord<std::uint32_t> _skippedRecordCounter{0};
+
+    boost::optional<MultikeyPaths> _multikeyPaths;
 };
 
 }  // namespace mongo

@@ -27,10 +27,24 @@
  *    it in the license file.
  */
 
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/lasterror.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_command.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace repl {
@@ -46,11 +60,15 @@ public:
     CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus") {}
 
     bool run(OperationContext* opCtx,
-             const std::string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        // Critical to monitoring and observability, categorize the command as immediate priority.
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            opCtx, AdmissionContext::Priority::kExempt);
+
         if (cmdObj["forShell"].trueValue())
-            LastError::get(opCtx->getClient()).disable();
+            NotPrimaryErrorTracker::get(opCtx->getClient()).disable();
 
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
@@ -64,8 +82,8 @@ public:
         if (includeInitialSync) {
             responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kInitialSync;
         }
-        status =
-            ReplicationCoordinator::get(opCtx)->processReplSetGetStatus(&result, responseStyle);
+        status = ReplicationCoordinator::get(opCtx)->processReplSetGetStatus(
+            opCtx, &result, responseStyle);
         uassertStatusOK(status);
         return true;
     }
@@ -74,7 +92,8 @@ private:
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetGetStatus};
     }
-} cmdReplSetGetStatus;
+};
+MONGO_REGISTER_COMMAND(CmdReplSetGetStatus).forShard();
 
 }  // namespace repl
 }  // namespace mongo

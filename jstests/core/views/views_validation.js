@@ -1,10 +1,10 @@
 // @tags: [
+//   # Running getCollection on views in sharded suites tries to shard views, which fails.
+//   assumes_unsharded_collection,
 //   requires_non_retryable_commands,
-//   requires_fcv_49
+//   references_foreign_collection,
 // ]
 
-(function() {
-"use strict";
 let viewsDb = db.getSiblingDB("views_validation");
 const kMaxViewDepth = 20;
 
@@ -20,8 +20,6 @@ function makeView(viewName, viewOn, pipeline, expectedErrorCode) {
     } else {
         assert.commandWorked(res, "Could not create view " + tojson(options));
     }
-
-    return viewsDb.getCollection(viewName);
 }
 
 function makeLookup(from) {
@@ -136,12 +134,34 @@ makeView("v0", "ok", [makeFacet("v1")], ErrorCodes.ViewDepthLimitExceeded);
 makeView("v0", "ok", [makeUnion("v1")], ErrorCodes.ViewDepthLimitExceeded);
 
 // Test that querying a view that descends more than 20 views will fail.
-assert.commandFailedWithCode(
-    viewsDb.runCommand({aggregate: "v10", pipeline: [makeUnion("v1")], cursor: {}}),
-    ErrorCodes.ViewDepthLimitExceeded);
-assert.commandFailedWithCode(
-    viewsDb.runCommand({aggregate: "v10", pipeline: [makeLookup("v1")], cursor: {}}),
-    ErrorCodes.ViewDepthLimitExceeded);
+
+// Run the initial aggregate 'kMaxRetries' times. If this is a sharded cluster and the targeted node
+// doesn't have the necessary routing information to detect that the view is invalid, this will
+// throw a StaleConfig error instead. In doing so it will obtain the routing information for 10 of
+// our views (one on each attempt), which will allow the subsequent aggregates to discover that the
+// view chain is 20 deep and fail as expected. We run it at most 'kMaxRetries' times in the event
+// that we have multiple nodes in our cluster that can answer this query. We expect that,
+// eventually, we'll detect a 'ViewDepthLimitExceeded' error.
+// TODO SERVER-85941: This ticket aims to prevent needing extra aggregates to get some of the
+// routing information.
+function detectViewError(aggStage) {
+    const kMaxRetries = 6;
+    let detectedViewError = false;
+    for (let i = 0; i < kMaxRetries; ++i) {
+        const res = viewsDb.runCommand({aggregate: "v10", pipeline: [aggStage], cursor: {}});
+        assert.commandFailedWithCode(res,
+                                     [ErrorCodes.ViewDepthLimitExceeded, ErrorCodes.StaleConfig]);
+        if (res.code === ErrorCodes.ViewDepthLimitExceeded) {
+            detectedViewError = true;
+            break;
+        }
+    }
+    assert(detectedViewError,
+           "Did not detect view error after " + kMaxRetries + " retries of the aggregation");
+}
+
+detectViewError(makeUnion("v1"));
+detectViewError(makeLookup("v1"));
 
 // But adding to the middle should be ok.
 makeView("vMid", "v10");
@@ -165,6 +185,12 @@ assert.commandFailedWithCode(
     "BSON field 'collMod.pipeline' is the wrong type 'object', expected type 'array'");
 clear();
 
+// Check that collMod disallows the 'expireAfterSeconds' option over a view.
+makeView("a", "b");
+assert.commandFailedWithCode(viewsDb.runCommand({collMod: "a", expireAfterSeconds: 1}),
+                             ErrorCodes.InvalidOptions);
+clear();
+
 // Check that invalid pipelines are disallowed. The following $lookup is missing the 'as' field.
 makeView("a",
          "b",
@@ -181,4 +207,3 @@ assert.commandFailedWithCode(
     [17320, ErrorCodes.InvalidNamespace, ErrorCodes.InvalidViewDefinition]);
 // Delete the invalid view (by dropping the database) so that the validate hook succeeds.
 assert.commandWorked(invalidDb.dropDatabase());
-}());

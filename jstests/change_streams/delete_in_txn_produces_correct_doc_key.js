@@ -6,11 +6,8 @@
 //  assumes_against_mongod_not_mongos
 //  ]
 
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const collName = "delete_in_txn_produces_correct_doc_key";
 
@@ -23,11 +20,6 @@ const collName = "delete_in_txn_produces_correct_doc_key";
 function testDeleteInMultiDocTxn({collName, deleteCommand, expectedChanges}) {
     // Initialize the collection.
     const coll = assertDropAndRecreateCollection(db, collName);
-
-    // Enable the 'recordPreImages' flag on the collection. This allows us to verify that the full
-    // document is not written to the 'documentKey' field even when we know it is available to the
-    // oplog writer during the delete operation.
-    assert.commandWorked(db.runCommand({collMod: collName, recordPreImages: true}));
 
     assert.commandWorked(coll.insertMany([
         {_id: 1, a: 0, fullDoc: "It's a full document!"},
@@ -61,7 +53,7 @@ function testDeleteInMultiDocTxn({collName, deleteCommand, expectedChanges}) {
         collection: coll
     });
     assert.commandWorked(coll.insert({_id: 5}));
-    assert.docEq(cst.getOneChange(cursor).documentKey, {_id: 5});
+    assert.docEq({_id: 5}, cst.getOneChange(cursor).documentKey);
 
     cst.cleanUp();
 }
@@ -121,4 +113,3 @@ testDeleteInMultiDocTxn({
         },
     ],
 });
-}());

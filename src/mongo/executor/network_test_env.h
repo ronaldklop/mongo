@@ -29,16 +29,27 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <chrono>
 #include <functional>
+#include <future>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -84,9 +95,9 @@ public:
     template <class T>
     class FutureHandle {
     public:
-        FutureHandle<T>(stdx::future<T> future,
-                        executor::TaskExecutor* executor,
-                        executor::NetworkInterfaceMock* network)
+        FutureHandle(stdx::future<T> future,
+                     executor::TaskExecutor* executor,
+                     executor::NetworkInterfaceMock* network)
             : _future(std::move(future)), _executor(executor), _network(network) {}
 
         FutureHandle(FutureHandle&& other) = default;

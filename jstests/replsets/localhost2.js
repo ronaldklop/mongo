@@ -1,8 +1,7 @@
 // Test ReplSet default initiate with 0.0.0.0 binding
 // @tags: [multiversion_incompatible]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Select localhost when binding to localhost
 const rt = new ReplSetTest({name: "rsLocal", nodes: 1});
@@ -16,4 +15,3 @@ assert(!resp.me.startsWith('localhost:'), tojson(resp.me) + " should not start w
 // Wait for the primary to complete its election before shutting down the set.
 assert.soon(() => db.runCommand({hello: 1}).isWritablePrimary);
 rt.stopSet();
-})();

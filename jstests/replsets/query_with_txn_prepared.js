@@ -13,13 +13,11 @@
  *
  *
  * @tags: [
- *   requires_fcv_49,
  *   uses_prepare_transaction,
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -31,9 +29,8 @@ const collName = "coll";
 
 assert.commandWorked(primary.getDB(dbName)[collName].createIndexes([{x: 1}]));
 
-const transactionShell = startParallelShell(function() {
-    load("jstests/core/txns/libs/prepare_helpers.js");  // For PrepareHelpers.
-
+const transactionShell = startParallelShell(async function() {
+    const {PrepareHelpers} = await import("jstests/core/txns/libs/prepare_helpers.js");
     while (db.getSiblingDB("query_with_txn_prepared")["stopQueries"].find().count() == 0) {
         for (let i = 0; i < 100; ++i) {
             const session = db.getMongo().startSession();
@@ -61,4 +58,3 @@ assert.commandWorked(primary.getDB(dbName)["stopQueries"].insert({stop: 1}));
 transactionShell();
 
 replTest.stopSet();
-}());

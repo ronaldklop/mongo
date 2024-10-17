@@ -30,9 +30,97 @@ global:
 
 server_parameters:
     minNumChunksForSessionsCollection:
-        description: 'The minimum number of chunks for config.system.sessions collection'
+        description: >-
+            Deprecated. Has no effect on the number of chunks for config.system.sessions collection.
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int32_t>
         cpp_varname: minNumChunksForSessionsCollection
         default: 1024
         validator: { gte: 1, lte: 1000000 }
+        redact: false
+
+    chunkDefragmentationThrottlingMS:
+        description: >-
+            The minimum amount of time between two consecutive mergeChunks/splitChunk commands
+            issued by the balancer when 'configureCollectionBalancing' is invoked on a collection.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: chunkDefragmentationThrottlingMS
+        validator:
+          gte: 0
+        default: 1000
+        redact: false
+
+    autoMergerIntervalSecs:
+        description: Time interval in seconds between subsequent auto-merging rounds
+        set_at: [startup, runtime]
+        cpp_vartype: int
+        cpp_varname: autoMergerIntervalSecs
+        default: 3600 # 1 hour
+        redact: false
+
+    autoMergerThrottlingMS:
+        description: >-
+            The minimum amount of time between two consecutive auto-merge commands for the same collection.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: autoMergerThrottlingMS
+        validator:
+          gte: 0
+        default: 15000 # 15 seconds
+        redact: false
+
+    balancerMigrationsThrottlingMs:
+        # Sleep between balancer rounds in the case where the last round found some chunks which needed to
+        # be balanced. This value should be set sufficiently low so that imbalanced clusters will quickly
+        # reach balanced state, but setting it too low may cause CRUD operations to start failing due to
+        # not being able to establish a stable shard version.
+        description: The minimum amount of time between two consecutive balancing rounds
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: balancerMigrationsThrottlingMs
+        default: 1000 # 1 sec
+        redact: false
+
+    balancerChunksSelectionTimeoutMs:
+        description: >-
+            Maximum time in milliseconds the balancer will spend deciding which ranges to move in
+            the current balancing round.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: balancerChunksSelectionTimeoutMs
+        default: 5000 # 5 seconds
+        redact: false
+
+    newShardExistingClusterTimeKeysExpirationSecs:
+        description: >-
+            The amount of time in seconds that the config server should wait before removing the
+            key documents fetched from a replica set when it gets added to the cluster
+            as a shard.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gNewShardExistingClusterTimeKeysExpirationSecs
+        default:
+            expr: 7 * 24 * 3600 # 1 week
+        validator:
+            gte: 1
+        redact: false
+
+    enableShardedIndexConsistencyCheck:
+        description: >-
+          Enable the periodic sharded index consistency check on the config server's primary.
+          The count of sharded collections with inconsistent indexes is exposed via the
+          'shardedIndexConsistency' section in the serverStatus output.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: enableShardedIndexConsistencyCheck
+        default: true
+        redact: false
+
+    shardedIndexConsistencyCheckIntervalMS:
+        description: 'Time interval in milliseconds between subsequent index checks.'
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: shardedIndexConsistencyCheckIntervalMS
+        default: 600000
+        redact: false

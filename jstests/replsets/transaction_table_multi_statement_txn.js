@@ -4,10 +4,8 @@
  *
  * @tags: [uses_transactions]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/retryable_writes_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {RetryableWritesUtil} from "jstests/libs/retryable_writes_util.js";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}, {arbiter: true}]});
 replTest.startSet();
@@ -46,4 +44,3 @@ RetryableWritesUtil.assertSameRecordOnBothConnections(primary, secondary, sessio
 
 session.endSession();
 replTest.stopSet();
-})();

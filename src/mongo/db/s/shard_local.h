@@ -29,8 +29,30 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/rs_local_client.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -39,15 +61,19 @@ class ShardLocal : public Shard {
     ShardLocal& operator=(const ShardLocal&) = delete;
 
 public:
+    // ShardLocal doesn't have a "real" connection string since it's always a connection to the
+    // local process, so it uses the hardcoded local connection string. Only used in tests.
+    static const ConnectionString kLocalConnectionString;
+
     explicit ShardLocal(const ShardId& id);
 
-    ~ShardLocal() = default;
+    ~ShardLocal() override = default;
 
     /**
      * These functions are implemented for the Shard interface's sake. They should not be called on
      * ShardLocal because doing so triggers invariants.
      */
-    const ConnectionString getConnString() const override;
+    const ConnectionString& getConnString() const override;
     std::shared_ptr<RemoteCommandTargeter> getTargeter() const override;
     void updateReplSetMonitor(const HostAndPort& remoteHost,
                               const Status& remoteCommandStatus) override;
@@ -56,35 +82,34 @@ public:
 
     bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) final;
 
-    Status createIndexOnConfig(OperationContext* opCtx,
-                               const NamespaceString& ns,
-                               const BSONObj& keys,
-                               bool unique) override;
-
-    void updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) final;
-
-    LogicalTime getLastCommittedOpTime() const final;
-
     void runFireAndForgetCommand(OperationContext* opCtx,
                                  const ReadPreferenceSetting& readPref,
-                                 const std::string& dbName,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) override;
 
     Status runAggregation(OperationContext* opCtx,
                           const AggregateCommandRequest& aggRequest,
-                          std::function<bool(const std::vector<BSONObj>& batch)> callback);
+                          std::function<bool(const std::vector<BSONObj>& batch,
+                                             const boost::optional<BSONObj>& postBatchResumeToken)>
+                              callback) override;
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) final;
 
 private:
     StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,
                                                    const ReadPreferenceSetting& unused,
-                                                   StringData dbName,
+                                                   const DatabaseName& dbName,
                                                    Milliseconds maxTimeMSOverrideUnused,
                                                    const BSONObj& cmdObj) final;
 
     StatusWith<Shard::QueryResponse> _runExhaustiveCursorCommand(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        StringData dbName,
+        const DatabaseName& dbName,
         Milliseconds maxTimeMSOverride,
         const BSONObj& cmdObj) final;
 

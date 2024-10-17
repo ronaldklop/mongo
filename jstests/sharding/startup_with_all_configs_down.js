@@ -6,23 +6,21 @@
 // A restarted standalone will lose all data when using an ephemeral storage engine.
 // @tags: [requires_persistence]
 
-// The UUID consistency check uses connections to shards cached on the ShardingTest object, but this
-// test restarts a shard, so the cached connection is not usable.
-TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-"use strict";
+// The following checks use connections to shards cached on the ShardingTest object, but this test
+// restarts a shard, so the cached connection is not usable.
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 var st = new ShardingTest({shards: 2});
 
 jsTestLog("Setting up initial data");
-
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 for (var i = 0; i < 100; i++) {
     assert.commandWorked(st.s.getDB('test').foo.insert({_id: i}));
 }
-
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
 
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.foo', key: {_id: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: 'test.foo', find: {_id: 50}}));
@@ -33,9 +31,9 @@ assert.commandWorked(
 assert.eq(100, st.s.getDB('test').foo.find().itcount());
 
 jsTestLog("Shutting down all config servers");
-for (var i = 0; i < st._configServers.length; i++) {
-    st.stopConfigServer(i);
-}
+st.configRS.nodes.forEach((config) => {
+    st.stopConfigServer(config);
+});
 
 jsTestLog("Starting a new mongos when there are no config servers up");
 var newMongosInfo = MongoRunner.runMongos({configdb: st._configDB, waitForConnect: false});
@@ -59,9 +57,9 @@ assert(ErrorCodes.ReplicaSetNotFound == error.code || ErrorCodes.ExceededTimeLim
        ErrorCodes.FailedToSatisfyReadPreference == error.code);
 
 jsTestLog("Restarting the config servers");
-for (var i = 0; i < st._configServers.length; i++) {
-    st.restartConfigServer(i);
-}
+st.configRS.nodes.forEach((config) => {
+    st.restartConfigServer(config);
+});
 
 print("Sleeping for 60 seconds to let the other shards restart their ReplicaSetMonitors");
 sleep(60000);
@@ -85,6 +83,5 @@ assert.soon(function() {
 
 assert.eq(100, newMongosConn.getDB('test').foo.find().itcount());
 
-st.stop();
+st.stop({parallelSupported: false});
 MongoRunner.stopMongos(newMongosInfo);
-}());

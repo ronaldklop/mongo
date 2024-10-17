@@ -3,11 +3,8 @@
  * entries from the previous config in the current config.
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 // Start a 3 node replica set with two non-voting nodes. In this case, only one node is
 // needed to satisfy the oplog commitment check.
@@ -30,6 +27,10 @@ nodes.forEach(node => {
 replTest.initiateWithHighElectionTimeout();
 var primary = replTest.getPrimary();
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 // Do a write that should not be able to replicate to node1 since we stopped replication.
 stopServerReplication(nodes[1]);
 assert.commandWorked(primary.getDB("test")["test"].insert({x: 1}));
@@ -55,4 +56,3 @@ restartServerReplication(nodes[1]);
 replTest.awaitReplication();
 
 replTest.stopSet();
-}());

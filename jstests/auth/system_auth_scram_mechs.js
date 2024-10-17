@@ -1,10 +1,8 @@
 /**
- * Tests that the __system user can auth using both SCRAM-SHA-1 and SCRAM-SHA-256
- *
+ * Tests that the __system user can auth using SCRAM-SHA-256
  * @tags: [requires_replication]
  */
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const keyfile = 'jstests/libs/key1';
 const keyfileContents = cat(keyfile).replace(/[\011-\015\040]/g, '');
@@ -17,8 +15,8 @@ jsTestLog("Testing scram-sha-256");
 assert.eq(db.auth({mechanism: 'SCRAM-SHA-256', user: '__system', pwd: keyfileContents}), 1);
 db.logout();
 
+// Test that SCRAM-SHA-1 fails explicitly
 jsTestLog("Testing scram-sha-1");
-assert.eq(db.auth({mechanism: 'SCRAM-SHA-1', user: '__system', pwd: keyfileContents}), 1);
+assert.eq(db.auth({mechanism: 'SCRAM-SHA-1', user: '__system', pwd: keyfileContents}), 0);
 
 rs.stopSet();
-})();

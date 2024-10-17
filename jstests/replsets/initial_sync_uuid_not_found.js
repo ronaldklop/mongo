@@ -4,10 +4,8 @@
  * cases where using UUIDs results in NamespaceNotFound while using namespace strings
  * results in an empty result or zero count.
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const basename = 'initial_sync_rename_collection';
 
@@ -20,6 +18,10 @@ rst.initiate();
 const primary = rst.getPrimary();
 const primaryDB = primary.getDB('d');
 const primaryColl = primaryDB.coll;
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 jsTestLog('Create a collection (with a UUID) and insert a document.');
 assert.commandWorked(primaryColl.insert({_id: 0}));
@@ -40,8 +42,6 @@ function ResyncWithFailpoint(failpointName, failpointData) {
 
     jsTestLog('Wait for new node to start cloning');
     secondary.setSecondaryOk();
-    const secondaryDB = secondary.getDB(primaryDB.getName());
-    const secondaryColl = secondaryDB[primaryColl.getName()];
 
     rst.reInitiate();
     assert.commandWorked(secondary.adminCommand({
@@ -76,4 +76,3 @@ ResyncWithFailpoint(
     'hangAfterClonerStage',
     {cloner: 'DatabaseCloner', stage: 'listCollections', database: primaryDB.getName()});
 rst.stopSet();
-})();

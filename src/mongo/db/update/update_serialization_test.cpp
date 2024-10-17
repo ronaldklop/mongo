@@ -27,19 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
-#include <iostream>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/update/update_driver.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -85,7 +90,9 @@ TEST(UpdateSerialization, IncrementSerializesExactly) {
 }
 
 TEST(UpdateSerialization, MinimumSerializesExactly) {
-    auto myTrip = [](std::string foo) { return updateRoundTrip(foo.c_str()); };
+    auto myTrip = [](std::string foo) {
+        return updateRoundTrip(foo.c_str());
+    };
     ASSERT_IDENTITY(R"({ "$min" : { "e" : 2, "i" : -2 } })", myTrip);
 }
 

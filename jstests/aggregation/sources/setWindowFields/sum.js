@@ -1,19 +1,11 @@
 /**
  * Test that $sum works as a window function.
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/window_function_helpers.js");
-
-load("jstests/aggregation/extras/utils.js");  // documentEq
-const featureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1}))
-        .featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
+import {documentEq} from "jstests/aggregation/extras/utils.js";
+import {
+    seedWithTickerData,
+    testAccumAgainstGroup
+} from "jstests/aggregation/extras/window_function_helpers.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -113,6 +105,41 @@ result = coll.aggregate([
 verifyResults(result, function(num, baseObj) {
     baseObj.a = firstSum(num);
     baseObj.b = secondSum(num);
+    return baseObj;
+});
+
+// Test with unbounded and left shifted window
+result = coll.aggregate([
+                 sortStage,
+                 {
+                     $setWindowFields: {
+                         sortBy: {one: 1},
+                         output: {out: {$sum: "$one", window: {documents: ["unbounded", -2]}}}
+                     }
+                 }
+             ])
+             .toArray();
+verifyResults(result, function(num, baseObj) {
+    baseObj.out = firstSum(Math.max(num - 2, 0));
+    return baseObj;
+});
+
+// Test with additional expression on window function
+result =
+    coll.aggregate([
+            sortStage,
+            {
+                $setWindowFields: {
+                    sortBy: {one: 1},
+                    output:
+                        {out: {$sum: {$abs: "$one"},
+                               window: {documents: ["unbounded", "current"]}}}
+                }
+            }
+        ])
+        .toArray();
+verifyResults(result, function(num, baseObj) {
+    baseObj.out = firstSum(num);
     return baseObj;
 });
 
@@ -285,4 +312,3 @@ verifyResults(result, function(num, baseObj) {
     }
     return baseObj;
 });
-})();

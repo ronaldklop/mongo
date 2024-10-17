@@ -29,11 +29,32 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <js/AllocPolicy.h>
+#include <js/CallArgs.h>
+#include <js/GCVector.h>
+#include <js/Id.h>
+#include <js/Object.h>
+#include <js/PropertyAndElement.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <js/ValueArray.h>
 #include <jsapi.h>
 #include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/scripting/mozjs/exception.h"
 #include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
@@ -113,6 +134,11 @@ public:
     bool getBoolean(Key key);
     BSONObj getObject(Key key);
     void getValue(Key key, JS::MutableHandleValue value);
+    OID getOID(Key key);
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    void getBinData(Key key, std::function<void(const BSONBinData&)> withBinData);
+    Timestamp getTimestamp(Key key);
+    JSRegEx getRegEx(Key key);
 
     void setNumber(Key key, double val);
     void setString(Key key, StringData val);
@@ -138,6 +164,9 @@ public:
     int type(Key key);
 
     void rename(Key key, const char* to);
+
+    // Rename key and delete the original property
+    void renameAndDeleteProperty(Key key, const char* to);
 
     // has field walks the prototype heirarchy
     bool hasField(Key key);

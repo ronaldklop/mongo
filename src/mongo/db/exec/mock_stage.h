@@ -29,9 +29,19 @@
 
 #pragma once
 
+#include <memory>
 #include <queue>
+#include <variant>
 
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -67,7 +77,7 @@ public:
      * The caller is responsible for allocating 'id' and filling out the WSM keyed by 'id'
      * appropriately.
      *
-     * The QueuedDataStage takes ownership of 'id', so the caller should not call WorkingSet::free()
+     * The MockStage takes ownership of 'id', so the caller should not call WorkingSet::free()
      * on it.
      */
     void enqueueAdvanced(WorkingSetID wsid) {
@@ -97,7 +107,7 @@ public:
 private:
     // The mock stage holds a queue of objects of this type. Each element in the queue can either be
     // a document to return, a StageState code, or a Status representing an error.
-    using MockResult = stdx::variant<WorkingSetID, PlanStage::StageState, Status>;
+    using MockResult = std::variant<WorkingSetID, PlanStage::StageState, Status>;
 
     WorkingSet* _ws;
 

@@ -3,16 +3,12 @@
  * startup.
  *
  * @tags: [
- *   requires_fcv_47,
- *   requires_persistence
+ *   requires_persistence,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 const rst = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0, votes: 0}}],
@@ -41,4 +37,3 @@ assert.commandWorked(
 // Node 1 re-checks isSelf on next heartbeat and succeeds.
 waitForState(restartNode, ReplSetTest.State.SECONDARY);
 rst.stopSet();
-})();

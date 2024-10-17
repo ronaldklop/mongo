@@ -1,5 +1,6 @@
 /**
- * TODO: SERVER-44105 maybe remove this test.
+ * TODO (SERVER-69813): Evaluate to get rid of this when ShardServerCatalogCacheLoader will be
+ * removed.
  * This test is a simplified version that tries to simulate the condition described in
  * SERVER-42737. It is very hard to replicate the exact condition because of:
  *
@@ -8,12 +9,13 @@
  * This means that secondary should be replicating a newer refresh after that line
  * above and hit the condition described in the ticket to hit the bug.
  */
-(function() {
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 let rsOptions = {nodes: 2};
 let st = new ShardingTest({shards: {rs0: rsOptions, rs1: rsOptions}});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: 'test.user', middle: {x: 0}}));
 
@@ -43,6 +45,7 @@ let joinUpdate = startParallelShell(
 
 // This secondary read should not cause a hang.
 st.s.setReadPref('secondary');
+st.rs0.awaitReplication();
 let res = assert.commandWorked(coll.getDB('test').runReadCommand(
     {find: 'user', filter: {dummy: {'$exists': false}}, readConcern: {level: 'local'}}));
 
@@ -51,4 +54,3 @@ assert.eq(2, res.cursor.firstBatch.length, tojson(res));
 joinUpdate();
 
 st.stop();
-})();

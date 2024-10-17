@@ -3,15 +3,12 @@
  * would result in SnapshotTooOld error regardless of the snapshot history window.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({nodes: 2});
 
@@ -100,4 +97,3 @@ assert.sameMembers(newNodeDB
                    [{_id: 0}, {_id: 1}, {_id: 2}]);
 
 replSet.stopSet();
-})();

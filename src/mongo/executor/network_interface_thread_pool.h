@@ -29,13 +29,16 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 namespace executor {
@@ -61,15 +64,14 @@ public:
     void schedule(Task task) override;
 
 private:
-    void _consumeTasks(stdx::unique_lock<Latch> lk);
-    void _consumeTasksInline(stdx::unique_lock<Latch> lk) noexcept;
+    void _consumeTasks(stdx::unique_lock<stdx::mutex> lk);
+    void _consumeTasksInline(stdx::unique_lock<stdx::mutex> lk) noexcept;
     void _dtorImpl();
 
     NetworkInterface* const _net;
 
     // Protects all of the pool state below
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "NetworkInterfaceThreadPool::_mutex");
+    stdx::mutex _mutex;
     stdx::condition_variable _joiningCondition;
     std::vector<Task> _tasks;
     bool _started = false;

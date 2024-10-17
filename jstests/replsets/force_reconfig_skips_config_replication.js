@@ -4,9 +4,7 @@
  * committed across a majority of nodes.
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2, useBridge: true});
 const nodes = replTest.startSet();
@@ -48,4 +46,3 @@ secondary.reconnect(primary);
 
 replTest.awaitNodesAgreeOnConfigVersion();
 replTest.stopSet();
-}());

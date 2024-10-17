@@ -13,13 +13,10 @@
  *   from two different primaries.
  * 6. Reconnect node0 to the rest of the set and verify that its reconfig fails.
  */
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
-load('jstests/libs/test_background_ops.js');
-load("jstests/replsets/rslib.js");
-load('jstests/aggregation/extras/utils.js');
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 let rst = new ReplSetTest({nodes: 4, useBridge: true});
 rst.startSet();
@@ -52,9 +49,17 @@ jsTestLog("Current replica set topology: [node0 (Primary)] [node1, node2, node3]
 // This reconfig will not get propagated.
 const parallelShell = startParallelShell(
     funWithArgs(function(config) {
-        assert.commandFailedWithCode(db.getMongo().adminCommand({replSetReconfig: config}),
-                                     ErrorCodes.InterruptedDueToReplStateChange,
-                                     "Reconfig C1 should fail");
+        assert.soon(() => {
+            try {
+                const res = db.getMongo().adminCommand({replSetReconfig: config});
+                return ErrorCodes.isNotPrimaryError(res.code);
+            } catch (e) {
+                if (e.toString().includes("network error while attempting to run command")) {
+                    return false;
+                }
+                throw e;
+            }
+        }, "Reconfig C1 should fail");
     }, C1), node0.port);
 
 assert.commandWorked(node1.adminCommand({replSetStepUp: 1}));
@@ -77,7 +82,7 @@ node0.reconnect([node1, node2, node3]);
 // The newly connected node will receive a heartbeat with a higher term, and
 // step down from being primary. The reconfig command issued to this node, C1, will fail.
 rst.waitForState(node0, ReplSetTest.State.SECONDARY);
-rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, [node0, node1, node3]);
+rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, [node0, node1, node3], node1);
 rst.waitForConfigReplication(node1);
 assert.eq(C2, rst.getReplSetConfigFromNode());
 
@@ -88,7 +93,8 @@ C3.version++;
 
 assert.commandWorked(node1.adminCommand({replSetReconfig: C3}));
 assert.soon(() => isConfigCommitted(node1));
+// Make sure all nodes, including the once-removed node2, have the final config.
+rst.waitForConfigReplication(node1);
 rst.awaitNodesAgreeOnPrimary();
 parallelShell();
 rst.stopSet();
-}());

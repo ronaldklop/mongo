@@ -29,39 +29,52 @@
 
 #include "mongo/db/index/hash_access_method.h"
 
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/hasher.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState,
                                    std::unique_ptr<SortedDataInterface> btree)
-    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     uassert(16764,
             "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
             !descriptor->unique());
-    ExpressionParams::parseHashParams(descriptor->infoObj(), &_seed, &_hashVersion, &_keyPattern);
+    ExpressionParams::parseHashParams(descriptor->infoObj(), &_hashVersion, &_keyPattern);
 
     _collator = btreeState->getCollator();
 }
 
-void HashAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+void HashAccessMethod::validateDocument(const CollectionPtr& collection,
+                                        const BSONObj& obj,
+                                        const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
+void HashAccessMethod::doGetKeys(OperationContext* opCtx,
+                                 const CollectionPtr& collection,
+                                 const IndexCatalogEntry* entry,
+                                 SharedBufferFragmentBuilder& pooledBufferBuilder,
                                  const BSONObj& obj,
                                  GetKeysContext context,
                                  KeyStringSet* keys,
                                  KeyStringSet* multikeyMetadataKeys,
                                  MultikeyPaths* multikeyPaths,
-                                 boost::optional<RecordId> id) const {
+                                 const boost::optional<RecordId>& id) const {
     ExpressionKeysPrivate::getHashKeys(pooledBufferBuilder,
                                        obj,
                                        _keyPattern,
-                                       _seed,
                                        _hashVersion,
-                                       _descriptor->isSparse(),
+                                       entry->descriptor()->isSparse(),
                                        _collator,
                                        keys,
                                        getSortedDataInterface()->getKeyStringVersion(),

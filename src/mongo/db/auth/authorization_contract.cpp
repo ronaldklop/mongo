@@ -27,20 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/auth/authorization_contract.h"
 
-#include "mongo/bson/bsontypes.h"
+#include <cstddef>
+#include <mutex>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/access_checks_gen.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/action_type_gen.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/debug_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 
 void AuthorizationContract::clear() {
+    stdx::lock_guard<stdx::mutex> lck(_mutex);
+
     _checks.reset();
     for (size_t i = 0; i < _privilegeChecks.size(); ++i) {
         _privilegeChecks[i].removeAllActions();
@@ -48,26 +60,48 @@ void AuthorizationContract::clear() {
 }
 
 void AuthorizationContract::addAccessCheck(AccessCheckEnum check) {
+    if (!_isTestModeEnabled) {
+        return;
+    }
+
+    stdx::lock_guard<stdx::mutex> lck(_mutex);
+
     _checks.set(static_cast<size_t>(check), true);
 }
 
 bool AuthorizationContract::hasAccessCheck(AccessCheckEnum check) const {
+    stdx::lock_guard<stdx::mutex> lck(_mutex);
+
     return _checks.test(static_cast<size_t>(check));
 }
 
 void AuthorizationContract::addPrivilege(const Privilege& p) {
+    if (!_isTestModeEnabled) {
+        return;
+    }
+
+    stdx::lock_guard<stdx::mutex> lck(_mutex);
+
     auto matchType = p.getResourcePattern().matchType();
 
     _privilegeChecks[static_cast<size_t>(matchType)].addAllActionsFromSet(p.getActions());
 }
 
 bool AuthorizationContract::hasPrivileges(const Privilege& p) const {
+    stdx::lock_guard<stdx::mutex> lck(_mutex);
+
     auto matchType = p.getResourcePattern().matchType();
 
     return _privilegeChecks[static_cast<size_t>(matchType)].contains(p.getActions());
 }
 
 bool AuthorizationContract::contains(const AuthorizationContract& other) const {
+
+    if (this == &other) {
+        return true;  // this and other are same - so contains is necessarily true
+    }
+
+    std::scoped_lock<stdx::mutex, stdx::mutex> lk(_mutex, other._mutex);
 
     if ((_checks | other._checks) != _checks) {
         if (kDebugBuild) {

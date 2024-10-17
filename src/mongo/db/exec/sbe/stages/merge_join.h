@@ -29,18 +29,39 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
  * This stage performs a merge join given an outer and an inner child stage. The stage remaps
  * both the outer side (buffer to support full cross product) and the inner side to buffer inner
- * values to survive yielding.
+ * values to survive yielding. The join is an equi-join where the join key from the outer side is
+ * given by the 'outerKeys' slot vector and the join key from the inner side is given by the
+ * 'innerKeys' slot vector. In addition, each resulting row returned by the join has the
+ * 'outerProjects' values from the outer side and the 'innerProjects' values from the inner side.
  *
- * The stage expects the data to be sorted according to the 'sortDirs' parameter.
+ * The stage expects the data to be sorted according to the 'sortDirs' parameter. This describes the
+ * sort direction for each of keys on which we are joining, so the 'sortDirs', 'outerKeys', and
+ * 'innerKeys' vectors must each be the same length.
+ *
+ * Debug string format:
+ *
+ *   mj [asc|desc, ...]
+ *     left [<outer keys>] [<outer projects>] childStage
+ *     right [<inner keys>] [<inner projects>] childStage
  */
 class MergeJoinStage final : public PlanStage {
 public:
@@ -51,7 +72,8 @@ public:
                    value::SlotVector innerKeys,
                    value::SlotVector innerProjects,
                    std::vector<value::SortDirection> sortDirs,
-                   PlanNodeId planNodeId);
+                   PlanNodeId planNodeId,
+                   bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -64,6 +86,10 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    void doSaveState(bool relinquishCursor) final;
 
 private:
     using MergeJoinBuffer = std::vector<value::MaterializedRow>;

@@ -28,7 +28,10 @@
  */
 
 #include "mongo/util/net/http_client.h"
+
 #include "mongo/base/status.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo {
 
@@ -41,6 +44,29 @@ HttpClientProvider::~HttpClientProvider() {}
 void registerHTTPClientProvider(HttpClientProvider* factory) {
     invariant(_factory == nullptr);
     _factory = factory;
+}
+
+Status HttpClient::endpointIsSecure(StringData url) {
+    return [&] {
+        if (url.starts_with("https://"))
+            return true;
+        if (!getTestCommandsEnabled())
+            return false;
+        constexpr StringData localhostPrefix = "http://localhost"_sd;
+        if (!url.starts_with(localhostPrefix)) {
+            return false;
+        }
+        url.remove_prefix(localhostPrefix.size());
+        if (url.starts_with(':')) {
+            url.remove_prefix(1);
+            while (!url.empty() && ctype::isDigit(url[0])) {
+                url.remove_prefix(1);
+            }
+        }
+        return url.empty() || url.starts_with('/');
+    }()
+        ? Status::OK()
+        : Status(ErrorCodes::IllegalOperation, "Endpoint is not HTTPS");
 }
 
 std::unique_ptr<HttpClient> HttpClient::create() {

@@ -29,11 +29,33 @@
 
 #pragma once
 
+#include <cstdint>
+#include <list>
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_group.h"
 #include "mongo/db/s/namespace_metadata_change_notifications.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog_cache_loader.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -51,40 +73,59 @@ class ShardServerCatalogCacheLoader : public CatalogCacheLoader {
 
 public:
     ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configServerLoader);
-    ~ShardServerCatalogCacheLoader();
+    ~ShardServerCatalogCacheLoader() override;
 
     /**
      * Initializes internal state so that the loader behaves as a primary or secondary. This can
      * only be called once, when the sharding state is initialized.
      */
-    void initializeReplicaSetRole(bool isPrimary) override;
+    void initializeReplicaSetRole(bool isPrimary);
 
     /**
      * Updates internal state so that the loader can start behaving like a secondary.
      */
-    void onStepDown() override;
+    void onStepDown();
 
     /**
      * Updates internal state so that the loader can start behaving like a primary.
      */
-    void onStepUp() override;
+    void onStepUp();
 
     void shutDown() override;
+
+    /**
+     * Interrupts ongoing refreshes to prevent secondaries from waiting for opTimes from wrong terms
+     * in case of rollback. Primaries must step down before going through rollback, so this should
+     * only be run on secondaries.
+     */
+    void onReplicationRollback();
 
     /**
      * Sets any notifications waiting for this version to arrive and invalidates the catalog cache's
      * chunk metadata for collection 'nss' so that the next caller provokes a refresh.
      */
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
+    void notifyOfCollectionRefreshEndMarkerSeen(const NamespaceString& nss,
+                                                const Timestamp& commitTime);
 
     SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
                                                           ChunkVersion version) override;
 
-    SemiFuture<DatabaseType> getDatabase(StringData dbName) override;
+    SemiFuture<DatabaseType> getDatabase(const DatabaseName& dbName) override;
 
-    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
+    /**
+     * Waits for any pending changes for the specified database or collection to be persisted
+     * locally (not necessarily majority replicated). If newer changes come after this method has
+     * started running, they will not be waited for except if there is a drop.
+     *
+     * May throw if the node steps down from primary or if the operation time is exceeded or due to
+     * any other error condition.
+     *
+     * If the specific loader implementation does not support persistence, these methods are
+     * undefined and must fassert.
+     */
+    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss);
 
-    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
+    void waitForDatabaseFlush(OperationContext* opCtx, const DatabaseName& dbName);
 
 private:
     // Differentiates the server's role in the replica set so that the chunk loader knows whether to
@@ -109,9 +150,6 @@ private:
          * Note: statusWithCollectionAndChangedChunks must always be NamespaceNotFound or
          * OK, otherwise the constructor will invariant because there is no task to complete.
          *
-         * if 'metadataFormatChanged' is true, this task updates the persistent
-         * metadata format of the collection and its chunks. This specific kind
-         * of task doesn't have changed chunks.
          *
          * 'collectionAndChangedChunks' is only initialized if 'dropped' is false.
          * 'minimumQueryVersion' sets 'minQueryVersion'.
@@ -121,8 +159,7 @@ private:
         CollAndChunkTask(
             StatusWith<CollectionAndChangedChunks> statusWithCollectionAndChangedChunks,
             ChunkVersion minimumQueryVersion,
-            long long currentTerm,
-            bool metadataFormatChanged = false);
+            long long currentTerm);
 
         // Always-incrementing task number to uniquely identify different tasks
         uint64_t taskNum;
@@ -144,22 +181,22 @@ private:
         // Indicates whether the collection metadata must be cleared.
         bool dropped{false};
 
-        // Indicates whether the collection metadata and all its chunks must be updated due to a
-        // metadata format change.
-        bool updateMetadataFormat{false};
-
         // The term in which the loader scheduled this task.
         uint32_t termCreated;
-    };
 
-    /* This class represents the results of a _getEnqueuedMetadata call. It contains information
-     * about:
-     *	- Whether we must patch up the metadata results that are sent back to the CatalogCache.
-     *	- The Collection and the changed chunks.
-     */
-    struct EnqueuedMetadataResults {
-        bool mustPatchUpMetadataResults{false};
-        CollectionAndChangedChunks collAndChangedChunks;
+        std::string toString() const {
+            std::stringstream ss;
+            ss << "CollAndChunkTask -"
+               << " taskNum: " << taskNum << ", collectionAndChangedChunksSize: "
+               << (collectionAndChangedChunks ? collectionAndChangedChunks->changedChunks.size()
+                                              : -1)
+               << ", minQueryVersion: "
+               << (minQueryVersion.isSet() ? minQueryVersion.toString() : "(unset)")
+               << ", maxQueryVersion: "
+               << (maxQueryVersion.isSet() ? maxQueryVersion.toString() : "(unset)")
+               << ", dropped: " << dropped << ", termCreated: " << termCreated;
+            return ss.str();
+        }
     };
 
     /**
@@ -212,16 +249,6 @@ private:
         }
 
         /**
-         * Must only be called if there is an active task. Behaves like a condition variable and
-         * will be signaled when the active task has been completed.
-         *
-         * NOTE: Because this call unlocks and locks the provided mutex, it is not safe to use the
-         * same task object on which it was called because it might have been deleted during the
-         * unlocked period.
-         */
-        void waitForActiveTaskCompletion(stdx::unique_lock<Latch>& lg);
-
-        /**
          * Checks whether 'term' matches the term of the latest task in the task list. This is
          * useful to check whether the task list has outdated data that's no longer valid to use in
          * the current/new term specified by 'term'.
@@ -234,13 +261,15 @@ private:
         ChunkVersion getHighestVersionEnqueued() const;
 
         /**
-         * Iterates over the task list to retrieve the enqueued metadata. Only retrieves collects
-         * data from tasks that have terms matching the specified 'term'.
+         * Iterates over the task list to retrieve the enqueued metadata. Only retrieves
+         * collects data from tasks that have terms matching the specified 'term'.
          */
-        EnqueuedMetadataResults getEnqueuedMetadataForTerm(const long long term) const;
+        CollectionAndChangedChunks getEnqueuedMetadataForTerm(long long term) const;
 
 
     private:
+        friend class ShardServerCatalogCacheLoader;
+
         std::list<CollAndChunkTask> _tasks{};
 
         // Condition variable which will be signaled whenever the active task from the tasks list is
@@ -322,24 +351,16 @@ private:
             return _tasks.empty();
         }
 
-        /**
-         * Must only be called if there is an active task. Behaves like a condition variable and
-         * will be signaled when the active task has been completed.
-         *
-         * NOTE: Because this call unlocks and locks the provided mutex, it is not safe to use the
-         * same task object on which it was called because it might have been deleted during the
-         * unlocked period.
-         */
-        void waitForActiveTaskCompletion(stdx::unique_lock<Latch>& lg);
-
     private:
+        friend class ShardServerCatalogCacheLoader;
+
         std::list<DBTask> _tasks{};
 
         // Condition variable which will be signaled whenever the active task from the tasks list is
         // completed. Must be used in conjunction with the loader's mutex.
         std::shared_ptr<stdx::condition_variable> _activeTaskCompletedCondVar;
     };
-    typedef std::map<std::string, DbTaskList> DbTaskLists;
+    typedef std::map<DatabaseName, DbTaskList> DbTaskLists;
 
     typedef std::map<NamespaceString, CollAndChunkTaskList> CollAndChunkTaskLists;
 
@@ -361,7 +382,7 @@ private:
      *
      * Returns the metadata retrieved locally from the shard persisted metadata
      * store and any in-memory enqueued tasks to update that store that match the given term,
-     * grather then or equal to the given chunk version.
+     * greater then or equal to the given chunk version.
      *
      * Only run on the shard primary.
      */
@@ -376,7 +397,8 @@ private:
      * has caught up to the primary's.
      * Returns the database version from this node's persisted metadata store.
      */
-    StatusWith<DatabaseType> _runSecondaryGetDatabase(OperationContext* opCtx, StringData dbName);
+    StatusWith<DatabaseType> _runSecondaryGetDatabase(OperationContext* opCtx,
+                                                      const DatabaseName& dbName);
 
     /**
      * Refreshes db version from the config server's metadata store, and schedules maintenance
@@ -389,7 +411,7 @@ private:
      * Only run on the shard primary.
      */
     StatusWith<DatabaseType> _schedulePrimaryGetDatabase(OperationContext* opCtx,
-                                                         StringData dbName,
+                                                         const DatabaseName& dbName,
                                                          long long termScheduled);
 
     /**
@@ -419,10 +441,8 @@ private:
      *
      * Only run on the shard primary.
      */
-    std::pair<bool, EnqueuedMetadataResults> _getEnqueuedMetadata(
-        const NamespaceString& nss,
-        const ChunkVersion& catalogCacheSinceVersion,
-        const long long term);
+    std::pair<bool, CollectionAndChangedChunks> _getEnqueuedMetadata(
+        const NamespaceString& nss, const ChunkVersion& catalogCacheSinceVersion, long long term);
 
     /**
      * First ensures that this server is a majority primary in the case of a replica set with two
@@ -439,7 +459,7 @@ private:
                                                             CollAndChunkTask task);
 
     void _ensureMajorityPrimaryAndScheduleDbTask(OperationContext* opCtx,
-                                                 StringData dbName,
+                                                 const DatabaseName& dbName,
                                                  DBTask task);
     /**
      * Schedules tasks in the 'nss' task list to execute until the task list is depleted.
@@ -448,7 +468,7 @@ private:
      */
     void _runCollAndChunksTasks(const NamespaceString& nss);
 
-    void _runDbTasks(StringData dbName);
+    void _runDbTasks(const DatabaseName& dbName);
 
     /**
      * Executes the task at the front of the task list for 'nss'. The task will either drop 'nss's
@@ -458,7 +478,17 @@ private:
      */
     void _updatePersistedCollAndChunksMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
-    void _updatePersistedDbMetadata(OperationContext* opCtx, StringData dbName);
+    void _updatePersistedDbMetadata(OperationContext* opCtx, const DatabaseName& dbName);
+
+    /**
+     * Sends _flushRoutingTableCacheUpdates to the primary to force it to refresh its routing table
+     * for collection 'nss' and then waits for the refresh to replicate to this node. Returns a
+     * notification that can be used to wait for the refreshing flag to be set to true in the
+     * config.collections entry to provide a consistent view of config.chunks.
+     */
+    NamespaceMetadataChangeNotifications::ScopedNotification
+    _forcePrimaryCollectionRefreshAndWaitForReplication(OperationContext* opCtx,
+                                                        const NamespaceString& nss);
 
     /**
      * Attempts to read the collection and chunk metadata since 'version' from the shard persisted
@@ -470,7 +500,10 @@ private:
      * NamespaceNotFound error means the collection does not exist.
      */
     CollectionAndChangedChunks _getCompletePersistedMetadataForSecondarySinceVersion(
-        OperationContext* opCtx, const NamespaceString& nss, const ChunkVersion& version);
+        OperationContext* opCtx,
+        NamespaceMetadataChangeNotifications::ScopedNotification&& notif,
+        const NamespaceString& nss,
+        const ChunkVersion& version);
 
     // Loader used by the shard primary to retrieve the authoritative routing metadata from the
     // config server
@@ -483,7 +516,7 @@ private:
     NamespaceMetadataChangeNotifications _namespaceNotifications;
 
     // Protects the class state below
-    Mutex _mutex = MONGO_MAKE_LATCH("ShardServerCatalogCacheLoader::_mutex");
+    stdx::mutex _mutex;
 
     // True if shutDown was called.
     bool _inShutdown{false};

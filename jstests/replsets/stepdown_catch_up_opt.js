@@ -3,10 +3,8 @@
  * correctly, and will affect the delay appropriately.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = 'stepdown_catch_up_opt';
 // Only 2 nodes, so that we can control whether the secondary is caught up.
@@ -16,6 +14,10 @@ replTest.initiate();
 replTest.awaitSecondaryNodes();
 var primary = replTest.getPrimary();
 var secondary = replTest.getSecondary();
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Error codes we expect to see.
 
@@ -59,16 +61,16 @@ try {
     jsTestLog('Try to step down.');
     var startTime = new Date();
     assert.commandFailedWithCode(
-        primary.getDB('admin').runCommand({replSetStepDown: 10, secondaryCatchUpPeriodSecs: 1}),
+        primary.getDB('admin').runCommand({replSetStepDown: 10, secondaryCatchUpPeriodSecs: 2}),
         noCaughtUpSecondariesCode,
         'Expected replSetStepDown to fail, since no secondaries should be caught up.');
     var endTime = new Date();
 
-    // Ensure it took at least 1 second to time out. Adjust the timeout a little bit
+    // Ensure it took at least 2 second to time out. Adjust the timeout a little bit
     // for the precision issue of clock on Windows 2K8.
-    assert.lte(0.95,
+    assert.lte(1.95,
                (endTime - startTime) / 1000,
-               'Expected replSetStepDown command to fail after 1 second.');
+               'Expected replSetStepDown command to fail after 2 seconds.');
 } catch (err) {
     disableFailPoint();
     throw err;
@@ -84,4 +86,3 @@ assert.eq(primaryStatus.myState,
           'Expected original primary node to still be primary');
 
 replTest.stopSet();
-}());

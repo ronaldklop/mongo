@@ -27,21 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/icu.h"
-
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <unicode/localpointer.h>
-#include <unicode/putil.h>
-#include <unicode/uiter.h>
-#include <unicode/unistr.h>
+#include <unicode/uchar.h>
+#include <unicode/umachine.h>
 #include <unicode/usprep.h>
 #include <unicode/ustring.h>
+#include <unicode/utf8.h>
 #include <unicode/utypes.h>
 #include <vector>
 
+#include <absl/base/attributes.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/icu.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -183,6 +187,16 @@ StatusWith<std::string> icuX509DNPrep(StringData str) try {
     return USPrep(USPREP_RFC4518_LDAP).prepare(UString::fromUTF8(str), USPREP_DEFAULT).toUTF8();
 } catch (const DBException& e) {
     return e.toStatus();
+}
+
+/**
+ * ICU has a subtle undefined behavior race condition in the USPrep cache code. While unlikely to
+ * cause a problem, we can mitigate by causing the caches to be initialized at startup time.
+ */
+MONGO_INITIALIZER_GENERAL(LoadIcuPrep, ("LoadICUData"), ("default"))(InitializerContext*) {
+    // Force ICU to load its caches by calling each function.
+    invariant(icuSaslPrep("a"_sd).getStatus());
+    invariant(icuX509DNPrep("a"_sd).getStatus());
 }
 
 }  // namespace mongo

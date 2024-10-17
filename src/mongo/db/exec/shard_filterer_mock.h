@@ -29,8 +29,8 @@
 
 #pragma once
 
-#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 
 namespace mongo {
 
@@ -61,6 +61,12 @@ public:
 
     bool isCollectionSharded() const override {
         return true;
+    }
+
+    size_t getApproximateSize() const override {
+        auto size = sizeof(ConstantFilterMock);
+        size += _pattern.getApproximateSize() - sizeof(KeyPattern);
+        return size;
     }
 
 private:
@@ -103,6 +109,12 @@ public:
 
     bool isCollectionSharded() const override {
         return true;
+    }
+
+    size_t getApproximateSize() const override {
+        auto size = sizeof(AllNullShardKeyFilterMock);
+        size += _pattern.getApproximateSize() - sizeof(ShardKeyPattern);
+        return size;
     }
 
 private:

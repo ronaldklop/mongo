@@ -1,8 +1,7 @@
 // SERVER-15310 Ensure that stepDown kills all other running operations
 
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({name: TestData.name, nodes: 2});
 const nodes = replSet.nodeList();
@@ -63,4 +62,3 @@ assert.lt(duration,
           "Sleep lock held longer than expected, possibly uninterrupted.");
 
 replSet.stopSet();
-})();

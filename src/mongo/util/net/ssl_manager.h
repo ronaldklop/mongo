@@ -34,6 +34,7 @@
 #include <string>
 
 #include "mongo/config.h"
+#include "mongo/db/tenant_id.h"
 
 #ifdef MONGO_CONFIG_SSL
 
@@ -45,6 +46,7 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl/apple.hpp"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/out_of_line_executor.h"
@@ -67,18 +69,22 @@ const std::string getSSLVersion(const std::string& prefix, const std::string& su
 /**
  * Validation callback for setParameter 'opensslCipherConfig'.
  */
-Status validateOpensslCipherConfig(const std::string&);
+Status validateOpensslCipherConfig(const std::string&, const boost::optional<TenantId>&);
 
 /**
  * Validation callback for setParameter 'disableNonTLSConnectionLogging'.
  */
-Status validateDisableNonTLSConnectionLogging(const bool&);
+Status validateDisableNonTLSConnectionLogging(const bool&, const boost::optional<TenantId>&);
 }  // namespace mongo
 
 #ifdef MONGO_CONFIG_SSL
 namespace mongo {
 struct SSLParams;
-struct TransientSSLParams;
+class TransientSSLParams;
+
+namespace transport {
+struct SSLConnectionContext;
+}  // namespace transport
 
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 typedef SSL_CTX* SSLContextType;
@@ -147,6 +153,11 @@ const ASN1OID mongodbRolesOID("1.3.6.1.4.1.34601.2.1.1",
                               "MongoRoles",
                               "Sequence of MongoDB Database Roles");
 
+const ASN1OID mongodbClusterMembershipOID(
+    "1.3.6.1.4.1.34601.2.1.2",
+    "MongoDBClusterMembership",
+    "String name identifying the cluster this certificate is a member of");
+
 /**
  * Counts of negogtiated version used by TLS connections.
  */
@@ -170,26 +181,12 @@ struct CertInformationToLog {
     Date_t validityNotAfter;
     // If the certificate was loaded from file, this is the file name. If empty,
     // it means the certificate came from memory payload.
-    std::optional<std::string> keyFile;
+    boost::optional<std::string> keyFile;
     // If the certificate targets a particular cluster, this is cluster URI. If empty,
     // it means the certificate is the default one for the local cluster.
-    std::optional<std::string> targetClusterURI;
+    boost::optional<std::string> targetClusterURI;
 
-    logv2::DynamicAttributes getDynamicAttributes() const {
-        logv2::DynamicAttributes attrs;
-        attrs.add("subject", subject);
-        attrs.add("issuer", issuer);
-        attrs.add("thumbprint", StringData(hexEncodedThumbprint));
-        attrs.add("notValidBefore", validityNotBefore);
-        attrs.add("notValidAfter", validityNotAfter);
-        if (keyFile) {
-            attrs.add("keyFile", StringData(*keyFile));
-        }
-        if (targetClusterURI) {
-            attrs.add("targetClusterURI", StringData(*targetClusterURI));
-        }
-        return attrs;
-    }
+    logv2::DynamicAttributes getDynamicAttributes() const;
 };
 
 struct CRLInformationToLog {
@@ -205,6 +202,18 @@ struct SSLInformationToLog {
 };
 
 class SSLManagerInterface : public Decorable<SSLManagerInterface> {
+protected:
+    /**
+     * SSLCoreParams is a lightweight view of SSL configuration parameters.
+     * It holds references to existing strings. The lifetime of an SSLCoreParams object
+     * must not exceed the lifetime of the strings it references.
+     */
+    struct SSLCoreParams {
+        const std::string& clientPEM;
+        const std::string& clientPassword;
+        const std::string& cafile;
+    };
+
 public:
     /**
      * Creates an instance of SSLManagerInterface.
@@ -213,7 +222,7 @@ public:
      */
     static std::shared_ptr<SSLManagerInterface> create(
         const SSLParams& params,
-        const std::optional<TransientSSLParams>& transientSSLParams,
+        const boost::optional<TransientSSLParams>& transientSSLParams,
         bool isServer);
 
     /**
@@ -221,7 +230,7 @@ public:
      */
     static std::shared_ptr<SSLManagerInterface> create(const SSLParams& params, bool isServer);
 
-    virtual ~SSLManagerInterface();
+    ~SSLManagerInterface() override;
 
     /**
      * Initiates a TLS connection.
@@ -265,6 +274,37 @@ public:
      */
     virtual bool isTransient() const {
         return false;
+    }
+
+    /**
+     * Defines the operational modes of SSLManager, which determine how TLS parameters are applied
+     * to connections. This should not be confused with SSLParams::SSLModes that control whether
+     * connections are unencrypted or encrypted.
+     *
+     * Different SSLManager modes:
+     * 1. Normal:
+     *    - Uses global TLS parameters.
+     * 2. TransientNoOverride:
+     *    - Applies short-lived connections with TLS parameters that do not override global
+     * settings.
+     * 3. TransientWithOverride:
+     *    - Applies new connections with TLS parameters that override the global settings.
+     */
+    enum class SSLManagerMode { Normal, TransientNoOverride, TransientWithOverride };
+
+    // Returns the SSLManager mode based on transientSSLParams object presence.
+    virtual SSLManagerMode getSSLManagerMode() const {
+        return SSLManagerMode::Normal;
+    }
+
+    SSLCoreParams parseSSLCoreParams(
+        const SSLParams& params, const boost::optional<TransientSSLParams>& transientSSLParams) {
+        if (MONGO_unlikely(transientSSLParams && transientSSLParams->createNewConnection())) {
+            const auto& tlsParams = transientSSLParams->getTLSCredentials();
+            return {tlsParams->tlsPEMKeyFile, tlsParams->tlsPEMKeyPassword, tlsParams->tlsCAFile};
+        } else {
+            return {params.sslPEMKeyFile, params.sslPEMKeyPassword, params.sslCAFile};
+        }
     }
 
     /**
@@ -320,6 +360,12 @@ public:
     virtual Status initSSLContext(SSLContextType context,
                                   const SSLParams& params,
                                   ConnectionDirection direction) = 0;
+
+    /**
+     * Registers this SSL context as the owner of this manager.
+     */
+    virtual void registerOwnedBySSLContext(
+        std::weak_ptr<const transport::SSLConnectionContext> ownedByContext) = 0;
 
     /**
      * Fetches a peer certificate and validates it if it exists. If validation fails, but weak
@@ -387,7 +433,7 @@ public:
     void rotate();
 
 private:
-    Mutex _lock = MONGO_MAKE_LATCH("SSLManagerCoordinator::_lock");
+    stdx::mutex _lock;
     synchronized_value<std::shared_ptr<SSLManagerInterface>> _manager;
 };
 
@@ -398,6 +444,11 @@ extern bool isSSLServer;
  * x.509 certificate.  Matches a remote host name to an x.509 host name, including wildcards.
  */
 bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName);
+
+/**
+ * Parse a UTF8 string from a DER encoded ASN.1 DisplayString.
+ */
+StatusWith<std::string> parseDERString(ConstDataRange cdr);
 
 /**
  * Parse a binary blob of DER encoded ASN.1 into a set of RoleNames.
@@ -423,6 +474,14 @@ std::string removeFQDNRoot(std::string name);
  * See "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
  */
 std::string escapeRfc2253(StringData str);
+
+/**
+ * Generates a new SSLX509Name containing only the attributes requested in filteredAttributes.
+ * Note that multi-valued RDNs will be preserved if any of the attributes in the RDN are specified
+ * in filteredAttributes.
+ */
+SSLX509Name filterClusterDN(const SSLX509Name& fullClusterDN,
+                            const stdx::unordered_set<std::string>& filterAttributes);
 
 /**
  * Parse a DN from a string per RFC 4514
@@ -468,16 +527,16 @@ void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days)
  * Logs the SSL information by dispatching to either logCert() or logCRL().
  */
 void logSSLInfo(const SSLInformationToLog& info,
-                const int logNumPEM = 4913010,
-                const int logNumCluster = 4913011,
-                const int logNumCrl = 4913012);
+                int logNumPEM = 4913010,
+                int logNumCluster = 4913011,
+                int logNumCrl = 4913012);
 
 /**
  * Logs the certificate.
  * @param certType human-readable description of the certificate type.
  */
-void logCert(const CertInformationToLog& cert, StringData certType, const int logNum);
-void logCRL(const CRLInformationToLog& crl, const int logNum);
+void logCert(const CertInformationToLog& cert, StringData certType, int logNum);
+void logCRL(const CRLInformationToLog& crl, int logNum);
 
 }  // namespace mongo
 #endif  // #ifdef MONGO_CONFIG_SSL

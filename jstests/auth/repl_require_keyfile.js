@@ -1,6 +1,5 @@
 // Validate that starting a replica set with auth enabled requires a keyfile
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rsTest = new ReplSetTest({nodes: 1});
 
@@ -14,4 +13,3 @@ const mongoOutput = rawMongoProgramOutput();
 assert(mongoOutput.indexOf(
            "security.keyFile is required when authorization is enabled with replica sets") >= 0,
        "Expected error message about missing keyFile on startup");
-})();

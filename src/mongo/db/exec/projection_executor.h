@@ -29,16 +29,31 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
-
 #include <boost/intrusive_ptr.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
 #include <memory>
+#include <set>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/projection_policies.h"
+#include "mongo/platform/basic.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo::projection_executor {
 /**
@@ -59,8 +74,13 @@ public:
      */
     void optimize() override {
         if (_rootReplacementExpression) {
-            _rootReplacementExpression->optimize();
+            _rootReplacementExpression = _rootReplacementExpression->optimize();
         }
+    }
+
+    Pipeline::SourceContainer::iterator doOptimizeAt(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) override {
+        return std::next(itr);
     }
 
     /**
@@ -73,7 +93,7 @@ public:
     /**
      * Apply the projection transformation.
      */
-    Document applyTransformation(const Document& input) override {
+    Document applyTransformation(const Document& input) const override {
         auto output = applyProjection(input);
         if (_rootReplacementExpression) {
             return _applyRootReplacementExpression(input, output);
@@ -89,6 +109,14 @@ public:
      */
     void setRootReplacementExpression(boost::intrusive_ptr<Expression> expr) {
         _rootReplacementExpression = expr;
+    }
+
+    /**
+     * Returns the root-replacement expression to this tree. Can return nullptr if this tree does
+     * not have a root replacing expression.
+     */
+    boost::intrusive_ptr<Expression> rootReplacementExpression() const {
+        return _rootReplacementExpression;
     }
 
     /**
@@ -117,7 +145,7 @@ protected:
     boost::intrusive_ptr<Expression> _rootReplacementExpression;
 
 private:
-    Document _applyRootReplacementExpression(const Document& input, const Document& output) {
+    Document _applyRootReplacementExpression(const Document& input, const Document& output) const {
         using namespace fmt::literals;
 
         _expCtx->variables.setValue(_projectionPostImageVarId, Value{output});

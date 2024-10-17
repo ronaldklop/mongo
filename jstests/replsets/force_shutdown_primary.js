@@ -10,11 +10,10 @@
  * 6.  Test that the primary node still shuts down.
  *
  */
-(function() {
-"use strict";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {stopReplicationOnSecondaries} from "jstests/libs/write_concern_util.js";
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");  // for stopReplicationOnSecondaries.
 const replTest = new ReplSetTest({nodes: 3});
 replTest.startSet();
 replTest.initiateWithHighElectionTimeout();
@@ -71,5 +70,7 @@ assert.soonNoExcept(function() {
     return true;
 }, "expected primary node to shut down and not be connectable");
 
+// We need to ensure that the primary that is shutting down completes the shutdown
+// process before attempting to stop the set.
+MongoRunner.stopMongod(primary);
 replTest.stopSet();
-})();

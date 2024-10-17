@@ -1,8 +1,6 @@
-load('jstests/readonly/lib/read_only_test.js');
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
-
     return {
         name: 'geo',
 
@@ -27,7 +25,7 @@ runReadOnlyTest(function() {
                 {name: "Kinfolk 94", loc: {type: "Point", coordinates: [40.7217058, -73.9605489]}}
             ];
 
-            writableCollection.insertMany(locDocs);
+            writableCollection.insertMany(locDocs, {ordered: false});
         },
         exec: function(readableCollection) {
             const res =

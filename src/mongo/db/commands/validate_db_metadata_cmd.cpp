@@ -27,21 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_helper.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/validate_db_metadata_common.h"
 #include "mongo/db/commands/validate_db_metadata_gen.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/views/view.h"
+#include "mongo/db/views/view_catalog_helpers.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 namespace mongo {
 namespace {
 void overrideAPIParams(OperationContext* opCtx, const APIParamsForCmd& params) {
@@ -75,7 +100,7 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
-    bool maintenanceOk() const {
+    bool maintenanceOk() const override {
         return false;
     }
 
@@ -119,8 +144,13 @@ public:
 
             // If there is no database name present in the input, run validation against all the
             // databases.
+            // validateDBMetadata accepts a command parameter `db` which is different than `$db`.
+            // If we have `getDb` which returns the `db` parameter, we should use it.
             auto dbNames = validateCmdRequest.getDb()
-                ? std::vector<std::string>{validateCmdRequest.getDb()->toString()}
+                ? std::vector<DatabaseName>{DatabaseNameUtil::deserialize(
+                      validateCmdRequest.getDbName().tenantId(),
+                      validateCmdRequest.getDb()->toString(),
+                      validateCmdRequest.getSerializationContext())}
                 : collectionCatalog->getAllDbNames();
 
             for (const auto& dbName : dbNames) {
@@ -130,8 +160,9 @@ public:
                 }
 
                 if (validateCmdRequest.getCollection()) {
-                    if (!_validateNamespace(
-                            opCtx, NamespaceString(dbName, *validateCmdRequest.getCollection()))) {
+                    if (!_validateNamespace(opCtx,
+                                            NamespaceStringUtil::deserialize(
+                                                dbName, *validateCmdRequest.getCollection()))) {
                         return;
                     }
                     continue;
@@ -139,18 +170,15 @@ public:
 
                 // If there is no collection name present in the input, run validation against all
                 // the collections.
-                if (auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, dbName)) {
-                    viewCatalog->iterate([this, opCtx](const ViewDefinition& view) {
+                collectionCatalog->iterateViews(
+                    opCtx, dbName, [this, opCtx](const ViewDefinition& view) {
                         return _validateView(opCtx, view);
                     });
-                }
 
-                for (auto collIt = collectionCatalog->begin(opCtx, dbName);
-                     collIt != collectionCatalog->end(opCtx);
-                     ++collIt) {
+                for (auto&& coll : collectionCatalog->range(dbName)) {
                     if (!_validateNamespace(
                             opCtx,
-                            collectionCatalog->lookupNSSByUUID(opCtx, collIt.uuid().get()).get())) {
+                            collectionCatalog->lookupNSSByUUID(opCtx, coll->uuid()).value())) {
                         return;
                     }
                 }
@@ -161,9 +189,9 @@ public:
          * Returns false, if the evaluation needs to be aborted.
          */
         bool _validateView(OperationContext* opCtx, const ViewDefinition& view) {
-            auto pipelineStatus = ViewCatalog::validatePipeline(opCtx, view);
+            auto pipelineStatus = view_catalog_helpers::validatePipeline(opCtx, view);
             if (!pipelineStatus.isOK()) {
-                ErrorReplyElement error(view.name().ns(),
+                ErrorReplyElement error(view.name(),
                                         ErrorCodes::APIStrictError,
                                         ErrorCodes::errorString(ErrorCodes::APIStrictError),
                                         pipelineStatus.getStatus().reason());
@@ -179,13 +207,16 @@ public:
         /**
          * Returns false, if the evaluation needs to be aborted.
          */
-        bool _validateNamespace(OperationContext* opCtx, const NamespaceStringOrUUID& coll) {
+        bool _validateNamespace(OperationContext* opCtx, const NamespaceString& coll) {
             bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
             auto apiVersion = APIParameters::get(opCtx).getAPIVersion().value_or("");
 
             // We permit views here so that user requested views can be allowed.
-            AutoGetCollection collection(
-                opCtx, coll, LockMode::MODE_IS, AutoGetCollectionViewMode::kViewsPermitted);
+            AutoGetCollection collection(opCtx,
+                                         coll,
+                                         LockMode::MODE_IS,
+                                         AutoGetCollection::Options{}.viewMode(
+                                             auto_get_collection::ViewMode::kViewsPermitted));
 
             // If it view, just do the validations for view.
             if (auto viewDef = collection.getView()) {
@@ -197,7 +228,7 @@ public:
             }
             const auto status = collection->checkValidatorAPIVersionCompatability(opCtx);
             if (!status.isOK()) {
-                ErrorReplyElement error(coll.nss()->ns(),
+                ErrorReplyElement error(coll,
                                         ErrorCodes::APIStrictError,
                                         ErrorCodes::errorString(ErrorCodes::APIStrictError),
                                         status.reason());
@@ -211,14 +242,16 @@ public:
 
             // Ensure there are no unstable indexes.
             const auto* indexCatalog = collection->getIndexCatalog();
-            std::unique_ptr<IndexCatalog::IndexIterator> ii =
-                indexCatalog->getIndexIterator(opCtx, true /* includeUnfinishedIndexes */);
+            auto ii = indexCatalog->getIndexIterator(
+                opCtx,
+                IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished |
+                    IndexCatalog::InclusionPolicy::kFrozen);
             while (ii->more()) {
                 // Check if the index is allowed in API version 1.
                 const IndexDescriptor* desc = ii->next()->descriptor();
                 if (apiStrict && apiVersion == "1" &&
                     !index_key_validate::isIndexAllowedInAPIVersion1(*desc)) {
-                    ErrorReplyElement error(coll.nss()->ns(),
+                    ErrorReplyElement error(coll,
                                             ErrorCodes::APIStrictError,
                                             ErrorCodes::errorString(ErrorCodes::APIStrictError),
                                             str::stream()
@@ -238,5 +271,6 @@ public:
         std::vector<ErrorReplyElement> apiVersionErrors;
         ValidateDBMetadataCommandReply _reply;
     };
-} validateDBMetadataCmd;
+};
+MONGO_REGISTER_COMMAND(ValidateDBMetadataCmd).forShard();
 }  // namespace mongo

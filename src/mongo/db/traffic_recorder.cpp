@@ -27,24 +27,42 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <fstream>  // IWYU pragma: keep
+#include <limits>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/traffic_recorder.h"
-#include "mongo/db/traffic_recorder_gen.h"
-
-#include <boost/filesystem/operations.hpp>
-#include <fstream>
+#include <boost/filesystem/path.hpp>
 
 #include "mongo/base/data_builder.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_type_terminated.h"
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/rpc/factory.h"
+#include "mongo/db/traffic_recorder.h"
+#include "mongo/db/traffic_recorder_gen.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/producer_consumer_queue.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -120,9 +138,7 @@ public:
                         uassertStatusOK(db.writeAndAdvance<LittleEndian<uint32_t>>(0));
                         uassertStatusOK(db.writeAndAdvance<LittleEndian<uint64_t>>(packet.id));
                         uassertStatusOK(db.writeAndAdvance<Terminated<'\0', StringData>>(
-                            StringData(packet.local)));
-                        uassertStatusOK(db.writeAndAdvance<Terminated<'\0', StringData>>(
-                            StringData(packet.remote)));
+                            StringData(packet.session)));
                         uassertStatusOK(db.writeAndAdvance<LittleEndian<uint64_t>>(
                             packet.now.toMillisSinceEpoch()));
                         uassertStatusOK(db.writeAndAdvance<LittleEndian<uint64_t>>(packet.order));
@@ -131,7 +147,7 @@ public:
                         db.getCursor().write<LittleEndian<uint32_t>>(size);
 
                         {
-                            stdx::lock_guard<Latch> lk(_mutex);
+                            stdx::lock_guard<stdx::mutex> lk(_mutex);
                             _written += size;
                         }
 
@@ -148,7 +164,7 @@ public:
             } catch (...) {
                 auto status = exceptionToStatus();
 
-                stdx::lock_guard<Latch> lk(_mutex);
+                stdx::lock_guard<stdx::mutex> lk(_mutex);
                 _result = status;
             }
         });
@@ -157,13 +173,12 @@ public:
     /**
      * pushRecord returns false if the queue was full.  This is ultimately fatal to the recording
      */
-    bool pushRecord(const transport::SessionHandle& ts,
+    bool pushRecord(const std::shared_ptr<transport::Session>& ts,
                     Date_t now,
                     const uint64_t order,
                     const Message& message) {
         try {
-            _pcqPipe.producer.push(
-                {ts->id(), ts->local().toString(), ts->remote().toString(), now, order, message});
+            _pcqPipe.producer.push({ts->id(), ts->toBSON().toString(), now, order, message});
             return true;
         } catch (const ExceptionFor<ErrorCodes::ProducerConsumerQueueProducerQueueDepthExceeded>&) {
             invariant(!shouldAlwaysRecordTraffic);
@@ -171,7 +186,7 @@ public:
             // If we couldn't push our packet begin the process of failing the recording
             _pcqPipe.producer.close();
 
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
 
             // If the result was otherwise okay, mark it as failed due to the queue blocking.  If
             // it failed for another reason, don't overwrite that.
@@ -185,7 +200,7 @@ public:
     }
 
     Status shutdown() {
-        stdx::unique_lock<Latch> lk(_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
 
         if (!_inShutdown) {
             _inShutdown = true;
@@ -201,7 +216,7 @@ public:
     }
 
     BSONObj getStats() {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _trafficStats.setBufferedBytes(_pcqPipe.controller.getStats().queueDepth);
         _trafficStats.setCurrentFileSize(_written);
         return _trafficStats.toBSON();
@@ -212,8 +227,7 @@ public:
 private:
     struct TrafficRecordingPacket {
         const uint64_t id;
-        const std::string local;
-        const std::string remote;
+        const std::string session;
         const Date_t now;
         const uint64_t order;
         const Message message;
@@ -249,7 +263,7 @@ private:
     MultiProducerSingleConsumerQueue<TrafficRecordingPacket, CostFunction>::Pipe _pcqPipe;
     stdx::thread _thread;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("Recording::_mutex");
+    stdx::mutex _mutex;
     bool _inShutdown = false;
     TrafficRecorderStats _trafficStats;
     size_t _written = 0;
@@ -280,7 +294,7 @@ void TrafficRecorder::start(const StartRecordingTraffic& options) {
             !gTrafficRecordingDirectory.empty());
 
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         uassert(ErrorCodes::BadValue, "Traffic recording already active", !_recording);
 
@@ -297,7 +311,7 @@ void TrafficRecorder::stop() {
     _shouldRecord.store(false);
 
     auto recording = [&] {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         uassert(ErrorCodes::BadValue, "Traffic recording not active", _recording);
 
@@ -307,12 +321,12 @@ void TrafficRecorder::stop() {
     uassertStatusOK(recording->shutdown());
 }
 
-void TrafficRecorder::observe(const transport::SessionHandle& ts,
-                              Date_t now,
-                              const Message& message) {
+void TrafficRecorder::observe(const std::shared_ptr<transport::Session>& ts,
+                              const Message& message,
+                              ServiceContext* svcCtx) {
     if (shouldAlwaysRecordTraffic) {
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
 
             if (!_recording) {
                 StartRecordingTraffic options;
@@ -324,7 +338,8 @@ void TrafficRecorder::observe(const transport::SessionHandle& ts,
             }
         }
 
-        invariant(_recording->pushRecord(ts, now, _recording->order.addAndFetch(1), message));
+        invariant(_recording->pushRecord(
+            ts, svcCtx->getPreciseClockSource()->now(), _recording->order.addAndFetch(1), message));
         return;
     }
 
@@ -340,12 +355,13 @@ void TrafficRecorder::observe(const transport::SessionHandle& ts,
     }
 
     // Try to record the message
-    if (recording->pushRecord(ts, now, recording->order.addAndFetch(1), message)) {
+    if (recording->pushRecord(
+            ts, svcCtx->getPreciseClockSource()->now(), recording->order.addAndFetch(1), message)) {
         return;
     }
 
     // We couldn't queue
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     // If the recording isn't the one we have in hand bail (its been ended, or a new one has
     // been created
@@ -358,13 +374,13 @@ void TrafficRecorder::observe(const transport::SessionHandle& ts,
 }
 
 std::shared_ptr<TrafficRecorder::Recording> TrafficRecorder::_getCurrentRecording() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _recording;
 }
 
 class TrafficRecorder::TrafficRecorderSSS : public ServerStatusSection {
 public:
-    TrafficRecorderSSS() : ServerStatusSection("trafficRecording") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -386,6 +402,8 @@ public:
 
         return recording->getStats();
     }
-} trafficRecorderStats;
+};
+auto& trafficRecorderStats =
+    *ServerStatusSectionBuilder<TrafficRecorder::TrafficRecorderSSS>("trafficRecording");
 
 }  // namespace mongo

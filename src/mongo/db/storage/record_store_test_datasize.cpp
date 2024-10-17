@@ -27,13 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <ostream>
+#include <string>
 
-#include "mongo/db/storage/record_store_test_harness.h"
+#include <boost/move/utility_core.hpp>
 
-
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 
 namespace mongo {
@@ -46,7 +55,7 @@ using std::unique_ptr;
 // Verify that an empty collection takes up no space.
 TEST(RecordStoreTestHarness, DataSizeEmpty) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -62,7 +71,7 @@ TEST(RecordStoreTestHarness, DataSizeEmpty) {
 // Verify that a nonempty collection takes up some space.
 TEST(RecordStoreTestHarness, DataSizeNonEmpty) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());

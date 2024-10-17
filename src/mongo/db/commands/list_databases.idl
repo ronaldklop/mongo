@@ -32,33 +32,43 @@ global:
 imports:
     - "mongo/db/auth/access_checks.idl"
     - "mongo/db/auth/action_type.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ListDatabasesReplyItem:
         description: "Individual result"
         fields:
-            name: string
+            name:
+                type: string
+                stability: stable
             sizeOnDisk:
                 type: long
                 optional: true
+                stability: stable
             empty:
                 type: bool
                 optional: true
+                stability: stable
             shards:
                 type: object_owned
                 optional: true
+                stability: stable
 
     ListDatabasesReply:
         description: "The listDatabases command's reply."
+        is_command_reply: true
         fields:
-            databases: array<ListDatabasesReplyItem>
+            databases:
+                type: array<ListDatabasesReplyItem>
+                stability: stable
             totalSize:
                 type: long
                 optional: true
+                stability: stable
             totalSizeMb:
                 type: long
                 optional: true
+                stability: stable
 
 commands:
     listDatabases:
@@ -79,12 +89,15 @@ commands:
                 description: "Return just the database name without metadata"
                 type: safeBool
                 default: false
+                stability: stable
             authorizedDatabases:
                 description: "Only return those databases for which the user is authorized"
                 type: bool
                 optional: true
+                stability: stable
             filter:
                 description: "Filter description to limit results"
                 type: object
                 optional: true
+                stability: stable
         reply_type: ListDatabasesReply

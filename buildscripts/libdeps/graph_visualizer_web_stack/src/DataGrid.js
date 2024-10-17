@@ -10,7 +10,46 @@ import Typography from "@material-ui/core/Typography";
 
 import { getRows } from "./redux/store";
 import { updateSelected } from "./redux/nodes";
-import { socket } from "./connect";
+import { setGraphData } from "./redux/graphData";
+import { setNodeInfos } from "./redux/nodeInfo";
+import { setLinks } from "./redux/links";
+import { setLinksTrans } from "./redux/linksTrans";
+
+const {REACT_APP_API_URL} = process.env;
+
+function componentToHex(c) {
+  var hex = c.toString(16);
+  return hex.length == 1 ? "0" + hex : hex;
+}
+
+function rgbToHex(r, g, b) {
+  return "#" + componentToHex(r) + componentToHex(g) + componentToHex(b);
+}
+
+function hexToRgb(hex) {
+  // Expand shorthand form (e.g. "03F") to full form (e.g. "0033FF")
+  var shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+  hex = hex.replace(shorthandRegex, function (m, r, g, b) {
+    return r + r + g + g + b + b;
+  });
+
+  var result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result
+    ? {
+        r: parseInt(result[1], 16),
+        g: parseInt(result[2], 16),
+        b: parseInt(result[3], 16),
+      }
+    : null;
+}
+
+function incrementPallete(palleteColor, increment) {
+  var rgb = hexToRgb(palleteColor);
+  rgb.r += increment;
+  rgb.g += increment;
+  rgb.b += increment;
+  return rgbToHex(rgb.r, rgb.g, rgb.b);
+}
 
 const styles = (theme) => ({
   flexContainer: {
@@ -26,12 +65,14 @@ const styles = (theme) => ({
     },
   },
   tableRowOdd: {
-    backgroundColor: "#4d4d4d",
+    backgroundColor: incrementPallete(theme.palette.grey[800], 10),
   },
-  tableRowEven: {},
+  tableRowEven: {
+    backgroundColor: theme.palette.grey[800],
+  },
   tableRowHover: {
     "&:hover": {
-      backgroundColor: theme.palette.grey[700],
+      backgroundColor: theme.palette.grey[600],
     },
   },
   tableCell: {
@@ -52,12 +93,54 @@ const DataGrid = ({
   onNodeClicked,
   updateSelected,
   classes,
+  setGraphData,
+  setLinks,
+  setLinksTrans,
+  selectedGraph,
+  setNodeInfos,
+  selectedNodes,
+  searchedNodes,
+  showTransitive
 }) => {
   const [checkBoxes, setCheckBoxes] = React.useState([]);
 
   React.useEffect(() => {
-    setCheckBoxes(nodes);
-  }, [nodes]);
+    setCheckBoxes(searchedNodes);
+  }, [searchedNodes]);
+
+  function newGraphData() {
+    let gitHash = selectedGraph;
+    if (gitHash) {
+      let postData = {
+          "selected_nodes": nodes.filter(node => node.selected == true).map(node => node.node),
+          "transitive_edges": showTransitive
+      };
+      fetch(REACT_APP_API_URL + '/api/graphs/' + gitHash + '/d3', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(postData)
+      })
+        .then(response => response.json())
+        .then(data => {
+          setGraphData(data.graphData);
+          setLinks(data.graphData.links);
+          setLinksTrans(data.graphData.links_trans);
+        });
+      fetch(REACT_APP_API_URL + '/api/graphs/' + gitHash + '/nodes/details', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(postData)
+      })
+        .then(response => response.json())
+        .then(data => {
+          setNodeInfos(data.nodeInfos);
+        });
+    }
+  }
 
   const getRowClassName = ({ index }) => {
     return clsx(
@@ -76,7 +159,7 @@ const DataGrid = ({
       style["justifyContent"] = "space-evenly";
       finalCellData = (
         <Checkbox
-          checked={checkBoxes[rowIndex].selected}
+          checked={checkBoxes[rowIndex] ? checkBoxes[rowIndex].selected : false}
           onChange={(event) => {
             setCheckBoxes(
               checkBoxes.map((checkbox, index) => {
@@ -89,10 +172,7 @@ const DataGrid = ({
             if (checkBoxes[rowIndex].selected != event.target.checked) {
               updateSelected({ index: rowIndex, value: event.target.checked });
             }
-            socket.emit("row_selected", {
-              data: { node: nodes[rowIndex].node, name: nodes[rowIndex].name },
-              isSelected: event.target.checked,
-            });
+            newGraphData();
           }}
         />
       );
@@ -181,6 +261,6 @@ const DataGrid = ({
   );
 };
 
-export default connect(getRows, { updateSelected })(
+export default connect(getRows, { updateSelected, setGraphData, setNodeInfos, setLinks, setLinksTrans })(
   withStyles(styles)(DataGrid)
 );

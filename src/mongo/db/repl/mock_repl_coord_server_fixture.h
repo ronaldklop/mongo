@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#include <utility>
+
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
@@ -42,7 +44,7 @@ class StorageInterfaceMock;
 }  // namespace repl
 
 /**
- * This is a basic fixture that is backed by an ephemeral storage engine and a mock replication
+ * This is a basic fixture that is backed by a real storage engine and a mock replication
  * coordinator that is running as primary.
  */
 class MockReplCoordServerFixture : public ServiceContextMongoDTest {
@@ -56,6 +58,10 @@ public:
     void insertOplogEntry(const repl::OplogEntry& entry);
 
     OperationContext* opCtx();
+
+protected:
+    explicit MockReplCoordServerFixture(Options options = {})
+        : ServiceContextMongoDTest(std::move(options)) {}
 
 private:
     ServiceContext::UniqueOperationContext _opCtx;

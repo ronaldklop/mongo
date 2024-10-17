@@ -27,11 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <set>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/none_t.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/process_interface/standalone_process_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -40,9 +56,10 @@ class MongoProcessInterfaceForTest : public StandaloneProcessInterface {
 public:
     using StandaloneProcessInterface::StandaloneProcessInterface;
 
-    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                         const NamespaceString& nss,
-                                         const std::set<FieldPath>& fields) const override {
+    SupportingUniqueIndex fieldsHaveSupportingUniqueIndex(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        const std::set<FieldPath>& fields) const override {
         return hasSupportingIndexForFields;
     }
 
@@ -53,7 +70,7 @@ public:
         return;
     }
 
-    bool hasSupportingIndexForFields{true};
+    SupportingUniqueIndex hasSupportingIndexForFields{SupportingUniqueIndex::Full};
 };
 
 class ProcessInterfaceStandaloneTest : public AggregationContextFixture {
@@ -64,38 +81,40 @@ public:
 };
 
 TEST_F(ProcessInterfaceStandaloneTest,
-       FailsToEnsureFieldsUniqueIfTargetCollectionVersionIsSpecifiedOnMongos) {
+       FailsToEnsureFieldsUniqueIftargetCollectionPlacementVersionIsSpecifiedOnMongos) {
     auto expCtx = getExpCtx();
-    auto targetCollectionVersion =
-        boost::make_optional(ChunkVersion(0, 0, OID::gen(), boost::none /* timestamp */));
+    auto targetCollectionPlacementVersion =
+        boost::make_optional(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {0, 0}));
     auto processInterface = makeProcessInterface();
 
-    // Test that 'targetCollectionVersion' is not accepted if not from mongos.
-    expCtx->fromMongos = false;
+    // Test that 'targetCollectionPlacementVersion' is not accepted if not from router.
+    expCtx->fromRouter = false;
     ASSERT_THROWS_CODE(processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-                           expCtx, {{"_id"}}, targetCollectionVersion, expCtx->ns),
+                           expCtx, {{"_id"}}, targetCollectionPlacementVersion, expCtx->ns),
                        AssertionException,
                        51123);
 
-    // Test that 'targetCollectionVersion' is accepted if from mongos.
-    expCtx->fromMongos = true;
-    auto [joinKey, chunkVersion] = processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-        expCtx, {{"_id"}}, targetCollectionVersion, expCtx->ns);
+    // Test that 'targetCollectionPlacementVersion' is accepted if from router.
+    expCtx->fromRouter = true;
+    auto [joinKey, chunkVersion, supportingUniqueIndex] =
+        processInterface->ensureFieldsUniqueOrResolveDocumentKey(
+            expCtx, {{"_id"}}, targetCollectionPlacementVersion, expCtx->ns);
     ASSERT_EQ(joinKey.size(), 1UL);
     ASSERT_EQ(joinKey.count(FieldPath("_id")), 1UL);
     ASSERT(chunkVersion);
-    ASSERT_EQ(*chunkVersion, *targetCollectionVersion);
+    ASSERT_EQ(*chunkVersion, *targetCollectionPlacementVersion);
+    ASSERT_EQ(supportingUniqueIndex, MongoProcessInterface::SupportingUniqueIndex::Full);
 }
 
 TEST_F(ProcessInterfaceStandaloneTest, FailsToEnsureFieldsUniqueIfJoinFieldsAreNotSentFromMongos) {
     auto expCtx = getExpCtx();
-    auto targetCollectionVersion =
-        boost::make_optional(ChunkVersion(0, 0, OID::gen(), boost::none /* timestamp */));
+    auto targetCollectionPlacementVersion =
+        boost::make_optional(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {0, 0}));
     auto processInterface = makeProcessInterface();
 
-    expCtx->fromMongos = true;
+    expCtx->fromRouter = true;
     ASSERT_THROWS_CODE(processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-                           expCtx, boost::none, targetCollectionVersion, expCtx->ns),
+                           expCtx, boost::none, targetCollectionPlacementVersion, expCtx->ns),
                        AssertionException,
                        51124);
 }
@@ -103,13 +122,14 @@ TEST_F(ProcessInterfaceStandaloneTest, FailsToEnsureFieldsUniqueIfJoinFieldsAreN
 TEST_F(ProcessInterfaceStandaloneTest,
        FailsToEnsureFieldsUniqueIfFieldsDoesNotHaveSupportingUniqueIndex) {
     auto expCtx = getExpCtx();
-    auto targetCollectionVersion = boost::none;
+    auto targetCollectionPlacementVersion = boost::none;
     auto processInterface = makeProcessInterface();
 
-    expCtx->fromMongos = false;
-    processInterface->hasSupportingIndexForFields = false;
+    expCtx->fromRouter = false;
+    processInterface->hasSupportingIndexForFields =
+        MongoProcessInterface::SupportingUniqueIndex::None;
     ASSERT_THROWS_CODE(processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-                           expCtx, {{"x"}}, targetCollectionVersion, expCtx->ns),
+                           expCtx, {{"x"}}, targetCollectionPlacementVersion, expCtx->ns),
                        AssertionException,
                        51183);
 }

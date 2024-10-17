@@ -29,8 +29,15 @@
 
 #pragma once
 
+#include <bitset>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/query/projection_ast.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -46,9 +53,12 @@ struct ProjectionDependencies {
     // Whether the entire document is required to do the projection.
     bool requiresDocument = false;
     bool hasExpressions = false;
+    bool containsElemMatch = false;
 
-    // Which fields are necessary to perform the projection, or boost::none if all are required.
-    boost::optional<std::vector<std::string>> requiredFields;
+    // If inclusion projection, contains field paths that are necessary to perform the projection,
+    // or boost::none if all are required. If exclusion projection, contains field paths that are
+    // explicitly excluded.
+    boost::optional<OrderedPathSet> paths;
 
     bool hasDottedPath = false;
 
@@ -56,9 +66,10 @@ struct ProjectionDependencies {
 };
 
 /**
- * Used to represent a projection for dependency analysis and query planning.
+ * Used to represent a projection for dependency analysis and query planning. 'kAddition' is for
+ * $addFields, which is implemented as a variant of projection.
  */
-enum class ProjectType { kInclusion, kExclusion };
+enum class ProjectType { kInclusion, kExclusion, kAddition };
 class Projection {
 public:
     Projection(ProjectionPathASTNode root, ProjectType type);
@@ -92,11 +103,15 @@ public:
 
     /**
      * Return which fields are required to compute the projection, assuming the entire document is
-     * not needed.
+     * not needed. Includes _id explicitly if it is required - implicitily or explicitly.
      */
-    const std::vector<std::string>& getRequiredFields() const {
-        invariant(_type == ProjectType::kInclusion);
-        return *_deps.requiredFields;
+    const OrderedPathSet& getRequiredFields() const {
+        return *_deps.paths;
+    }
+
+    const OrderedPathSet& getExcludedPaths() const {
+        invariant(_type == ProjectType::kExclusion);
+        return *_deps.paths;
     }
 
     const QueryMetadataBitSet& metadataDeps() const {
@@ -110,14 +125,22 @@ public:
      */
     bool isFieldRetainedExactly(StringData path) const;
 
+
     /**
-     * A projection is considered "simple" if it doesn't require the full document, operates only
-     * on top-level fields, has no positional projection or expressions, and doesn't require
-     * metadata.
+     * Returns true if this projection has any dotted paths; false otherwise.
+     */
+    bool hasDottedPaths() const {
+        return _deps.hasDottedPath;
+    }
+    /**
+     * A projection is considered "simple" if it operates only on top-level fields,
+     * has no positional projection or expressions, and doesn't require metadata.
+     * Both exclusion and inclusion projections can be simple but not addition projections.
      */
     bool isSimple() const {
         return !_deps.hasDottedPath && !_deps.requiresMatchDetails &&
-            !_deps.metadataRequested.any() && !_deps.requiresDocument && !_deps.hasExpressions;
+            !_deps.metadataRequested.any() && !_deps.hasExpressions &&
+            _type != ProjectType::kAddition;
     }
 
     /**
@@ -137,11 +160,39 @@ public:
             _deps.metadataRequested.none() && !_deps.requiresDocument && !_deps.hasExpressions;
     }
 
+    /**
+     * Check if this an exclusion only projection, without expressions or metadata dependencies.
+     */
+    bool isExclusionOnly() const {
+        return _type == ProjectType::kExclusion && !_deps.requiresMatchDetails &&
+            _deps.metadataRequested.none() && !_deps.hasExpressions;
+    }
+
+    bool containsElemMatch() const {
+        return _deps.containsElemMatch;
+    }
+
+    /**
+     * Optimizes the projection tree. Additionally, re-computes dependencies in case anything
+     * changes as in projection {x: {$and: [false, "$b"]}} - which when optimized will no longer
+     * depend on "b".
+     */
+    void optimize();
+
 private:
     ProjectionPathASTNode _root;
     ProjectType _type;
     ProjectionDependencies _deps;
+    bool _projOptimized = false;
 };
+
+/**
+ * Walks the projection AST and optimizes each node. Note if you have a 'Projection' instance you
+ * should prefer to use Projection::optimize() since it will additionally re-compute dependencies in
+ * case anything changes as in projection {x: {$and: [false, "$b"]}} - which when optimized will no
+ * longer depend on "b".
+ */
+void optimizeProjection(ProjectionPathASTNode* root);
 
 }  // namespace projection_ast
 }  // namespace mongo

@@ -7,10 +7,9 @@
  * - in its storage catalog, with the same UUID as the collection has in the sharding catalog
  * - in its catalog cache, with the same UUID as the collection has in the sharding catalog
  *
- * TODO (SERVER-33252): extend the hook to add consistency checks for databases
  * TODO (SERVER-33253): extend the hook to add consistency checks for collection indexes and options
  */
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
     if (jsTest.options().skipCheckingUUIDsConsistentAcrossCluster) {
@@ -48,7 +47,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
             }
             var rs = this._rs[i].test;
 
-            var keyFile = this._otherParams.keyFile;
+            var keyFile = this.keyFile;
             if (keyFile) {
                 authutil.asCluster(rs.nodes, keyFile, function() {
                     rs.awaitLastOpCommitted(timeout);
@@ -72,8 +71,10 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
         // Read from config.collections, config.shards, and config.chunks to construct a picture
         // of which shards own data for which collections, and what the UUIDs for those collections
         // are.
+        // Create a new connection in case the router was restarted during the test.
+        let mongos = new Mongo(this.s.host);
         let authoritativeCollMetadataArr =
-            this.s.getDB("config")
+            mongos.getDB("config")
                 .chunks
                 .aggregate([
                     {

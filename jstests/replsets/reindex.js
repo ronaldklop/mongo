@@ -3,11 +3,11 @@
  * that the command can't be run on a primary or a secondary. Then it will make sure that the
  * reindex command can be successfully run on a standalone node.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 jsTestLog("Testing that the reindex command cannot be run on a primary or secondary");
 
@@ -71,4 +71,3 @@ assert.commandFailedWithCode(nonExistentDb.getCollection('test').reIndex(),
 assert.eq(2, testColl.getIndexes().length, "Standalone didn't have proper indexes after reindex");
 
 MongoRunner.stopMongod(standalone);
-})();

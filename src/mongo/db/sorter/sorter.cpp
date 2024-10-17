@@ -48,43 +48,70 @@
 
 #include "mongo/db/sorter/sorter.h"
 
-#include <boost/filesystem/operations.hpp>
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <functional>
+#include <istream>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <queue>
 #include <snappy.h>
+#include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/string_data.h"
-#include "mongo/config.h"
-#include "mongo/db/jsobj.h"
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/query/util/spill_util.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/sorter/sorter_checksum_calculator.h"
+#include "mongo/db/sorter/sorter_gen.h"
+#include "mongo/db/sorter/sorter_stats.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/encryption_hooks.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/overflow_arithmetic.h"
-#include "mongo/s/is_mongos.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/destructor_guard.h"
+#include "mongo/util/file.h"
+#include "mongo/util/shared_buffer_fragment.h"
 #include "mongo/util/str.h"
-#include "mongo/util/unowned_ptr.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
 namespace {
 
-/**
- * Calculates and returns a new murmur hash value based on the prior murmur hash and a new piece
- * of data.
- */
-uint32_t addDataToChecksum(const void* startOfData, size_t sizeOfData, uint32_t checksum) {
-    unsigned newChecksum;
-    MurmurHash3_x86_32(startOfData, sizeOfData, checksum, &newChecksum);
-    return newChecksum;
-}
-
 void checkNoExternalSortOnMongos(const SortOptions& opts) {
     // This should be checked by consumers, but if it isn't try to fail early.
     uassert(16947,
             "Attempting to use external sort from mongos. This is not allowed.",
-            !(isMongos() && opts.extSortAllowed));
+            !(serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer) &&
+              opts.extSortAllowed));
 }
 
 /**
@@ -105,11 +132,11 @@ EncryptionHooks* getEncryptionHooksIfEnabled() {
     return encryptionHooks;
 }
 
+constexpr std::size_t kSortedFileBufferSize = 64 * 1024;
+
 }  // namespace
 
 namespace sorter {
-
-using std::shared_ptr;
 
 // We need to use the "real" errno everywhere, not GetLastError() on Windows
 inline std::string myErrnoWithDescription() {
@@ -119,8 +146,8 @@ inline std::string myErrnoWithDescription() {
     return sb.str();
 }
 
-template <typename Data, typename Comparator>
-void dassertCompIsSane(const Comparator& comp, const Data& lhs, const Data& rhs) {
+template <typename Key, typename Comparator>
+void dassertCompIsSane(const Comparator& comp, const Key& lhs, const Key& rhs) {
 #if defined(MONGO_CONFIG_DEBUG_BUILD) && !defined(_MSC_VER)
     // MSVC++ already does similar verification in debug mode in addition to using
     // algorithms that do more comparisons. Doing our own verification in addition makes
@@ -160,20 +187,78 @@ public:
     template <typename Container>
     InMemIterator(const Container& input) : _data(input.begin(), input.end()) {}
 
-    void openSource() {}
-    void closeSource() {}
+    InMemIterator(std::vector<Data> data) : _data(std::move(data)) {}
 
-    bool more() {
-        return !_data.empty();
+    void openSource() override {}
+    void closeSource() override {}
+
+    bool more() override {
+        return _index < _data.size();
     }
-    Data next() {
-        Data out = std::move(_data.front());
-        _data.pop_front();
+    Data next() override {
+        Data out = std::move(_data[_index]);
+        _index++;
         return out;
     }
 
+    Key nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    const Key& current() override {
+        tasserted(ErrorCodes::NotImplemented, "current() not implemented for InMemIterator");
+    }
+
 private:
-    std::deque<Data> _data;
+    std::vector<Data> _data;
+    uint32_t _index{0};
+};
+
+/**
+ * This class is used to return the in-memory state from the sorter in read-only mode.
+ * This is used by streams checkpoint use case mainly to save in-memory state on persistent
+ * storage.
+ */
+template <typename Key, typename Value, typename Container>
+class InMemReadOnlyIterator : public SortIteratorInterface<Key, Value> {
+public:
+    typedef std::pair<Key, Value> Data;
+
+    InMemReadOnlyIterator(const Container& data) : _data(data) {
+        _iterator = _data.begin();
+    }
+
+    void openSource() override {}
+    void closeSource() override {}
+
+    bool more() override {
+        return _iterator != _data.end();
+    }
+
+    Data next() override {
+        Data out = *_iterator++;
+        return out;
+    }
+
+    Key nextWithDeferredValue() override {
+        MONGO_UNIMPLEMENTED_TASSERT(8248302);
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNIMPLEMENTED_TASSERT(8248303);
+    }
+
+    const Key& current() override {
+        return std::prev(_iterator)->first;
+    }
+
+private:
+    const Container& _data;
+    typename Container::const_iterator _iterator;
 };
 
 /**
@@ -193,51 +278,32 @@ public:
         Settings;
     typedef std::pair<Key, Value> Data;
 
-    FileIterator(const std::string& fileFullPath,
-                 std::streampos fileStartOffset,
-                 std::streampos fileEndOffset,
+    FileIterator(std::shared_ptr<typename Sorter<Key, Value>::File> file,
+                 std::streamoff fileStartOffset,
+                 std::streamoff fileEndOffset,
                  const Settings& settings,
-                 const boost::optional<std::string>& dbName,
-                 const uint32_t checksum)
+                 const boost::optional<DatabaseName>& dbName,
+                 const size_t checksum,
+                 const SorterChecksumVersion checksumVersion)
         : _settings(settings),
-          _done(false),
-          _fileFullPath(fileFullPath),
+          _file(std::move(file)),
           _fileStartOffset(fileStartOffset),
+          _fileCurrentOffset(fileStartOffset),
           _fileEndOffset(fileEndOffset),
           _dbName(dbName),
-          _originalChecksum(checksum) {
-        uassert(16815,
-                str::stream() << "unexpected empty file: " << _fileFullPath,
-                boost::filesystem::file_size(_fileFullPath) != 0);
-    }
+          _afterReadChecksumCalculator(checksumVersion),
+          _originalChecksum(checksum) {}
 
-    void openSource() {
-        _file.open(_fileFullPath.c_str(), std::ios::in | std::ios::binary);
-        uassert(16814,
-                str::stream() << "error opening file \"" << _fileFullPath
-                              << "\": " << myErrnoWithDescription(),
-                _file.good());
-        _file.seekg(_fileStartOffset);
-        uassert(50979,
-                str::stream() << "error seeking starting offset of '" << _fileStartOffset
-                              << "' in file \"" << _fileFullPath
-                              << "\": " << myErrnoWithDescription(),
-                _file.good());
-    }
+    void openSource() override {}
 
-    void closeSource() {
-        _file.close();
-        uassert(50969,
-                str::stream() << "error closing file \"" << _fileFullPath
-                              << "\": " << myErrnoWithDescription(),
-                !_file.fail());
-
+    void closeSource() override {
         // If the file iterator reads through all data objects, we can ensure non-corrupt data
         // by comparing the newly calculated checksum with the original checksum from the data
         // written to disk. Some iterators do not read back all data from the file, which prohibits
         // the _afterReadChecksum from obtaining all the information needed. Thus, we only fassert
         // if all data that was written to disk is read back and the checksums are not equivalent.
-        if (_done && _bufferReader->atEof() && (_originalChecksum != _afterReadChecksum)) {
+        if (_done && _bufferReader->atEof() &&
+            (_originalChecksum != _afterReadChecksumCalculator.checksum())) {
             fassert(31182,
                     Status(ErrorCodes::Error::ChecksumMismatch,
                            "Data read from disk does not match what was written to disk. Possible "
@@ -245,57 +311,87 @@ public:
         }
     }
 
-    bool more() {
+    bool more() override {
+        invariant(!_startOfNewData);
         if (!_done)
-            fillBufferIfNeeded();  // may change _done
+            _fillBufferIfNeeded();  // may change _done
+
         return !_done;
     }
 
-    Data next() {
-        verify(!_done);
-        fillBufferIfNeeded();
+    Data next() override {
+        Key deserializedKey = nextWithDeferredValue();
+        Value deserializedValue = getDeferredValue();
+        return Data(std::move(deserializedKey), std::move(deserializedValue));
+    }
 
-        const char* startOfNewData = static_cast<const char*>(_bufferReader->pos());
+    Key nextWithDeferredValue() override {
+        invariant(!_done);
+        invariant(!_startOfNewData);
+        _fillBufferIfNeeded();
+
+        _startOfNewData = static_cast<const char*>(_bufferReader->pos());
 
         // Note: calling read() on the _bufferReader buffer in the deserialize function advances the
         // buffer. Since Key comes before Value in the _bufferReader, and C++ makes no function
         // parameter evaluation order guarantees, we cannot deserialize Key and Value straight into
         // the Data constructor
-        auto first = Key::deserializeForSorter(*_bufferReader, _settings.first);
-        auto second = Value::deserializeForSorter(*_bufferReader, _settings.second);
+        return Key::deserializeForSorter(*_bufferReader, _settings.first);
+    }
+
+    Value getDeferredValue() override {
+        invariant(!_done);
+        invariant(_startOfNewData);
+        Value deserializedValue = Value::deserializeForSorter(*_bufferReader, _settings.second);
 
         // The difference of _bufferReader's position before and after reading the data
         // will provide the length of the data that was just read.
         const char* endOfNewData = static_cast<const char*>(_bufferReader->pos());
 
-        _afterReadChecksum =
-            addDataToChecksum(startOfNewData, endOfNewData - startOfNewData, _afterReadChecksum);
-
-        return Data(std::move(first), std::move(second));
+        if (_afterReadChecksumCalculator.version() == SorterChecksumVersion::v1) {
+            _afterReadChecksumCalculator.addData(_startOfNewData, endOfNewData - _startOfNewData);
+        }
+        _startOfNewData = nullptr;
+        return deserializedValue;
     }
 
-    SorterRange getRange() const {
-        return {_fileStartOffset, _fileEndOffset, _originalChecksum};
+    const Key& current() override {
+        tasserted(ErrorCodes::NotImplemented, "current() not implemented for FileIterator");
+    }
+
+    SorterRange getRange() const override {
+        SorterRange range{
+            _fileStartOffset, _fileEndOffset, static_cast<int64_t>(_originalChecksum)};
+        if (_afterReadChecksumCalculator.version() != SorterChecksumVersion::v1) {
+            range.setChecksumVersion(_afterReadChecksumCalculator.version());
+        }
+        return range;
     }
 
 private:
     /**
      * Attempts to refill the _bufferReader if it is empty. Expects _done to be false.
      */
-    void fillBufferIfNeeded() {
-        verify(!_done);
+    void _fillBufferIfNeeded() {
+        invariant(!_done);
 
-        if (!_bufferReader || _bufferReader->atEof())
-            fillBufferFromDisk();
+        if (!_bufferReader || _bufferReader->atEof()) {
+            _fillBufferFromDisk();
+            if (_afterReadChecksumCalculator.version() > SorterChecksumVersion::v1 &&
+                !_bufferReader->atEof()) {
+                _afterReadChecksumCalculator.addData(static_cast<const char*>(_bufferReader->pos()),
+                                                     _bufferReader->remaining());
+            }
+        }
     }
 
     /**
      * Tries to read from disk and places any results in _bufferReader. If there is no more data to
      * read, then _done is set to true and the function returns immediately.
      */
-    void fillBufferFromDisk() {
+    void _fillBufferFromDisk() {
         int32_t rawSize;
-        read(&rawSize, sizeof(rawSize));
+        _read(&rawSize, sizeof(rawSize));
         if (_done)
             return;
 
@@ -304,7 +400,7 @@ private:
         int32_t blockSize = std::abs(rawSize);
 
         _buffer.reset(new char[blockSize]);
-        read(_buffer.get(), blockSize);
+        _read(_buffer.get(), blockSize);
         uassert(16816, "file too short?", !_done);
 
         if (auto encryptionHooks = getEncryptionHooksIfEnabled()) {
@@ -348,58 +444,53 @@ private:
 
     /**
      * Attempts to read data from disk. Sets _done to true when file offset reaches _fileEndOffset.
-     *
-     * Masserts on any file errors
      */
-    void read(void* out, size_t size) {
-        invariant(_file.is_open());
-
-        const std::streampos offset = _file.tellg();
-        uassert(51049,
-                str::stream() << "error reading file \"" << _fileFullPath
-                              << "\": " << myErrnoWithDescription(),
-                offset >= 0);
-
-        if (offset >= _fileEndOffset) {
-            invariant(offset == _fileEndOffset);
+    void _read(void* out, size_t size) {
+        if (_fileCurrentOffset == _fileEndOffset) {
             _done = true;
             return;
         }
 
-        _file.read(reinterpret_cast<char*>(out), size);
-        uassert(16817,
-                str::stream() << "error reading file \"" << _fileFullPath
-                              << "\": " << myErrnoWithDescription(),
-                _file.good());
-        verify(_file.gcount() == static_cast<std::streamsize>(size));
+        invariant(_fileCurrentOffset < _fileEndOffset,
+                  str::stream() << "Current file offset (" << _fileCurrentOffset
+                                << ") greater than end offset (" << _fileEndOffset << ")");
+
+        _file->read(_fileCurrentOffset, size, out);
+        _fileCurrentOffset += size;
     }
 
     const Settings _settings;
-    bool _done;
+    bool _done = false;
 
     std::unique_ptr<char[]> _buffer;
     std::unique_ptr<BufReader> _bufferReader;
-    std::string _fileFullPath;        // File containing the sorted data range.
-    std::streampos _fileStartOffset;  // File offset at which the sorted data range starts.
-    std::streampos _fileEndOffset;    // File offset at which the sorted data range ends.
-    std::ifstream _file;
-    boost::optional<std::string> _dbName;
+    std::shared_ptr<typename Sorter<Key, Value>::File>
+        _file;                          // File containing the sorted data range.
+    std::streamoff _fileStartOffset;    // File offset at which the sorted data range starts.
+    std::streamoff _fileCurrentOffset;  // File offset at which we are currently reading from.
+    std::streamoff _fileEndOffset;      // File offset at which the sorted data range ends.
+    boost::optional<DatabaseName> _dbName;
 
+    // Points to the beginning of a serialized key in the key-value pair currently being read, and
+    // used for computing the checksum value. This is set to nullptr after reading each key-value
+    // pair.
+    const char* _startOfNewData = nullptr;
     // Checksum value that is updated with each read of a data object from disk. We can compare
     // this value with _originalChecksum to check for data corruption if and only if the
     // FileIterator is exhausted.
-    uint32_t _afterReadChecksum = 0;
+    SorterChecksumCalculator _afterReadChecksumCalculator;
 
     // Checksum value retrieved from SortedFileWriter that was calculated as data was spilled
     // to disk. This is not modified, and is only used for comparison against _afterReadChecksum
     // when the FileIterator is exhausted to ensure no data corruption.
-    const uint32_t _originalChecksum;
+    const size_t _originalChecksum;
 };
 
 /**
  * Merge-sorts results from 0 or more FileIterators, all of which should be iterating over sorted
- * ranges within the same file. This class is given the data source file name upon construction and
- * is responsible for deleting the data source file upon destruction.
+ * ranges within the same file. The input iterators must implement nextWithDeferredValue() and
+ * getDeferredValue(). This class is given the data source file name upon construction and is
+ * responsible for deleting the data source file upon destruction.
  */
 template <typename Key, typename Value, typename Comparator>
 class MergeIterator : public SortIteratorInterface<Key, Value> {
@@ -412,12 +503,16 @@ public:
                   const Comparator& comp)
         : _opts(opts),
           _remaining(opts.limit ? opts.limit : std::numeric_limits<unsigned long long>::max()),
-          _first(true),
+          _positioned(false),
           _greater(comp) {
         for (size_t i = 0; i < iters.size(); i++) {
             iters[i]->openSource();
             if (iters[i]->more()) {
-                _heap.push_back(std::make_shared<Stream>(i, iters[i]->next(), iters[i]));
+                _heap.push_back(
+                    std::make_shared<Stream>(i, iters[i]->nextWithDeferredValue(), iters[i]));
+                if (i > _maxFile) {
+                    _maxFile = i;
+                }
             } else {
                 iters[i]->closeSource();
             }
@@ -432,38 +527,80 @@ public:
         std::pop_heap(_heap.begin(), _heap.end(), _greater);
         _current = _heap.back();
         _heap.pop_back();
+
+        _positioned = true;
     }
 
-    ~MergeIterator() {
-        // Clear the remaining Stream objects to close the file handles. Some systems will error
-        // closing the file if any file handles are still open.
+    ~MergeIterator() override {
         _current.reset();
         _heap.clear();
     }
 
-    void openSource() {}
-    void closeSource() {}
+    void openSource() override {}
+    void closeSource() override {}
 
-    bool more() {
-        if (_remaining > 0 && (_first || !_heap.empty() || _current->more()))
+    void addSource(std::shared_ptr<Input> iter) {
+        iter->openSource();
+        if (iter->more()) {
+            _heap.push_back(
+                std::make_shared<Stream>(++_maxFile, iter->nextWithDeferredValue(), iter));
+            std::push_heap(_heap.begin(), _heap.end(), _greater);
+
+            if (_greater(_current, _heap.front())) {
+                std::pop_heap(_heap.begin(), _heap.end(), _greater);
+                std::swap(_current, _heap.back());
+                std::push_heap(_heap.begin(), _heap.end(), _greater);
+            }
+        } else {
+            iter->closeSource();
+        }
+    }
+
+    bool more() override {
+        if (_remaining > 0 && (_positioned || !_heap.empty() || _current->more()))
             return true;
 
         _remaining = 0;
         return false;
     }
 
-    Data next() {
-        verify(_remaining);
+    const Key& current() override {
+        invariant(_remaining);
+
+        if (!_positioned) {
+            advance();
+            _positioned = true;
+        }
+
+        return _current->current();
+    }
+
+    Data next() override {
+        invariant(_remaining);
 
         _remaining--;
 
-        if (_first) {
-            _first = false;
-            return _current->current();
+        if (_positioned) {
+            _positioned = false;
+        } else {
+            advance();
         }
+        Key key = _current->current();
+        Value value = _current->getDeferredValue();
+        return Data(std::move(key), std::move(value));
+    }
 
+    Key nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void advance() {
         if (!_current->advance()) {
-            verify(!_heap.empty());
+            invariant(!_heap.empty());
             std::pop_heap(_heap.begin(), _heap.end(), _greater);
             _current = _heap.back();
             _heap.pop_back();
@@ -472,10 +609,7 @@ public:
             std::swap(_current, _heap.back());
             std::push_heap(_heap.begin(), _heap.end(), _greater);
         }
-
-        return _current->current();
     }
-
 
 private:
     /**
@@ -487,15 +621,18 @@ private:
      */
     class Stream {
     public:
-        Stream(size_t fileNum, const Data& first, std::shared_ptr<Input> rest)
+        Stream(size_t fileNum, const Key& first, std::shared_ptr<Input> rest)
             : fileNum(fileNum), _current(first), _rest(rest) {}
 
         ~Stream() {
             _rest->closeSource();
         }
 
-        const Data& current() const {
+        const Key& current() const {
             return _current;
+        }
+        Value getDeferredValue() {
+            return _rest->getDeferredValue();
         }
         bool more() {
             return _rest->more();
@@ -504,21 +641,23 @@ private:
             if (!_rest->more())
                 return false;
 
-            _current = _rest->next();
+            _current = _rest->nextWithDeferredValue();
             return true;
         }
 
         const size_t fileNum;
 
     private:
-        Data _current;
+        Key _current;
         std::shared_ptr<Input> _rest;
     };
 
     class STLComparator {  // uses greater rather than less-than to maintain a MinHeap
     public:
         explicit STLComparator(const Comparator& comp) : _comp(comp) {}
-        bool operator()(unowned_ptr<const Stream> lhs, unowned_ptr<const Stream> rhs) const {
+
+        template <typename Ptr>
+        bool operator()(const Ptr& lhs, const Ptr& rhs) const {
             // first compare data
             dassertCompIsSane(_comp, lhs->current(), rhs->current());
             int ret = _comp(lhs->current(), rhs->current());
@@ -535,97 +674,284 @@ private:
 
     SortOptions _opts;
     unsigned long long _remaining;
-    bool _first;
+    bool _positioned;
     std::shared_ptr<Stream> _current;
     std::vector<std::shared_ptr<Stream>> _heap;  // MinHeap
     STLComparator _greater;                      // named so calls make sense
+    size_t _maxFile = 0;                         // The maximum file identifier used thus far
 };
 
 template <typename Key, typename Value, typename Comparator>
-class NoLimitSorter : public Sorter<Key, Value> {
+class MergeableSorter : public Sorter<Key, Value> {
 public:
-    typedef std::pair<Key, Value> Data;
-    typedef SortIteratorInterface<Key, Value> Iterator;
+    static constexpr std::size_t kFileIteratorSize = sizeof(FileIterator<Key, Value>);
+
     typedef std::pair<typename Key::SorterDeserializeSettings,
                       typename Value::SorterDeserializeSettings>
         Settings;
+    typedef SortIteratorInterface<Key, Value> Iterator;
+
+    MergeableSorter(const SortOptions& opts, const Comparator& comp, const Settings& settings)
+        : Sorter<Key, Value>(opts), _comp(comp), _settings(settings) {
+        setMaxMemoryUsageBytes();
+    }
+
+    MergeableSorter(const SortOptions& opts,
+                    const std::string& fileName,
+                    const Comparator& comp,
+                    const Settings& settings)
+        : Sorter<Key, Value>(opts, fileName), _comp(comp), _settings(settings) {
+        setMaxMemoryUsageBytes();
+    }
+
+protected:
+    /**
+     * The maximum number of spills that can be merged simultaneously in order to respect memory
+     * limits. While merging, a chuck of 64KB from each spill is loaded to memory. The total size of
+     * chunks loaded to memory should not exceed the available memory.
+     */
+    size_t _spillsNumToRespectMemoryLimits = std::max(
+        this->_opts.maxMemoryUsageBytes / kSortedFileBufferSize, static_cast<std::size_t>(2));
+
+    /**
+     * An implementation of a k-way merge sort.
+     *
+     * This method will take a target number of sorted spills (numTargetedSpills) to merge and will
+     * proceed to merge the set of them in batches of at most numParallelSpills until it reaches the
+     * target.
+     *
+     * To give an example, if we have 7 spills, a target number of 2 and 3 spills can be merged in
+     * parallel the algorithm will do the following:
+     *
+     * {1, 2, 3, 4, 5, 6, 7}
+     * {123, 456, 7}
+     * {1234567}
+     */
+    void _mergeSpills(std::size_t numTargetedSpills, std::size_t numParallelSpills) {
+        using File = typename Sorter<Key, Value>::File;
+
+        if (numTargetedSpills == 0) {
+            numTargetedSpills = 1;
+        }
+
+        std::shared_ptr<File> file = std::move(this->_file);
+        std::vector<std::shared_ptr<Iterator>> iterators = std::move(this->_iters);
+
+        LOGV2_INFO(8203700,
+                   "Merging spills",
+                   "currentNumSpills"_attr = iterators.size(),
+                   "targetNumSpills"_attr = numTargetedSpills,
+                   "parallelNumSpills"_attr = numParallelSpills);
+
+        while (iterators.size() > numTargetedSpills) {
+            std::shared_ptr<File> newSpillsFile = std::make_shared<File>(
+                this->_opts.tempDir + "/" + nextFileName(), this->_opts.sorterFileStats);
+
+            LOGV2_DEBUG(6033103,
+                        1,
+                        "Created new intermediate file for merged spills",
+                        "path"_attr = newSpillsFile->path().string());
+
+            std::vector<std::shared_ptr<Iterator>> mergedIterators;
+            for (std::size_t i = 0; i < iterators.size(); i += numParallelSpills) {
+                std::vector<std::shared_ptr<Iterator>> spillsToMerge;
+                auto endIndex = std::min(i + numParallelSpills, iterators.size());
+
+                // Since we are merging the spills to a new file, we make sure we have sufficient
+                // available disk space
+                int64_t minRequiredDiskSpace = 0;
+                std::for_each(
+                    iterators.begin() + i, iterators.begin() + endIndex, [&](const auto& it) {
+                        minRequiredDiskSpace +=
+                            it->getRange().getEndOffset() - it->getRange().getStartOffset();
+                    });
+                minRequiredDiskSpace = std::max(
+                    minRequiredDiskSpace,
+                    static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load()));
+                uassertStatusOK(ensureSufficientDiskSpaceForSpilling(this->_opts.tempDir,
+                                                                     minRequiredDiskSpace));
+
+                std::move(iterators.begin() + i,
+                          iterators.begin() + endIndex,
+                          std::back_inserter(spillsToMerge));
+
+                LOGV2_DEBUG(6033102,
+                            2,
+                            "Merging spills",
+                            "beginIdx"_attr = i,
+                            "endIdx"_attr = endIndex - 1);
+
+                auto mergeIterator =
+                    std::unique_ptr<Iterator>(Iterator::merge(spillsToMerge, this->_opts, _comp));
+                mergeIterator->openSource();
+                SortedFileWriter<Key, Value> writer(this->_opts, newSpillsFile, _settings);
+                while (mergeIterator->more()) {
+                    auto pair = mergeIterator->next();
+                    writer.addAlreadySorted(pair.first, pair.second);
+                }
+                auto iteratorPtr = std::shared_ptr<Iterator>(writer.done());
+                mergeIterator->closeSource();
+                mergedIterators.push_back(std::move(iteratorPtr));
+                this->_stats.incrementSpilledRanges();
+            }
+
+            LOGV2_DEBUG(6033101,
+                        1,
+                        "Merged spills",
+                        "currentNumSpills"_attr = mergedIterators.size(),
+                        "targetNumSpills"_attr = numTargetedSpills);
+
+            iterators = std::move(mergedIterators);
+            file = std::move(newSpillsFile);
+        }
+        this->_file = std::move(file);
+        this->_iters = std::move(iterators);
+
+        LOGV2_INFO(6033100, "Finished merging spills");
+    }
+
+    void _mergeSpills(std::size_t numTargetedSpills) {
+        // The number of target spills and the number of parallel spills are equal.
+        _mergeSpills(numTargetedSpills, numTargetedSpills);
+    }
+
+    const Comparator _comp;
+    const Settings _settings;
+
+private:
+    // Update the maxMemoryUsageBytes subtracting the memory reserved for the file iterators. File
+    // iterators can use up to maxIteratorsMemoryUsagePercentage of the maxMemoryUsageBytes with
+    // lower bound fileIteratorsMaxBytesSize and upper bound 1MB.
+    void setMaxMemoryUsageBytes() {
+        double percRequested = maxIteratorsMemoryUsagePercentage.load();
+        auto iteratorMemBytesRequested =
+            static_cast<size_t>(this->_opts.maxMemoryUsageBytes * percRequested);
+        if (iteratorMemBytesRequested < this->fileIteratorsMaxBytesSize) {
+            this->fileIteratorsMaxBytesSize =
+                std::max(kFileIteratorSize, iteratorMemBytesRequested);
+        }
+        this->fileIteratorsMaxNum =
+            static_cast<size_t>(this->fileIteratorsMaxBytesSize / kFileIteratorSize);
+        this->fileIteratorsMaxBytesSize = kFileIteratorSize * this->fileIteratorsMaxNum;
+
+        if (this->fileIteratorsMaxBytesSize >= this->_opts.maxMemoryUsageBytes) {
+            this->_opts.MaxMemoryUsageBytes(0);
+        } else {
+            this->_opts.MaxMemoryUsageBytes(this->_opts.maxMemoryUsageBytes -
+                                            this->fileIteratorsMaxBytesSize);
+        }
+    }
+};
+
+template <typename Key, typename Value, typename Comparator>
+class NoLimitSorter : public MergeableSorter<Key, Value, Comparator> {
+public:
+    typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
+    using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
+    using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
 
     NoLimitSorter(const SortOptions& opts,
                   const Comparator& comp,
                   const Settings& settings = Settings())
-        : Sorter<Key, Value>(opts), _comp(comp), _settings(settings) {
+        : MergeableSorter<Key, Value, Comparator>(opts, comp, settings) {
         invariant(opts.limit == 0);
     }
 
     NoLimitSorter(const std::string& fileName,
-                  const std::vector<SorterRange> ranges,
+                  const std::vector<SorterRange>& ranges,
                   const SortOptions& opts,
                   const Comparator& comp,
                   const Settings& settings = Settings())
-        : Sorter<Key, Value>(opts, fileName),
-          _comp(comp),
-          _settings(settings),
-          _nextSortedFileWriterOffset(!ranges.empty() ? ranges.back().getEndOffset() : 0) {
+        : MergeableSorter<Key, Value, Comparator>(opts, fileName, comp, settings) {
         invariant(opts.extSortAllowed);
 
-        this->_numSpills += ranges.size();
+        uassert(16815,
+                str::stream() << "Unexpected empty file: " << this->_file->path().string(),
+                ranges.empty() || boost::filesystem::file_size(this->_file->path()) != 0);
+
+        this->_iters.reserve(ranges.size());
         std::transform(ranges.begin(),
                        ranges.end(),
                        std::back_inserter(this->_iters),
                        [this](const SorterRange& range) {
                            return std::make_shared<sorter::FileIterator<Key, Value>>(
-                               this->_fileFullPath,
+                               this->_file,
                                range.getStartOffset(),
                                range.getEndOffset(),
                                this->_settings,
                                this->_opts.dbName,
-                               range.getChecksum());
+                               range.getChecksum(),
+                               range.getChecksumVersion().value_or(SorterChecksumVersion::v1));
                        });
+        this->_stats.setSpilledRanges(this->_iters.size());
     }
 
-    ~NoLimitSorter() {
-        // This Sorter is responsible for file deletion, even if done() was called.
-        if (!this->_shouldKeepFilesOnDestruction) {
-            DESTRUCTOR_GUARD(boost::filesystem::remove(this->_fileFullPath));
+    template <typename DataProducer>
+    void addImpl(DataProducer dataProducer) {
+        invariant(!_done);
+        invariant(!_paused);
+
+        auto& keyVal = _data.emplace_back(dataProducer());
+
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            auto memUsedInsideSorter = (sizeof(Key) + sizeof(Value)) * (_data.size() + 1);
+            this->_stats.setMemUsage(memPool->memUsage() + memUsedInsideSorter);
+        } else {
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
+        }
+
+        if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes) {
+            spill();
         }
     }
 
-    void add(const Key& key, const Value& val) {
-        invariant(!_done);
-
-        _data.emplace_back(key.getOwned(), val.getOwned());
-
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
-
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
-            spill();
+    void add(const Key& key, const Value& val) override {
+        addImpl([&]() -> Data { return {key.getOwned(), val.getOwned()}; });
     }
 
-    void emplace(Key&& key, Value&& val) override {
-        invariant(!_done);
-
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
-
-        _data.emplace_back(std::move(key), std::move(val));
-
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
-            spill();
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl([&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
     }
 
-    Iterator* done() {
+    Iterator* done() override {
         invariant(!std::exchange(_done, true));
 
         if (this->_iters.empty()) {
             sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_data));
+            }
             return new InMemIterator<Key, Value>(_data);
         }
 
         spill();
-        return Iterator::merge(this->_iters, this->_opts, _comp);
+        this->_mergeSpills(this->_spillsNumToRespectMemoryLimits);
+
+        return Iterator::merge(this->_iters, this->_opts, this->_comp);
+    }
+
+    Iterator* pause() override {
+        invariant(!_done);
+        invariant(!_paused);
+
+        _paused = true;
+        if (this->_iters.empty()) {
+            return new InMemReadOnlyIterator<Key, Value, std::vector<Data>>(_data);
+        }
+        tassert(8248300, "Spilled sort cannot be paused", this->_iters.empty());
+        return nullptr;
+    }
+
+    void resume() override {
+        _paused = false;
     }
 
 private:
@@ -633,8 +959,8 @@ private:
     public:
         explicit STLComparator(const Comparator& comp) : _comp(comp) {}
         bool operator()(const Data& lhs, const Data& rhs) const {
-            dassertCompIsSane(_comp, lhs, rhs);
-            return _comp(lhs, rhs) < 0;
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
         }
 
     private:
@@ -642,15 +968,23 @@ private:
     };
 
     void sort() {
-        STLComparator less(_comp);
-        std::stable_sort(_data.begin(), _data.end(), less);
-        this->_numSorted += _data.size();
+        STLComparator less(this->_comp);
+        std::sort(_data.begin(), _data.end(), less);
+        this->_stats.incrementNumSorted(_data.size());
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            invariant(memPool->totalFragmentBytesUsed() >= this->_stats.bytesSorted());
+            this->_stats.incrementBytesSorted(memPool->totalFragmentBytesUsed() -
+                                              this->_stats.bytesSorted());
+        } else {
+            this->_stats.incrementBytesSorted(this->_stats.memUsage());
+        }
     }
 
-    void spill() {
-        this->_numSpills++;
-        if (_data.empty())
+    void spill() override {
+        if (_data.empty()) {
             return;
+        }
 
         if (!this->_opts.extSortAllowed) {
             // This error message only applies to sorts from user queries made through the find or
@@ -659,31 +993,50 @@ private:
             // appropriate error.
             uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                       str::stream()
-                          << "Sort exceeded memory limit of " << this->_opts.maxMemoryUsageBytes
+                          << "Sort exceeded memory limit of "
+                          << (this->_opts.maxMemoryUsageBytes + this->fileIteratorsMaxBytesSize)
                           << " bytes, but did not opt in to external sorting.");
         }
 
+        // Ensure there is sufficient disk space for spilling
+        uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+            this->_opts.tempDir, internalQuerySpillingMinAvailableDiskSpaceBytes.load()));
+
         sort();
 
-        SortedFileWriter<Key, Value> writer(
-            this->_opts, this->_fileFullPath, _nextSortedFileWriterOffset, _settings);
-        for (; !_data.empty(); _data.pop_front()) {
-            writer.addAlreadySorted(_data.front().first, _data.front().second);
+        SortedFileWriter<Key, Value> writer(this->_opts, this->_file, this->_settings);
+        for (auto& data : _data) {
+            writer.addAlreadySorted(data.first, data.second);
         }
+
+        _data.clear();
+        // _data may have grown very large. Even though it's clear()ed, we need to
+        // free the excess memory.
+        _data.shrink_to_fit();
         Iterator* iteratorPtr = writer.done();
-        _nextSortedFileWriterOffset = writer.getFileEndOffset();
 
         this->_iters.push_back(std::shared_ptr<Iterator>(iteratorPtr));
 
-        _memUsed = 0;
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            // We expect that all buffers are unused at this point.
+            memPool->freeUnused();
+            this->_stats.setMemUsage(memPool->memUsage());
+        } else {
+            this->_stats.resetMemUsage();
+        }
+
+        this->_stats.incrementSpilledRanges();
+
+        // Merge spills to remain below the `fileIteratorsMaxBytesSize` threshold.
+        if (this->_iters.size() >= this->fileIteratorsMaxNum) {
+            this->_mergeSpills(this->_iters.size() / 2, this->_spillsNumToRespectMemoryLimits);
+        }
     }
 
-    const Comparator _comp;
-    const Settings _settings;
-    std::streampos _nextSortedFileWriterOffset = 0;
     bool _done = false;
-    size_t _memUsed = 0;
-    std::deque<Data> _data;  // Data that has not been spilled.
+    std::vector<Data> _data;  // Data that has not been spilled.
+    bool _paused = false;
 };
 
 template <typename Key, typename Value, typename Comparator>
@@ -692,38 +1045,67 @@ class LimitOneSorter : public Sorter<Key, Value> {
     // spill to disk and only tracks memory usage if explicitly requested.
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     typedef SortIteratorInterface<Key, Value> Iterator;
 
     LimitOneSorter(const SortOptions& opts, const Comparator& comp)
-        : _comp(comp), _haveData(false) {
-        verify(opts.limit == 1);
+        : Sorter<Key, Value>(opts), _comp(comp), _haveData(false) {
+        invariant(opts.limit == 1);
     }
 
-    void add(const Key& key, const Value& val) {
-        Data contender(key, val);
-
-        this->_numSorted += 1;
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
+        this->_stats.incrementNumSorted();
         if (_haveData) {
-            dassertCompIsSane(_comp, _best, contender);
-            if (_comp(_best, contender) <= 0)
+            dassertCompIsSane(_comp, _best.first, key);
+            if (_comp(_best.first, key) <= 0)
                 return;  // not good enough
         } else {
             _haveData = true;
         }
 
-        _best = {contender.first.getOwned(), contender.second.getOwned()};
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _best = dataProducer();
     }
 
-    Iterator* done() {
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
+    }
+
+    Iterator* done() override {
         if (_haveData) {
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_best));
+            }
             return new InMemIterator<Key, Value>(_best);
         } else {
             return new InMemIterator<Key, Value>();
         }
     }
 
+    Iterator* pause() override {
+        if (_haveData) {
+            // ok to return InMemIterator as this is a single value constructed from copy
+            return new InMemIterator<Key, Value>(_best);
+        } else {
+            return new InMemIterator<Key, Value>();
+        }
+    }
+
+    void resume() override {}
+
 private:
-    void spill() {
+    void spill() override {
         invariant(false, "LimitOneSorter does not spill to disk");
     }
 
@@ -733,21 +1115,17 @@ private:
 };
 
 template <typename Key, typename Value, typename Comparator>
-class TopKSorter : public Sorter<Key, Value> {
+class TopKSorter : public MergeableSorter<Key, Value, Comparator> {
 public:
     typedef std::pair<Key, Value> Data;
-    typedef SortIteratorInterface<Key, Value> Iterator;
-    typedef std::pair<typename Key::SorterDeserializeSettings,
-                      typename Value::SorterDeserializeSettings>
-        Settings;
+    typedef std::function<Value()> ValueProducer;
+    using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
+    using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
 
     TopKSorter(const SortOptions& opts,
                const Comparator& comp,
                const Settings& settings = Settings())
-        : Sorter<Key, Value>(opts),
-          _comp(comp),
-          _settings(settings),
-          _memUsed(0),
+        : MergeableSorter<Key, Value, Comparator>(opts, comp, settings),
           _haveCutoff(false),
           _worstCount(0),
           _medianCount(0) {
@@ -763,35 +1141,30 @@ public:
         }
     }
 
-    ~TopKSorter() {
-        // This Sorter is responsible for file deletion, even if done() was called.
-        if (!this->_shouldKeepFilesOnDestruction) {
-            DESTRUCTOR_GUARD(boost::filesystem::remove(this->_fileFullPath));
-        }
-    }
-
-    void add(const Key& key, const Value& val) {
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
         invariant(!_done);
+        invariant(!_paused);
 
-        this->_numSorted += 1;
+        this->_stats.incrementNumSorted();
 
-        STLComparator less(_comp);
-        Data contender(key, val);
+        STLComparator less(this->_comp);
 
         if (_data.size() < this->_opts.limit) {
-            if (_haveCutoff && !less(contender, _cutoff))
+            if (_haveCutoff && this->_comp(key, _cutoff.first) >= 0)
                 return;
 
-            _data.emplace_back(contender.first.getOwned(), contender.second.getOwned());
+            // Invoking dataProducer could invalidate key if it uses move semantics,
+            // don't reference them anymore from this point on.
+            auto& keyVal = _data.emplace_back(dataProducer());
 
-            auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-            _memUsed += memUsage;
-            this->_totalDataSizeSorted += memUsage;
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
 
             if (_data.size() == this->_opts.limit)
                 std::make_heap(_data.begin(), _data.end(), less);
 
-            if (_memUsed > this->_opts.maxMemoryUsageBytes)
+            if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes)
                 spill();
 
             return;
@@ -799,36 +1172,73 @@ public:
 
         invariant(_data.size() == this->_opts.limit);
 
-        if (!less(contender, _data.front()))
+        if (this->_comp(key, _data.front().first) >= 0)
             return;  // not good enough
 
         // Remove the old worst pair and insert the contender, adjusting _memUsed
 
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
-
-        _memUsed -= _data.front().first.memUsageForSorter();
-        _memUsed -= _data.front().second.memUsageForSorter();
+        this->_stats.decrementMemUsage(_data.front().first.memUsageForSorter());
+        this->_stats.decrementMemUsage(_data.front().second.memUsageForSorter());
 
         std::pop_heap(_data.begin(), _data.end(), less);
-        _data.back() = {contender.first.getOwned(), contender.second.getOwned()};
+
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _data.back() = dataProducer();
+
+        this->_stats.incrementMemUsage(_data.back().first.memUsageForSorter());
+        this->_stats.incrementMemUsage(_data.back().second.memUsageForSorter());
+
         std::push_heap(_data.begin(), _data.end(), less);
 
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
+        if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes)
             spill();
     }
 
-    Iterator* done() {
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
+    }
+
+    Iterator* done() override {
         if (this->_iters.empty()) {
             sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_data));
+            }
             return new InMemIterator<Key, Value>(_data);
         }
 
         spill();
-        Iterator* iterator = Iterator::merge(this->_iters, this->_opts, _comp);
+        this->_mergeSpills(this->_spillsNumToRespectMemoryLimits);
+
+        Iterator* iterator = Iterator::merge(this->_iters, this->_opts, this->_comp);
         _done = true;
         return iterator;
+    }
+
+    Iterator* pause() override {
+        invariant(!_done);
+        invariant(!_paused);
+        _paused = true;
+
+        if (this->_iters.empty()) {
+            return new InMemReadOnlyIterator<Key, Value, std::vector<Data>>(_data);
+        }
+        tassert(8248301, "Spilled sort cannot be paused", this->_iters.empty());
+        return nullptr;
+    }
+
+    void resume() override {
+        _paused = false;
     }
 
 private:
@@ -836,8 +1246,8 @@ private:
     public:
         explicit STLComparator(const Comparator& comp) : _comp(comp) {}
         bool operator()(const Data& lhs, const Data& rhs) const {
-            dassertCompIsSane(_comp, lhs, rhs);
-            return _comp(lhs, rhs) < 0;
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
         }
 
     private:
@@ -845,13 +1255,15 @@ private:
     };
 
     void sort() {
-        STLComparator less(_comp);
+        STLComparator less(this->_comp);
 
         if (_data.size() == this->_opts.limit) {
             std::sort_heap(_data.begin(), _data.end(), less);
         } else {
-            std::stable_sort(_data.begin(), _data.end(), less);
+            std::sort(_data.begin(), _data.end(), less);
         }
+
+        this->_stats.incrementBytesSorted(this->_stats.memUsage());
     }
 
     // Can only be called after _data is sorted
@@ -897,7 +1309,7 @@ private:
         // all space complexities measure disk space rather than memory since this class is
         // O(1) in memory due to the _opts.maxMemoryUsageBytes limit.
 
-        STLComparator less(_comp);  // less is "better" for TopK.
+        STLComparator less(this->_comp);  // less is "better" for TopK.
 
         // Pick a new _worstSeen or _lastMedian if should.
         if (_worstCount == 0 || less(_worstSeen, _data.back())) {
@@ -932,10 +1344,9 @@ private:
         }
     }
 
-    void spill() {
+    void spill() override {
         invariant(!_done);
 
-        this->_numSpills += 1;
         if (_data.empty())
             return;
 
@@ -945,38 +1356,40 @@ private:
             // external sorting or by catching and throwing a more appropriate error.
             uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                       str::stream()
-                          << "Sort exceeded memory limit of " << this->_opts.maxMemoryUsageBytes
+                          << "Sort exceeded memory limit of "
+                          << (this->_opts.maxMemoryUsageBytes + this->fileIteratorsMaxBytesSize)
                           << " bytes, but did not opt in to external sorting. Aborting operation."
                           << " Pass allowDiskUse:true to opt in.");
         }
 
-        // We should check readOnly before getting here.
-        invariant(!storageGlobalParams.readOnly);
-
         sort();
         updateCutoff();
 
-        SortedFileWriter<Key, Value> writer(
-            this->_opts, this->_fileFullPath, _nextSortedFileWriterOffset, _settings);
+        SortedFileWriter<Key, Value> writer(this->_opts, this->_file, this->_settings);
         for (size_t i = 0; i < _data.size(); i++) {
             writer.addAlreadySorted(_data[i].first, _data[i].second);
         }
 
-        // clear _data and release backing array's memory
-        std::vector<Data>().swap(_data);
+        _data.clear();
+        // _data may have grown very large. Even though it's clear()ed, we need to
+        // free the excess memory.
+        _data.shrink_to_fit();
 
         Iterator* iteratorPtr = writer.done();
-        _nextSortedFileWriterOffset = writer.getFileEndOffset();
         this->_iters.push_back(std::shared_ptr<Iterator>(iteratorPtr));
 
-        _memUsed = 0;
+        this->_stats.resetMemUsage();
+        this->_stats.incrementSpilledRanges();
+
+        // Merge spills to remain below the `fileIteratorsMaxBytesSize` threshold.
+        if (this->_iters.size() >= this->fileIteratorsMaxNum) {
+            this->_mergeSpills(this->_iters.size() / 2, this->_spillsNumToRespectMemoryLimits);
+            this->_stats.setSpilledRanges(this->_iters.size());
+        }
     }
 
-    const Comparator _comp;
-    const Settings _settings;
-    std::streampos _nextSortedFileWriterOffset = 0;
     bool _done = false;
-    size_t _memUsed;
+    bool _paused = false;
 
     // Data that has not been spilled. Organized as max-heap if size == limit.
     std::vector<Data> _data;
@@ -992,24 +1405,45 @@ private:
 
 }  // namespace sorter
 
+namespace {
+SharedBufferFragmentBuilder makeMemPool() {
+    return SharedBufferFragmentBuilder(
+        gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
+        SharedBufferFragmentBuilder::DoubleGrowStrategy(
+            gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024)));
+}
+}  // namespace
+
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts)
-    : _opts(opts),
-      _fileName(opts.extSortAllowed ? nextFileName() : ""),
-      _fileFullPath(opts.extSortAllowed ? opts.tempDir + "/" + _fileName : "") {}
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
+      _file(opts.extSortAllowed ? std::make_shared<Sorter<Key, Value>::File>(
+                                      opts.tempDir + "/" + nextFileName(), opts.sorterFileStats)
+                                : nullptr) {
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
+}
 
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts, const std::string& fileName)
-    : _opts(opts), _fileName(fileName), _fileFullPath(opts.tempDir + "/" + fileName) {
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
+      _file(std::make_shared<Sorter<Key, Value>::File>(opts.tempDir + "/" + fileName,
+                                                       opts.sorterFileStats)) {
     invariant(opts.extSortAllowed);
     invariant(!opts.tempDir.empty());
     invariant(!fileName.empty());
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
 }
 
 template <typename Key, typename Value>
 typename Sorter<Key, Value>::PersistedState Sorter<Key, Value>::persistDataForShutdown() {
     spill();
-    _shouldKeepFilesOnDestruction = true;
+    this->_file->keep();
 
     std::vector<SorterRange> ranges;
     ranges.reserve(_iters.size());
@@ -1017,7 +1451,148 @@ typename Sorter<Key, Value>::PersistedState Sorter<Key, Value>::persistDataForSh
         return it->getRange();
     });
 
-    return {_fileName, ranges};
+    return {_file->path().filename().string(), ranges};
+}
+
+template <typename Key, typename Value>
+Sorter<Key, Value>::File::File(std::string path, SorterFileStats* stats)
+    : _path(std::move(path)), _stats(stats) {
+    invariant(!_path.empty());
+    if (_stats && boost::filesystem::exists(_path) && boost::filesystem::is_regular_file(_path)) {
+        _stats->addSpilledDataSize(boost::filesystem::file_size(_path));
+    }
+}
+
+template <typename Key, typename Value>
+Sorter<Key, Value>::File::~File() {
+    if (_stats && _file.is_open()) {
+        _stats->closed.addAndFetch(1);
+    }
+
+    if (_keep) {
+        if (!_file.is_open()) {
+            return;
+        }
+        DESTRUCTOR_GUARD(_file.flush());
+
+        mongo::File fileForFsync;
+        fileForFsync.open(_path.string().c_str());
+        if (fileForFsync.is_open()) {
+            fileForFsync.fsync();
+        }
+
+        return;
+    }
+
+    if (_file.is_open()) {
+        DESTRUCTOR_GUARD(_file.exceptions(std::ios::failbit));
+        DESTRUCTOR_GUARD(_file.close());
+    }
+
+    DESTRUCTOR_GUARD(boost::filesystem::remove(_path));
+}
+
+template <typename Key, typename Value>
+void Sorter<Key, Value>::File::read(std::streamoff offset, std::streamsize size, void* out) {
+    if (!_file.is_open()) {
+        _open();
+    }
+
+    // If the _offset is not -1, we may have written data to it, so we must flush.
+    if (_offset != -1) {
+        _file.exceptions(std::ios::goodbit);
+        _file.flush();
+        _offset = -1;
+
+        uassert(5479100,
+                str::stream() << "Error flushing file " << _path.string() << ": "
+                              << sorter::myErrnoWithDescription(),
+                _file);
+    }
+
+    _file.seekg(offset);
+    _file.read(reinterpret_cast<char*>(out), size);
+
+    uassert(16817,
+            str::stream() << "Error reading file " << _path.string() << ": "
+                          << sorter::myErrnoWithDescription(),
+            _file);
+
+    invariant(_file.gcount() == size,
+              str::stream() << "Number of bytes read (" << _file.gcount()
+                            << ") not equal to expected number (" << size << ")");
+
+    uassert(51049,
+            str::stream() << "Error reading file " << _path.string() << ": "
+                          << sorter::myErrnoWithDescription(),
+            _file.tellg() >= 0);
+}
+
+template <typename Key, typename Value>
+void Sorter<Key, Value>::File::write(const char* data, std::streamsize size) {
+    _ensureOpenForWriting();
+
+    try {
+        _file.write(data, size);
+        _offset += size;
+        if (_stats) {
+            this->_stats->addSpilledDataSize(size);
+        };
+    } catch (const std::system_error& ex) {
+        if (ex.code() == std::errc::no_space_on_device) {
+            uasserted(ErrorCodes::OutOfDiskSpace,
+                      str::stream() << ex.what() << ": " << _path.string());
+        }
+        uasserted(5642403,
+                  str::stream() << "Error writing to file " << _path.string() << ": "
+                                << sorter::myErrnoWithDescription());
+    } catch (const std::exception&) {
+        uasserted(16821,
+                  str::stream() << "Error writing to file " << _path.string() << ": "
+                                << sorter::myErrnoWithDescription());
+    }
+}
+
+template <typename Key, typename Value>
+std::streamoff Sorter<Key, Value>::File::currentOffset() {
+    _ensureOpenForWriting();
+    invariant(_offset >= 0);
+    return _offset;
+}
+
+template <typename Key, typename Value>
+void Sorter<Key, Value>::File::_open() {
+    invariant(!_file.is_open());
+
+    boost::filesystem::create_directories(_path.parent_path());
+
+    // We open the provided file in append mode so that SortedFileWriter instances can share
+    // the same file, used serially. We want to share files in order to stay below system
+    // open file limits.
+    _file.open(_path.string(), std::ios::app | std::ios::binary | std::ios::in | std::ios::out);
+
+    uassert(16818,
+            str::stream() << "Error opening file " << _path.string() << ": "
+                          << sorter::myErrnoWithDescription(),
+            _file.good());
+
+    if (_stats) {
+        _stats->opened.addAndFetch(1);
+    }
+}
+
+template <typename Key, typename Value>
+void Sorter<Key, Value>::File::_ensureOpenForWriting() {
+    if (!_file.is_open()) {
+        _open();
+    }
+
+    // If we are opening the file for the first time, or if we previously flushed and switched to
+    // read mode, we need to set the _offset to the file size.
+    if (_offset == -1) {
+        _file.exceptions(std::ios::failbit | std::ios::badbit);
+        _offset = boost::filesystem::file_size(_path);
+    }
 }
 
 //
@@ -1025,39 +1600,23 @@ typename Sorter<Key, Value>::PersistedState Sorter<Key, Value>::persistDataForSh
 //
 
 template <typename Key, typename Value>
-SortedFileWriter<Key, Value>::SortedFileWriter(const SortOptions& opts,
-                                               const std::string& fileFullPath,
-                                               const std::streampos fileStartOffset,
-                                               const Settings& settings)
+SortedFileWriter<Key, Value>::SortedFileWriter(
+    const SortOptions& opts,
+    std::shared_ptr<typename Sorter<Key, Value>::File> file,
+    const Settings& settings)
     : _settings(settings),
-      _fileFullPath(fileFullPath),
-      // The file descriptor is positioned at the end of a file when opened in append mode, but
-      // _file.tellp() is not initialized on all systems to reflect this. Therefore, we must also
-      // pass in the expected offset to this constructor.
-      _fileStartOffset(fileStartOffset),
-      _dbName(opts.dbName) {
-
+      _file(std::move(file)),
+      _checksumCalculator(_getSorterChecksumVersion()),
+      _fileStartOffset(_file->currentOffset()),
+      _opts(opts) {
     // This should be checked by consumers, but if we get here don't allow writes.
-    uassert(
-        16946, "Attempting to use external sort from mongos. This is not allowed.", !isMongos());
+    uassert(16946,
+            "Attempting to use external sort from mongos. This is not allowed.",
+            !serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer));
 
     uassert(17148,
             "Attempting to use external sort without setting SortOptions::tempDir",
             !opts.tempDir.empty());
-
-    boost::filesystem::create_directories(opts.tempDir);
-
-    // We open the provided file in append mode so that SortedFileWriter instances can share the
-    // same file, used serially. We want to share files in order to stay below system open file
-    // limits.
-    _file.open(_fileFullPath.c_str(), std::ios::binary | std::ios::app | std::ios::out);
-    uassert(16818,
-            str::stream() << "error opening file \"" << _fileFullPath
-                          << "\": " << sorter::myErrnoWithDescription(),
-            _file.good());
-
-    // throw on failure
-    _file.exceptions(std::ios::failbit | std::ios::badbit | std::ios::eofbit);
 }
 
 template <typename Key, typename Value>
@@ -1072,26 +1631,35 @@ void SortedFileWriter<Key, Value>::addAlreadySorted(const Key& key, const Value&
 
     // Serializing the key and value grows the buffer, but _buffer.buf() still points to the
     // beginning. Use _buffer.len() to determine portion of buffer containing new datum.
-    _checksum =
-        addDataToChecksum(_buffer.buf() + _nextObjPos, _buffer.len() - _nextObjPos, _checksum);
+    if (_checksumCalculator.version() == SorterChecksumVersion::v1) {
+        _checksumCalculator.addData(_buffer.buf() + _nextObjPos, _buffer.len() - _nextObjPos);
+    }
 
-    if (_buffer.len() > 64 * 1024)
-        spill();
+    if (_buffer.len() > static_cast<int>(kSortedFileBufferSize))
+        writeChunk();
 }
 
 template <typename Key, typename Value>
-void SortedFileWriter<Key, Value>::spill() {
+void SortedFileWriter<Key, Value>::writeChunk() {
     int32_t size = _buffer.len();
     char* outBuffer = _buffer.buf();
 
     if (size == 0)
         return;
 
+    if (_checksumCalculator.version() > SorterChecksumVersion::v1) {
+        _checksumCalculator.addData(outBuffer, size);
+    }
+
+    if (_opts.sorterFileStats) {
+        _opts.sorterFileStats->addSpilledDataSizeUncompressed(size);
+    }
+
     std::string compressed;
     snappy::Compress(outBuffer, size, &compressed);
-    verify(compressed.size() <= size_t(std::numeric_limits<int32_t>::max()));
+    invariant(compressed.size() <= size_t(std::numeric_limits<int32_t>::max()));
 
-    const bool shouldCompress = compressed.size() < size_t(_buffer.len() / 10 * 9);
+    const bool shouldCompress = compressed.size() < (size_t(_buffer.len()) / 10 * 9);
     if (shouldCompress) {
         size = compressed.size();
         outBuffer = const_cast<char*>(compressed.data());
@@ -1107,7 +1675,7 @@ void SortedFileWriter<Key, Value>::spill() {
                                                         reinterpret_cast<uint8_t*>(out.get()),
                                                         protectedSizeMax,
                                                         &resultLen,
-                                                        _dbName);
+                                                        _opts.dbName);
         uassert(28842,
                 str::stream() << "Failed to compress data: " << status.toString(),
                 status.isOK());
@@ -1115,36 +1683,236 @@ void SortedFileWriter<Key, Value>::spill() {
         size = resultLen;
     }
 
-    // negative size means compressed
-    size = shouldCompress ? -size : size;
-    try {
-        _file.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        _file.write(outBuffer, std::abs(size));
-    } catch (const std::exception&) {
-        msgasserted(16821,
-                    str::stream() << "error writing to file \"" << _fileFullPath
-                                  << "\": " << sorter::myErrnoWithDescription());
-    }
+    // Negative size means compressed.
+    int32_t signedSize = shouldCompress ? -size : size;
+    _file->write(reinterpret_cast<const char*>(&signedSize), sizeof(signedSize));
+    _file->write(outBuffer, size);
+    sortCounters.incrementSortCountersPerSpilling(1 /* sortSpills */, sizeof(signedSize) + size);
 
     _buffer.reset();
 }
 
 template <typename Key, typename Value>
 SortIteratorInterface<Key, Value>* SortedFileWriter<Key, Value>::done() {
-    spill();
-    std::streampos currentFileOffset = _file.tellp();
-    uassert(50980,
-            str::stream() << "error fetching current file descriptor offset in file \""
-                          << _fileFullPath << "\": " << sorter::myErrnoWithDescription(),
-            currentFileOffset >= 0);
+    writeChunk();
 
-    // In case nothing was written to disk, use _fileStartOffset because tellp() may not be
-    // initialized on all systems upon opening the file.
-    _fileEndOffset = currentFileOffset < _fileStartOffset ? _fileStartOffset : currentFileOffset;
-    _file.close();
+    return new sorter::FileIterator<Key, Value>(_file,
+                                                _fileStartOffset,
+                                                _file->currentOffset(),
+                                                _settings,
+                                                _opts.dbName,
+                                                _checksumCalculator.checksum(),
+                                                _checksumCalculator.version());
+}
 
-    return new sorter::FileIterator<Key, Value>(
-        _fileFullPath, _fileStartOffset, _fileEndOffset, _settings, _dbName, _checksum);
+template <typename Key, typename Value>
+std::shared_ptr<SortIteratorInterface<Key, Value>>
+SortedFileWriter<Key, Value>::createFileIteratorForResume(
+    std::shared_ptr<typename Sorter<Key, Value>::File> file,
+    std::streamoff fileStartOffset,
+    std::streamoff fileEndOffset,
+    const Settings& settings,
+    const boost::optional<DatabaseName>& dbName,
+    const size_t checksum,
+    const SorterChecksumVersion checksumVersion) {
+
+    return std::shared_ptr<SortIteratorInterface<Key, Value>>(new sorter::FileIterator<Key, Value>(
+        file, fileStartOffset, fileEndOffset, settings, dbName, checksum, checksumVersion));
+}
+
+template <typename Key, typename Value>
+SorterChecksumVersion SortedFileWriter<Key, Value>::_getSorterChecksumVersion() const {
+    // We need to use isEnabledUseLatestFCVWhenUninitialized instead of isEnabled because
+    // this could run during currentOp which is allowed during initial sync while the FCV is still
+    // uninitialized.
+    if (gFeatureFlagUseSorterChecksumV2.isEnabledUseLatestFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        return SorterChecksumVersion::v2;
+    }
+    return SorterChecksumVersion::v1;
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+BoundedSorter<Key, Value, Comparator, BoundMaker>::BoundedSorter(const SortOptions& opts,
+                                                                 Comparator comp,
+                                                                 BoundMaker makeBound,
+                                                                 bool checkInput)
+    : BoundedSorterInterface<Key, Value>(opts),
+      compare(comp),
+      makeBound(makeBound),
+      _checkInput(checkInput),
+      _opts(opts),
+      _heap(Greater{&compare}),
+      _file(opts.extSortAllowed ? std::make_shared<typename Sorter<Key, Value>::File>(
+                                      opts.tempDir + "/" + nextFileName(), opts.sorterFileStats)
+                                : nullptr) {}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::add(Key key, Value value) {
+    invariant(!_done);
+    // If a new value violates what we thought was our min bound, something has gone wrong.
+    uassert(6369910,
+            str::stream() << "BoundedSorter input is too out-of-order: with bound "
+                          << _min->toString() << ", did not expect input " << key.toString(),
+            !_checkInput || !_min || compare(*_min, key) <= 0);
+
+    // Each new item can potentially give us a tighter bound (a higher min).
+    Key newMin = makeBound(key, value);
+    if (!_min || compare(*_min, newMin) < 0)
+        _min = newMin;
+
+    auto memUsage = key.memUsageForSorter() + value.memUsageForSorter();
+    _heap.emplace(std::move(key), std::move(value));
+
+    this->_stats.incrementMemUsage(memUsage);
+    this->_stats.incrementBytesSorted(memUsage);
+    if (this->_stats.memUsage() > _opts.maxMemoryUsageBytes)
+        _spill();
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::restart() {
+    tassert(
+        6434804, "BoundedSorter must be in state kDone to restart()", getState() == State::kDone);
+
+    // In state kDone, the heap and spill are usually empty, because kDone means the sorter has
+    // no more elements to return. However, if there is a limit then we can also reach state
+    // kDone when 'this->_stats.numSorted() == _opts.limit'.
+    _spillIter.reset();
+    _heap = decltype(_heap){Greater{&compare}};
+    this->_stats.resetMemUsage();
+
+    _done = false;
+    _min.reset();
+
+    // There are now two possible states we could be in:
+    // - Typically, we should be ready for more input (kWait).
+    // - If there is a limit and we reached it, then we're done. We were done before restart()
+    //   and we're still done.
+    if (_opts.limit && this->_stats.numSorted() == _opts.limit) {
+        tassert(6434806,
+                "BoundedSorter has fulfilled _opts.limit and should still be in state kDone",
+                getState() == State::kDone);
+    } else {
+        tassert(6434805, "BoundedSorter should now be ready for input", getState() == State::kWait);
+    }
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+typename BoundedSorterInterface<Key, Value>::State
+BoundedSorter<Key, Value, Comparator, BoundMaker>::getState() const {
+    if (_opts.limit > 0 && _opts.limit == this->_stats.numSorted()) {
+        return State::kDone;
+    }
+
+    if (_done) {
+        // No more input will arrive, so we're never in state kWait.
+        return _heap.empty() && !_spillIter ? State::kDone : State::kReady;
+    }
+
+    if (_heap.empty() && !_spillIter)
+        return State::kWait;
+
+    // _heap.top() is the min of _heap, but we also need to consider whether a smaller input
+    // will arrive later. So _heap.top() is safe to return only if _heap.top() < _min.
+    if (!_heap.empty() && compare(_heap.top().first, *_min) < 0)
+        return State::kReady;
+
+    // Similarly, we can return the next element from the spilled iterator if it's < _min.
+    if (_spillIter && compare(_spillIter->current(), *_min) < 0)
+        return State::kReady;
+
+    // A later call to add() may improve _min. Or in the worst case, after done() is called
+    // we will return everything in _heap.
+    return State::kWait;
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() {
+    dassert(getState() == State::kReady);
+    std::pair<Key, Value> result;
+
+    auto pullFromHeap = [this, &result]() {
+        result = std::move(_heap.top());
+        _heap.pop();
+
+        auto memUsage = result.first.memUsageForSorter() + result.second.memUsageForSorter();
+        this->_stats.decrementMemUsage(memUsage);
+    };
+
+    auto pullFromSpilled = [this, &result]() {
+        result = _spillIter->next();
+        if (!_spillIter->more()) {
+            _spillIter.reset();
+        }
+    };
+
+    if (!_heap.empty() && _spillIter) {
+        if (compare(_heap.top().first, _spillIter->current()) <= 0) {
+            pullFromHeap();
+        } else {
+            pullFromSpilled();
+        }
+    } else if (!_heap.empty()) {
+        pullFromHeap();
+    } else {
+        pullFromSpilled();
+    }
+
+    this->_stats.incrementNumSorted();
+
+    return result;
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill() {
+    if (_heap.empty())
+        return;
+
+    // If we have a small $limit, we can simply extract that many of the smallest elements from
+    // the _heap and discard the rest, avoiding an expensive spill to disk.
+    if (_opts.limit > 0 && _opts.limit < (_heap.size() / 2)) {
+        this->_stats.resetMemUsage();
+        decltype(_heap) retained{Greater{&compare}};
+        for (size_t i = 0; i < _opts.limit; ++i) {
+            this->_stats.incrementMemUsage(_heap.top().first.memUsageForSorter() +
+                                           _heap.top().second.memUsageForSorter());
+            retained.emplace(_heap.top());
+            _heap.pop();
+        }
+        _heap.swap(retained);
+
+        if (this->_stats.memUsage() < _opts.maxMemoryUsageBytes) {
+            return;
+        }
+    }
+
+    uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+            str::stream() << "Sort exceeded memory limit of " << this->_opts.maxMemoryUsageBytes
+                          << " bytes, but did not opt in to external sorting.",
+            _opts.extSortAllowed);
+
+    this->_stats.incrementSpilledRanges();
+
+    // Write out all the values from the heap in sorted order.
+    SortedFileWriter<Key, Value> writer(_opts, _file, {});
+    while (!_heap.empty()) {
+        writer.addAlreadySorted(_heap.top().first, _heap.top().second);
+        _heap.pop();
+    }
+    std::shared_ptr<SpillIterator> iteratorPtr(writer.done());
+
+    if (auto* mergeIter = static_cast<typename sorter::MergeIterator<Key, Value, Comparator>*>(
+            _spillIter.get())) {
+        mergeIter->addSource(std::move(iteratorPtr));
+    } else {
+        std::vector<std::shared_ptr<SpillIterator>> iters{std::move(iteratorPtr)};
+        _spillIter.reset(SpillIterator::merge(iters, _opts, compare));
+    }
+
+    dassert(_spillIter->more());
+
+    this->_stats.resetMemUsage();
 }
 
 //
@@ -1184,7 +1952,7 @@ template <typename Key, typename Value>
 template <typename Comparator>
 Sorter<Key, Value>* Sorter<Key, Value>::makeFromExistingRanges(
     const std::string& fileName,
-    const std::vector<SorterRange> ranges,
+    const std::vector<SorterRange>& ranges,
     const SortOptions& opts,
     const Comparator& comp,
     const Settings& settings) {
@@ -1199,3 +1967,4 @@ Sorter<Key, Value>* Sorter<Key, Value>::makeFromExistingRanges(
         fileName, ranges, opts, comp, settings);
 }
 }  // namespace mongo
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

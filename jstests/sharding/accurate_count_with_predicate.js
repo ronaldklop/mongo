@@ -6,8 +6,7 @@
  * of the shards. It then runs a count() and ensures that the orphan documents are not counted
  * twice.
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;
@@ -23,8 +22,8 @@ function getNthDocument(n) {
 
 // Shard the collection. Shard 0 will get keys from [0, middle) and shard 1 will get everything
 // from [middle, num).
-assert.commandWorked(st.s.getDB("admin").runCommand({enableSharding: "test"}));
-st.ensurePrimaryShard("test", st.shard0.name);
+assert.commandWorked(
+    st.s.getDB("admin").runCommand({enableSharding: "test", primaryShard: st.shard0.name}));
 st.shardColl(shard0Coll.getName(), {x: 1}, {x: middle}, {x: middle + 1}, "test", true);
 
 // Insert some docs.
@@ -43,4 +42,3 @@ for (let i = middle + 1; i < middle + 3; i++) {
 assert.eq(st.getDB("test").slowcount.count({one: 1}), num);
 
 st.stop();
-})();

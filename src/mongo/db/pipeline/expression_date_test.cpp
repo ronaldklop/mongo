@@ -27,14 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <initializer_list>
+#include <ostream>
 #include <set>
 #include <string>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -64,8 +87,11 @@ TEST_F(ExpressionDateFromPartsTest, SerializesToObjectSyntax) {
                                  {"second", Document{{"$const", 15}}},
                                  {"millisecond", Document{{"$const", 414}}},
                                  {"timezone", Document{{"$const", "America/Los_Angeles"_sd}}}}}});
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 }
 
 TEST_F(ExpressionDateFromPartsTest, OptimizesToConstantIfAllInputsAreConstant) {
@@ -183,8 +209,11 @@ TEST_F(ExpressionDateToPartsTest, SerializesToObjectSyntax) {
                         Document{{"date", Document{{"$const", Date_t{}}}},
                                  {"timezone", Document{{"$const", "Europe/London"_sd}}},
                                  {"iso8601", Document{{"$const", false}}}}}});
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 }
 
 TEST_F(ExpressionDateToPartsTest, OptimizesToConstantIfAllInputsAreConstant) {
@@ -430,22 +459,31 @@ TEST_F(DateExpressionTest, SerializesToObjectSyntax) {
             Value(Document{{expName,
                             Document{{"date", Document{{"$const", Date_t{}}}},
                                      {"timezone", Document{{"$const", "Europe/London"_sd}}}}}});
-        ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-        ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+        ASSERT_VALUE_EQ(
+            dateExp->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+            expectedSerialization);
+        ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 
         // Test that it serializes to the full format if given a date.
         spec = BSON(expName << Date_t{});
         expectedSerialization =
             Value(Document{{expName, Document{{"date", Document{{"$const", Date_t{}}}}}}});
         dateExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
-        ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-        ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+        ASSERT_VALUE_EQ(
+            dateExp->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+            expectedSerialization);
+        ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 
         // Test that it serializes to the full format if given a date within an array.
         spec = BSON(expName << BSON_ARRAY(Date_t{}));
         dateExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
-        ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-        ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+        ASSERT_VALUE_EQ(
+            dateExp->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+            expectedSerialization);
+        ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
     }
 }
 
@@ -598,8 +636,11 @@ TEST_F(ExpressionDateToStringTest, SerializesToObjectSyntax) {
                                  {"timezone", Document{{"$const", "Europe/London"_sd}}},
                                  {"onNull", Document{{"$const", "nullDefault"_sd}}}}}});
 
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 }
 
 TEST_F(ExpressionDateToStringTest, OptimizesToConstantIfAllInputsAreConstant) {
@@ -824,8 +865,11 @@ TEST_F(ExpressionDateFromStringTest, SerializesToObjectSyntax) {
         Document{{"$dateFromString",
                   Document{{"dateString", Document{{"$const", "2017-07-04T13:06:44Z"_sd}}}}}});
 
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 
     // Test that it serializes to the full format if given an object specification.
     spec = BSON("$dateFromString" << BSON("dateString"
@@ -838,8 +882,11 @@ TEST_F(ExpressionDateFromStringTest, SerializesToObjectSyntax) {
                         Document{{"dateString", Document{{"$const", "2017-07-04T13:06:44Z"_sd}}},
                                  {"timezone", Document{{"$const", "Europe/London"_sd}}}}}});
 
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 
     spec = BSON("$dateFromString" << BSON("dateString"
                                           << "2017-07-04T13:06:44Z"
@@ -854,8 +901,11 @@ TEST_F(ExpressionDateFromStringTest, SerializesToObjectSyntax) {
                                  {"timezone", Document{{"$const", "Europe/London"_sd}}},
                                  {"format", Document{{"$const", "%Y-%d-%mT%H:%M:%S"_sd}}}}}});
 
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 
     spec = BSON("$dateFromString" << BSON("dateString"
                                           << "2017-07-04T13:06:44Z"
@@ -876,8 +926,11 @@ TEST_F(ExpressionDateFromStringTest, SerializesToObjectSyntax) {
                                  {"onNull", Document{{"$const", "nullDefault"_sd}}},
                                  {"onError", Document{{"$const", "errorDefault"_sd}}}}}});
 
-    ASSERT_VALUE_EQ(dateExp->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(dateExp->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        dateExp->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(dateExp->serialize(), expectedSerialization);
 }
 
 TEST_F(ExpressionDateFromStringTest, OptimizesToConstantIfAllInputsAreConstant) {
@@ -1349,7 +1402,7 @@ TEST_F(ExpressionDateFromStringTest, ReturnsOnErrorForParseFailures) {
 
     std::vector<std::string> invalidDates = {
         "60.Monday1770/06:59", "July 4th", "12:50:53", "2017, 12:50:53"};
-    for (auto date : invalidDates) {
+    for (const auto& date : invalidDates) {
         auto spec = BSON("$dateFromString" << BSON("dateString" << date << "onError"
                                                                 << "Error default"));
         auto dateExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
@@ -1362,7 +1415,7 @@ TEST_F(ExpressionDateFromStringTest, ReturnsOnErrorForFormatMismatch) {
 
     const std::string date = "2018/02/06";
     std::vector<std::string> unmatchedFormats = {"%Y", "%Y/%m/%d:%H", "Y/m/d"};
-    for (auto format : unmatchedFormats) {
+    for (const auto& format : unmatchedFormats) {
         auto spec =
             BSON("$dateFromString" << BSON("dateString" << date << "format" << format << "onError"
                                                         << "Error default"));
@@ -1416,13 +1469,16 @@ void assertParsesAndSerializesExpression(boost::intrusive_ptr<ExpressionContextF
     const auto expression =
         Expression::parseExpression(expCtx.get(), expressionSpec, expCtx->variablesParseState);
     const auto expectedSerialization = Value(expectedSerializedExpressionSpec);
-    ASSERT_VALUE_EQ(expression->serialize(true), expectedSerialization);
-    ASSERT_VALUE_EQ(expression->serialize(false), expectedSerialization);
+    ASSERT_VALUE_EQ(
+        expression->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+        expectedSerialization);
+    ASSERT_VALUE_EQ(expression->serialize(), expectedSerialization);
 
     // Verify that parsed and then serialized expression is the same.
     ASSERT_VALUE_EQ(Expression::parseExpression(
                         expCtx.get(), expectedSerializedExpressionSpec, expCtx->variablesParseState)
-                        ->serialize(false),
+                        ->serialize(),
                     expectedSerialization);
 }
 
@@ -1624,8 +1680,9 @@ TEST_F(ExpressionDateDiffTest, EvaluatesExpression) {
          Value{"century"_sd},
          utc,
          null,
-         5439014,  // Error code.
-         "$dateDiff parameter 'unit' value cannot be recognized as a time unit: century"},
+         ErrorCodes::FailedToParse,  // Error code.
+         "$dateDiff parameter 'unit' value parsing failed :: caused by :: unknown time unit value: "
+         "century"},
         {// Invalid 'timezone' value.
          anyDate,
          anyDate,
@@ -1768,10 +1825,10 @@ TEST_F(ExpressionDateDiffTest, AddsDependencies) {
                                                             Value{"$startOfWeekField"_sd});
 
     // Verify that dependencies for $dateDiff expression are determined correctly.
-    auto depsTracker = dateDiffExpression->getDependencies();
+    auto depsTracker = expression::getDependencies(dateDiffExpression.get());
     ASSERT_TRUE(
         (depsTracker.fields ==
-         std::set<std::string>{
+         OrderedPathSet{
              "startDateField", "endDateField", "unitField", "timezoneField", "startOfWeekField"}));
 }
 }  // namespace ExpressionDateDiffTest
@@ -1866,10 +1923,10 @@ TEST_F(ExpressionDateTruncTest, AddsDependencies) {
                                                                    Value{"$startOfWeekField"_sd});
 
     // Verify that dependencies for $dateTrunc expression are determined correctly.
-    const auto depsTracker = dateTruncExpression->getDependencies();
+    const auto depsTracker = expression::getDependencies(dateTruncExpression.get());
     ASSERT_TRUE(
         (depsTracker.fields ==
-         std::set<std::string>{
+         OrderedPathSet{
              "dateField", "unitField", "binSizeField", "timezoneField", "startOfWeekField"}));
 }
 }  // namespace
@@ -1893,8 +1950,11 @@ TEST_F(ExpressionDateArithmeticsTest, SerializesToObject) {
                             Document{{"startDate", Document{{"$const", Date_t{}}}},
                                      {"unit", Document{{"$const", "day"_sd}}},
                                      {"amount", Document{{"$const", 1}}}}}});
-        ASSERT_VALUE_EQ(dateAddExp->serialize(true), expectedSerialization);
-        ASSERT_VALUE_EQ(dateAddExp->serialize(false), expectedSerialization);
+        ASSERT_VALUE_EQ(
+            dateAddExp->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+            expectedSerialization);
+        ASSERT_VALUE_EQ(dateAddExp->serialize(), expectedSerialization);
 
         // with timezone
         doc = BSON(expName << BSON("startDate" << Date_t{} << "unit"
@@ -1908,8 +1968,11 @@ TEST_F(ExpressionDateArithmeticsTest, SerializesToObject) {
                                      {"unit", Document{{"$const", "day"_sd}}},
                                      {"amount", Document{{"$const", -1}}},
                                      {"timezone", Document{{"$const", "America/New_York"_sd}}}}}});
-        ASSERT_VALUE_EQ(dateAddExp->serialize(true), expectedSerialization);
-        ASSERT_VALUE_EQ(dateAddExp->serialize(false), expectedSerialization);
+        ASSERT_VALUE_EQ(
+            dateAddExp->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}),
+            expectedSerialization);
+        ASSERT_VALUE_EQ(dateAddExp->serialize(), expectedSerialization);
     }
 }
 
@@ -1992,9 +2055,9 @@ TEST_F(ExpressionDateArithmeticsTest, ThrowsExceptionOnInvalidInput) {
             {BSON(expName << BSON("startDate"
                                   << "myDate"
                                   << "unit" << 123 << "amount" << 1)),
-             5166403},
+             5439013},
             {BSON(expName << BSON("startDate" << Date_t{} << "unit" << 123 << "amount" << 1)),
-             5166404},
+             5439013},
             {BSON(expName << BSON("startDate" << Date_t{} << "unit"
                                               << "decade"
                                               << "amount" << 1)),
@@ -2135,6 +2198,7 @@ TEST_F(ExpressionDateArithmeticsTest, OptimizesToConstant) {
         dateAddExp = Expression::parseExpression(expCtx.get(), doc, expCtx->variablesParseState);
         ASSERT(dynamic_cast<ExpressionConstant*>(dateAddExp->optimize().get()));
 
+        // Test that $$NOW will be optimized as constant.
         doc = BSON(expName << BSON("startDate"
                                    << "$$NOW"
                                    << "unit"
@@ -2176,7 +2240,7 @@ TEST_F(ExpressionDateArithmeticsTest, AddsDependencies) {
         auto dateAddExp =
             Expression::parseExpression(expCtx.get(), doc, expCtx->variablesParseState);
         DepsTracker dependencies;
-        dateAddExp->addDependencies(&dependencies);
+        expression::addDependencies(dateAddExp.get(), &dependencies);
         ASSERT_EQ(dependencies.fields.size(), 4UL);
         ASSERT_EQ(dependencies.fields.count("date"), 1UL);
         ASSERT_EQ(dependencies.fields.count("unit"), 1UL);

@@ -29,25 +29,26 @@
 
 
 #include "mongo/platform/decimal128.h"
-#include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
-#include <memory>
 #include <string>
-#include <utility>
+
+
 // The Intel C library typedefs wchar_t, but it is a distinct fundamental type
 // in C++, so we #define _WCHAR_T here to prevent the library from trying to typedef.
 #define _WCHAR_T
-#include <third_party/IntelRDFPMathLib20U1/LIBRARY/src/bid_conf.h>
-#include <third_party/IntelRDFPMathLib20U1/LIBRARY/src/bid_functions.h>
+#include <bid_conf.h>
+#include <bid_functions.h>
+
 #undef _WCHAR_T
 
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/endian.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/ctype.h"
@@ -57,22 +58,33 @@ namespace mongo {
 
 namespace {
 
-// Returns the number of characters consumed from input string. If unable to parse,
-// it returns 0.
+/**
+ * Returns the number of characters consumed from input string. If unable to parse,
+ * it returns 0.
+ *
+ * Input must be of these forms:
+ *  - Valid decimal (standard or scientific notation): /(?i)^[+-]?\d*(.\d+)?(e[+-]?\d+)?$/
+ *  - NaN: /(?i)^[+-]?nan$/
+ *  - Infinity: /(?i)^[+-]?inf(inity)?$)
+ */
 size_t validateInputString(StringData input, std::uint32_t* signalingFlags) {
-    // Input must be of these forms:
-    // * Valid decimal (standard or scientific notation):
-    //      /[-+]?\d*(.\d+)?([e][+\-]?\d+)?/
-    // * NaN: /[-+]?[[Nn][Aa][Nn]]/
-    // * Infinity: /[+\-]?(inf|infinity)
-
+    if (input.empty()) {
+        *signalingFlags = Decimal128::SignalingFlag::kInvalid;
+        return 0;
+    }
     bool isSigned = input[0] == '-' || input[0] == '+';
 
     // Check for NaN and Infinity
     size_t start = (isSigned) ? 1 : 0;
     size_t charsConsumed = start;
     StringData noSign = input.substr(start);
-    bool isNanOrInf = noSign == "nan" || noSign == "inf" || noSign == "infinity";
+    if (noSign.empty()) {
+        *signalingFlags = Decimal128::SignalingFlag::kInvalid;
+        return 0;
+    }
+    bool isNanOrInf = noSign.equalCaseInsensitive("nan") || noSign.equalCaseInsensitive("inf") ||
+        noSign.equalCaseInsensitive("infinity");
+
     if (isNanOrInf)
         return start + noSign.size();
 
@@ -130,7 +142,7 @@ size_t validateInputString(StringData input, std::uint32_t* signalingFlags) {
     // Check exponent
     StringData exponent = noSign.substr(i);
 
-    if (exponent[0] != 'e' || exponent.size() < 2) {
+    if ((exponent[0] != 'e' && exponent[0] != 'E') || exponent.size() < 2) {
         *signalingFlags = Decimal128::SignalingFlag::kInvalid;
         return 0;
     }
@@ -290,21 +302,22 @@ Decimal128::Decimal128(double doubleValue,
     invariant(getCoefficientLow() <= kLargest15DigitInt);
 }
 
-Decimal128::Decimal128(std::string stringValue, RoundingMode roundMode, size_t* charsConsumed) {
+Decimal128::Decimal128(const std::string& stringValue,
+                       RoundingMode roundMode,
+                       size_t* charsConsumed) {
     std::uint32_t throwAwayFlag = 0;
     *this = Decimal128(stringValue, &throwAwayFlag, roundMode, charsConsumed);
 }
 
-Decimal128::Decimal128(std::string stringValue,
+Decimal128::Decimal128(const std::string& stringValue,
                        std::uint32_t* signalingFlags,
                        RoundingMode roundMode,
                        size_t* charsConsumed) {
-    std::string lower = str::toLower(stringValue);
     BID_UINT128 dec128;
     // The intel library function requires a char * while c_str() returns a const char*.
     // We're using const_cast here since the library function should not modify the input.
-    dec128 = bid128_from_string(const_cast<char*>(lower.c_str()), roundMode, signalingFlags);
-    size_t consumed = validateInputString(lower, signalingFlags);
+    dec128 = bid128_from_string(const_cast<char*>(stringValue.c_str()), roundMode, signalingFlags);
+    size_t consumed = validateInputString(stringValue, signalingFlags);
     if (charsConsumed)
         *charsConsumed = consumed;
     _value = libraryTypeToValue(dec128);
@@ -417,6 +430,32 @@ Decimal128 Decimal128::cos(RoundingMode roundMode) const {
 Decimal128 Decimal128::cos(std::uint32_t* signalingFlags, RoundingMode roundMode) const {
     BID_UINT128 current = decimal128ToLibraryType(_value);
     current = bid128_cos(current, roundMode, signalingFlags);
+    return Decimal128{libraryTypeToValue(current)};
+}
+
+Decimal128 Decimal128::round(RoundingMode roundMode) const {
+    std::uint32_t throwAwayFlag = 0;
+    return round(&throwAwayFlag, roundMode);
+}
+
+Decimal128 Decimal128::round(std::uint32_t* signalingFlags, RoundingMode roundMode) const {
+    BID_UINT128 current = decimal128ToLibraryType(_value);
+    current = [&]() {
+        switch (roundMode) {
+            case kRoundTiesToEven:
+                return bid128_round_integral_nearest_even(current, signalingFlags);
+            case kRoundTowardNegative:
+                return bid128_round_integral_negative(current, signalingFlags);
+            case kRoundTowardPositive:
+                return bid128_round_integral_positive(current, signalingFlags);
+            case kRoundTowardZero:
+                return bid128_round_integral_zero(current, signalingFlags);
+            case kRoundTiesToAway:
+                return bid128_round_integral_nearest_away(current, signalingFlags);
+        }
+        MONGO_UNREACHABLE;
+    }();
+
     return Decimal128{libraryTypeToValue(current)};
 }
 
@@ -801,36 +840,33 @@ Decimal128 Decimal128::exponential(std::uint32_t* signalingFlags, RoundingMode r
     return Decimal128{libraryTypeToValue(current)};
 }
 
-Decimal128 Decimal128::logarithm(RoundingMode roundMode) const {
+Decimal128 Decimal128::naturalLogarithm(RoundingMode roundMode) const {
     std::uint32_t throwAwayFlag = 0;
-    return logarithm(&throwAwayFlag, roundMode);
+    return naturalLogarithm(&throwAwayFlag, roundMode);
 }
 
-Decimal128 Decimal128::logarithm(std::uint32_t* signalingFlags, RoundingMode roundMode) const {
+Decimal128 Decimal128::naturalLogarithm(std::uint32_t* signalingFlags,
+                                        RoundingMode roundMode) const {
     BID_UINT128 current = decimal128ToLibraryType(_value);
     current = bid128_log(current, roundMode, signalingFlags);
     return Decimal128{libraryTypeToValue(current)};
 }
 
-Decimal128 Decimal128::logarithm(const Decimal128& other, RoundingMode roundMode) const {
+Decimal128 Decimal128::logarithm(const Decimal128& base, RoundingMode roundMode) const {
     std::uint32_t throwAwayFlag = 0;
-    if (other.isEqual(Decimal128(2))) {
+    if (base.isEqual(Decimal128(2))) {
         BID_UINT128 current = decimal128ToLibraryType(_value);
         current = bid128_log2(current, roundMode, &throwAwayFlag);
         return Decimal128{libraryTypeToValue(current)};
     }
-    if (other.isEqual(Decimal128(10))) {
+    if (base.isEqual(Decimal128(10))) {
         BID_UINT128 current = decimal128ToLibraryType(_value);
         current = bid128_log10(current, roundMode, &throwAwayFlag);
         return Decimal128{libraryTypeToValue(current)};
     }
-    return logarithm(other, &throwAwayFlag);
-}
-
-Decimal128 Decimal128::logarithm(const Decimal128& other,
-                                 std::uint32_t* signalingFlags,
-                                 RoundingMode roundMode) const {
-    return logarithm(signalingFlags, roundMode).divide(other);
+    // Logarithm with a generic base is equivalent to `ln(input) / ln(base)`.
+    return naturalLogarithm(&throwAwayFlag, roundMode)
+        .divide(base.naturalLogarithm(&throwAwayFlag, roundMode));
 }
 
 Decimal128 Decimal128::modulo(const Decimal128& other) const {
@@ -865,6 +901,15 @@ Decimal128 Decimal128::power(const Decimal128& other,
     else
         result = bid128_pow(base, exp, roundMode, signalingFlags);
     return Decimal128{libraryTypeToValue(result)}.add(kLargestNegativeExponentZero);
+}
+
+Decimal128 Decimal128::scale(int n, RoundingMode roundMode) const {
+    std::uint32_t throwAwayFlag = 0;
+    BID_UINT128 x = decimal128ToLibraryType(_value);
+
+    BID_UINT128 result = bid128_scalbn(x, n, roundMode, &throwAwayFlag);
+    return Decimal128{libraryTypeToValue(result)};
+    ;
 }
 
 Decimal128 Decimal128::nonNormalizingQuantize(const Decimal128& other,
@@ -1016,6 +1061,33 @@ const Decimal128 Decimal128::k180OverPi(Decimal128("180").divide(Decimal128::kPi
 
 std::ostream& operator<<(std::ostream& stream, const Decimal128& value) {
     return stream << value.toString();
+}
+
+void DataType::Handler<Decimal128>::unsafeLoad(Decimal128* valueOut,
+                                               const char* ptr,
+                                               size_t* advanced) {
+    if (valueOut) {
+        ConstDataView decimalView(ptr);
+        uint64_t low = decimalView.read<LittleEndian<uint64_t>>();
+        uint64_t high = decimalView.read<LittleEndian<uint64_t>>(sizeof(uint64_t));
+        *valueOut = Decimal128(Decimal128::Value{low, high});
+    }
+
+    if (advanced) {
+        *advanced = kSizeOfDecimal;
+    }
+}
+
+void DataType::Handler<Decimal128>::unsafeStore(const Decimal128& valueIn,
+                                                char* ptr,
+                                                size_t* advanced) {
+    DataView decimalView(ptr);
+    decimalView.write<LittleEndian<uint64_t>>(valueIn.getValue().low64, 0);
+    decimalView.write<LittleEndian<uint64_t>>(valueIn.getValue().high64, sizeof(uint64_t));
+
+    if (advanced) {
+        *advanced = kSizeOfDecimal;
+    }
 }
 
 }  // namespace mongo

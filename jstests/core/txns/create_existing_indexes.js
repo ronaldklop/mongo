@@ -4,12 +4,11 @@
  * indexes on existing collections are not permitted inside multi-document transactions.
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: endSession.
+ *   not_allowed_with_signed_security_token,
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
 const session = db.getMongo().startSession();
 const collName = "create_existing_indexes";
 
@@ -49,4 +48,3 @@ assert.commandFailedWithCode(
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 session.endSession();
-}());

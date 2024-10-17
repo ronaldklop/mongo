@@ -2,13 +2,17 @@
  * Test that we can restart a node that has an oplog hole open at the stable optime
  * when we kill it.
  *
- * @tags: [requires_persistence]
+ * This test utilizes a single-node replica set and restarts its lone node during execution. Because
+ * single-node replica sets are initiated with the latest FCV, when this test restarts the
+ * node it is possible on multiversion suites for an older binary to be used that is incompatible
+ * with the latest FCV document. Therefore, this test is multiversion incompatible.
+ * @tags: [
+ *   requires_persistence,
+ *   multiversion_incompatible
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = TestData.testName;
 const dbName = testName;
@@ -23,6 +27,10 @@ const primaryDB = primary.getDB(dbName);
 const primaryColl = primaryDB[collName];
 const nss = primaryColl.getFullName();
 TestData.collectionName = collName;
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Turn on checkpoint logging.
 assert.commandWorked(primary.adminCommand(
@@ -63,4 +71,3 @@ jsTestLog("Joining failed write");
 joinHungWrite({checkExitStatus: false});
 
 replTest.stopSet();
-})();

@@ -1,15 +1,16 @@
 """Helper functions."""
 
 import contextlib
-import errno
-import os.path
+import random
 import re
-import shutil
 import sys
 
 import yaml
 
+from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib.utils import archival
+
+__all__ = ["archival"]
 
 
 @contextlib.contextmanager
@@ -47,32 +48,9 @@ def is_windows():
     return sys.platform.startswith("win32") or sys.platform.startswith("cygwin")
 
 
-def remove_if_exists(path):
-    """Remove path if it exists."""
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
 def is_string_list(lst):
     """Return true if 'lst' is a list of strings, and false otherwise."""
     return isinstance(lst, list) and all(isinstance(x, str) for x in lst)
-
-
-def is_string_set(value):
-    """Return true if 'value' is a set of strings, and false otherwise."""
-    return isinstance(value, set) and all(isinstance(x, str) for x in value)
-
-
-def is_js_file(filename):
-    """Return true if 'filename' ends in .js, and false otherwise."""
-    return os.path.splitext(filename)[1] == ".js"
-
-
-def is_yaml_file(filename):
-    """Return true if 'filename' ends in .yml or .yaml, and false otherwise."""
-    return os.path.splitext(filename)[1] in (".yaml", ".yml")
 
 
 def load_yaml_file(filename):
@@ -107,26 +85,30 @@ def load_yaml(value):
         raise ValueError("Attempted to parse invalid YAML value '%s': %s" % (value, err))
 
 
-def mkdir_p(path):
-    """
-    Make the directory and all missing parents (like mkdir -p).
-
-    :type path: string the directory path
-    """
-    try:
-        os.makedirs(path)
-    except OSError as exc:  # Python >2.5
-        if exc.errno == errno.EEXIST and os.path.isdir(path):
-            pass
-        else:
-            raise
-
-
 def get_task_name_without_suffix(task_name, variant_name):
     """Return evergreen task name without suffix added to the generated task.
 
     Remove evergreen variant name, numerical suffix and underscores between them from evergreen task name.
-    Example: "noPassthrough_0_enterprise-rhel-80-64-bit-dynamic-required" -> "noPassthrough"
+    Example: "noPassthrough_0_enterprise-rhel-8-64-bit-dynamic-required" -> "noPassthrough"
     """
     task_name = task_name if task_name else ""
-    return re.sub(fr"(_[0-9]+)?(_{variant_name})?$", "", task_name)
+    return re.sub(rf"(_[0-9]+)?(_{variant_name})?$", "", task_name)
+
+
+def pick_catalog_shard_node(config_shard, num_shards):
+    """Get config_shard node index or None if no config_shard."""
+    if config_shard is None:
+        return None
+
+    if config_shard == "any":
+        # We check _config.NOOP_MONGO_D_S_PROCESSES because when running in antithesis
+        # the resmoke setup needs to be deterministic so the config shard cannot be random.
+        if num_shards is None or num_shards == 0 or _config.NOOP_MONGO_D_S_PROCESSES:
+            return 0
+        return random.randint(0, num_shards - 1)
+
+    config_shard_index = int(config_shard)
+    if config_shard_index < 0 or config_shard_index >= num_shards:
+        raise ValueError('Config shard value must be in range 0..num_shards-1 or "any"')
+
+    return config_shard_index

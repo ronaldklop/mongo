@@ -1,8 +1,7 @@
 /**
  * Tests whether new sharding is detected on insert by mongos
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 10, mongos: 3});
 
@@ -30,8 +29,8 @@ var shards = [
     st.shard9
 ];
 
-assert.commandWorked(admin.runCommand({enableSharding: "" + collA.getDB()}));
-st.ensurePrimaryShard(collA.getDB().getName(), st.shard1.shardName);
+assert.commandWorked(
+    admin.runCommand({enableSharding: "" + collA.getDB(), primaryShard: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: "" + collA, key: {_id: 1}}));
 
 jsTestLog("Splitting up the collection...");
@@ -64,4 +63,3 @@ printjson(collB.count());
 printjson(collC.find().toArray());
 
 st.stop();
-})();

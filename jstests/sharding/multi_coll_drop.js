@@ -1,5 +1,10 @@
 // Tests the dropping and re-adding of a collection
-(function() {
+// @tags: [
+//   # TODO (SERVER-88123): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({name: "multidrop", shards: 1, mongos: 2});
 
@@ -30,7 +35,7 @@ assert(coll.drop());
 jsTestLog("Recreating collection...");
 
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
-for (var i = -10; i < 10; i++) {
+for (let i = -10; i < 10; i++) {
     assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: i}}));
 }
 
@@ -40,4 +45,3 @@ assert.eq(0, coll.find().itcount());
 assert.eq(0, collB.find().itcount());
 
 st.stop();
-})();

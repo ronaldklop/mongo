@@ -27,7 +27,13 @@
  *    it in the license file.
  */
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <string>
+
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/fail_point.h"
 
@@ -62,6 +68,6 @@ public:
                                           OperationContext* opCtx,
                                           const std::string& failpointMsg,
                                           const std::function<void()>& whileWaiting = nullptr,
-                                          boost::optional<NamespaceString> nss = boost::none);
+                                          const NamespaceString& nss = {});
 };
 }  // namespace mongo

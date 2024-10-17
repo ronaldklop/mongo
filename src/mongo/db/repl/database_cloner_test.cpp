@@ -27,18 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <map>
 
-#include "mongo/db/clientcursor.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
 #include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/initial_sync_cloner_test_fixture.h"
-#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/service_context_test_fixture.h"
-#include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -48,9 +66,12 @@ struct CollectionCloneInfo {
     CollectionBulkLoaderMock* loader = nullptr;
 };
 
+const std::string dbNameStr = "testDb";
+
 class DatabaseClonerTest : public InitialSyncClonerTestFixture {
 public:
-    DatabaseClonerTest() {}
+    DatabaseClonerTest()
+        : _dbName(DatabaseName::createDatabaseName_forTest(boost::none, dbNameStr)) {}
 
 protected:
     void setUp() override {
@@ -83,7 +104,8 @@ protected:
     }
 
     BSONObj createListCollectionsResponse(const std::vector<BSONObj>& collections) {
-        auto ns = _dbName + "$cmd.listCollections";
+        auto ns = DatabaseNameUtil::serialize(_dbName, SerializationContext::stateDefault()) +
+            "$cmd.listCollections";
         BSONObjBuilder bob;
         {
             BSONObjBuilder cursorBob(bob.subobjStart("cursor"));
@@ -107,11 +129,8 @@ protected:
 
     std::map<NamespaceString, CollectionCloneInfo> _collections;
 
-    static std::string _dbName;
+    DatabaseName _dbName;
 };
-
-/* static */
-std::string DatabaseClonerTest::_dbName = "testDb";
 
 // A database may have no collections. Nothing to do for the database cloner.
 TEST_F(DatabaseClonerTest, ListCollectionsReturnedNoCollections) {
@@ -148,9 +167,9 @@ TEST_F(DatabaseClonerTest, ListCollections) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "a"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[1].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
 }
 
@@ -189,9 +208,9 @@ TEST_F(DatabaseClonerTest, ListCollectionsAllowsExtraneousFields) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "a"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[1].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
 }
 
@@ -318,8 +337,8 @@ TEST_F(DatabaseClonerTest, ListCollectionsFailsOnInvalidCollectionOptions) {
 TEST_F(DatabaseClonerTest, FirstCollectionListIndexesFailed) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const std::vector<BSONObj> sourceInfos = {BSON("name"
                                                    << "a"
                                                    << "type"
@@ -339,11 +358,12 @@ TEST_F(DatabaseClonerTest, FirstCollectionListIndexesFailed) {
     _mockServer->setCommandReply("listCollections",
                                  createListCollectionsResponse({sourceInfos[0], sourceInfos[1]}));
     _mockServer->setCommandReply("count", {createCountResponse(0), createCountResponse(0)});
-    _mockServer->setCommandReply("listIndexes",
-                                 {BSON("ok" << 0 << "errmsg"
-                                            << "fake message"
-                                            << "code" << ErrorCodes::CursorNotFound),
-                                  createCursorResponse(_dbName + ".b", BSON_ARRAY(idIndexSpec))});
+    _mockServer->setCommandReply(
+        "listIndexes",
+        {BSON("ok" << 0 << "errmsg"
+                   << "fake message"
+                   << "code" << ErrorCodes::CursorNotFound),
+         createCursorResponse(_dbName.toString_forTest() + ".b", BSON_ARRAY(idIndexSpec))});
     auto cloner = makeDatabaseCloner();
     auto status = cloner->run();
     ASSERT_NOT_OK(status);
@@ -355,8 +375,8 @@ TEST_F(DatabaseClonerTest, FirstCollectionListIndexesFailed) {
 TEST_F(DatabaseClonerTest, CreateCollections) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const std::vector<BSONObj> sourceInfos = {BSON("name"
                                                    << "a"
                                                    << "type"
@@ -376,21 +396,22 @@ TEST_F(DatabaseClonerTest, CreateCollections) {
     // metrics.
     _mockServer->setCommandReply("collStats", BSON("size" << 0));
     _mockServer->setCommandReply("count", {createCountResponse(0), createCountResponse(0)});
-    _mockServer->setCommandReply("listIndexes",
-                                 {createCursorResponse(_dbName + ".a", BSON_ARRAY(idIndexSpec)),
-                                  createCursorResponse(_dbName + ".b", BSON_ARRAY(idIndexSpec))});
+    _mockServer->setCommandReply(
+        "listIndexes",
+        {createCursorResponse(_dbName.toString_forTest() + ".a", BSON_ARRAY(idIndexSpec)),
+         createCursorResponse(_dbName.toString_forTest() + ".b", BSON_ARRAY(idIndexSpec))});
     auto cloner = makeDatabaseCloner();
     auto status = cloner->run();
     ASSERT_OK(status);
 
     ASSERT_EQUALS(2U, _collections.size());
 
-    auto collInfo = _collections[NamespaceString{_dbName, "a"}];
+    auto collInfo = _collections[NamespaceString::createNamespaceString_forTest(_dbName, "a")];
     auto stats = *collInfo.stats;
     ASSERT_EQUALS(0, stats.insertCount);
     ASSERT(stats.commitCalled);
 
-    collInfo = _collections[NamespaceString{_dbName, "b"}];
+    collInfo = _collections[NamespaceString::createNamespaceString_forTest(_dbName, "b")];
     stats = *collInfo.stats;
     ASSERT_EQUALS(0, stats.insertCount);
     ASSERT(stats.commitCalled);
@@ -399,8 +420,8 @@ TEST_F(DatabaseClonerTest, CreateCollections) {
 TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const BSONObj extraIndexSpec = BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
                                             << "_extra_");
     const std::vector<BSONObj> sourceInfos = {BSON("name"
@@ -424,8 +445,9 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     _mockServer->setCommandReply("count", {createCountResponse(0), createCountResponse(0)});
     _mockServer->setCommandReply(
         "listIndexes",
-        {createCursorResponse(_dbName + ".a", BSON_ARRAY(idIndexSpec << extraIndexSpec)),
-         createCursorResponse(_dbName + ".b", BSON_ARRAY(idIndexSpec))});
+        {createCursorResponse(_dbName.toString_forTest() + ".a",
+                              BSON_ARRAY(idIndexSpec << extraIndexSpec)),
+         createCursorResponse(_dbName.toString_forTest() + ".b", BSON_ARRAY(idIndexSpec))});
     auto cloner = makeDatabaseCloner();
 
     auto collClonerBeforeFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
@@ -433,15 +455,17 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     auto timesEntered = collClonerBeforeFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" + _dbName + ".a'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" +
+                 _dbName.toString_forTest() + ".a'}"));
     collClonerAfterFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" + _dbName + ".a'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" +
+                 _dbName.toString_forTest() + ".a'}"));
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -454,8 +478,10 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     ASSERT_EQ(2, stats.collections);
     ASSERT_EQ(0, stats.clonedCollections);
     ASSERT_EQ(2, stats.collectionStats.size());
-    ASSERT_EQ(_dbName + ".a", stats.collectionStats[0].ns);
-    ASSERT_EQ(_dbName + ".b", stats.collectionStats[1].ns);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"),
+              stats.collectionStats[0].nss);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"),
+              stats.collectionStats[1].nss);
     ASSERT_EQ(_clock.now(), stats.collectionStats[0].start);
     ASSERT_EQ(Date_t(), stats.collectionStats[0].end);
     ASSERT_EQ(Date_t(), stats.collectionStats[1].start);
@@ -467,7 +493,8 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     timesEntered = collClonerBeforeFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" + _dbName + ".b'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'count', nss: '" +
+                 _dbName.toString_forTest() + ".b'}"));
     collClonerAfterFailPoint->setMode(FailPoint::off);
 
     // Wait for the failpoint to be reached
@@ -477,8 +504,10 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     ASSERT_EQ(2, stats.collections);
     ASSERT_EQ(1, stats.clonedCollections);
     ASSERT_EQ(2, stats.collectionStats.size());
-    ASSERT_EQ(_dbName + ".a", stats.collectionStats[0].ns);
-    ASSERT_EQ(_dbName + ".b", stats.collectionStats[1].ns);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"),
+              stats.collectionStats[0].nss);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"),
+              stats.collectionStats[1].nss);
     ASSERT_EQ(2, stats.collectionStats[0].indexes);
     ASSERT_EQ(0, stats.collectionStats[1].indexes);
     ASSERT_EQ(_clock.now(), stats.collectionStats[0].end);
@@ -496,11 +525,103 @@ TEST_F(DatabaseClonerTest, DatabaseAndCollectionStats) {
     ASSERT_EQ(2, stats.collections);
     ASSERT_EQ(2, stats.clonedCollections);
     ASSERT_EQ(2, stats.collectionStats.size());
-    ASSERT_EQ(_dbName + ".a", stats.collectionStats[0].ns);
-    ASSERT_EQ(_dbName + ".b", stats.collectionStats[1].ns);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"),
+              stats.collectionStats[0].nss);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"),
+              stats.collectionStats[1].nss);
     ASSERT_EQ(2, stats.collectionStats[0].indexes);
     ASSERT_EQ(1, stats.collectionStats[1].indexes);
     ASSERT_EQ(_clock.now(), stats.collectionStats[1].end);
+}
+
+class DatabaseClonerMultitenancyTest : public DatabaseClonerTest {
+public:
+    DatabaseClonerMultitenancyTest()
+        : _dbName(DatabaseName::createDatabaseName_forTest(TenantId(OID::gen()), dbNameStr)) {}
+
+protected:
+    void setUp() override {
+        DatabaseClonerTest::setUp();
+    }
+
+    std::unique_ptr<DatabaseCloner> makeDatabaseCloner() {
+        return std::make_unique<DatabaseCloner>(_dbName,
+                                                getSharedData(),
+                                                _source,
+                                                _mockClient.get(),
+                                                &_storageInterface,
+                                                _dbWorkThreadPool.get());
+    }
+
+    DatabaseName _dbName;
+};
+
+TEST_F(DatabaseClonerMultitenancyTest, ListCollectionsMultitenancySupport) {
+    RAIIServerParameterControllerForTest multitenancySupportController("multitenancySupport", true);
+
+    auto cloner = makeDatabaseCloner();
+    cloner->setStopAfterStage_forTest("listCollections");
+    auto uuid1 = UUID::gen();
+    auto uuid2 = UUID::gen();
+    const std::vector<BSONObj> sourceInfos = {BSON("name"
+                                                   << "a"
+                                                   << "type"
+                                                   << "collection"
+                                                   << "options" << BSONObj() << "info"
+                                                   << BSON("readOnly" << false << "uuid" << uuid1)),
+                                              BSON(
+                                                  "name"
+                                                  << "b"
+                                                  << "type"
+                                                  << "collection"
+                                                  << "options" << BSONObj() << "info"
+                                                  << BSON("readOnly" << false << "uuid" << uuid2))};
+    _mockServer->setCommandReply("listCollections",
+                                 createListCollectionsResponse({sourceInfos[0], sourceInfos[1]}));
+    ASSERT_OK(cloner->run());
+    ASSERT_OK(getSharedData()->getStatus(WithLock::withoutLock()));
+    auto collections = getCollectionsFromCloner(cloner.get());
+
+    ASSERT_EQUALS(2U, collections.size());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
+    ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
+    ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
+}
+
+TEST_F(DatabaseClonerMultitenancyTest,
+       ListCollectionsMultitenancySupportFeatureFlagRequireTenantId) {
+    RAIIServerParameterControllerForTest multitenancySupportController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    auto cloner = makeDatabaseCloner();
+    cloner->setStopAfterStage_forTest("listCollections");
+    auto uuid1 = UUID::gen();
+    auto uuid2 = UUID::gen();
+    const std::vector<BSONObj> sourceInfos = {BSON("name"
+                                                   << "a"
+                                                   << "type"
+                                                   << "collection"
+                                                   << "options" << BSONObj() << "info"
+                                                   << BSON("readOnly" << false << "uuid" << uuid1)),
+                                              BSON(
+                                                  "name"
+                                                  << "b"
+                                                  << "type"
+                                                  << "collection"
+                                                  << "options" << BSONObj() << "info"
+                                                  << BSON("readOnly" << false << "uuid" << uuid2))};
+    _mockServer->setCommandReply("listCollections",
+                                 createListCollectionsResponse({sourceInfos[0], sourceInfos[1]}));
+    ASSERT_OK(cloner->run());
+    ASSERT_OK(getSharedData()->getStatus(WithLock::withoutLock()));
+    auto collections = getCollectionsFromCloner(cloner.get());
+
+    ASSERT_EQUALS(2U, collections.size());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
+    ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
+    ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
 }
 
 }  // namespace repl

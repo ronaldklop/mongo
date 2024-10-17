@@ -29,13 +29,26 @@
 
 #pragma once
 
-#include "mongo/db/logical_session_id.h"
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
+#include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
-
 namespace migrationutil {
+
 /**
  * Manages the migration commit/abort process, including updates to config.rangeDeletions on the
  * donor and the recipient, and updates to the routing table on the config server.
@@ -49,7 +62,9 @@ public:
                          UUID collectionUuid,
                          ChunkRange range,
                          ChunkVersion preMigrationChunkVersion,
+                         const KeyPattern& shardKeyPattern,
                          bool waitForDelete);
+
     MigrationCoordinator(const MigrationCoordinatorDocument& doc);
     MigrationCoordinator(const MigrationCoordinator&) = delete;
     MigrationCoordinator& operator=(const MigrationCoordinator&) = delete;
@@ -61,6 +76,12 @@ public:
     const UUID& getMigrationId() const;
     const LogicalSessionId& getLsid() const;
     TxnNumber getTxnNumber() const;
+
+    /**
+     * Sets the shard key pattern on the coordinator. Needs to be called by migration recovery to
+     * allow the range deletion task to access the shard key pattern.
+     */
+    void setShardKeyPattern(const boost::optional<KeyPattern>& shardKeyPattern);
 
     /**
      * Initializes persistent state required to ensure that orphaned ranges are properly handled,
@@ -87,12 +108,19 @@ public:
      * If the decision was to commit, returns a future that is set when range deletion for
      * the donated range completes.
      */
-    boost::optional<SemiFuture<void>> completeMigration(OperationContext* opCtx);
+    boost::optional<SharedSemiFuture<void>> completeMigration(OperationContext* opCtx);
 
     /**
      * Deletes the persistent state for this migration from config.migrationCoordinators.
      */
     void forgetMigration(OperationContext* opCtx);
+
+    /**
+     * Asynchronously releases the recipient critical section without waiting for it to finish. Sets
+     * the _releaseRecipientCriticalSectionFuture future that will be readied once the recipient
+     * critical section has been released.
+     */
+    void launchReleaseRecipientCriticalSection(OperationContext* opCtx);
 
 private:
     /**
@@ -100,7 +128,7 @@ private:
      * the donor as ready to be processed. Returns a future that is set when range deletion for
      * the donated range completes.
      */
-    SemiFuture<void> _commitMigrationOnDonorAndRecipient(OperationContext* opCtx);
+    SharedSemiFuture<void> _commitMigrationOnDonorAndRecipient(OperationContext* opCtx);
 
     /**
      * Deletes the range deletion task from the donor node and marks the range deletion task on the
@@ -108,8 +136,16 @@ private:
      */
     void _abortMigrationOnDonorAndRecipient(OperationContext* opCtx);
 
+    /**
+     * Waits for the completion of _releaseRecipientCriticalSectionFuture and ignores ShardNotFound
+     * exceptions.
+     */
+    void _waitForReleaseRecipientCriticalSectionFutureIgnoreShardNotFound(OperationContext* opCtx);
+
     MigrationCoordinatorDocument _migrationInfo;
+    boost::optional<KeyPattern> _shardKeyPattern;
     bool _waitForDelete = false;
+    boost::optional<ExecutorFuture<void>> _releaseRecipientCriticalSectionFuture;
 };
 
 }  // namespace migrationutil

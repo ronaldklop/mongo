@@ -27,41 +27,46 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/repl_set_config_checks.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
 #include <iterator>
+#include <set>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_config_gen.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/repl_set_config_checks.h"
+#include "mongo/db/repl/repl_set_config_gen.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 namespace mongo {
 namespace repl {
 
 namespace {
-
-/**
- * Checks if the node with the given config index is electable, returning a useful
- * status message if not.
- */
-Status checkElectable(const ReplSetConfig& newConfig, int configIndex) {
-    const MemberConfig& myConfig = newConfig.getMemberAt(configIndex);
-    if (!myConfig.isElectable()) {
-        return Status(ErrorCodes::NodeNotElectable,
-                      str::stream() << "This node, " << myConfig.getHostAndPort().toString()
-                                    << ", with _id " << myConfig.getId()
-                                    << " is not electable under the new configuration with "
-                                    << newConfig.getConfigVersionAndTerm().toString()
-                                    << " for replica set " << newConfig.getReplSetName());
-    }
-    return Status::OK();
-}
 
 /**
  * Checks that the priorities of all the arbiters in the configuration are 0.  If they were 1,
@@ -100,63 +105,6 @@ Status ensureNoNewlyAddedMembers(const ReplSetConfig& config) {
 }
 
 /**
- * Checks that the current feature compatibility version is compatible with
- * each member config's delay field name. If the feature flag 'featureFlagUseSecondaryDelaySecs' is
- * enabled, the nodes must use the 'secondaryDelaySecs' field instead of the 'slaveDelay' field.
- */
-Status isFCVCompatible(const ReplSetConfig& config) {
-    auto version = serverGlobalParams.featureCompatibility.getVersion();
-    // New shard servers using 'latest' binaries will default to the 'lastLTS' FCV prior to being
-    // added to the cluster. If they have not yet been added to a sharded cluster via addShard,
-    // allow them to use 'secondaryDelaySecs'.
-    bool isNewShardServer = (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
-                             !ShardingState::get(getGlobalServiceContext())->enabled());
-    // TODO (SERVER-53354) If we are currently upgrading, we check if the feature flag is enabled
-    // for the target version. We use the generic FCV references here to avoid having to update the
-    // FCV constants used after each continuous release. After release, we should make sure to
-    // remove these references while removing the feature flag.
-    //
-    //(Generic FCV reference): feature flag support
-    if (version == ServerGlobalParams::FeatureCompatibility::kUpgradingFromLastLTSToLatest ||
-        version == ServerGlobalParams::FeatureCompatibility::kUpgradingFromLastContinuousToLatest) {
-        version = ServerGlobalParams::FeatureCompatibility::kLatest;
-    }
-
-    ServerGlobalParams::FeatureCompatibility targetFCV;
-    targetFCV.setVersion(version);
-    bool isEnabled = feature_flags::gUseSecondaryDelaySecs.isEnabled(targetFCV);
-    // We must check that every member config has a valid delay field name.
-    for (auto iter = config.membersBegin(); iter != config.membersEnd(); ++iter) {
-        // TODO (SERVER-53354) If the feature flag is disabled, getVersion() will throw. In this
-        // case, the version should default to kLatest. We use the generic FCV references here
-        // to avoid having to update the FCV constants used after each continuous release. After
-        // release, we should make sure to remove these references while removing the feature
-        // flag.
-        //
-        //(Generic FCV reference): feature flag support
-        if (isEnabled && iter->hasSlaveDelay()) {
-            auto featureFlagVersion = FeatureCompatibilityVersionParser::toString(
-                feature_flags::gUseSecondaryDelaySecs.getVersion());
-            return Status(ErrorCodes::BadValue,
-                          str::stream()
-                              << "Incompatible delay field name. If the node is in FCV "
-                              << featureFlagVersion << ", it must use secondaryDelaySecs.");
-        }
-        //(Generic FCV reference): feature flag support
-        if (!isEnabled && iter->hasSecondaryDelaySecs() && !isNewShardServer) {
-            auto latestVersion = FeatureCompatibilityVersionParser::toString(
-                ServerGlobalParams::FeatureCompatibility::kLatest);
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "Incompatible delay field name. In FCV versions below "
-                                        << latestVersion << ", nodes must use slaveDelay.");
-        }
-    }
-
-
-    return Status::OK();
-}
-
-/**
  * Compares two initialized and validated replica set configurations and checks to see if the
  * transition from 'oldConfig' to 'newConfig' adds or removes at most 1 voting node.
  *
@@ -166,10 +114,10 @@ Status isFCVCompatible(const ReplSetConfig& config) {
 Status validateSingleNodeChange(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
     // Add MemberId of voting nodes from each config into respective sets.
     std::set<MemberId> oldIdSet, newIdSet;
-    for (MemberConfig m : oldConfig.votingMembers()) {
+    for (const MemberConfig& m : oldConfig.votingMembers()) {
         oldIdSet.insert(m.getId());
     }
-    for (MemberConfig m : newConfig.votingMembers()) {
+    for (const MemberConfig& m : newConfig.votingMembers()) {
         newIdSet.insert(m.getId());
     }
 
@@ -248,10 +196,13 @@ Status validateOldAndNewConfigsCompatible(const ReplSetConfig& oldConfig,
                                     << newConfig.getReplicaSetId());
     }
 
-    if (oldConfig.getConfigServer() && !newConfig.getConfigServer()) {
+    if (oldConfig.getConfigServer_deprecated() && !newConfig.getConfigServer_deprecated() &&
+        !gFeatureFlagAllMongodsAreSharded.isEnabledUseLatestFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         return Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
-                      str::stream() << "Cannot remove \"" << ReplSetConfig::kConfigServerFieldName
-                                    << "\" from replica set configuration on reconfig");
+                      str::stream()
+                          << "Cannot remove \"" << ReplSetConfig::kConfigServer_deprecatedFieldName
+                          << "\" from replica set configuration on reconfig");
     }
 
     //
@@ -307,9 +258,74 @@ Status validateOldAndNewConfigsCompatible(const ReplSetConfig& oldConfig,
             }
         }
     }
+
+    if (!enableReconfigRollbackCommittedWritesCheck.load()) {
+        // Skip the following check. This parameter can only be set to false in tests.
+        return Status::OK();
+    }
+
+    const int numVotersOldConfig =
+        std::count_if(oldConfig.membersBegin(),
+                      oldConfig.membersEnd(),
+                      // Use 'getBaseNumVotes()' since a node may be newly added at this point,
+                      // which would indicate that it temporarily has 'votes: 0'.
+                      [](const auto& x) { return x.getBaseNumVotes() > 0; });
+    const int numArbitersOldConfig = std::count_if(oldConfig.membersBegin(),
+                                                   oldConfig.membersEnd(),
+                                                   [](const auto& x) { return x.isArbiter(); });
+    const int majorityVoteCountOldConfig = numVotersOldConfig / 2 + 1;
+    const int writableVotingMembersCountOldConfig = numVotersOldConfig - numArbitersOldConfig;
+
+    // An overlap between an election and write quorum is guaranteed to exist if the number of
+    // writable voting members is greater than or equal to the majority of voters. This is because
+    // at least one writable voting member will be a part of the majority in any election. This
+    // overlap is important so that if a candidate node that has not replicated recently committed
+    // writes decides to run for election, the writable voting member participating in the election
+    // will not vote for the candidate. As a result, the candidate cannot successfully become the
+    // primary.
+    const auto overlapBetweenElectionAndWriteQuorumOldConfig =
+        majorityVoteCountOldConfig <= writableVotingMembersCountOldConfig;
+    const auto numElectableNodesNewConfig = std::count_if(
+        newConfig.membersBegin(),
+        newConfig.membersEnd(),
+        // Use 'getBasePriority()' since newly added nodes also temporarily have 'priority: 0'.
+        [](const MemberConfig& mem) { return mem.getBasePriority() > 0.0; });
+
+    // If the aforementioned overlap doesn't exist, and we have a PSA set where the secondary can
+    // run for election, there is a risk that the secondary will not have replicated recent majority
+    // committed writes, but will be elected primary with the help of the arbiter. To prevent this
+    // from happening,, we fail the reconfig and refer the user to the appropriate next steps.
+    if (!overlapBetweenElectionAndWriteQuorumOldConfig && newConfig.isPSASet() &&
+        numElectableNodesNewConfig > 1) {
+        return Status(
+            ErrorCodes::NewReplicaSetConfigurationIncompatible,
+            str::stream()
+                << "Rejecting reconfig where the new config has a PSA topology and the secondary "
+                << "is electable, but the old config contains only one writable node. Refer to "
+                << "https://docs.mongodb.com/manual/reference/method/rs.reconfigForPSASet/"
+                << " for next steps on reconfiguring a PSA set.");
+    }
+
     return Status::OK();
 }
 }  // namespace
+
+/**
+ * Checks if the node with the given config index is electable, returning a useful
+ * status message if not.
+ */
+Status checkElectable(const ReplSetConfig& newConfig, int configIndex) {
+    const MemberConfig& myConfig = newConfig.getMemberAt(configIndex);
+    if (!myConfig.isElectable()) {
+        return Status(ErrorCodes::NodeNotElectable,
+                      str::stream() << "This node, " << myConfig.getHostAndPort().toString()
+                                    << ", with _id " << myConfig.getId()
+                                    << " is not electable under the new configuration with "
+                                    << newConfig.getConfigVersionAndTerm().toString()
+                                    << " for replica set " << newConfig.getReplSetName());
+    }
+    return Status::OK();
+}
 
 bool sameConfigContents(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
     auto oldBSON = oldConfig.toBSON();
@@ -330,8 +346,18 @@ StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalSt
     for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
          iter != newConfig.membersEnd();
          ++iter) {
-        if (externalState->isSelf(iter->getHostAndPort(), ctx)) {
+        if (externalState->isSelfFastPath(iter->getHostAndPort())) {
             meConfigs.push_back(iter);
+        }
+    }
+    if (meConfigs.empty()) {
+        // No self-hosts were found using the fastpath; check with the slow path.
+        for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
+             iter != newConfig.membersEnd();
+             ++iter) {
+            if (externalState->isSelfSlowPath(iter->getHostAndPort(), ctx, Seconds(30))) {
+                meConfigs.push_back(iter);
+            }
         }
     }
     if (meConfigs.empty()) {
@@ -372,12 +398,45 @@ StatusWith<int> findSelfInConfigIfElectable(ReplicationCoordinatorExternalState*
     return result;
 }
 
+int findOwnHostInConfigQuick(const ReplSetConfig& newConfig, HostAndPort host) {
+    if (host.empty()) {
+        return -1;
+    }
+
+    int firstMatchIndex = -1;
+    int currIndex = 0;
+
+    for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
+         iter != newConfig.membersEnd();
+         ++iter) {
+
+        if (iter->getHostAndPort() == host) {
+            firstMatchIndex = currIndex;
+            invariant(firstMatchIndex >= 0);
+            break;
+        }
+
+        currIndex++;
+    }
+
+    return firstMatchIndex;
+}
+
 StatusWith<int> validateConfigForStartUp(ReplicationCoordinatorExternalState* externalState,
                                          const ReplSetConfig& newConfig,
                                          ServiceContext* ctx) {
     Status status = newConfig.validateAllowingSplitHorizonIP();
     if (!status.isOK()) {
         return StatusWith<int>(status);
+    }
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
+        fassertFailedWithStatusNoTrace(
+            5624100,
+            {ErrorCodes::IllegalOperation,
+             str::stream() << "Failed to start up: Replica set config contains customized "
+                              "getLastErrorDefaults, which "
+                              "has been deprecated and is now ignored. Use setDefaultRWConcern "
+                              "instead to set a cluster-wide default writeConcern."});
     }
     return findSelfInConfig(externalState, newConfig, ctx);
 }
@@ -390,15 +449,14 @@ StatusWith<int> validateConfigForInitiate(ReplicationCoordinatorExternalState* e
         return StatusWith<int>(status);
     }
 
-    status = isFCVCompatible(newConfig);
-    if (!status.isOK()) {
-        return StatusWith<int>(status);
-    }
-
-    status = newConfig.checkIfWriteConcernCanBeSatisfied(newConfig.getDefaultWriteConcern());
-    if (!status.isOK()) {
-        return status.withContext(
-            "Found invalid default write concern in 'getLastErrorDefaults' field");
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
+        fassertFailedWithStatusNoTrace(
+            5624101,
+            {ErrorCodes::IllegalOperation,
+             str::stream() << "Failed to initiate: Replica set config contains customized "
+                              "getLastErrorDefaults, which "
+                              "has been deprecated and is now ignored. Use setDefaultRWConcern "
+                              "instead to set a cluster-wide default writeConcern."});
     }
 
     status = validateArbiterPriorities(newConfig);
@@ -436,16 +494,12 @@ Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
         return status;
     }
 
-    status = isFCVCompatible(newConfig);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    status = newConfig.checkIfWriteConcernCanBeSatisfied(newConfig.getDefaultWriteConcern());
-    if (!status.isOK()) {
-        return status.withContext(
-            "Found invalid default write concern in 'getLastErrorDefaults' field");
-    }
+    uassert(5624102,
+            "Failed to reconfig: Replica set config contains customized "
+            "getLastErrorDefaults, which has "
+            "been deprecated and is now ignored. Use setDefaultRWConcern instead to "
+            "set a cluster-wide default writeConcern.",
+            !newConfig.containsCustomizedGetLastErrorDefaults());
 
     status = validateOldAndNewConfigsCompatible(oldConfig, newConfig);
     if (!status.isOK()) {
@@ -473,10 +527,26 @@ Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
 StatusWith<int> validateConfigForHeartbeatReconfig(
     ReplicationCoordinatorExternalState* externalState,
     const ReplSetConfig& newConfig,
+    HostAndPort ownHost,
     ServiceContext* ctx) {
     Status status = newConfig.validateAllowingSplitHorizonIP();
     if (!status.isOK()) {
         return StatusWith<int>(status);
+    }
+
+    tassert(5624103,
+            "Replica set config during heartbeat reconfig contains "
+            "customized getLastErrorDefaults, which has "
+            "been deprecated and is now ignored. Use setDefaultRWConcern instead to "
+            "set a cluster-wide default writeConcern.",
+            !newConfig.containsCustomizedGetLastErrorDefaults());
+
+    auto quickIndex = findOwnHostInConfigQuick(newConfig, ownHost);
+    if (quickIndex >= 0) {
+        LOGV2(6475001,
+              "Was able to quickly find new index in config. Skipping full isSelf checks",
+              "index"_attr = quickIndex);
+        return quickIndex;
     }
 
     return findSelfInConfig(externalState, newConfig, ctx);

@@ -1,10 +1,7 @@
 // Check $match pipeline stage.
 // - Filtering behavior equivalent to a mongo query.
 // - $where and geo operators are not allowed
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.jstests_aggregation_match;
 coll.drop();
@@ -57,7 +54,9 @@ assertError(2, {a: {$mod: [0 /* invalid */, 0]}});
 assertError(ErrorCodes.BadValue, {$where: 'true'});
 
 // Geo not allowed.
-assertError(ErrorCodes.BadValue, {$match: {a: {$near: [0, 0]}}});
+assertError(5626500, {a: {$near: [-1, 1]}});
+assertError(5626500, {a: {$nearSphere: [-10, 10]}});
+assertError(5626500, {a: {$geoNear: [-100, 100]}});
 
 function checkMatchResults(indexed) {
     // No results.
@@ -167,4 +166,3 @@ checkMatchResults(true);
 coll.createIndex({'a.b': 1});
 coll.createIndex({'a.c': 1});
 checkMatchResults(true);
-})();

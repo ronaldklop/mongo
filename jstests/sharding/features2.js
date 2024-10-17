@@ -1,9 +1,8 @@
-(function() {
-'use strict';
+// @tags: [requires_scripting]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({shards: 2, mongos: 1});
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 
 let db = s.getDB("test");
 
@@ -157,25 +156,8 @@ db.countaa.save({"regex": /foo/i});
 assert.eq(3, db.countaa.count(), "counta1");
 assert.eq(3, db.countaa.find().itcount(), "counta1");
 
-// hello and query-wrapped-command
 let hello = db.runCommand({hello: 1});
 assert(hello.isWritablePrimary);
 assert.eq('isdbgrid', hello.msg);
-delete hello.localTime;
-delete hello.$clusterTime;
-delete hello.operationTime;
-
-let hello2 = db.runCommand({query: {hello: 1}});
-delete hello2.localTime;
-delete hello2.$clusterTime;
-delete hello2.operationTime;
-assert.eq(hello, hello2);
-
-hello2 = db.runCommand({$query: {hello: 1}});
-delete hello2.localTime;
-delete hello2.$clusterTime;
-delete hello2.operationTime;
-assert.eq(hello, hello2);
 
 s.stop();
-})();

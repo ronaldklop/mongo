@@ -2,10 +2,9 @@
  * Tests that writeConcern 'majority' writes succeed and are visible in a replica set that has one
  * data-bearing node and two arbiters.
  *
- * @tags: [requires_majority_read_concern]
+ * @tags: [requires_majority_read_concern, requires_fcv_53]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function log(arg) {
     jsTest.log(tojson(arg));
@@ -13,10 +12,9 @@ function log(arg) {
 
 // Set up a set and grab things for later.
 var name = "read_majority_two_arbs";
-var replTest =
-    new ReplSetTest({name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}});
+var replTest = new ReplSetTest({name: name, nodes: 3});
 
-replTest.startSet();
+replTest.startSet({setParameter: {allowMultipleArbiters: true}});
 var nodes = replTest.nodeList();
 var config = {
     "_id": name,
@@ -64,4 +62,3 @@ jsTest.log("doing committed read");
 assert.eq(doCommittedRead(), 0);
 jsTest.log("stopping replTest; test completed successfully");
 replTest.stopSet();
-}());

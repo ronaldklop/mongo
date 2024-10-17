@@ -1,21 +1,18 @@
 // Runner for checkDBHashes() that runs the dbhash command on all replica set nodes
 // to ensure all nodes have the same data.
-'use strict';
+import "jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js";
+
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 (function() {
-load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
-load('jstests/libs/parallelTester.js');     // For Thread.
-
-function checkReplicatedDataHashesThread(hosts) {
-    load('jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js');
-
+async function checkReplicatedDataHashesThread(hosts) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
     try {
         const excludedDBs = jsTest.options().excludedDBsFromDBHash;
         const rst = new ReplSetTest(hosts[0]);
         rst.checkReplicatedDataHashes(undefined, excludedDBs);
-        if (TestData.checkCollectionCounts) {
-            rst.checkCollectionCounts();
-        }
         return {ok: 1};
     } catch (e) {
         return {ok: 0, hosts: hosts, error: e.toString(), stack: e.stack};

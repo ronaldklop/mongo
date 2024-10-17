@@ -1,10 +1,7 @@
 // Test that including intermediate certificates
 // in the certificate key file will be sent to the remote.
 
-(function() {
-'use strict';
-
-load('jstests/ssl/libs/ssl_helpers.js');
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 // server-intermediate-ca was signed by ca.pem, not trusted-ca.pem
 const VALID_CA = 'jstests/libs/ca.pem';
@@ -12,11 +9,11 @@ const INVALID_CA = 'jstests/libs/trusted-ca.pem';
 
 function runTest(inbound, outbound) {
     const mongod = MongoRunner.runMongod({
-        sslMode: 'requireSSL',
-        sslAllowConnectionsWithoutCertificates: '',
-        sslPEMKeyFile: 'jstests/libs/server-intermediate-ca.pem',
-        sslCAFile: outbound,
-        sslClusterCAFile: inbound,
+        tlsMode: 'requireTLS',
+        tlsAllowConnectionsWithoutCertificates: '',
+        tlsCertificateKeyFile: 'jstests/libs/server-intermediate-ca.pem',
+        tlsCAFile: outbound,
+        tlsClusterCAFile: inbound,
     });
     assert(mongod);
     assert.commandWorked(mongod.getDB('admin').runCommand('serverStatus'));
@@ -33,10 +30,10 @@ runTest(VALID_CA, INVALID_CA);
 // Validate we can make a connection from the shell with the intermediate certs
 {
     const mongod = MongoRunner.runMongod({
-        sslMode: 'requireSSL',
-        sslAllowConnectionsWithoutCertificates: '',
-        sslPEMKeyFile: 'jstests/libs/server.pem',
-        sslCAFile: VALID_CA,
+        tlsMode: 'requireTLS',
+        tlsAllowConnectionsWithoutCertificates: '',
+        tlsCertificateKeyFile: 'jstests/libs/server.pem',
+        tlsCAFile: VALID_CA,
     });
     assert(mongod);
     assert.eq(mongod.getDB('admin').system.users.find({}).toArray(), []);
@@ -46,10 +43,10 @@ runTest(VALID_CA, INVALID_CA);
                                   "localhost",
                                   "--port",
                                   mongod.port,
-                                  "--ssl",
-                                  "--sslCAFile",
+                                  "--tls",
+                                  "--tlsCAFile",
                                   VALID_CA,
-                                  "--sslPEMKeyFile",
+                                  "--tlsCertificateKeyFile",
                                   "jstests/libs/server-intermediate-ca.pem",
                                   "--eval",
                                   "1;");
@@ -61,17 +58,17 @@ runTest(VALID_CA, INVALID_CA);
 // Validate we can make a chain with intermediate certs in ca file instead of key file
 if (determineSSLProvider() === 'apple') {
     print("Skipping test as this configuration is not supported on OSX");
-    return;
+    quit();
 }
 
 // Validate the server can build a certificate chain when the chain is split across the CA and PEM
 // files.
 {
     const mongod = MongoRunner.runMongod({
-        sslMode: 'requireSSL',
-        sslAllowConnectionsWithoutCertificates: '',
-        sslPEMKeyFile: 'jstests/libs/server-intermediate-leaf.pem',
-        sslCAFile: 'jstests/libs/intermediate-ca-chain.pem',
+        tlsMode: 'requireTLS',
+        tlsAllowConnectionsWithoutCertificates: '',
+        tlsCertificateKeyFile: 'jstests/libs/server-intermediate-leaf.pem',
+        tlsCAFile: 'jstests/libs/intermediate-ca-chain.pem',
     });
     assert(mongod);
     assert.eq(mongod.getDB('admin').system.users.find({}).toArray(), []);
@@ -81,10 +78,10 @@ if (determineSSLProvider() === 'apple') {
                                   "localhost",
                                   "--port",
                                   mongod.port,
-                                  "--ssl",
-                                  "--sslCAFile",
+                                  "--tls",
+                                  "--tlsCAFile",
                                   VALID_CA,
-                                  "--sslPEMKeyFile",
+                                  "--tlsCertificateKeyFile",
                                   "jstests/libs/client.pem",
                                   "--eval",
                                   "1;");
@@ -92,4 +89,3 @@ if (determineSSLProvider() === 'apple') {
 
     MongoRunner.stopMongod(mongod);
 }
-})();

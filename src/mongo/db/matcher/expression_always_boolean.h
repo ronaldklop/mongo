@@ -30,8 +30,23 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/matcher/matchable.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -42,7 +57,7 @@ public:
                                  clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : MatchExpression(type, std::move(annotation)), _value(value) {}
 
-    virtual ~AlwaysBooleanMatchExpression() = default;
+    ~AlwaysBooleanMatchExpression() override = default;
 
     /**
      * The name of this MatchExpression.
@@ -59,11 +74,14 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final {
         _debugAddSpace(debug, indentationLevel);
-        debug << name() << ": 1\n";
+        debug << name() << ": 1";
+        _debugStringAttachTagInfo(&debug);
     }
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final {
-        out->append(name(), 1);
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final {
+        opts.appendLiteral(out, name(), 1);
     }
 
     bool equivalent(const MatchExpression* other) const final {
@@ -79,6 +97,10 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const override {
+        MONGO_UNREACHABLE_TASSERT(6400202);
+    }
+
+    void resetChild(size_t, MatchExpression*) override {
         MONGO_UNREACHABLE;
     }
 
@@ -88,7 +110,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     bool _value;
@@ -105,7 +129,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         return std::make_unique<AlwaysFalseMatchExpression>(_errorAnnotation);
     }
 
@@ -133,7 +157,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         return std::make_unique<AlwaysTrueMatchExpression>(_errorAnnotation);
     }
 

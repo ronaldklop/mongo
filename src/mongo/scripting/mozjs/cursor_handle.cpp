@@ -27,16 +27,26 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
+#include <js/CallArgs.h>
+#include <js/Object.h>
+#include <js/RootingAPI.h>
+
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/client/dbclient_base.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/scripting/mozjs/cursor_handle.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/scripting_util_gen.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace mozjs {
@@ -52,7 +62,8 @@ namespace {
 
 long long* getCursorId(JSObject* thisv) {
     CursorHandleInfo::CursorTracker* tracker =
-        static_cast<CursorHandleInfo::CursorTracker*>(JS_GetPrivate(thisv));
+        JS::GetMaybePtrFromReservedSlot<CursorHandleInfo::CursorTracker>(
+            thisv, CursorHandleInfo::CursorTrackerSlot);
     if (tracker) {
         return &tracker->cursorId;
     }
@@ -66,8 +77,9 @@ long long* getCursorId(JS::CallArgs& args) {
 
 }  // namespace
 
-void CursorHandleInfo::finalize(js::FreeOp* fop, JSObject* obj) {
-    auto cursorTracker = static_cast<CursorHandleInfo::CursorTracker*>(JS_GetPrivate(obj));
+void CursorHandleInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto cursorTracker =
+        JS::GetMaybePtrFromReservedSlot<CursorHandleInfo::CursorTracker>(obj, CursorTrackerSlot);
     if (cursorTracker) {
         const long long cursorId = cursorTracker->cursorId;
         if (!skipShellCursorFinalize && cursorId) {
@@ -87,7 +99,7 @@ void CursorHandleInfo::finalize(js::FreeOp* fop, JSObject* obj) {
             }
         }
 
-        getScope(fop)->trackedDelete(cursorTracker);
+        getScope(gcCtx)->trackedDelete(cursorTracker);
     }
 }
 

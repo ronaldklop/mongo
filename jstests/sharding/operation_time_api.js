@@ -5,8 +5,8 @@
  *   - mongod from a non-sharded replica set
  *   - standalone mongod
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function responseContainsTimestampOperationTime(res) {
     return res.operationTime !== undefined && isTimestamp(res.operationTime);
@@ -45,6 +45,10 @@ assert(responseContainsTimestampOperationTime(res),
 
 st.stop();
 
+if (jsTestOptions().useAutoBootstrapProcedure) {  // TODO: SERVER-80318 Delete tests below
+    quit();
+}
+
 // A mongod from a non-sharded replica set returns an operationTime that is a Timestamp.
 var replTest = new ReplSetTest({name: "operation_time_api_non_sharded_replset", nodes: 1});
 replTest.startSet();
@@ -68,4 +72,3 @@ assert(!responseContainsTimestampOperationTime(res),
            "received: " + tojson(res));
 
 MongoRunner.stopMongod(standalone);
-})();

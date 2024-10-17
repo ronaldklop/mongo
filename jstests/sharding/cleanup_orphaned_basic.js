@@ -4,20 +4,21 @@
 // requires_persistence because it restarts a shard.
 // @tags: [requires_persistence]
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test restarts a shard.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-/*****************************************************************************
- * Unsharded mongod.
- ****************************************************************************/
+if (!jsTestOptions().useAutoBootstrapProcedure) {  // TODO: SERVER-80318 Remove block
+    /*****************************************************************************
+     * Unsharded mongod.
+     ****************************************************************************/
 
-// cleanupOrphaned fails against unsharded mongod.
-var mongod = MongoRunner.runMongod();
-assert.commandFailed(mongod.getDB('admin').runCommand({cleanupOrphaned: 'foo.bar'}));
-MongoRunner.stopMongod(mongod);
+    // cleanupOrphaned fails against unsharded mongod.
+    var mongod = MongoRunner.runMongod();
+    assert.commandFailed(mongod.getDB('admin').runCommand({cleanupOrphaned: 'foo.bar'}));
+    MongoRunner.stopMongod(mongod);
+}
 
 /*****************************************************************************
  * Bad invocations of cleanupOrphaned command.
@@ -30,6 +31,9 @@ var mongosAdmin = mongos.getDB('admin');
 var dbName = 'foo';
 var collectionName = 'bar';
 var ns = dbName + '.' + collectionName;
+
+assert.commandWorked(
+    mongosAdmin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 var coll = mongos.getCollection(ns);
 
 // cleanupOrphaned fails against mongos ('no such command'): it must be run
@@ -52,10 +56,6 @@ var badNS = ' \\/."*<>:|?';
 assert.commandFailed(shardAdmin.runCommand({cleanupOrphaned: badNS}));
 
 // cleanupOrphaned works on sharded collection.
-assert.commandWorked(mongosAdmin.runCommand({enableSharding: coll.getDB().getName()}));
-
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard0.shardName);
-
 assert.commandWorked(mongosAdmin.runCommand({shardCollection: ns, key: {_id: 1}}));
 
 assert.commandWorked(shardAdmin.runCommand({cleanupOrphaned: ns}));
@@ -97,4 +97,3 @@ function testBadStartingFromKeys(shardAdmin) {
 testBadStartingFromKeys(shardAdmin);
 
 st.stop();
-})();

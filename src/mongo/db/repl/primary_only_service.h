@@ -29,25 +29,45 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
 #include <memory>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
+#include "mongo/util/lockable_adapter.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -59,6 +79,7 @@ namespace repl {
 
 extern FailPoint PrimaryOnlyServiceHangBeforeRebuildingInstances;
 extern FailPoint PrimaryOnlyServiceFailRebuildingInstances;
+extern FailPoint PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic;
 
 /**
  * A PrimaryOnlyService is a group of tasks (represented in memory as Instances) that should only
@@ -118,6 +139,13 @@ public:
          *
          * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancellation token will be
          * marked canceled.
+         *
+         * 3. Currently, 'run()' is scheduled on the Instance ScopedTaskExecutor, which means it's
+         * possible the task never gets executed if the scheduling executor is shutdown
+         * (eg. as part of stepdown) before the task gets run. This also implies that creating
+         * an instance does not guarantee that run() will be called before destruction, and so
+         * PrimaryOnlyService implementations should not rely on run() to guarantee behavior around
+         * safe destruction of an Instance.
          */
         virtual SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                      const CancellationToken& token) noexcept = 0;
@@ -138,6 +166,13 @@ public:
         virtual boost::optional<BSONObj> reportForCurrentOp(
             MongoProcessInterface::CurrentOpConnectionsMode connMode,
             MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept = 0;
+
+        /**
+         * Validate the found instance matches options in the state document of a new instance.
+         * Called in PrimaryOnlyService::getOrCreateInstance to check found instances for conflict.
+         * Throws an exception if state document conflicts with found instance.
+         */
+        virtual void checkIfOptionsConflict(const BSONObj& stateDoc) const = 0;
     };
 
     /**
@@ -149,21 +184,23 @@ public:
     class TypedInstance : public Instance, public std::enable_shared_from_this<InstanceType> {
     public:
         TypedInstance() = default;
-        virtual ~TypedInstance() = default;
+        ~TypedInstance() override = default;
 
         /**
          * Same functionality as PrimaryOnlyService::lookupInstance, but returns a pointer of
          * the proper derived class for the Instance.
          */
-        static boost::optional<std::shared_ptr<InstanceType>> lookup(OperationContext* opCtx,
-                                                                     PrimaryOnlyService* service,
-                                                                     const InstanceID& id) {
-            auto instance = service->lookupInstance(opCtx, id);
+        static std::pair<boost::optional<std::shared_ptr<InstanceType>>, bool> lookup(
+            OperationContext* opCtx, PrimaryOnlyService* service, const InstanceID& id) {
+            auto [instance, isPausedOrShutdown] = service->lookupInstance(opCtx, id);
             if (!instance) {
-                return boost::none;
+                return {boost::none, isPausedOrShutdown};
             }
 
-            return checked_pointer_cast<InstanceType>(instance.get());
+            // If there is an active instance, the service must be running.
+            invariant(!isPausedOrShutdown);
+
+            return {checked_pointer_cast<InstanceType>(instance.get()), isPausedOrShutdown};
         }
 
         /**
@@ -172,8 +209,10 @@ public:
          */
         static std::shared_ptr<InstanceType> getOrCreate(OperationContext* opCtx,
                                                          PrimaryOnlyService* service,
-                                                         BSONObj initialState) {
-            auto [instance, _] = service->getOrCreateInstance(opCtx, std::move(initialState));
+                                                         BSONObj initialState,
+                                                         bool checkOptions = true) {
+            auto [instance, _] =
+                service->getOrCreateInstance(opCtx, std::move(initialState), checkOptions);
             return checked_pointer_cast<InstanceType>(instance);
         }
     };
@@ -188,7 +227,8 @@ public:
 
     /**
      * Returns the collection where state documents corresponding to instances of this service are
-     * persisted.
+     * persisted. MUST be in the config database, due to the PrimaryOnlyServiceOpObserver's
+     * NamespaceFilter.
      */
     virtual NamespaceString getStateDocumentsNS() const = 0;
 
@@ -242,16 +282,10 @@ public:
     void releaseAllInstances(Status status);
 
     /**
-     * Returns whether this service is currently running.  This is true only when the node is in
-     * state PRIMARY *and* this service has finished all asynchronous work associated with resuming
-     * after stepUp.
+     * Adds information of this service to the result 'BSONObjBuilder', containing the number of
+     * active instances and the state of this service.
      */
-    bool isRunning() const;
-
-    /**
-     * Returns the number of currently running Instances of this service.
-     */
-    size_t getNumberOfInstances();
+    void reportForServerStatus(BSONObjBuilder* result) noexcept;
 
     /**
      * Adds information about the Instances belonging to this service to 'ops', to show up in
@@ -278,6 +312,8 @@ public:
      */
     void unregisterOpCtx(OperationContext* opCtx);
 
+    void waitForStateNotRebuilding_forTest(OperationContext* opCtx);
+
 protected:
     /**
      * Allows OpCtxs created on PrimaryOnlyService threads to remain uninterrupted, even if the
@@ -297,17 +333,30 @@ protected:
     };
 
     /**
-     * Constructs a new Instance object with the given initial state.
+     * Validate the instance to be created with initialState does not conflict with any existing
+     * ones. The implementation can choose to throw ConflictingOperationInProgress if there is a
+     * conflict or a named error code specified to the particular service if it would like to attach
+     * ErrorExtraInfo.
      */
-    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) const = 0;
+    virtual void checkIfConflictsWithOtherInstances(
+        OperationContext* opCtx,
+        BSONObj initialState,
+        const std::vector<const Instance*>& existingInstances) = 0;
 
     /**
-     * Given an InstanceId returns the corresponding running Instance object, or boost::none if
-     * there is none. If the service is in State::kRebuilding, will wait (interruptibly on the
-     * opCtx) for the rebuild to complete.
+     * Constructs a new Instance object with the given initial state.
      */
-    boost::optional<std::shared_ptr<Instance>> lookupInstance(OperationContext* opCtx,
-                                                              const InstanceID& id);
+    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) = 0;
+
+    /**
+     * Given an InstanceId returns the corresponding running Instance object (or boost::none if
+     * there is none), as well as a boolean flag indicating whether the service is paused (i.e.
+     * stepped down) or shutdown, in which case all the instances have been released so we will
+     * always return boost::none. If the service state is kRebuilding, we will first wait
+     * (interruptibly on the opCtx) for the rebuild to complete.
+     */
+    std::pair<boost::optional<std::shared_ptr<Instance>>, bool> lookupInstance(
+        OperationContext* opCtx, const InstanceID& id);
 
     /**
      * Extracts an InstanceID from the _id field of the given 'initialState' object. If an Instance
@@ -323,7 +372,17 @@ protected:
      * Throws NotWritablePrimary if the node is not currently primary.
      */
     std::pair<std::shared_ptr<Instance>, bool> getOrCreateInstance(OperationContext* opCtx,
-                                                                   BSONObj initialState);
+                                                                   BSONObj initialState,
+                                                                   bool checkOptions = true);
+
+    /**
+     * Return the executor where Instances of this PrimaryOnlyService are executed
+     *
+     * Tasks running on this executor will not survive a step down - step up cycle.
+     * This executor is shut down when this node steps down and joined on step up before rebuilding
+     * new instances.
+     */
+    std::shared_ptr<executor::ScopedTaskExecutor> getInstanceExecutor() const;
 
     /**
      * Since, scoped task executor shuts down on stepdown, we might need to run some instance work,
@@ -331,7 +390,20 @@ protected:
      */
     std::shared_ptr<executor::TaskExecutor> getInstanceCleanupExecutor() const;
 
+    /**
+     * Returns shared pointers to all Instance objects that belong to this service.
+     */
+    std::vector<std::shared_ptr<Instance>> getAllInstances(OperationContext* opCtx);
+
 private:
+    enum class State {
+        kRunning,
+        kPaused,
+        kRebuilding,
+        kRebuildFailed,
+        kShutdown,
+    };
+
     /**
      * Represents a PrimaryOnlyService::Instance that has already been scheduled to be run.
      */
@@ -339,9 +411,9 @@ private:
     public:
         ActiveInstance(std::shared_ptr<Instance> instance,
                        CancellationSource source,
-                       SemiFuture<void> instanceComplete)
+                       SemiFuture<void> runCompleteFuture)
             : _instance(std::move(instance)),
-              _instanceComplete(std::move(instanceComplete)),
+              _runCompleteFuture(std::move(runCompleteFuture)),
               _source(std::move(source)) {
             invariant(_instance);
         }
@@ -356,7 +428,7 @@ private:
          * Blocking call that returns once the instance has finished running.
          */
         void waitForCompletion() const {
-            _instanceComplete.wait();
+            _runCompleteFuture.wait();
         }
 
         std::shared_ptr<Instance> getInstance() const {
@@ -372,7 +444,7 @@ private:
         const std::shared_ptr<Instance> _instance;
 
         // A future that will be resolved when the passed in Instance has finished running.
-        const SemiFuture<void> _instanceComplete;
+        const SemiFuture<void> _runCompleteFuture;
 
         // Each instance of a PrimaryOnlyService will own a CancellationSource for memory management
         // purposes. Any memory associated with an instance's CancellationSource will be cleaned up
@@ -404,11 +476,21 @@ private:
     };
 
     /**
+     * Called as part of the POS onStepUp hook before rebuilding the service.
+     */
+    virtual void _onServiceInitialization() {}
+
+    /**
+     * Called as part of the POS onStepDown/onShutdown hooks before interrupting instances.
+     */
+    virtual void _onServiceTermination() {}
+
+    /**
      * Called as part of onStepUp.  Queries the state document collection for this
      * PrimaryOnlyService, constructs Instance objects for each document found, and schedules work
      * to run all the newly recreated Instances.
      */
-    void _rebuildInstances(long long term) noexcept;
+    void _rebuildInstances(long long term);
 
     /**
      * Schedules work to call the provided instance's 'run' method and inserts the new instance into
@@ -422,6 +504,22 @@ private:
      */
     void _interruptInstances(WithLock, Status);
 
+    /**
+     * Returns a string representation of the current state.
+     */
+    StringData _getStateString(WithLock) const;
+
+    /**
+     *  Blocks until `_state` is not equal to `kRebuilding`. May release the mutex, but always
+     * acquires it before returning.
+     */
+    void _waitForStateNotRebuilding(OperationContext* opCtx, BasicLockableAdapter m);
+
+    /**
+     * Updates `_state` with `newState` and notifies waiters on `_stateChangeCV`.
+     */
+    void _setState(State newState, WithLock);
+
     ServiceContext* const _serviceContext;
 
     // All member variables are labeled with one of the following codes indicating the
@@ -431,10 +529,10 @@ private:
     // (S)  Self-synchronizing; access according to class's own rules.
     // (M)  Reads and writes guarded by _mutex.
     // (W)  Synchronization required only for writes.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyService::_mutex");
+    mutable stdx::mutex _mutex;
 
-    // Condvar to receive notifications when _rebuildInstances has completed after stepUp.
-    stdx::condition_variable _rebuildCV;  // (S)
+    // Condvar to receive notifications when _state changes.
+    stdx::condition_variable _stateChangeCV;  // (S)
 
     // A ScopedTaskExecutor that is used to perform all work run on behalf of an Instance.
     // This ScopedTaskExecutor wraps _executor and is created at stepUp and destroyed at
@@ -456,18 +554,13 @@ private:
     // guarantee that all outstanding tasks are interrupted at stepDown.
     std::shared_ptr<executor::TaskExecutor> _executor;  // (W)
 
-    enum class State {
-        kRunning,
-        kPaused,
-        kRebuilding,
-        kRebuildFailed,
-        kShutdown,
-    };
-
     State _state = State::kPaused;  // (M)
 
-    // If reloading the state documents from disk fails, this Status gets set to a non-ok value and
-    // calls to lookup() or getOrCreate() will throw this status until the node steps down.
+    // If rebuilding the instances fails, for example due to a failure reloading the state documents
+    // from disk, this Status gets set to a non-ok value and calls to lookup() or getOrCreate() will
+    // throw this status until the node steps down. Note that this status must be populated with the
+    // relevant error before _setState is used to change the status to kRebuildFailed and waiters on
+    // _stateChangeCV are notified, as those waiters may attempt to read this status.
     Status _rebuildStatus = Status::OK();  // (M)
 
     // The term that this service is running under.
@@ -494,7 +587,7 @@ private:
 class PrimaryOnlyServiceRegistry final : public ReplicaSetAwareService<PrimaryOnlyServiceRegistry> {
 public:
     PrimaryOnlyServiceRegistry() = default;
-    ~PrimaryOnlyServiceRegistry() = default;
+    ~PrimaryOnlyServiceRegistry() override = default;
 
     static PrimaryOnlyServiceRegistry* get(ServiceContext* serviceContext);
 
@@ -518,11 +611,10 @@ public:
     PrimaryOnlyService* lookupServiceByNamespace(const NamespaceString& ns);
 
     /**
-     * Adds a 'primaryOnlyServices' sub-obj to the 'result' BSONObjBuilder containing a count of the
-     * number of active instances for each registered service.
+     * Adds a 'primaryOnlyServices' sub-obj to the 'result' BSONObjBuilder containing information
+     * (given by PrimaryService::reportForServerStatus) of each registered service.
      */
     void reportServiceInfoForServerStatus(BSONObjBuilder* result) noexcept;
-
 
     /**
      * Adds information about the Instances running in all registered services to 'ops', to show up
@@ -535,18 +627,26 @@ public:
                                        std::vector<BSONObj>* ops) noexcept;
 
     void onStartup(OperationContext*) final;
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {}
     void onShutdown() final;
     void onStepUpBegin(OperationContext*, long long term) final {}
     void onBecomeArbiter() final {}
     void onStepUpComplete(OperationContext*, long long term) final;
     void onStepDown() final;
+    void onRollbackBegin() final {}
+    inline std::string getServiceName() const final {
+        return "PrimaryOnlyServiceRegistry";
+    }
 
 private:
     StringMap<std::unique_ptr<PrimaryOnlyService>> _servicesByName;
 
     // Doesn't own the service, contains a pointer to the service owned by _servicesByName.
     // This is safe since services don't change after startup.
-    StringMap<PrimaryOnlyService*> _servicesByNamespace;
+    mongo::stdx::unordered_map<NamespaceString, PrimaryOnlyService*> _servicesByNamespace;
 };
 
 }  // namespace repl

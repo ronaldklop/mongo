@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/mutable/algorithm.h"
-
+#include "mongo/bson/mutable/const_element.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/bson/mutable/element.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/platform/basic.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/safe_num.h"
 
 namespace {
 
@@ -66,7 +70,7 @@ TEST_F(DocumentTest, FindInEmptyObject) {
 }
 
 class OneChildTest : public DocumentTest {
-    virtual void setUp() {
+    void setUp() override {
         ASSERT_EQUALS(Status::OK(), doc().root().appendBool("t", true));
     }
 };
@@ -92,7 +96,7 @@ TEST_F(OneChildTest, FindMatch) {
 }
 
 class ManyChildrenTest : public DocumentTest {
-    virtual void setUp() {
+    void setUp() override {
         ASSERT_EQUALS(Status::OK(), doc().root().appendString("begin", "a"));
         ASSERT_EQUALS(Status::OK(), doc().root().appendString("repeated_sparse", "b"));
         ASSERT_EQUALS(Status::OK(), doc().root().appendString("repeated_dense", "c"));
@@ -233,7 +237,7 @@ TEST_F(ManyChildrenTest, getNthSibling) {
 }
 
 class CountTest : public DocumentTest {
-    virtual void setUp() {
+    void setUp() override {
         Element root = doc().root();
 
         ASSERT_OK(root.appendInt("leaf", 0));

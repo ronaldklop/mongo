@@ -1,7 +1,13 @@
 /**
  * Test that adding a config server replica set as a shard fails.
+ * @tags: [
+ *   # TODO (SERVER-88123): Re-enable this test.
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   embedded_router_incompatible,
+ * ]
  */
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var addShardRes;
 
@@ -21,7 +27,7 @@ var assertAddShardFailed = function(res, shardName) {
 };
 
 var st = new ShardingTest({
-    shards: 0,
+    shards: TestData.configShard ? 1 : 0,
     mongos: 1,
 });
 
@@ -45,4 +51,3 @@ assertAddShardFailed(addShardRes, "nonConfig");
 configRS.stopSet();
 
 st.stop();
-})();

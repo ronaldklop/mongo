@@ -3,17 +3,18 @@
  * lastApplied, the node can update its own lastOpCommitted to its lastApplied.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");  // for [stop|restart]ServerReplication.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "coll";
 
 // Set up a ReplSetTest where nodes only sync one oplog entry at a time.
-const rst = new ReplSetTest(
-    {nodes: 5, useBridge: true, nodeOptions: {setParameter: "bgSyncOplogFetcherBatchSize=1"}});
+const rst = new ReplSetTest({
+    nodes: 5,
+    useBridge: true,
+    nodeOptions: {setParameter: {bgSyncOplogFetcherBatchSize: 1, numInitialSyncAttempts: 25}}
+});
 rst.startSet();
 const config = rst.getReplSetConfig();
 // Ban chaining and prevent elections.
@@ -22,6 +23,10 @@ config.settings = {
     electionTimeoutMillis: 12 * 60 * 60 * 1000
 };
 rst.initiate(config);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const nodeA = rst.nodes[0];
 const nodeB = rst.nodes[1];
@@ -83,4 +88,3 @@ assert.eq(
 assert.commandWorked(
     nodeE.adminCommand({configureFailPoint: "stopReplProducerOnDocument", mode: "off"}));
 rst.stopSet();
-}());

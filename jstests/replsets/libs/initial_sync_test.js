@@ -12,9 +12,7 @@
  *
  */
 
-"use strict";
-
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 /**
  * This fixture allows the user to optionally pass in a custom ReplSetTest to be used for the test.
@@ -27,7 +25,9 @@ load('jstests/replsets/rslib.js');
  * @param {Object} [replSet] the ReplSetTest instance to adopt
  * @param {int} [timeout] how long to wait for initial sync to start
  */
-function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
+export function InitialSyncTest(
+    name = "InitialSyncTest", replSet, timeout, replBatchLimitBytes = 100 * 1024 * 1024) {
+    this.replBatchLimitBytes = replBatchLimitBytes;
     const State = {
         kBeforeInitialSync: "kBeforeInitialSync",
         kDuringInitialSync: "kDuringInitialSync",
@@ -64,7 +64,8 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
         let nodeOptions = {};
         if (TestData.logComponentVerbosity) {
             nodeOptions["setParameter"] = {
-                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
+                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity),
+                "replBatchLimitBytes": replBatchLimitBytes,
             };
         }
 
@@ -123,17 +124,13 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
         return isNodeInState(secondary, ReplSetTest.State.SECONDARY);
     }
 
-    function checkDataConsistency() {
-        const name = replSet.name;
-
-        // Make sure there are no open transactions.
-        let status = assert.commandWorked(primary.adminCommand('serverStatus'));
+    /**
+     * Asserts that there are no open transactions.
+     */
+    function assertNoOpenTxns() {
+        const status = assert.commandWorked(primary.adminCommand('serverStatus'));
         assert(typeof status.transactions === "object", status);
         assert.eq(0, status.transactions.currentOpen, status.transactions);
-
-        // We must check counts before validate is called during stopSet since validate fixes
-        // counts.
-        replSet.checkCollectionCounts(name);
     }
 
     /**
@@ -148,6 +145,7 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
             startClean: true,
             setParameter: {
                 'failpoint.initialSyncFuzzerSynchronizationPoint1': tojson({mode: 'alwaysOn'}),
+                'replBatchLimitBytes': replBatchLimitBytes,
             },
         };
 
@@ -270,13 +268,20 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
         return secondary;
     };
 
+    this.fail = function() {
+        assert.commandWorked(secondary.adminCommand(
+            {"configureFailPoint": 'initialSyncFuzzerSynchronizationPoint1', "mode": 'off'}));
+        assert.commandWorked(secondary.adminCommand(
+            {"configureFailPoint": 'initialSyncFuzzerSynchronizationPoint2', "mode": 'off'}));
+    };
+
     /**
      * Performs data consistency checks and then stops the replica set. Will fail if there is a
      * transaction that wasn't aborted or committed.
      */
     this.stop = function() {
         transitionIfAllowed(State.kStopped);
-        checkDataConsistency();
+        assertNoOpenTxns();
         return replSet.stopSet();
     };
 }

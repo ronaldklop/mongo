@@ -2,8 +2,7 @@
  * Tests that none of the operations in the ShardingTest shutdown consistency checks are affected by
  * the cluster wide default read and write concern.
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1, rs: {nodes: 1}});
 
@@ -22,4 +21,3 @@ assert.commandWorked(st.s.adminCommand({
 }));
 
 st.stop();
-})();

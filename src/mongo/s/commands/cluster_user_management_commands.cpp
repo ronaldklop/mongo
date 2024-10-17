@@ -27,33 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
-
-#include "mongo/platform/basic.h"
 
 #include <fmt/format.h>
+#include <iosfwd>
+#include <memory>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/config.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/user_management_commands_parser.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/user_management_commands_common.h"
 #include "mongo/db/commands/user_management_commands_gen.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 
 using std::string;
 using std::stringstream;
-using std::vector;
 using namespace fmt::literals;
 
 namespace {
@@ -75,7 +93,7 @@ void uassertEmptyReply(BSONObj obj) {
 
 template <typename Request, typename Reply>
 Reply parseUMCReply(BSONObj obj) try {
-    return Reply::parse(IDLParserErrorContext(Request::kCommandName), obj);
+    return Reply::parse(IDLParserContext(Request::kCommandName), obj);
 } catch (const AssertionException& ex) {
     uasserted(ex.code(),
               "Received invalid response from {} command: {}, error: {}"_format(
@@ -84,27 +102,32 @@ Reply parseUMCReply(BSONObj obj) try {
 
 struct UserCacheInvalidatorNOOP {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext*, StringData) {}
+    static void invalidate(OperationContext*, const DatabaseName&) {}
 };
 struct UserCacheInvalidatorUser {
     static constexpr bool kRequireUserName = true;
     static void invalidate(OperationContext* opCtx, const UserName& userName) {
-        AuthorizationManager::get(opCtx->getServiceContext())
-            ->invalidateUserByName(opCtx, userName);
+        AuthorizationManager::get(opCtx->getService())->invalidateUserByName(userName);
     }
 };
 struct UserCacheInvalidatorDB {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext* opCtx, StringData dbname) {
-        AuthorizationManager::get(opCtx->getServiceContext())->invalidateUsersFromDB(opCtx, dbname);
+    static void invalidate(OperationContext* opCtx, const DatabaseName& dbname) {
+        AuthorizationManager::get(opCtx->getService())->invalidateUsersFromDB(dbname);
     }
 };
 struct UserCacheInvalidatorAll {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext* opCtx, StringData) {
-        AuthorizationManager::get(opCtx->getServiceContext())->invalidateUserCache(opCtx);
+    static void invalidate(OperationContext* opCtx, const DatabaseName&) {
+        AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
     }
 };
+
+template <typename T>
+using HasGetCmdParamOp = std::remove_cv_t<decltype(std::declval<T>().getCommandParameter())>;
+template <typename T>
+constexpr bool hasGetCmdParamStringData =
+    stdx::is_detected_exact_v<StringData, HasGetCmdParamOp, T>;
 
 /**
  * Most user management commands follow a very predictable pattern:
@@ -112,12 +135,12 @@ struct UserCacheInvalidatorAll {
  * 2. Invalidate whatever we were just working on.
  * 3. Panic if anything went wrong.
  */
-template <typename RequestT, typename ReplyT, typename InvalidatorT>
-class CmdUMCPassthrough : public TypedCommand<CmdUMCPassthrough<RequestT, ReplyT, InvalidatorT>> {
+template <typename RequestT, typename InvalidatorT>
+class CmdUMCPassthrough : public TypedCommand<CmdUMCPassthrough<RequestT, InvalidatorT>> {
 public:
     using Request = RequestT;
-    using Reply = ReplyT;
-    using TC = TypedCommand<CmdUMCPassthrough<RequestT, ReplyT, InvalidatorT>>;
+    using Reply = typename RequestT::Reply;
+    using TC = TypedCommand<CmdUMCPassthrough<RequestT, InvalidatorT>>;
 
     class Invocation final : public TC::InvocationBase {
     public:
@@ -125,17 +148,15 @@ public:
         using TC::InvocationBase::request;
 
         Reply typedRun(OperationContext* opCtx) {
-            const auto& cmd = request();
+            auto& cmd = request();
+            setReadWriteConcern(opCtx, cmd, this);
 
             BSONObjBuilder builder;
             auto status = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
                 opCtx,
                 Request::kCommandName,
                 cmd.getDbName(),
-                applyReadWriteConcern(
-                    opCtx,
-                    this,
-                    CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({}))),
+                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON()),
                 &builder);
 
             if constexpr (InvalidatorT::kRequireUserName) {
@@ -160,11 +181,16 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
-            auth::checkAuthForTypedCommand(opCtx->getClient(), request());
+            auth::checkAuthForTypedCommand(opCtx, request());
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            const auto& cmd = request();
+            if constexpr (hasGetCmdParamStringData<RequestT>) {
+                return NamespaceStringUtil::deserialize(cmd.getDbName(), cmd.getCommandParameter());
+            } else {
+                return NamespaceString(cmd.getDbName());
+            }
         }
     };
 
@@ -173,53 +199,54 @@ public:
     }
 };
 
-class CmdCreateUser : public CmdUMCPassthrough<CreateUserCommand, void, UserCacheInvalidatorNOOP> {
+class CmdCreateUser : public CmdUMCPassthrough<CreateUserCommand, UserCacheInvalidatorNOOP> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
     std::set<StringData> sensitiveFieldNames() const final {
         return {kPwdField};
     }
-} cmdCreateUser;
+};
+MONGO_REGISTER_COMMAND(CmdCreateUser).forRouter();
 
-class CmdUpdateUser : public CmdUMCPassthrough<UpdateUserCommand, void, UserCacheInvalidatorUser> {
+class CmdUpdateUser : public CmdUMCPassthrough<UpdateUserCommand, UserCacheInvalidatorUser> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
     std::set<StringData> sensitiveFieldNames() const final {
         return {kPwdField};
     }
-} cmdUpdateUser;
+};
+MONGO_REGISTER_COMMAND(CmdUpdateUser).forRouter();
 
-CmdUMCPassthrough<DropUserCommand, void, UserCacheInvalidatorUser> cmdDropUser;
-CmdUMCPassthrough<DropAllUsersFromDatabaseCommand,
-                  DropAllUsersFromDatabaseReply,
-                  UserCacheInvalidatorDB>
-    cmdDropAllUsersFromDatabase;
-CmdUMCPassthrough<GrantRolesToUserCommand, void, UserCacheInvalidatorUser> cmdGrantRolesToUser;
-CmdUMCPassthrough<RevokeRolesFromUserCommand, void, UserCacheInvalidatorUser>
-    cmdRevokeRolesFromUser;
-CmdUMCPassthrough<CreateRoleCommand, void, UserCacheInvalidatorNOOP> cmdCreateRole;
-CmdUMCPassthrough<UpdateRoleCommand, void, UserCacheInvalidatorAll> cmdUpdateRole;
-CmdUMCPassthrough<GrantPrivilegesToRoleCommand, void, UserCacheInvalidatorAll>
-    cmdGrantPrivilegesToRole;
-CmdUMCPassthrough<RevokePrivilegesFromRoleCommand, void, UserCacheInvalidatorAll>
-    cmdRevokePrivilegesFromRole;
-CmdUMCPassthrough<GrantRolesToRoleCommand, void, UserCacheInvalidatorAll> cmdGrantRolesToRole;
-CmdUMCPassthrough<RevokeRolesFromRoleCommand, void, UserCacheInvalidatorAll> cmdRevokeRolesFromRole;
-CmdUMCPassthrough<DropRoleCommand, void, UserCacheInvalidatorAll> cmdDropRole;
-CmdUMCPassthrough<DropAllRolesFromDatabaseCommand,
-                  DropAllRolesFromDatabaseReply,
-                  UserCacheInvalidatorAll>
-    cmdDropAllRolesFromDatabase;
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<DropUserCommand, UserCacheInvalidatorUser>).forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<DropAllUsersFromDatabaseCommand, UserCacheInvalidatorDB>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<GrantRolesToUserCommand, UserCacheInvalidatorUser>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<RevokeRolesFromUserCommand, UserCacheInvalidatorUser>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<CreateRoleCommand, UserCacheInvalidatorNOOP>).forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<UpdateRoleCommand, UserCacheInvalidatorAll>).forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<GrantPrivilegesToRoleCommand, UserCacheInvalidatorAll>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<RevokePrivilegesFromRoleCommand, UserCacheInvalidatorAll>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<GrantRolesToRoleCommand, UserCacheInvalidatorAll>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<RevokeRolesFromRoleCommand, UserCacheInvalidatorAll>)
+    .forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<DropRoleCommand, UserCacheInvalidatorAll>).forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCPassthrough<DropAllRolesFromDatabaseCommand, UserCacheInvalidatorAll>)
+    .forRouter();
 
 /**
  * usersInfo and rolesInfo are simpler read-only passthrough commands.
  */
-template <typename RequestT, typename ReplyT>
-class CmdUMCInfo : public TypedCommand<CmdUMCInfo<RequestT, ReplyT>> {
+template <typename RequestT>
+class CmdUMCInfo : public TypedCommand<CmdUMCInfo<RequestT>> {
 public:
     using Request = RequestT;
-    using Reply = ReplyT;
-    using TC = TypedCommand<CmdUMCInfo<RequestT, ReplyT>>;
+    using Reply = typename RequestT::Reply;
+    using TC = TypedCommand<CmdUMCInfo<RequestT>>;
 
     class Invocation final : public TC::InvocationBase {
     public:
@@ -227,16 +254,14 @@ public:
         using TC::InvocationBase::request;
 
         Reply typedRun(OperationContext* opCtx) {
-            const auto& cmd = request();
+            auto& cmd = request();
+            setReadWriteConcern(opCtx, cmd, this);
 
             BSONObjBuilder builder;
             const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
                 opCtx,
-                cmd.getDbName().toString(),
-                applyReadWriteConcern(
-                    opCtx,
-                    this,
-                    CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({}))),
+                cmd.getDbName(),
+                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON()),
                 &builder);
 
             auto result = builder.obj();
@@ -253,11 +278,11 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
-            auth::checkAuthForTypedCommand(opCtx->getClient(), request());
+            auth::checkAuthForTypedCommand(opCtx, request());
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -266,8 +291,8 @@ public:
     }
 };
 
-CmdUMCInfo<UsersInfoCommand, UsersInfoReply> cmdUsersInfo;
-CmdUMCInfo<RolesInfoCommand, RolesInfoReply> cmdRolesInfo;
+MONGO_REGISTER_COMMAND(CmdUMCInfo<UsersInfoCommand>).forRouter();
+MONGO_REGISTER_COMMAND(CmdUMCInfo<RolesInfoCommand>).forRouter();
 
 class CmdInvalidateUserCache : public TypedCommand<CmdInvalidateUserCache> {
 public:
@@ -278,8 +303,7 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            const auto authzManager = AuthorizationManager::get(opCtx->getServiceContext());
-            authzManager->invalidateUserCache(opCtx);
+            AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
         }
 
     private:
@@ -288,11 +312,11 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
-            auth::checkAuthForTypedCommand(opCtx->getClient(), request());
+            auth::checkAuthForTypedCommand(opCtx, request());
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -303,15 +327,17 @@ public:
     bool adminOnly() const final {
         return true;
     }
-} cmdInvalidateUserCache;
+};
+MONGO_REGISTER_COMMAND(CmdInvalidateUserCache).forRouter();
 
 class CmdMergeAuthzCollections
-    : public CmdUMCPassthrough<MergeAuthzCollectionsCommand, void, UserCacheInvalidatorNOOP> {
+    : public CmdUMCPassthrough<MergeAuthzCollectionsCommand, UserCacheInvalidatorNOOP> {
 public:
     bool adminOnly() const final {
         return true;
     }
-} cmdMergeAuthzCollections;
+};
+MONGO_REGISTER_COMMAND(CmdMergeAuthzCollections).forRouter();
 
 }  // namespace
 }  // namespace mongo

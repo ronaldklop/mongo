@@ -27,24 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/s/shard_server_test_fixture.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/commands.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-const HostAndPort ShardServerTestFixture::kConfigHostAndPort("dummy", 123);
-
-ShardServerTestFixture::ShardServerTestFixture() = default;
+ShardServerTestFixture::ShardServerTestFixture(Options options, bool setUpMajorityReads)
+    : ShardingMongoDTestFixture(std::move(options), setUpMajorityReads) {}
 
 ShardServerTestFixture::~ShardServerTestFixture() = default;
 
@@ -53,44 +58,76 @@ std::shared_ptr<RemoteCommandTargeterMock> ShardServerTestFixture::configTargete
 }
 
 void ShardServerTestFixture::setUp() {
-    ShardingMongodTestFixture::setUp();
+    ShardingMongoDTestFixture::setUp();
 
-    replicationCoordinator()->alwaysAllowWrites(true);
+    ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
-    // Initialize sharding components as a shard server.
-    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-
-    _clusterId = OID::gen();
-    ShardingState::get(getServiceContext())->setInitialized(_myShardName, _clusterId);
+    ShardingState::get(getServiceContext())
+        ->setRecoveryCompleted({OID::gen(),
+                                ClusterRole::ShardServer,
+                                ConnectionString(kConfigHostAndPort),
+                                kMyShardName});
 
     if (!_catalogCacheLoader)
-        _catalogCacheLoader = std::make_unique<ShardServerCatalogCacheLoader>(
+        _catalogCacheLoader = std::make_shared<ShardServerCatalogCacheLoader>(
             std::make_unique<ConfigServerCatalogCacheLoader>());
-    CatalogCacheLoader::set(getServiceContext(), std::move(_catalogCacheLoader));
 
-    uassertStatusOK(
-        initializeGlobalShardingStateForMongodForTest(ConnectionString(kConfigHostAndPort)));
+    if (!_catalogCache)
+        _catalogCache = std::make_unique<CatalogCache>(getServiceContext(), _catalogCacheLoader);
+
+    uassertStatusOK(initializeGlobalShardingStateForMongodForTest(
+        ConnectionString(kConfigHostAndPort), std::move(_catalogCache), _catalogCacheLoader));
 
     // Set the findHost() return value on the mock targeter so that later calls to the
     // config targeter's findHost() return the appropriate value.
     configTargeterMock()->setFindHostReturnValue(kConfigHostAndPort);
 }
 
-// Sets the catalog cache loader for mocking. This must be called before the setUp function is
-// invoked.
-void ShardServerTestFixture::setCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> loader) {
-    invariant(loader && !_catalogCacheLoader);
-    _catalogCacheLoader = std::move(loader);
+void ShardServerTestFixture::setCatalogCacheLoader(std::shared_ptr<CatalogCacheLoader> loader) {
+    invariant(loader && !_catalogCache && !_catalogCacheLoader);
+    _catalogCacheLoader = loader;
 }
 
-void ShardServerTestFixture::tearDown() {
-    CatalogCacheLoader::clearForTests(getServiceContext());
-
-    ShardingMongodTestFixture::tearDown();
+void ShardServerTestFixture::setCatalogCache(std::unique_ptr<CatalogCache> cache) {
+    invariant(cache && !_catalogCache);
+    _catalogCache = std::move(cache);
 }
 
 std::unique_ptr<ShardingCatalogClient> ShardServerTestFixture::makeShardingCatalogClient() {
-    return std::make_unique<ShardingCatalogClientImpl>();
+    return std::make_unique<ShardingCatalogClientImpl>(nullptr /* overrideConfigShard */);
+}
+
+void ShardServerTestFixtureWithCatalogCacheMock::setUp() {
+    auto loader = std::make_shared<CatalogCacheLoaderMock>();
+    _cacheLoaderMock = loader;
+    setCatalogCacheLoader(loader);
+    setCatalogCache(std::make_unique<CatalogCacheMock>(getServiceContext(), loader));
+    ShardServerTestFixture::setUp();
+}
+
+CatalogCacheMock* ShardServerTestFixtureWithCatalogCacheMock::getCatalogCacheMock() {
+    return static_cast<CatalogCacheMock*>(catalogCache());
+}
+
+std::shared_ptr<CatalogCacheLoaderMock>
+ShardServerTestFixtureWithCatalogCacheMock::getCatalogCacheLoaderMock() {
+    return _cacheLoaderMock;
+}
+
+void ShardServerTestFixtureWithCatalogCacheLoaderMock::setUp() {
+    auto loader = std::make_shared<CatalogCacheLoaderMock>();
+    _cacheLoaderMock = loader;
+    setCatalogCacheLoader(loader);
+    ShardServerTestFixture::setUp();
+}
+
+CatalogCacheMock* ShardServerTestFixtureWithCatalogCacheLoaderMock::getCatalogCacheMock() {
+    return static_cast<CatalogCacheMock*>(catalogCache());
+}
+
+std::shared_ptr<CatalogCacheLoaderMock>
+ShardServerTestFixtureWithCatalogCacheLoaderMock::getCatalogCacheLoaderMock() {
+    return _cacheLoaderMock;
 }
 
 }  // namespace mongo

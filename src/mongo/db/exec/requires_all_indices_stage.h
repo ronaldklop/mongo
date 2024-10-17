@@ -30,7 +30,8 @@
 #pragma once
 
 #include "mongo/db/exec/requires_collection_stage.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/query/all_indices_required_checker.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 
 namespace mongo {
 
@@ -43,43 +44,41 @@ class RequiresAllIndicesStage : public RequiresCollectionStage {
 public:
     RequiresAllIndicesStage(const char* stageType,
                             ExpressionContext* expCtx,
-                            const CollectionPtr& coll)
-        : RequiresCollectionStage(stageType, expCtx, coll) {
-        auto allEntriesShared = coll->getIndexCatalog()->getAllReadyEntriesShared();
-        _indexCatalogEntries.reserve(allEntriesShared.size());
-        _indexNames.reserve(allEntriesShared.size());
-        for (auto&& index : allEntriesShared) {
-            _indexCatalogEntries.emplace_back(index);
-            _indexNames.push_back(index->descriptor()->indexName());
-        }
+                            VariantCollectionPtrOrAcquisition collectionVariant)
+        : RequiresCollectionStage(stageType, expCtx, collectionVariant) {
+        const auto& coll = collection();
+        auto multipleCollection = coll.isAcquisition()
+            ? MultipleCollectionAccessor{coll.getAcquisition()}
+            : MultipleCollectionAccessor{coll.getCollectionPtr()};
+        _allIndicesRequiredChecker.emplace(std::move(multipleCollection));
     }
 
-    virtual ~RequiresAllIndicesStage() = default;
+    ~RequiresAllIndicesStage() override = default;
 
 protected:
-    void doSaveStateRequiresCollection() override final {}
+    void doSaveStateRequiresCollection() final {}
 
-    void doRestoreStateRequiresCollection() override final;
+    void doRestoreStateRequiresCollection() final {
+        if (_allIndicesRequiredChecker) {
+            const auto& coll = collection();
+            auto multipleCollection = coll.isAcquisition()
+                ? MultipleCollectionAccessor{coll.getAcquisition()}
+                : MultipleCollectionAccessor{coll.getCollectionPtr()};
+
+            _allIndicesRequiredChecker->check(opCtx(), multipleCollection);
+        }
+    }
 
     /**
      * Subclasses may call this to indicate that they no longer require all indices on the
      * collection to survive. After calling this, yield recovery will never fail.
      */
     void releaseAllIndicesRequirement() {
-        _indexCatalogEntries.clear();
-        _indexNames.clear();
+        _allIndicesRequiredChecker = boost::none;
     }
 
 private:
-    // This stage holds weak pointers to all of the index catalog entries known at the time of
-    // construction. During yield recovery, we attempt to lock each weak pointer in order to
-    // determine whether an index we rely on has been destroyed. If we can lock the weak pointer, we
-    // need to check the 'isDropped()' flag on the index catalog entry. If any index has been
-    // destroyed, then we throw a query-fatal exception during restore.
-    std::vector<std::weak_ptr<const IndexCatalogEntry>> _indexCatalogEntries;
-
-    // The names of the indices above. Used for error reporting.
-    std::vector<std::string> _indexNames;
+    boost::optional<AllIndicesRequiredChecker> _allIndicesRequiredChecker;
 };
 
 }  // namespace mongo

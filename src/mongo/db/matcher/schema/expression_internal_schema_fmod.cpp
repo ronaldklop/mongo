@@ -27,18 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <utility>
 
-#include "mongo/db/matcher/schema/expression_internal_schema_fmod.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_fmod.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 InternalSchemaFmodMatchExpression::InternalSchemaFmodMatchExpression(
-    StringData path,
+    boost::optional<StringData> path,
     Decimal128 divisor,
     Decimal128 remainder,
     clonable_ptr<ErrorAnnotation> annotation)
@@ -68,21 +75,13 @@ void InternalSchemaFmodMatchExpression::debugString(StringBuilder& debug,
     _debugAddSpace(debug, indentationLevel);
     debug << path() << " fmod: divisor: " << _divisor.toString()
           << " remainder: " << _remainder.toString();
-    MatchExpression::TagData* td = getTag();
-    if (td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+    _debugStringAttachTagInfo(&debug);
 }
 
-BSONObj InternalSchemaFmodMatchExpression::getSerializedRightHandSide() const {
-    BSONObjBuilder objMatchBob;
-    BSONArrayBuilder arrBuilder(objMatchBob.subarrayStart("$_internalSchemaFmod"));
-    arrBuilder.append(_divisor);
-    arrBuilder.append(_remainder);
-    arrBuilder.doneFast();
-    return objMatchBob.obj();
+void InternalSchemaFmodMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    bob->append("$_internalSchemaFmod"_sd,
+                BSON_ARRAY(opts.serializeLiteral(_divisor) << opts.serializeLiteral(_remainder)));
 }
 
 bool InternalSchemaFmodMatchExpression::equivalent(const MatchExpression* other) const {

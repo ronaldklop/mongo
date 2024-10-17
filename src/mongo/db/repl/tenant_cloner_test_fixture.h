@@ -29,8 +29,24 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/cloner_test_fixture.h"
 #include "mongo/db/repl/tenant_migration_shared_data.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -47,7 +63,7 @@ protected:
                                           const std::vector<BSONObj>& secondaryIndexSpecs);
 
     const Timestamp _operationTime = Timestamp(12345, 67);
-    const std::string _tenantId = "tenant42";
+    const std::string _tenantId = OID::gen().toString();
     const UUID _migrationId = UUID::gen();
 
 private:

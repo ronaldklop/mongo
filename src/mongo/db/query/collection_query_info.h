@@ -29,10 +29,22 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
+#include <utility>
+
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_indexability.h"
+#include "mongo/db/query/plan_cache/plan_cache_invalidator.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/update_index_data.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
@@ -56,11 +68,33 @@ public:
     static CollectionQueryInfo& get(Collection* collection) {
         return CollectionQueryInfo::getCollectionQueryInfo(collection);
     }
+    /**
+     * Populate the outData structure using the index keys found in the index definition.
+     */
+    static void computeUpdateIndexData(const IndexCatalogEntry* entry,
+                                       const IndexAccessMethod* accessMethod,
+                                       UpdateIndexData* outData);
 
     /**
-     * Get the PlanCache for this collection.
+     * Gets the PlanCache for this collection.
      */
-    PlanCache* getPlanCache() const;
+    PlanCache* getPlanCache() const {
+        return &_planCacheState->classicPlanCache;
+    }
+
+    /**
+     * Gets the number of the current collection version used for Plan Cache invalidation.
+     */
+    size_t getPlanCacheInvalidatorVersion() const {
+        return _planCacheState->planCacheInvalidator.versionNumber();
+    }
+
+    /**
+     * Gets the "indexability discriminators" used in the PlanCache for generating plan cache keys.
+     */
+    const PlanCacheIndexabilityState& getPlanCacheIndexabilityState() const {
+        return _planCacheState->planCacheIndexabilityState;
+    }
 
     /* get set of index keys for this namespace.  handy to quickly check if a given
        field is indexed (Note it might be a secondary component of a compound index.)
@@ -70,7 +104,7 @@ public:
     /**
      * Builds internal cache state based on the current state of the Collection's IndexCatalog.
      */
-    void init(OperationContext* opCtx, const CollectionPtr& coll);
+    void init(OperationContext* opCtx, Collection* coll);
 
     /**
      * Rebuilds cached index information. Must be called when an index is modified or an index is
@@ -78,7 +112,7 @@ public:
      *
      * Must be called under exclusive collection lock.
      */
-    void rebuildIndexData(OperationContext* opCtx, const CollectionPtr& coll);
+    void rebuildIndexData(OperationContext* opCtx, const Collection* coll);
 
     /**
      * Removes all cached query plans after ensuring that the PlanCache is uniquely owned. The
@@ -94,20 +128,53 @@ public:
      */
     void clearQueryCacheForSetMultikey(const CollectionPtr& coll) const;
 
+    /**
+     * Notify of a query so as to record statistics. The first overload records the statistics
+     * from the given PlanSummaryStats while the second records stats previously stored in the
+     * OpDebug.
+     */
     void notifyOfQuery(OperationContext* opCtx,
                        const CollectionPtr& coll,
                        const PlanSummaryStats& summaryStats) const;
+    void notifyOfQuery(const CollectionPtr& coll, const OpDebug& debug) const;
 
 private:
-    void computeIndexKeys(OperationContext* opCtx, const CollectionPtr& coll);
-    void updatePlanCacheIndexEntries(OperationContext* opCtx, const CollectionPtr& coll);
+    /**
+     * Stores Clasic and SBE PlanCache-related state. Classic Plan Cache is stored per collection
+     * and represented by a mongo::PlanCache object. SBE PlanCache is stored in a process-global
+     * object, therefore, it is represented here as a PlanCacheInvalidator which knows what
+     * collection version to invalidate.
+     */
+    struct PlanCacheState {
+        PlanCacheState();
+
+        PlanCacheState(OperationContext* opCtx, const Collection* collection);
+
+        /**
+         * Clears classic and SBE cache entries with the current collection version.
+         */
+        void clearPlanCache();
+
+        // Per collection version classic plan cache.
+        PlanCache classicPlanCache;
+
+        // SBE PlanCacheInvalidator which can invalidate cache entries associated with a particular
+        // version of a collection.
+        PlanCacheInvalidator planCacheInvalidator;
+
+        // Holds computed information about the collection's indexes. Used for generating plan
+        // cache keys.
+        PlanCacheIndexabilityState planCacheIndexabilityState;
+    };
+
+    void computeUpdateIndexData(OperationContext* opCtx, const Collection* coll);
+    void updatePlanCacheIndexEntries(OperationContext* opCtx, const Collection* coll);
 
     // ---  index keys cache
     bool _keysComputed;
     UpdateIndexData _indexedPaths;
 
-    // A cache for query plans. Shared across cloned Collection instances.
-    std::shared_ptr<PlanCache> _planCache;
+    std::shared_ptr<PlanCacheState> _planCacheState;
 };
 
 }  // namespace mongo

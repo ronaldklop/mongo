@@ -1,21 +1,19 @@
 // Basic sanity check of log component helpers
 
-(function(db) {
-"use strict";
 var mongo = db.getMongo();
 
-// Get current log component setttings. We will reset to these later.
+// Get current log component settings. We will reset to these later.
 var originalSettings =
     assert.commandWorked(db.adminCommand({getParameter: 1, logComponentVerbosity: 1}))
         .logComponentVerbosity;
 
 // getLogComponents
 var components1 = mongo.getLogComponents();
-assert.docEq(components1, originalSettings);
+assert.docEq(originalSettings, components1);
 
 // getLogComponents via db
 var components2 = db.getLogComponents();
-assert.docEq(components2, originalSettings);
+assert.docEq(originalSettings, components2);
 
 // setLogLevel - default component
 mongo.setLogLevel(2);
@@ -41,4 +39,3 @@ assert.throws(function() {
 
 // Restore originalSettings
 assert.commandWorked(db.adminCommand({setParameter: 1, logComponentVerbosity: originalSettings}));
-}(db));

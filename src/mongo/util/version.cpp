@@ -27,36 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/util/version.h"
 
-#include "mongo/config.h"
 
 #ifdef MONGO_CONFIG_SSL
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/crypto.h>
+#include <openssl/opensslv.h>
 #endif
 #endif
 
+#include <climits>
 #include <fmt/format.h>
 #include <sstream>
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/debug_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 namespace {
-
-std::string formatVersionString(StringData versioned, const VersionInfoInterface& provider) {
-    return format(FMT_STRING("{} version v{}"), versioned, provider.version());
-}
 
 class FallbackVersionInfo : public VersionInfoInterface {
 public:
@@ -131,6 +137,40 @@ std::string VersionInfoInterface::makeVersionString(StringData binaryName) const
     return format(FMT_STRING("{} v{}"), binaryName, version());
 }
 
+#ifdef __APPLE__
+namespace {
+const std::map<std::string, std::string> kMacOSInfoMap = {
+    // sysctl name, followed by label for returned info object.
+    {"kern.osproductversion", "osProductVersion"},
+    {"kern.osrelease", "osRelease"},
+    {"kern.version", "version"},
+};
+// Collect macOS specific detail about the running version.
+void appendMacOSInfo(BSONObjBuilder* builder) {
+    BSONObjBuilder macOS(builder->subobjStart("macOS"));
+    char buffer[2048];
+
+    for (const auto& item : kMacOSInfoMap) {
+        std::size_t buffer_len = sizeof(buffer) - 1;
+        if ((sysctlbyname(item.first.c_str(), buffer, &buffer_len, nullptr, 0) == 0) &&
+            (buffer_len > 1)) {
+            // buffer_len returned by macOS includes the trailing nul byte.
+            macOS.append(item.second, StringData(buffer, buffer_len - 1));
+        }
+    }
+}
+}  // namespace
+#endif
+
+void VersionInfoInterface::appendVersionInfoOnly(BSONObjBuilder* result) const {
+    result->append("version"_sd, version());
+    BSONArrayBuilder(result->subarrayStart("versionArray"))
+        .append(majorVersion())
+        .append(minorVersion())
+        .append(patchVersion())
+        .append(extraVersion());
+}
+
 void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
     BSONObjBuilder& o = *result;
     o.append("version", version());
@@ -177,6 +217,9 @@ void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
     o.append("bits", (int)sizeof(void*) * CHAR_BIT);
     o.appendBool("debug", kDebugBuild);
     o.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
+#ifdef __APPLE__
+    appendMacOSInfo(&o);
+#endif
 }
 
 std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData suffix) const {
@@ -215,12 +258,20 @@ void VersionInfoInterface::logBuildInfo(std::ostream* os) const {
     }
 }
 
+std::string formatVersionString(StringData versioned, const VersionInfoInterface& provider) {
+    return format(FMT_STRING("{} version v{}"), versioned, provider.version());
+}
+
 std::string mongoShellVersion(const VersionInfoInterface& provider) {
     return formatVersionString("MongoDB shell", provider);
 }
 
 std::string mongosVersion(const VersionInfoInterface& provider) {
     return formatVersionString("mongos", provider);
+}
+
+std::string mongocryptVersion(const VersionInfoInterface& provider) {
+    return formatVersionString("mongocrypt", provider);
 }
 
 std::string mongodVersion(const VersionInfoInterface& provider) {

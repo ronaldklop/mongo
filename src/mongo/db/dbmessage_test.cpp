@@ -29,9 +29,13 @@
 
 #include <string>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 using std::string;
@@ -101,7 +105,7 @@ TEST(DBMessage1, GoodInsert) {
     string ns("test");
 
     b.appendNum(static_cast<int>(1));
-    b.appendStr(ns);
+    b.appendCStr(ns);
     b.appendNum(static_cast<int>(3));
     b.appendNum(static_cast<int>(39));
 
@@ -120,7 +124,7 @@ TEST(DBMessage1, GoodInsert2) {
     string ns("test");
 
     b.appendNum(static_cast<int>(1));
-    b.appendStr(ns);
+    b.appendCStr(ns);
     b.appendNum(static_cast<int>(3));
     b.appendNum(static_cast<int>(39));
 

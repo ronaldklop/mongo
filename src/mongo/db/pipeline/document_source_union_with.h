@@ -29,12 +29,43 @@
 
 #pragma once
 
+#include <algorithm>
 #include <boost/optional.hpp>
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -57,23 +88,40 @@ public:
                   std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)) {}
 
         PrivilegeVector requiredPrivileges(bool isMongos,
-                                           bool bypassDocumentValidation) const override final;
+                                           bool bypassDocumentValidation) const final;
     };
 
     DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                            std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
-        : DocumentSource(kStageName, expCtx), _pipeline(std::move(pipeline)) {
-        // If this pipeline is being run as part of explain, then cache a copy to use later during
-        // serialization.
-        if (expCtx->explain >= ExplainOptions::Verbosity::kExecStats) {
-            _cachedPipeline = _pipeline->getSources();
-        }
+                            NamespaceString unionNss,
+                            std::vector<BSONObj> pipeline);
+
+    // Expose a constructor that skips the parsing step for testing purposes.
+    DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            std::unique_ptr<Pipeline, PipelineDeleter> pipeline);
+
+    DocumentSourceUnionWith(const DocumentSourceUnionWith& original,
+                            const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
+        : DocumentSource(kStageName, newExpCtx),
+          _pipeline(original._pipeline->clone(
+              newExpCtx ? newExpCtx->copyForSubPipeline(
+                              newExpCtx->getResolvedNamespace(original._userNss).ns,
+                              newExpCtx->getResolvedNamespace(original._userNss).uuid)
+                        : nullptr)),
+          _userNss(original._userNss),
+          _userPipeline(original._userPipeline),
+          _variables(original._variables),
+          _variablesParseState(original._variablesParseState) {
+        _pipeline->getContext()->inUnionWith = true;
     }
 
-    ~DocumentSourceUnionWith();
+    ~DocumentSourceUnionWith() override;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
+    }
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kUnionWith;
     }
 
     GetModPathsReturn getModifiedPaths() const final {
@@ -113,6 +161,8 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
         return DistributedPlanLogic{nullptr, this, boost::none};
@@ -124,10 +174,36 @@ public:
 
     void reattachToOperationContext(OperationContext* opCtx) final;
 
+    bool validateOperationContext(const OperationContext* opCtx) const final;
+
     bool usedDisk() final;
 
     const SpecificStats* getSpecificStats() const final {
         return &_stats;
+    }
+
+    bool hasNonEmptyPipeline() const {
+        return _pipeline && !_pipeline->getSources().empty();
+    }
+
+    const Pipeline& getPipeline() const {
+        tassert(7113100, "Pipeline has been already disposed", _pipeline);
+        return *_pipeline;
+    }
+
+    Pipeline& getPipeline() {
+        tassert(7113101, "Pipeline has been already disposed", _pipeline);
+        return *_pipeline;
+    }
+
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
+
+    const Pipeline::SourceContainer* getSubPipeline() const final {
+        if (_pipeline) {
+            return &_pipeline->getSources();
+        }
+        return nullptr;
     }
 
 protected:
@@ -160,16 +236,34 @@ private:
         kFinished
     };
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     void addViewDefinition(NamespaceString nss, std::vector<BSONObj> viewPipeline);
 
-    void recordPlanSummaryStats(const Pipeline& pipeline);
+    void logStartingSubPipeline(const std::vector<BSONObj>& serializedPipeline);
+    void logShardedViewFound(
+        const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) const;
 
     std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
-    Pipeline::SourceContainer _cachedPipeline;
+    // The original, unresolved namespace to union.
+    NamespaceString _userNss;
+    // The aggregation pipeline defined with the user request, prior to optimization and view
+    // resolution.
+    std::vector<BSONObj> _userPipeline;
+    // Match and/or project stages after a $unionWith can be pushed down into the $unionWith (and
+    // the head of the pipeline). If we're doing an explain with execution stats, we will need
+    // copies of these stages as they may be pushed down to the find layer.
+    std::vector<BSONObj> _pushedDownStages;
     ExecutionProgress _executionState = ExecutionProgress::kIteratingSource;
     UnionWithStats _stats;
+
+    // $unionWith will execute the subpipeline twice for explain with execution stats - once for
+    // results and once for explain info. During the first execution, built in variables (such as
+    // SEARCH_META) might be set, which are not allowed to be set at the start of the second
+    // execution. We need to store the initial state of the variables to reset them for the second
+    // execution
+    Variables _variables;
+    VariablesParseState _variablesParseState;
 };
 
 }  // namespace mongo

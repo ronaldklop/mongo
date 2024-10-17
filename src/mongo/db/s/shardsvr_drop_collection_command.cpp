@@ -27,21 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
-#include "mongo/db/s/drop_collection_legacy.h"
+#include "mongo/db/s/drop_collection_coordinator_document_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -55,7 +77,8 @@ public:
                "directly. Drops a collection.";
     }
 
-    bool acceptsAnyApiVersionParameters() const override {
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
         return true;
     }
 
@@ -68,40 +91,40 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << Request::kCommandName
-                                  << " must be called with majority writeConcern, got "
-                                  << opCtx->getWriteConcern().wMode,
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
 
-            const auto useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(
-                serverGlobalParams.featureCompatibility);
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            if (!useNewPath) {
-                LOGV2_DEBUG(5280951,
-                            1,
-                            "Running legacy drop collection procedure",
-                            "namespace"_attr = ns());
-                dropCollectionLegacy(opCtx, ns());
-                return;
+            try {
+                const auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, ns());
+
+                uassert(ErrorCodes::IllegalOperation,
+                        "Sharded time-series buckets collections cannot be dropped directly; drop "
+                        "the logical namespace instead",
+                        !coll.getTimeseriesFields() || coll.getUnsplittable());
+
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // The collection is not tracked or doesn't exist.
             }
-
-            LOGV2_DEBUG(
-                5280952, 1, "Running new drop collection procedure", "namespace"_attr = ns());
 
             // Since this operation is not directly writing locally we need to force its db
             // profile level increase in order to be logged in "<db>.system.profile"
             CurOp::get(opCtx)->raiseDbProfileLevel(
-                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns().db()));
+                DatabaseProfileSettings::get(opCtx->getServiceContext())
+                    .getDatabaseProfileLevel(ns().dbName()));
 
             auto coordinatorDoc = DropCollectionCoordinatorDocument();
             coordinatorDoc.setShardingDDLCoordinatorMetadata(
                 {{ns(), DDLCoordinatorTypeEnum::kDropCollection}});
+            coordinatorDoc.setCollectionUUID(request().getCollectionUUID());
+
             auto service = ShardingDDLCoordinatorService::getService(opCtx);
             auto dropCollCoordinator = checked_pointer_cast<DropCollectionCoordinator>(
                 service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+
             dropCollCoordinator->getCompletionFuture().get(opCtx);
         }
 
@@ -118,11 +141,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} sharsvrdDropCollectionCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrDropCollectionCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -28,22 +28,30 @@
  */
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <memory>
+#include <utility>
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/dbclient_base.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/background.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
@@ -60,6 +68,7 @@ public:
         ServiceContext* service() const {
             return _service;
         }
+
         ReshardingMetrics* metrics() const {
             return _metrics;
         }
@@ -69,6 +78,10 @@ public:
         ReshardingMetrics* _metrics;
     };
 
+    // Special value to use for startAt to indicate there are no more oplog entries needing to be
+    // fetched.
+    static const ReshardingDonorOplogId kFinalOpAlreadyFetched;
+
     ReshardingOplogFetcher(std::unique_ptr<Env> env,
                            UUID reshardingUUID,
                            UUID collUUID,
@@ -77,7 +90,7 @@ public:
                            ShardId recipientShard,
                            NamespaceString toWriteInto);
 
-    ~ReshardingOplogFetcher();
+    ~ReshardingOplogFetcher() override;
 
     Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override;
 
@@ -96,7 +109,8 @@ public:
      * will be rescheduled in a way that resumes where it had left off from.
      */
     ExecutorFuture<void> schedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                  const CancellationToken& cancelToken);
+                                  const CancellationToken& cancelToken,
+                                  CancelableOperationContextFactory factory);
 
     /**
      * Given a shard, fetches and copies oplog entries until
@@ -107,9 +121,9 @@ public:
      * Returns true if there are more oplog entries to be copied, and returns false if the sentinel
      * finish oplog entry has been copied.
      */
-    bool consume(Client* client, Shard* shard);
+    bool consume(Client* client, CancelableOperationContextFactory factory, Shard* shard);
 
-    bool iterate(Client* client);
+    bool iterate(Client* client, CancelableOperationContextFactory factory);
 
     int getNumOplogEntriesCopied() const {
         return _numOplogEntriesCopied;
@@ -135,10 +149,14 @@ private:
     /**
      * Returns true if there's more work to do and the task should be rescheduled.
      */
-    void _ensureCollection(Client* client, const NamespaceString nss);
-    AggregateCommandRequest _makeAggregateCommandRequest(Client* client);
+    void _ensureCollection(Client* client,
+                           CancelableOperationContextFactory factory,
+                           NamespaceString nss);
+    AggregateCommandRequest _makeAggregateCommandRequest(Client* client,
+                                                         CancelableOperationContextFactory factory);
     ExecutorFuture<void> _reschedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                     const CancellationToken& cancelToken);
+                                     const CancellationToken& cancelToken,
+                                     CancelableOperationContextFactory factory);
 
     ServiceContext* _service() const {
         return _env->service();
@@ -155,7 +173,7 @@ private:
 
     int _numOplogEntriesCopied = 0;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingOplogFetcher::_mutex");
+    stdx::mutex _mutex;
     Promise<void> _onInsertPromise;
     Future<void> _onInsertFuture;
 

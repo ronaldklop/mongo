@@ -1,11 +1,12 @@
 // Tests that $out preserves the collection options of the "out" collection.
 // @tags: [
 //   does_not_support_transactions,
+//   # TODO (SERVER-89668): Remove tag. Currently incompatible due to collection
+//   # options containing the recordIdsReplicated:true option, which
+//   # this test dislikes.
+//   exclude_when_record_ids_replicated
 // ]
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
+import {dropWithoutImplicitRecreate} from "jstests/aggregation/extras/merge_helpers.js";
 
 // Setup and populate input collection.
 const inputName = "out_preserve_coll_options";
@@ -37,4 +38,3 @@ const targetOptionsResultsNew = new DBCommandCursor(db, targetOptionsResponseNew
 assert.eq(targetOptionsResultsNew.length, 1, targetOptionsResultsNew);
 assert.eq(
     {validationLevel: "moderate"}, targetOptionsResultsNew[0].options, targetOptionsResultsNew[0]);
-}());

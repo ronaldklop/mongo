@@ -12,11 +12,9 @@
  * thread after finding the issued noop. The secondary thread should throw
  * an exception and exit.
  */
-load('jstests/replsets/rslib.js');
-load('jstests/libs/parallelTester.js');
-load('jstests/libs/write_concern_util.js');
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getLatestOp} from "jstests/replsets/rslib.js";
+
 var send_linearizable_read = function() {
     // The primary will step down and throw an exception, which is expected.
     var coll = db.getSiblingDB("test").foo;
@@ -44,13 +42,17 @@ config.settings = {
 replTest.startSet();
 replTest.initiate(config);
 
+var primary = replTest.getPrimary();
+var secondaries = replTest.getSecondaries();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Without a sync source the heartbeat interval will be half of the election timeout, 30
 // seconds. It thus will take almost 30 seconds for the secondaries to set the primary as
 // their sync source and begin replicating.
 replTest.awaitReplication();
-var primary = replTest.getPrimary();
-var secondaries = replTest.getSecondaries();
-
 // Do a write to have something to read.
 assert.commandWorked(primary.getDB("test").foo.insert(
     {"number": 7}, {"writeConcern": {"w": "majority", "wtimeout": ReplSetTest.kDefaultTimeoutMS}}));
@@ -78,16 +80,16 @@ assert.eq(opTimeCmd.errmsg, "afterOpTime not compatible with linearizable read c
 assert.eq(opTimeCmd.code, ErrorCodes.FailedToParse);
 
 // A $out aggregation is not allowed with readConcern level "linearizable".
-let outResult = assert.throws(() => primary.getDB("test").foo.aggregate(
-                                  [{$out: "out"}], {readConcern: {level: "linearizable"}}));
-assert.eq(outResult.code, ErrorCodes.InvalidOptions);
+assert.throwsWithCode(() => primary.getDB("test").foo.aggregate(
+                          [{$out: "out"}], {readConcern: {level: "linearizable"}}),
+                      ErrorCodes.InvalidOptions);
 
 // A $merge aggregation is not allowed with readConcern level "linearizable".
-let mergeResult =
-    assert.throws(() => primary.getDB("test").foo.aggregate(
-                      [{$merge: {into: "out", whenMatched: "replace", whenNotMatched: "insert"}}],
-                      {readConcern: {level: "linearizable"}}));
-assert.eq(mergeResult.code, ErrorCodes.InvalidOptions);
+assert.throwsWithCode(
+    () => primary.getDB("test").foo.aggregate(
+        [{$merge: {into: "out", whenMatched: "replace", whenNotMatched: "insert"}}],
+        {readConcern: {level: "linearizable"}}),
+    ErrorCodes.InvalidOptions);
 
 primary = replTest.getPrimary();
 
@@ -145,4 +147,3 @@ assert.commandWorked(
     primary.adminCommand({"replSetStepDown": 100, secondaryCatchUpPeriodSecs: 0, "force": true}));
 parallelShell();
 replTest.stopSet();
-}());

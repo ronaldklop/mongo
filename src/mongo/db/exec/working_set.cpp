@@ -29,9 +29,12 @@
 
 #include "mongo/db/exec/working_set.h"
 
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/service_context.h"
+#include <cstdint>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -72,17 +75,6 @@ WorkingSetID WorkingSet::allocate() {
     _freeList = _data[id].nextFreeOrSelf;
     _data[id].nextFreeOrSelf = id;  // set to self to mark as in-use
     return id;
-}
-
-void WorkingSet::free(WorkingSetID i) {
-    MemberHolder& holder = _data[i];
-    verify(i < _data.size());            // ID has been allocated.
-    verify(holder.nextFreeOrSelf == i);  // ID currently in use.
-
-    // Free resources and push this WSM to the head of the freelist.
-    holder.member.clear();
-    holder.nextFreeOrSelf = _freeList;
-    _freeList = i;
 }
 
 void WorkingSet::clear() {
@@ -140,10 +132,6 @@ void WorkingSetMember::clear() {
     _state = WorkingSetMember::INVALID;
 }
 
-WorkingSetMember::MemberState WorkingSetMember::getState() const {
-    return _state;
-}
-
 void WorkingSetMember::transitionToOwnedObj() {
     invariant(doc.value().isOwned());
     _state = OWNED_OBJ;
@@ -151,18 +139,6 @@ void WorkingSetMember::transitionToOwnedObj() {
 
 void WorkingSetMember::transitionToRecordIdAndObj() {
     _state = WorkingSetMember::RID_AND_OBJ;
-}
-
-bool WorkingSetMember::hasRecordId() const {
-    return _state == RID_AND_IDX || _state == RID_AND_OBJ;
-}
-
-bool WorkingSetMember::hasObj() const {
-    return _state == OWNED_OBJ || _state == RID_AND_OBJ;
-}
-
-bool WorkingSetMember::hasOwnedObj() const {
-    return _state == OWNED_OBJ || _state == RID_AND_OBJ;
 }
 
 void WorkingSetMember::makeObjOwnedIfNeeded() {
@@ -184,7 +160,7 @@ bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) con
 
     // Our state should be such that we have index data/are covered.
     if (auto outOpt = IndexKeyDatum::getFieldDotted(keyData, field)) {
-        *out = outOpt.get();
+        *out = outOpt.value();
         return true;
     } else {
         return false;
@@ -195,7 +171,7 @@ size_t WorkingSetMember::getMemUsage() const {
     size_t memUsage = 0;
 
     if (hasRecordId()) {
-        memUsage += sizeof(RecordId);
+        memUsage += recordId.memUsage();
     }
 
     if (hasObj()) {
@@ -245,10 +221,11 @@ void WorkingSetMember::serialize(BufBuilder& buf) const {
         recordId.withFormat([&](RecordId::Null n) { MONGO_UNREACHABLE_TASSERT(5472100); },
                             [&](int64_t rid) {
                                 buf.appendChar(static_cast<char>(RecordIdFormat::Long));
-                                buf.appendNum(recordId.asLong());
+                                buf.appendNum(recordId.getLong());
                             },
                             [&](const char* str, int size) {
                                 buf.appendChar(static_cast<char>(RecordIdFormat::String));
+                                buf.appendNum(size);
                                 buf.appendBuf(static_cast<const void*>(str), size);
                             });
     }
@@ -281,8 +258,7 @@ WorkingSetMember WorkingSetMember::deserialize(BufReader& buf) {
             auto indexId = buf.read<LittleEndian<unsigned int>>();
             auto snapshotIdRepr = buf.read<LittleEndian<uint64_t>>();
             auto snapshotId = snapshotIdRepr ? SnapshotId{snapshotIdRepr} : SnapshotId{};
-            wsm.keyData.push_back(IndexKeyDatum{
-                std::move(indexKeyPattern), std::move(indexKey), indexId, snapshotId});
+            wsm.keyData.push_back(IndexKeyDatum{indexKeyPattern, indexKey, indexId, snapshotId});
         }
     }
 
@@ -293,9 +269,9 @@ WorkingSetMember WorkingSetMember::deserialize(BufReader& buf) {
             wsm.recordId = RecordId{buf.read<LittleEndian<int64_t>>()};
         } else {
             invariant(recordIdFormat == RecordIdFormat::String);
-            invariant(static_cast<int>(RecordId::kSmallStrSize) == static_cast<int>(OID::kOIDSize));
-            const char* recordIdStr = static_cast<const char*>(buf.skip(RecordId::kSmallStrSize));
-            wsm.recordId = RecordId{recordIdStr, RecordId::kSmallStrSize};
+            auto size = buf.read<LittleEndian<int32_t>>();
+            const char* recordIdStr = static_cast<const char*>(buf.skip(size));
+            wsm.recordId = RecordId{recordIdStr, size};
         }
     }
 
@@ -310,15 +286,18 @@ SortableWorkingSetMember SortableWorkingSetMember::getOwned() const {
     return ret;
 }
 
-WorkingSetRegisteredIndexId WorkingSet::registerIndexAccessMethod(
-    const IndexAccessMethod* indexAccess) {
+void SortableWorkingSetMember::makeOwned() {
+    _holder->makeObjOwnedIfNeeded();
+}
+
+WorkingSetRegisteredIndexId WorkingSet::registerIndexIdent(const std::string& ident) {
     for (WorkingSetRegisteredIndexId i = 0; i < _registeredIndexes.size(); ++i) {
-        if (_registeredIndexes[i] == indexAccess) {
+        if (_registeredIndexes[i] == ident) {
             return i;
         }
     }
 
-    _registeredIndexes.push_back(indexAccess);
+    _registeredIndexes.push_back(ident);
     return _registeredIndexes.size() - 1;
 }
 

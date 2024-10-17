@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,10 @@
 
 #include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -77,10 +80,10 @@ LpiRecords getLogicalProcessorInformationRecords() {
                 lpiRecords.slpiRecords = std::unique_ptr<SlpiBuf[]>(
                     new SlpiBuf[((returnLength - 1) / sizeof(Slpi)) + 1]);
             } else {
-                DWORD gle = GetLastError();
+                auto ec = lastSystemError();
                 LOGV2_WARNING(23811,
                               "GetLogicalProcessorInformation failed",
-                              "error"_attr = errnoWithDescription(gle));
+                              "error"_attr = errorMessage(ec));
                 return LpiRecords{};
             }
         }
@@ -91,13 +94,27 @@ LpiRecords getLogicalProcessorInformationRecords() {
     return lpiRecords;
 }
 
-int getPhysicalCores() {
-    int processorCoreCount = 0;
+struct ParsedProcessorInfo {
+    int physicalCoreCount;
+    int numaNodeCount;
+    int processorPackageCount;
+};
+
+ParsedProcessorInfo getProcessorInfo() {
+    ParsedProcessorInfo ppi{0, 0, 0};
     for (auto&& lpi : getLogicalProcessorInformationRecords()) {
-        if (lpi.Relationship == RelationProcessorCore)
-            processorCoreCount++;
+        switch (lpi.Relationship) {
+            case RelationProcessorCore:
+                ppi.physicalCoreCount++;
+                break;
+            case RelationNumaNode:
+                ppi.numaNodeCount++;
+                break;
+            case RelationProcessorPackage:
+                ppi.processorPackageCount++;
+        }
     }
-    return processorCoreCount;
+    return ppi;
 }
 
 }  // namespace
@@ -147,8 +164,8 @@ int ProcessInfo::getVirtualMemorySize() {
     mse.dwLength = sizeof(mse);
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
-        DWORD gle = GetLastError();
-        LOGV2_ERROR(23812, "GlobalMemoryStatusEx failed", "error"_attr = errnoWithDescription(gle));
+        auto ec = lastSystemError();
+        LOGV2_ERROR(23812, "GlobalMemoryStatusEx failed", "error"_attr = errorMessage(ec));
         fassert(28621, status);
     }
 
@@ -161,8 +178,8 @@ int ProcessInfo::getResidentSize() {
     PROCESS_MEMORY_COUNTERS pmc;
     BOOL status = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
     if (!status) {
-        DWORD gle = GetLastError();
-        LOGV2_ERROR(23813, "GetProcessMemoryInfo failed", "error"_attr = errnoWithDescription(gle));
+        auto ec = lastSystemError();
+        LOGV2_ERROR(23813, "GetProcessMemoryInfo failed", "error"_attr = errorMessage(ec));
         fassert(28622, status);
     }
 
@@ -193,32 +210,32 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersionLS) {
     DWORD verSize = GetFileVersionInfoSizeA(filePath, NULL);
     if (verSize == 0) {
-        DWORD gle = GetLastError();
+        auto ec = lastSystemError();
         LOGV2_WARNING(23807,
                       "GetFileVersionInfoSizeA failed",
                       "path"_attr = filePath,
-                      "error"_attr = errnoWithDescription(gle));
+                      "error"_attr = errorMessage(ec));
         return false;
     }
 
     std::unique_ptr<char[]> verData(new char[verSize]);
     if (GetFileVersionInfoA(filePath, NULL, verSize, verData.get()) == 0) {
-        DWORD gle = GetLastError();
+        auto ec = lastSystemError();
         LOGV2_WARNING(23808,
                       "GetFileVersionInfoSizeA failed",
                       "path"_attr = filePath,
-                      "error"_attr = errnoWithDescription(gle));
+                      "error"_attr = errorMessage(ec));
         return false;
     }
 
     UINT size;
     VS_FIXEDFILEINFO* verInfo;
     if (VerQueryValueA(verData.get(), "\\", (LPVOID*)&verInfo, &size) == 0) {
-        DWORD gle = GetLastError();
+        auto ec = lastSystemError();
         LOGV2_WARNING(23809,
                       "VerQueryValueA failed",
                       "path"_attr = filePath,
-                      "error"_attr = errnoWithDescription(gle));
+                      "error"_attr = errorMessage(ec));
         return false;
     }
 
@@ -234,6 +251,43 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     return true;
 }
 
+std::string getCpuString() {
+    // get descriptive CPU string from registry
+    HKEY hKey;
+    LPCWSTR cpuKey = L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
+    LPCWSTR valueName = L"ProcessorNameString";
+    std::string cpuString;
+
+    // Open the CPU key in the Windows Registry
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, cpuKey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        ScopeGuard guard([hKey] { RegCloseKey(hKey); });
+        WCHAR cpuModel[128];
+        DWORD bufferSize = sizeof(cpuModel);
+
+        // Retrieve the value of ProcessorNameString
+        if (RegQueryValueEx(hKey,
+                            valueName,
+                            nullptr,
+                            nullptr,
+                            reinterpret_cast<LPBYTE>(cpuModel),
+                            &bufferSize) == ERROR_SUCCESS) {
+            cpuString = toUtf8String(cpuModel);
+        } else {
+            auto ec = lastSystemError();
+            LOGV2_WARNING(7663101,
+                          "Failed to retrieve CPU model name from the registry",
+                          "error"_attr = errorMessage(ec));
+        }
+
+        // Close the registry key
+    } else {
+        auto ec = lastSystemError();
+        LOGV2_WARNING(
+            7663102, "Failed to open CPU key in the registry", "error"_attr = errorMessage(ec));
+    }
+    return cpuString;
+}
+
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     BSONObjBuilder bExtra;
     std::stringstream verstr;
@@ -245,10 +299,16 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     GetNativeSystemInfo(&ntsysinfo);
     addrSize = (ntsysinfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? 64 : 32);
     numCores = ntsysinfo.dwNumberOfProcessors;
-    numPhysicalCores = getPhysicalCores();
+    auto ppi = getProcessorInfo();
+    numPhysicalCores = ppi.physicalCoreCount;
+    numCpuSockets = ppi.processorPackageCount;
+    hasNuma = ppi.numaNodeCount > 1;
+    numNumaNodes = ppi.numaNodeCount;
     pageSize = static_cast<unsigned long long>(ntsysinfo.dwPageSize);
     bExtra.append("pageSize", static_cast<long long>(pageSize));
-    bExtra.append("physicalCores", static_cast<int>(numPhysicalCores));
+
+    if (auto cpuString = getCpuString(); !cpuString.empty())
+        bExtra.append("cpuString", cpuString);
 
     // get memory info
     mse.dwLength = sizeof(mse);
@@ -352,21 +412,7 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 
     osType = "Windows";
     osVersion = verstr.str();
-    hasNuma = checkNumaEnabled();
     _extraStats = bExtra.obj();
-}
-
-
-bool ProcessInfo::checkNumaEnabled() {
-    DWORD numaNodeCount = 0;
-    for (auto&& lpi : getLogicalProcessorInformationRecords()) {
-        if (lpi.Relationship == RelationNumaNode)
-            // Non-NUMA systems report a single record of this type.
-            ++numaNodeCount;
-    }
-
-    // For non-NUMA machines, the count is 1
-    return numaNodeCount > 1;
 }
 
 }  // namespace mongo

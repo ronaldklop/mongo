@@ -2,15 +2,16 @@
 // Mark as assumes_read_preference_unchanged since reading from the non-replicated "system.profile"
 // collection results in a failure in the secondary reads suite.
 // @tags: [assumes_read_preference_unchanged]
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest and
-                                                   // assert[Valid|Invalid]ChangeStreamNss.
-
-const isMongos = FixtureHelpers.isMongos(db);
+import {
+    assertDropAndRecreateCollection,
+    assertDropCollection
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    assertInvalidChangeStreamNss,
+    assertValidChangeStreamNss,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
 
 // Drop and recreate the collections to be used in this set of tests.
 assertDropAndRecreateCollection(db, "t1");
@@ -19,7 +20,8 @@ assertDropAndRecreateCollection(db, "t2");
 // Test that $changeStream only accepts an object as its argument.
 function checkArgFails(arg) {
     assert.commandFailedWithCode(
-        db.runCommand({aggregate: "t1", pipeline: [{$changeStream: arg}], cursor: {}}), 50808);
+        db.runCommand({aggregate: "t1", pipeline: [{$changeStream: arg}], cursor: {}}),
+        [6188500, 50808]);
 }
 
 checkArgFails(1);
@@ -32,7 +34,7 @@ checkArgFails([1, 2, "invalid", {x: 1}]);
 assertInvalidChangeStreamNss("admin", "testColl");
 assertInvalidChangeStreamNss("config", "testColl");
 // Not allowed to access 'local' database through mongos.
-if (!isMongos) {
+if (!FixtureHelpers.isMongos(db)) {
     assertInvalidChangeStreamNss("local", "testColl");
 }
 
@@ -209,16 +211,6 @@ assert.commandWorked(db.t2.insert({_id: 101, renameCollection: "test.dne1", to: 
 cst.assertNoChange(dne1cursor);
 cst.assertNoChange(dne2cursor);
 
-if (!isMongos) {
-    jsTestLog("Ensuring attempt to read with legacy operations fails.");
-    db.getMongo().forceReadMode('legacy');
-    const legacyCursor = db.tailable2.aggregate([{$changeStream: {}}], {cursor: {batchSize: 0}});
-    assert.throws(function() {
-        legacyCursor.next();
-    }, [], "Legacy getMore expected to fail on changeStream cursor.");
-    db.getMongo().forceReadMode('commands');
-}
-
 jsTestLog("Testing resumability");
 assertDropAndRecreateCollection(db, "resume1");
 
@@ -229,7 +221,7 @@ let resumeCursor =
 // Insert a document and save the resulting change stream.
 assert.commandWorked(db.resume1.insert({_id: 1}));
 const firstInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(firstInsertChangeDoc.fullDocument, {_id: 1});
+assert.docEq({_id: 1}, firstInsertChangeDoc.fullDocument);
 
 jsTestLog("Testing resume after one document.");
 resumeCursor = cst.startWatchingChanges({
@@ -241,10 +233,10 @@ resumeCursor = cst.startWatchingChanges({
 jsTestLog("Inserting additional documents.");
 assert.commandWorked(db.resume1.insert({_id: 2}));
 const secondInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(secondInsertChangeDoc.fullDocument, {_id: 2});
+assert.docEq({_id: 2}, secondInsertChangeDoc.fullDocument);
 assert.commandWorked(db.resume1.insert({_id: 3}));
 const thirdInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(thirdInsertChangeDoc.fullDocument, {_id: 3});
+assert.docEq({_id: 3}, thirdInsertChangeDoc.fullDocument);
 
 jsTestLog("Testing resume after first document of three.");
 resumeCursor = cst.startWatchingChanges({
@@ -263,5 +255,25 @@ resumeCursor = cst.startWatchingChanges({
 });
 assert.docEq(cst.getOneChange(resumeCursor), thirdInsertChangeDoc);
 
+jsTestLog("Testing filtered updates");
+// With unmatched predicates
+cursor = cst.startWatchingChanges(
+    {pipeline: [{$changeStream: {}}, {$match: {"fullDocument.a": {$gt: 2}}}], collection: db.t1});
+let resumeToken = cursor.postBatchResumeToken._data;
+assert.soon(() => {
+    assert.commandWorked(db.t1.insert({a: 2}));
+    cursor = cst.assertNoChange(cursor);
+    return resumeToken != cursor.postBatchResumeToken._data;
+});
+
+// With trivially false predicates
+cursor = cst.startWatchingChanges(
+    {pipeline: [{$changeStream: {}}, {$match: {$alwaysFalse: 1}}], collection: db.t1});
+resumeToken = cursor.postBatchResumeToken._data;
+assert.soon(() => {
+    assert.commandWorked(db.t1.insert({a: 2}));
+    cursor = cst.assertNoChange(cursor);
+    return resumeToken != cursor.postBatchResumeToken._data;
+});
+
 cst.cleanUp();
-}());

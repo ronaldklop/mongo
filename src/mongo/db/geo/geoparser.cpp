@@ -27,21 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kGeo
 
 #include "mongo/db/geo/geoparser.h"
 
+#include <cstddef>
+#include <s1angle.h>
+#include <s1interval.h>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2cellid.h>
+#include <s2latlng.h>
+#include <s2loop.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <util/math/vector3-inl.h>
+#include <util/math/vector3.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <cmath>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/geo/big_polygon.h"
 #include "mongo/db/geo/shapes.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
-#include "third_party/s2/s2polygonbuilder.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kGeo
+
 
 #define BAD_VALUE(error) Status(ErrorCodes::BadValue, str::stream() << error)
 
@@ -49,43 +70,41 @@ namespace mongo {
 
 namespace dps = ::mongo::dotted_path_support;
 
-// This field must be present, and...
-static const string GEOJSON_TYPE = "type";
-// Have one of these values:
-static const string GEOJSON_TYPE_POINT = "Point";
-static const string GEOJSON_TYPE_LINESTRING = "LineString";
-static const string GEOJSON_TYPE_POLYGON = "Polygon";
-static const string GEOJSON_TYPE_MULTI_POINT = "MultiPoint";
-static const string GEOJSON_TYPE_MULTI_LINESTRING = "MultiLineString";
-static const string GEOJSON_TYPE_MULTI_POLYGON = "MultiPolygon";
-static const string GEOJSON_TYPE_GEOMETRY_COLLECTION = "GeometryCollection";
-// This field must also be present.  The value depends on the type.
-static const string GEOJSON_COORDINATES = "coordinates";
-static const string GEOJSON_GEOMETRIES = "geometries";
-
-// Coordinate System Reference
-// see http://portal.opengeospatial.org/files/?artifact_id=24045
-// and http://spatialreference.org/ref/epsg/4326/
-// and http://www.geojson.org/geojson-spec.html#named-crs
-static const string CRS_CRS84 = "urn:ogc:def:crs:OGC:1.3:CRS84";
-static const string CRS_EPSG_4326 = "EPSG:4326";
-static const string CRS_STRICT_WINDING = "urn:x-mongodb:crs:strictwinding:EPSG:4326";
-
-static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
-    if (!elem.isABSONObj())
-        return BAD_VALUE("Point must be an array or object");
-    BSONObjIterator it(elem.Obj());
-    BSONElement x = it.next();
-    if (!x.isNumber()) {
-        return BAD_VALUE("Point must only contain numeric elements");
+// Convenience function to extract flat point coordinates from enclosing element.
+// Note, coordinate elements must not outlive the parent element.
+Status GeoParser::parseFlatPointCoordinates(const BSONElement& elem,
+                                            BSONElement& x,
+                                            BSONElement& y,
+                                            bool allowAddlFields /* = false */) {
+    if (!elem.isABSONObj()) {
+        return BAD_VALUE("Point must be an array or object, instead got type "
+                         << typeName(elem.type()));
     }
-    BSONElement y = it.next();
+
+    BSONObjIterator it(elem.Obj());
+    x = it.next();
+    if (!x.isNumber()) {
+        return BAD_VALUE("Point must only contain numeric elements, instead got type "
+                         << typeName(x.type()));
+    }
+    y = it.next();
     if (!y.isNumber()) {
-        return BAD_VALUE("Point must only contain numeric elements");
+        return BAD_VALUE("Point must only contain numeric elements, instead got type "
+                         << typeName(y.type()));
     }
     if (!allowAddlFields && it.more()) {
         return BAD_VALUE("Point must only contain two numeric elements");
     }
+    return Status::OK();
+}
+
+static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
+    BSONElement x, y;
+    auto status = GeoParser::parseFlatPointCoordinates(elem, x, y, allowAddlFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
     out->x = x.number();
     out->y = y.number();
     // Point coordinates must be finite numbers, neither NaN or infinite.
@@ -106,7 +125,7 @@ static Status coordToPoint(double lng, double lat, S2Point* out) {
     // We don't rely on drem to clean up non-sane points.  We just don't let them become
     // spherical.
     if (!isValidLngLat(lng, lat))
-        return BAD_VALUE("longitude/latitude is out of bounds, lng: " << lng << " lat: " << lat);
+        return BAD_VALUE("Longitude/latitude is out of bounds, lng: " << lng << " lat: " << lat);
     // Note that it's (lat, lng) for S2 but (lng, lat) for MongoDB.
     S2LatLng ll = S2LatLng::FromDegrees(lat, lng).Normalized();
     // This shouldn't happen since we should only have valid lng/lats.
@@ -121,7 +140,8 @@ static Status coordToPoint(double lng, double lat, S2Point* out) {
 
 static Status parseGeoJSONCoordinate(const BSONElement& elem, S2Point* out) {
     if (Array != elem.type()) {
-        return BAD_VALUE("GeoJSON coordinates must be an array");
+        return BAD_VALUE("GeoJSON coordinates must be an array, instead got type "
+                         << typeName(elem.type()));
     }
     Point p;
     // GeoJSON allows extra elements, e.g. altitude.
@@ -136,10 +156,11 @@ static Status parseGeoJSONCoordinate(const BSONElement& elem, S2Point* out) {
 // "coordinates": [ [100.0, 0.0], [101.0, 1.0] ]
 static Status parseArrayOfCoordinates(const BSONElement& elem, vector<S2Point>* out) {
     if (Array != elem.type()) {
-        return BAD_VALUE("GeoJSON coordinates must be an array of coordinates");
+        return BAD_VALUE("GeoJSON coordinates must be an array of coordinates, instead got type "
+                         << typeName(elem.type()));
     }
     BSONObjIterator it(elem.Obj());
-    // Iterate all coordinates in array
+    // Iterate all coordinates in array.
     while (it.more()) {
         S2Point p;
         Status status = parseGeoJSONCoordinate(it.next(), &p);
@@ -151,11 +172,20 @@ static Status parseArrayOfCoordinates(const BSONElement& elem, vector<S2Point>* 
 }
 
 static void eraseDuplicatePoints(vector<S2Point>* vertices) {
-    for (size_t i = 1; i < vertices->size(); ++i) {
-        if ((*vertices)[i - 1] == (*vertices)[i]) {
-            vertices->erase(vertices->begin() + i);
-            // We could have > 2 adjacent identical vertices, and must examine i again.
-            --i;
+    // Duplicates can't exist in a vector of 0 or 1 elements, and we want to be careful about
+    // possible underflow of size - 1 in the next block.
+    if (vertices->size() < 2) {
+        return;
+    }
+
+    size_t i = 0;
+    while (i < vertices->size() - 1) {
+        if ((*vertices)[i] == (*vertices)[i + 1]) {
+            vertices->erase(vertices->begin() + i + 1);
+            // We could have > 2 adjacent identical vertices, and must examine i again, so we don't
+            // increment the iterator.
+        } else {
+            ++i;
         }
     }
 }
@@ -166,7 +196,8 @@ static Status isLoopClosed(const vector<S2Point>& loop, const BSONElement loopEl
     }
 
     if (loop[0] != loop[loop.size() - 1]) {
-        return BAD_VALUE("Loop is not closed: " << loopElt.toString(false));
+        return BAD_VALUE("Loop is not closed, first vertex does not equal last vertex: "
+                         << loopElt.toString(false));
     }
 
     return Status::OK();
@@ -176,7 +207,8 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
                                              bool skipValidation,
                                              S2Polygon* out) {
     if (Array != elem.type()) {
-        return BAD_VALUE("Polygon coordinates must be an array");
+        return BAD_VALUE("Polygon coordinates must be an array, instead got type "
+                         << typeName(elem.type()));
     }
 
     std::vector<std::unique_ptr<S2Loop>> loops;
@@ -204,14 +236,16 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
 
         // At least 3 vertices.
         if (points.size() < 3) {
-            return BAD_VALUE(
-                "Loop must have at least 3 different vertices: " << coordinateElt.toString(false));
+            return BAD_VALUE("Loop must have at least 3 different vertices, "
+                             << points.size() << " unique vertices were provided: "
+                             << coordinateElt.toString(false));
         }
 
         loops.push_back(std::make_unique<S2Loop>(points));
         S2Loop* loop = loops.back().get();
 
-        // Check whether this loop is valid.
+        // Check whether this loop is valid if vaildation hasn't been already done on 2dSphere index
+        // insertion which is controlled by the 'skipValidation' flag.
         // 1. At least 3 vertices.
         // 2. All vertices must be unit length. Guaranteed by parsePoints().
         // 3. Loops are not allowed to have any duplicate vertices.
@@ -224,7 +258,7 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
 
         // Check the first loop must be the exterior ring and any others must be
         // interior rings or holes.
-        if (loops.size() > 1 && !loops[0]->Contains(loop)) {
+        if (!skipValidation && loops.size() > 1 && !loops[0]->Contains(loop)) {
             return BAD_VALUE(
                 "Secondary loops not contained by first exterior loop - "
                 "secondary loops must be holes: "
@@ -285,15 +319,17 @@ static Status parseGeoJSONPolygonCoordinates(const BSONElement& elem,
 }
 
 static Status parseBigSimplePolygonCoordinates(const BSONElement& elem, BigSimplePolygon* out) {
-    if (Array != elem.type())
-        return BAD_VALUE("Coordinates of polygon must be an array");
+    if (Array != elem.type()) {
+        return BAD_VALUE("Coordinates of polygon must be an array, instead got type "
+                         << typeName(elem.type()));
+    }
 
 
     const vector<BSONElement>& coordinates = elem.Array();
     // Only one loop is allowed in a BigSimplePolygon
     if (coordinates.size() != 1) {
-        return BAD_VALUE(
-            "Only one simple loop is allowed in a big polygon: " << elem.toString(false));
+        return BAD_VALUE("Only one simple loop is allowed in a big polygon, instead provided "
+                         << coordinates.size() << " loops: " << elem.toString(false));
     }
 
     vector<S2Point> exteriorVertices;
@@ -316,7 +352,9 @@ static Status parseBigSimplePolygonCoordinates(const BSONElement& elem, BigSimpl
 
     // At least 3 vertices.
     if (exteriorVertices.size() < 3) {
-        return BAD_VALUE("Loop must have at least 3 different vertices: " << elem.toString(false));
+        return BAD_VALUE("Loop must have at least 3 different vertices, "
+                         << exteriorVertices.size()
+                         << " unique vertices were provided: " << elem.toString(false));
     }
 
     std::unique_ptr<S2Loop> loop(new S2Loop(exteriorVertices));
@@ -339,33 +377,40 @@ static Status parseBigSimplePolygonCoordinates(const BSONElement& elem, BigSimpl
 static Status parseGeoJSONCRS(const BSONObj& obj, CRS* crs, bool allowStrictSphere = false) {
     *crs = SPHERE;
 
-    BSONElement crsElt = obj["crs"];
+    BSONElement crsElt = obj[kCrsField];
     // "crs" field doesn't exist, return the default SPHERE
     if (crsElt.eoo()) {
         return Status::OK();
     }
 
-    if (!crsElt.isABSONObj())
-        return BAD_VALUE("GeoJSON CRS must be an object");
+    if (!crsElt.isABSONObj()) {
+        return BAD_VALUE("GeoJSON CRS must be an object, instead got type "
+                         << typeName(crsElt.type()));
+    }
     BSONObj crsObj = crsElt.embeddedObject();
 
     // "type": "name"
-    if (String != crsObj["type"].type() || "name" != crsObj["type"].String())
+    if (String != crsObj[kCrsTypeField].type() || kCrsNameField != crsObj[kCrsTypeField].String())
         return BAD_VALUE("GeoJSON CRS must have field \"type\": \"name\"");
 
     // "properties"
-    BSONElement propertiesElt = crsObj["properties"];
-    if (!propertiesElt.isABSONObj())
-        return BAD_VALUE("CRS must have field \"properties\" which is an object");
+    BSONElement propertiesElt = crsObj[kCrsPropertiesField];
+    if (!propertiesElt.isABSONObj()) {
+        return BAD_VALUE("CRS must have field \"properties\" which is an object, instead got type "
+                         << typeName(propertiesElt.type()));
+    }
     BSONObj propertiesObj = propertiesElt.embeddedObject();
-    if (String != propertiesObj["name"].type())
-        return BAD_VALUE("In CRS, \"properties.name\" must be a string");
-    const string& name = propertiesObj["name"].String();
+    if (String != propertiesObj[kPropertiesNameField].type()) {
+        return BAD_VALUE("In CRS, \"properties.name\" must be a string, instead got type "
+                         << typeName(propertiesObj[kPropertiesNameField].type()));
+    }
+
+    const string& name = propertiesObj[kPropertiesNameField].String();
     if (CRS_CRS84 == name || CRS_EPSG_4326 == name) {
         *crs = SPHERE;
     } else if (CRS_STRICT_WINDING == name) {
         if (!allowStrictSphere) {
-            return BAD_VALUE("Strict winding order is only supported by polygon");
+            return BAD_VALUE("Strict winding order CRS is only supported by polygon");
         }
         *crs = STRICT_SPHERE;
     } else {
@@ -388,8 +433,8 @@ static Status parseGeoJSONLineCoordinates(const BSONElement& elem,
     eraseDuplicatePoints(&vertices);
     if (!skipValidation) {
         if (vertices.size() < 2)
-            return BAD_VALUE(
-                "GeoJSON LineString must have at least 2 vertices: " << elem.toString(false));
+            return BAD_VALUE("GeoJSON LineString must have at least 2 vertices, instead got "
+                             << vertices.size() << " vertices: " << elem.toString(false));
 
         string err;
         if (!S2Polyline::IsValid(vertices, &err))
@@ -403,9 +448,10 @@ static Status parseGeoJSONLineCoordinates(const BSONElement& elem,
 // Parse legacy point or GeoJSON point, used by geo near.
 // Only stored legacy points allow additional fields.
 Status parsePoint(const BSONElement& elem, PointWithCRS* out, bool allowAddlFields) {
-    if (!elem.isABSONObj())
-        return BAD_VALUE("Point must be an array or object");
-
+    if (!elem.isABSONObj()) {
+        return BAD_VALUE("Point must be an array or object, instead got type "
+                         << typeName(elem.type()));
+    }
     BSONObj obj = elem.Obj();
     // location: [1, 2] or location: {x: 1, y:2}
     if (Array == elem.type() || obj.firstElement().isNumber()) {
@@ -458,7 +504,8 @@ Status GeoParser::parseLegacyPolygon(const BSONObj& obj, PolygonWithCRS* out) {
         points.push_back(p);
     }
     if (points.size() < 3)
-        return BAD_VALUE("Polygon must have at least 3 points");
+        return BAD_VALUE("Polygon must have at least 3 points, instead got " << points.size()
+                                                                             << " vertices");
     out->oldPolygon.init(points);
     out->crs = FLAT;
     return Status::OK();
@@ -466,6 +513,15 @@ Status GeoParser::parseLegacyPolygon(const BSONObj& obj, PolygonWithCRS* out) {
 
 // { "type": "Point", "coordinates": [100.0, 0.0] }
 Status GeoParser::parseGeoJSONPoint(const BSONObj& obj, PointWithCRS* out) {
+    if (obj.hasField(GEOJSON_TYPE)) {
+        // GeoJSON Point must explicitly specify the type as "Point".
+        auto typeVal = GeoParser::parseGeoJSONType(obj);
+        if (GeoParser::GEOJSON_POINT != typeVal) {
+            return BAD_VALUE("Expected geojson geometry with type Point, but got type "
+                             << GeoParser::geoJSONTypeEnumToString(typeVal));
+        }
+    }
+
     Status status = Status::OK();
     // "crs"
     status = parseGeoJSONCRS(obj, &out->crs);
@@ -480,7 +536,7 @@ Status GeoParser::parseGeoJSONPoint(const BSONObj& obj, PointWithCRS* out) {
     // Projection
     out->crs = FLAT;
     if (!ShapeProjection::supportsProject(*out, SPHERE))
-        return BAD_VALUE("longitude/latitude is out of bounds, lng: " << out->oldPoint.x << " lat: "
+        return BAD_VALUE("Longitude/latitude is out of bounds, lng: " << out->oldPoint.x << " lat: "
                                                                       << out->oldPoint.y);
     ShapeProjection::projectInto(out, SPHERE);
     return Status::OK();
@@ -553,18 +609,21 @@ Status GeoParser::parseMultiLine(const BSONObj& obj, bool skipValidation, MultiL
         return status;
 
     BSONElement coordElt = dps::extractElementAtPath(obj, GEOJSON_COORDINATES);
-    if (Array != coordElt.type())
-        return BAD_VALUE("MultiLineString coordinates must be an array");
+    if (Array != coordElt.type()) {
+        return BAD_VALUE("MultiLineString coordinates must be an array, instead got type "
+                         << typeName(coordElt.type()));
+    }
+
 
     out->lines.clear();
-    vector<S2Polyline*>& lines = out->lines.mutableVector();
+    auto& lines = out->lines;
 
     BSONObjIterator it(coordElt.Obj());
 
     // Iterate array
     while (it.more()) {
-        lines.push_back(new S2Polyline());
-        status = parseGeoJSONLineCoordinates(it.next(), skipValidation, lines.back());
+        lines.push_back(std::make_unique<S2Polyline>());
+        status = parseGeoJSONLineCoordinates(it.next(), skipValidation, lines.back().get());
         if (!status.isOK())
             return status;
     }
@@ -583,17 +642,18 @@ Status GeoParser::parseMultiPolygon(const BSONObj& obj,
         return status;
 
     BSONElement coordElt = dps::extractElementAtPath(obj, GEOJSON_COORDINATES);
-    if (Array != coordElt.type())
-        return BAD_VALUE("MultiPolygon coordinates must be an array");
-
+    if (Array != coordElt.type()) {
+        return BAD_VALUE("MultiPolygon coordinates must be an array, instead got type "
+                         << typeName(coordElt.type()));
+    }
     out->polygons.clear();
-    vector<S2Polygon*>& polygons = out->polygons.mutableVector();
+    auto& polygons = out->polygons;
 
     BSONObjIterator it(coordElt.Obj());
     // Iterate array
     while (it.more()) {
-        polygons.push_back(new S2Polygon());
-        status = parseGeoJSONPolygonCoordinates(it.next(), skipValidation, polygons.back());
+        polygons.push_back(std::make_unique<S2Polygon>());
+        status = parseGeoJSONPolygonCoordinates(it.next(), skipValidation, polygons.back().get());
         if (!status.isOK())
             return status;
     }
@@ -616,11 +676,11 @@ Status GeoParser::parseLegacyCenter(const BSONObj& obj, CapWithCRS* out) {
     BSONElement radius = objIt.next();
     // radius >= 0 and is not NaN
     if (!radius.isNumber() || !(radius.number() >= 0))
-        return BAD_VALUE("radius must be a non-negative number");
+        return BAD_VALUE("Radius must be a non-negative number: " << radius.toString(false));
 
     // No more
     if (objIt.more())
-        return BAD_VALUE("Only 2 fields allowed for circular region");
+        return BAD_VALUE("Only 2 fields allowed for circular region, but more were provided");
 
     out->circle.radius = radius.number();
     out->crs = FLAT;
@@ -646,13 +706,15 @@ Status GeoParser::parseCenterSphere(const BSONObj& obj, CapWithCRS* out) {
     // Radius
     BSONElement radiusElt = objIt.next();
     // radius >= 0 and is not NaN
-    if (!radiusElt.isNumber() || !(radiusElt.number() >= 0))
-        return BAD_VALUE("radius must be a non-negative number");
+    if (!radiusElt.isNumber() || !(radiusElt.number() >= 0)) {
+        return BAD_VALUE("Radius must be a non-negative number: " << radiusElt.toString(false));
+    }
+
     double radius = radiusElt.number();
 
     // No more elements
     if (objIt.more())
-        return BAD_VALUE("Only 2 fields allowed for circular region");
+        return BAD_VALUE("Only 2 fields allowed for circular region, but more were provided");
 
     out->cap = S2Cap::FromAxisAngle(centerPoint, S1Angle::Radians(radius));
     out->circle.radius = radius;
@@ -675,16 +737,20 @@ Status GeoParser::parseGeometryCollection(const BSONObj& obj,
                                           bool skipValidation,
                                           GeometryCollection* out) {
     BSONElement coordElt = dps::extractElementAtPath(obj, GEOJSON_GEOMETRIES);
-    if (Array != coordElt.type())
-        return BAD_VALUE("GeometryCollection geometries must be an array");
-
+    if (Array != coordElt.type()) {
+        return BAD_VALUE("GeometryCollection geometries must be an array, instead got type "
+                         << typeName(coordElt.type()));
+    }
     const vector<BSONElement>& geometries = coordElt.Array();
     if (0 == geometries.size())
         return BAD_VALUE("GeometryCollection geometries must have at least 1 element");
 
     for (size_t i = 0; i < geometries.size(); ++i) {
         if (Object != geometries[i].type())
-            return BAD_VALUE("Element " << i << " of \"geometries\" is not an object");
+            return BAD_VALUE("Element " << i
+                                        << " of \"geometries\" must be an object, instead got type "
+                                        << typeName(geometries[i].type()) << ": "
+                                        << geometries[i].toString(false));
 
         const BSONObj& geoObj = geometries[i].Obj();
         GeoJSONType type = parseGeoJSONType(geoObj);
@@ -701,21 +767,20 @@ Status GeoParser::parseGeometryCollection(const BSONObj& obj,
             out->points.resize(out->points.size() + 1);
             status = parseGeoJSONPoint(geoObj, &out->points.back());
         } else if (GEOJSON_LINESTRING == type) {
-            out->lines.mutableVector().push_back(new LineWithCRS());
-            status = parseGeoJSONLine(geoObj, skipValidation, out->lines.vector().back());
+            out->lines.push_back(std::make_unique<LineWithCRS>());
+            status = parseGeoJSONLine(geoObj, skipValidation, out->lines.back().get());
         } else if (GEOJSON_POLYGON == type) {
-            out->polygons.mutableVector().push_back(new PolygonWithCRS());
-            status = parseGeoJSONPolygon(geoObj, skipValidation, out->polygons.vector().back());
+            out->polygons.push_back(std::make_unique<PolygonWithCRS>());
+            status = parseGeoJSONPolygon(geoObj, skipValidation, out->polygons.back().get());
         } else if (GEOJSON_MULTI_POINT == type) {
-            out->multiPoints.mutableVector().push_back(new MultiPointWithCRS());
-            status = parseMultiPoint(geoObj, out->multiPoints.mutableVector().back());
+            out->multiPoints.push_back(std::make_unique<MultiPointWithCRS>());
+            status = parseMultiPoint(geoObj, out->multiPoints.back().get());
         } else if (GEOJSON_MULTI_LINESTRING == type) {
-            out->multiLines.mutableVector().push_back(new MultiLineWithCRS());
-            status = parseMultiLine(geoObj, skipValidation, out->multiLines.mutableVector().back());
+            out->multiLines.push_back(std::make_unique<MultiLineWithCRS>());
+            status = parseMultiLine(geoObj, skipValidation, out->multiLines.back().get());
         } else if (GEOJSON_MULTI_POLYGON == type) {
-            out->multiPolygons.mutableVector().push_back(new MultiPolygonWithCRS());
-            status = parseMultiPolygon(
-                geoObj, skipValidation, out->multiPolygons.mutableVector().back());
+            out->multiPolygons.push_back(std::make_unique<MultiPolygonWithCRS>());
+            status = parseMultiPolygon(geoObj, skipValidation, out->multiPolygons.back().get());
         } else {
             // Should not reach here.
             MONGO_UNREACHABLE;
@@ -771,15 +836,15 @@ GeoParser::GeoSpecifier GeoParser::parseGeoSpecifier(const BSONElement& type) {
         return GeoParser::UNKNOWN;
     }
     StringData fieldName = type.fieldNameStringData();
-    if (fieldName == "$box") {
+    if (fieldName == kBoxField) {
         return GeoParser::BOX;
-    } else if (fieldName == "$center") {
+    } else if (fieldName == kCenterField) {
         return GeoParser::CENTER;
-    } else if (fieldName == "$polygon") {
+    } else if (fieldName == kPolygonField) {
         return GeoParser::POLYGON;
-    } else if (fieldName == "$centerSphere") {
+    } else if (fieldName == kCenterSphereField) {
         return GeoParser::CENTER_SPHERE;
-    } else if (fieldName == "$geometry") {
+    } else if (fieldName == kGeometryField) {
         return GeoParser::GEOMETRY;
     }
     return GeoParser::UNKNOWN;
@@ -790,23 +855,61 @@ GeoParser::GeoJSONType GeoParser::parseGeoJSONType(const BSONObj& obj) {
     if (String != type.type()) {
         return GeoParser::GEOJSON_UNKNOWN;
     }
-    const string& typeString = type.String();
-    if (GEOJSON_TYPE_POINT == typeString) {
+    return geoJSONTypeStringToEnum(type.checkAndGetStringData());
+}
+
+// TODO: SERVER-86141 audit if this method is needed else remove.
+void GeoParser::assertValidGeoJSONType(const BSONObj& obj) {
+    BSONElement type = dps::extractElementAtPath(obj, GEOJSON_TYPE);
+    uassert(8459801,
+            str::stream() << "Expected valid geojson of type string, got non-string type of value "
+                          << type,
+            String == type.type());
+    auto str = type.checkAndGetStringData();
+    uassert(8459800,
+            str::stream() << "Expected valid geojson type, got " << str,
+            geoJSONTypeStringToEnum(str) != GeoParser::GEOJSON_UNKNOWN);
+}
+
+GeoParser::GeoJSONType GeoParser::geoJSONTypeStringToEnum(StringData type) {
+    if (GEOJSON_TYPE_POINT == type) {
         return GeoParser::GEOJSON_POINT;
-    } else if (GEOJSON_TYPE_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_LINESTRING == type) {
         return GeoParser::GEOJSON_LINESTRING;
-    } else if (GEOJSON_TYPE_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_POLYGON == type) {
         return GeoParser::GEOJSON_POLYGON;
-    } else if (GEOJSON_TYPE_MULTI_POINT == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POINT == type) {
         return GeoParser::GEOJSON_MULTI_POINT;
-    } else if (GEOJSON_TYPE_MULTI_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_LINESTRING == type) {
         return GeoParser::GEOJSON_MULTI_LINESTRING;
-    } else if (GEOJSON_TYPE_MULTI_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POLYGON == type) {
         return GeoParser::GEOJSON_MULTI_POLYGON;
-    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == typeString) {
+    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == type) {
         return GeoParser::GEOJSON_GEOMETRY_COLLECTION;
     }
     return GeoParser::GEOJSON_UNKNOWN;
+}
+
+StringData GeoParser::geoJSONTypeEnumToString(GeoParser::GeoJSONType type) {
+    switch (type) {
+        case GEOJSON_UNKNOWN:
+            return "unknown"_sd;
+        case GEOJSON_POINT:
+            return GEOJSON_TYPE_POINT;
+        case GEOJSON_LINESTRING:
+            return GEOJSON_TYPE_LINESTRING;
+        case GEOJSON_POLYGON:
+            return GEOJSON_TYPE_POLYGON;
+        case GEOJSON_MULTI_POINT:
+            return GEOJSON_TYPE_MULTI_POINT;
+        case GEOJSON_MULTI_LINESTRING:
+            return GEOJSON_TYPE_MULTI_LINESTRING;
+        case GEOJSON_MULTI_POLYGON:
+            return GEOJSON_TYPE_MULTI_POLYGON;
+        case GEOJSON_GEOMETRY_COLLECTION:
+            return GEOJSON_TYPE_GEOMETRY_COLLECTION;
+    }
+    MONGO_UNREACHABLE_TASSERT(8459802);
 }
 
 }  // namespace mongo

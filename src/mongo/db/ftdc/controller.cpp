@@ -27,30 +27,39 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/ftdc/controller.h"
-
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 #include <memory>
+#include <mutex>
+#include <tuple>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/ftdc/collector.h"
+#include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/exit.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
 Status FTDCController::setEnabled(bool enabled) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     if (_path.empty()) {
         return Status(ErrorCodes::FTDCPathNotSet,
@@ -64,38 +73,44 @@ Status FTDCController::setEnabled(bool enabled) {
     return Status::OK();
 }
 
+void FTDCController::setMetadataCaptureFrequency(std::uint64_t freq) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _configTemp.metadataCaptureFrequency = freq;
+    _condvar.notify_one();
+}
+
 void FTDCController::setPeriod(Milliseconds millis) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.period = millis;
     _condvar.notify_one();
 }
 
 void FTDCController::setMaxDirectorySizeBytes(std::uint64_t size) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.maxDirectorySizeBytes = size;
     _condvar.notify_one();
 }
 
 void FTDCController::setMaxFileSizeBytes(std::uint64_t size) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.maxFileSizeBytes = size;
     _condvar.notify_one();
 }
 
 void FTDCController::setMaxSamplesPerArchiveMetricChunk(size_t size) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.maxSamplesPerArchiveMetricChunk = size;
     _condvar.notify_one();
 }
 
 void FTDCController::setMaxSamplesPerInterimMetricChunk(size_t size) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _configTemp.maxSamplesPerInterimMetricChunk = size;
     _condvar.notify_one();
 }
 
 Status FTDCController::setDirectory(const boost::filesystem::path& path) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     if (!_path.empty()) {
         return Status(ErrorCodes::FTDCPathAlreadySet,
@@ -111,41 +126,51 @@ Status FTDCController::setDirectory(const boost::filesystem::path& path) {
 }
 
 
-void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<Latch> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicMetadataCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                                  ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _periodicCollectors.add(std::move(collector));
-    }
+    _periodicMetadataCollectors.add(std::move(collector), role);
 }
 
-void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<Latch> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _rotateCollectors.add(std::move(collector));
-    }
+    _periodicCollectors.add(std::move(collector), role);
+}
+
+void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(_state == State::kNotStarted);
+
+    _rotateCollectors.add(std::move(collector), role);
 }
 
 BSONObj FTDCController::getMostRecentPeriodicDocument() {
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         return _mostRecentPeriodicDocument.getOwned();
     }
 }
 
-void FTDCController::start() {
+void FTDCController::triggerRotate() {
+    _shouldRotateBeforeNextSample.store(true);
+}
+
+void FTDCController::start(Service* service) {
     LOGV2(20625,
           "Initializing full-time diagnostic data capture",
           "dataDirectory"_attr = _path.generic_string());
 
     // Start the thread
-    _thread = stdx::thread([this] { doLoop(); });
+    _thread = stdx::thread([this, service] { doLoop(service); });
 
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
 
         invariant(_state == State::kNotStarted);
         _state = State::kStarted;
@@ -156,7 +181,7 @@ void FTDCController::stop() {
     LOGV2(20626, "Shutting down full-time diagnostic data capture");
 
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
 
         bool started = (_state == State::kStarted);
 
@@ -188,19 +213,31 @@ void FTDCController::stop() {
     }
 }
 
-void FTDCController::doLoop() noexcept {
-    // Note: All exceptions thrown in this loop are considered process fatal. The default terminate
-    // is used to provide a good stack trace of the issue.
-    Client::initThread(kFTDCThreadName);
+void FTDCController::doLoop(Service* service) try {
+    // Note: All exceptions thrown in this loop are considered process fatal.
+    Client::initThread(kFTDCThreadName, service);
     Client* client = &cc();
+
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client);
+        client->setSystemOperationUnkillableByStepdown(lk);
+    }
 
     // Update config
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _config = _configTemp;
     }
 
+    // Periodic metadata is collected when metadataCaptureFrequencyCountdown hits 0 (which will
+    // always include the first iteration). Then, the value of metadataCaptureFrequencyCountdown is
+    // reset to _config.metadataCaptureFrequency and countdown starts again.
+    std::uint64_t metadataCaptureFrequencyCountdown = 1;
+
     while (true) {
+        _env->onStartLoop();
+
         // Compute the next interval to run regardless of how we were woken up
         // Skipping an interval due to a race condition with a config signal is harmless.
         auto now = getGlobalServiceContext()->getPreciseClockSource()->now();
@@ -210,7 +247,7 @@ void FTDCController::doLoop() noexcept {
 
         // Wait for the next run or signal to shutdown
         {
-            stdx::unique_lock<Latch> lock(_mutex);
+            stdx::unique_lock<stdx::mutex> lock(_mutex);
             MONGO_IDLE_THREAD_BLOCK;
 
             // We ignore spurious wakeups by just doing an iteration of the loop
@@ -237,29 +274,49 @@ void FTDCController::doLoop() noexcept {
 
         // TODO: consider only running this thread if we are enabled
         // for now, we just keep an idle thread as it is simpler
-        if (_config.enabled) {
-            // Delay initialization of FTDCFileManager until we are sure the user has enabled
-            // FTDC
-            if (!_mgr) {
-                auto swMgr = FTDCFileManager::create(&_config, _path, &_rotateCollectors, client);
+        if (!_config.enabled) {
+            continue;
+        }
 
-                _mgr = uassertStatusOK(std::move(swMgr));
-            }
+        // Delay initialization of FTDCFileManager until we are sure the user has enabled
+        // FTDC
+        if (!_mgr) {
+            auto swMgr = FTDCFileManager::create(
+                &_config, _path, &_rotateCollectors, client, _multiServiceSchema);
 
-            auto collectSample = _periodicCollectors.collect(client);
+            _mgr = uassertStatusOK(std::move(swMgr));
+        }
 
-            Status s = _mgr->writeSampleAndRotateIfNeeded(
+        if (bool req = true; _shouldRotateBeforeNextSample.compareAndSwap(&req, false)) {
+            iassert(_mgr->rotate(client));
+        }
+
+        auto collectSample = _periodicCollectors.collect(client, _multiServiceSchema);
+
+        Status s = _mgr->writeSampleAndRotateIfNeeded(
+            client, std::get<0>(collectSample), std::get<1>(collectSample));
+
+        uassertStatusOK(s);
+
+        // Store a reference to the most recent document from the periodic collectors
+        {
+            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            _mostRecentPeriodicDocument = std::get<0>(collectSample);
+        }
+
+        if (--metadataCaptureFrequencyCountdown == 0) {
+            metadataCaptureFrequencyCountdown = _config.metadataCaptureFrequency;
+            auto collectSample = _periodicMetadataCollectors.collect(client, _multiServiceSchema);
+            Status s = _mgr->writePeriodicMetadataSampleAndRotateIfNeeded(
                 client, std::get<0>(collectSample), std::get<1>(collectSample));
-
-            uassertStatusOK(s);
-
-            // Store a reference to the most recent document from the periodic collectors
-            {
-                stdx::lock_guard<Latch> lock(_mutex);
-                _mostRecentPeriodicDocument = std::get<0>(collectSample);
-            }
+            iassert(s);
         }
     }
+} catch (...) {
+    LOGV2_FATAL(9399800,
+                "Exception thrown in full-time diagnostic data capture subsystem. Terminating the "
+                "process because diagnostics cannot be captured.",
+                "exception"_attr = exceptionToStatus());
 }
 
 }  // namespace mongo

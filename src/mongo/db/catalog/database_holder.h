@@ -29,20 +29,19 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
-
-class CollectionCatalogEntry;
-class Database;
-class OperationContext;
-class RecordStore;
-class ViewCatalog;
 
 /**
  * Registry of opened databases.
@@ -55,74 +54,73 @@ public:
     static DatabaseHolder* get(OperationContext* opCtx);
     static void set(ServiceContext* service, std::unique_ptr<DatabaseHolder> databaseHolder);
 
+    DatabaseHolder() = default;
     virtual ~DatabaseHolder() = default;
 
-    DatabaseHolder() = default;
-
     /**
-     * Retrieves an already opened database or returns nullptr. Must be called with the database
-     * locked in at least IS-mode.
-     */
-    virtual Database* getDb(OperationContext* const opCtx, const StringData ns) const = 0;
-
-    /**
-     * Fetches the ViewCatalog decorating the Database matching 'dbName', or returns nullptr if the
-     * database does not exist. The returned ViewCatalog is safe to access without a lock because it
-     * is held as a shared_ptr.
+     * Retrieves an already opened database or returns nullptr.
      *
-     * The ViewCatalog must be fetched through this interface if the caller holds no database lock
-     * to ensure the Database object is safe to access. This class' internal mutex provides
-     * concurrency protection around looking up and accessing the Database object matching 'dbName.
+     * The caller must hold the database lock in MODE_IS.
      */
-    virtual std::shared_ptr<const ViewCatalog> getViewCatalog(OperationContext* const opCtx,
-                                                              StringData dbName) const = 0;
+    virtual Database* getDb(OperationContext* opCtx, const DatabaseName& dbName) const = 0;
+
+    /**
+     * Checks if a database exists without holding a database-level lock. This class' internal mutex
+     * provides concurrency protection around looking up the db name of 'dbName'.
+     */
+    virtual bool dbExists(OperationContext* opCtx, const DatabaseName& dbName) const = 0;
 
     /**
      * Retrieves a database reference if it is already opened, or opens it if it hasn't been
-     * opened/created yet. Must be called with the database locked in X-mode.
+     * opened/created yet.
+     *
+     * The caller must hold the database lock in MODE_IX.
      *
      * @param justCreated Returns whether the database was newly created (true) or it already
      *          existed (false). Can be NULL if this information is not necessary.
      */
-    virtual Database* openDb(OperationContext* const opCtx,
-                             const StringData ns,
-                             bool* const justCreated = nullptr) = 0;
+    virtual Database* openDb(OperationContext* opCtx,
+                             const DatabaseName& dbName,
+                             bool* justCreated = nullptr) = 0;
 
     /**
      * Physically drops the specified opened database and removes it from the server's metadata. It
      * doesn't notify the replication subsystem or do any other consistency checks, so it should
      * not be used directly from user commands.
      *
-     * Must be called with the specified database locked in X mode. The caller must ensure no index
-     * builds are in progress on the database.
+     * The caller must hold the database lock in MODE_X and ensure no index builds are in progress
+     * on the database.
      */
     virtual void dropDb(OperationContext* opCtx, Database* db) = 0;
 
     /**
-     * Closes the specified database. Must be called with the database locked in X-mode.
-     * No background jobs must be in progress on the database when this function is called.
+     * Closes the specified database.
+     *
+     * The caller must hold the database lock in MODE_X. No background jobs must be in progress on
+     * the database when this function is called.
      */
-    virtual void close(OperationContext* opCtx, const StringData ns) = 0;
+    virtual void close(OperationContext* opCtx, const DatabaseName& dbName) = 0;
 
     /**
-     * Closes all opened databases. Must be called with the global lock acquired in X-mode.
-     * Will uassert if any background jobs are running when this function is called.
+     * Closes all opened databases.
      *
-     * The caller must hold the global X lock and ensure there are no index builds in progress.
+     * The caller must hold the global lock in MODE_X and ensure no index builds are in progress on
+     * the databases. Will uassert if any background jobs are running when this function is called.
      */
     virtual void closeAll(OperationContext* opCtx) = 0;
 
     /**
-     * Returns the set of existing database names that differ only in casing.
+     * Returns the name of the database with conflicting casing if one exists.
      */
-    virtual std::set<std::string> getNamesWithConflictingCasing(const StringData name) = 0;
+    virtual boost::optional<DatabaseName> getNameWithConflictingCasing(
+        const DatabaseName& dbName) = 0;
 
     /**
      * Returns all the database names (including those which are empty).
      *
      * Unlike CollectionCatalog::getAllDbNames(), this returns databases that are empty.
      */
-    virtual std::vector<std::string> getNames() = 0;
+    virtual std::vector<DatabaseName> getNames() = 0;
 };
 
 }  // namespace mongo

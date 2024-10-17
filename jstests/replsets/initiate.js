@@ -3,8 +3,8 @@
  * configs, so this is just seeing if it fails when it's supposed to.
  * @tags: [multiversion_incompatible]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({name: 'testSet2', nodes: 1});
 var nodes = replTest.startSet();
 
@@ -22,4 +22,3 @@ assert.soon(function() {
 });
 
 replTest.stopSet();
-}());

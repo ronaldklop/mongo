@@ -2,9 +2,10 @@
 // as a shard.  Then it makes sure that we can move the primary for this unsharded database to
 // another shard that we add later, and after the move the data is still accessible.
 // @tags: [requires_replication, requires_sharding]
-
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
 var numDocs = 10000;
 var baseName = "moveprimary-replset";
@@ -43,8 +44,8 @@ assert.eq(testDB[testCollName].count({y: 'hello'}),
 
 mongosConn.adminCommand({addshard: replSet2.getURL()});
 
-assert.commandWorked(
-    mongosConn.getDB('admin').runCommand({moveprimary: testDBName, to: replSet2.getURL()}));
+moveDatabaseAndUnshardedColls(mongosConn.getDB(testDBName), replSet2.name);
+
 mongosConn.getDB('admin').printShardingStatus();
 assert.eq(testDB.getSiblingDB("config").databases.findOne({"_id": testDBName}).primary,
           replSet2.name,
@@ -56,4 +57,3 @@ assert.eq(testDB[testCollName].count({z: 'world'}),
           'updating and counting docs via mongos failed');
 
 shardingTest.stop();
-})();

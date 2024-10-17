@@ -2,14 +2,16 @@
  * Tests that prepare conflicts for prepared transactions are retried.
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: prepareTransaction, profile.
+ *   not_allowed_with_signed_security_token,
  *   uses_prepare_transaction,
  *   uses_transactions,
- *   uses_parallel_shell
+ *   uses_parallel_shell,
+ *   requires_profiling,
  * ]
  */
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
 
 const dbName = "test";
 const collName = "prepare_conflict";
@@ -76,7 +78,10 @@ assert.commandWorked(testColl.runCommand({
 
 // Enable the profiler to log slow queries. We expect a 'find' to hang until the prepare
 // conflict is resolved.
-assert.commandWorked(testDB.runCommand({profile: 1, level: 1, slowms: 100}));
+// Don't profile the setFCV command, which could be run during this test in the
+// fcv_upgrade_downgrade_replica_sets_jscore_passthrough suite.
+assert.commandWorked(testDB.runCommand(
+    {profile: 1, filter: {'command.setFeatureCompatibilityVersion': {'$exists': false}}}));
 
 const session = db.getMongo().startSession({causalConsistency: false});
 const sessionDB = session.getDatabase(dbName);
@@ -119,4 +124,3 @@ findAwait({checkExitSuccess: true});
 
 // The document should be unmodified, because we aborted.
 assert.eq(txnDoc, testColl.findOne(txnDoc));
-})();

@@ -27,11 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 /**
@@ -45,7 +54,7 @@ protected:
 
         // We're interested in testing plans that use a hashed index, so don't generate collection
         // scans.
-        params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+        params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     }
 
     /**
@@ -211,9 +220,9 @@ TEST_F(QueryPlannerHashedTest, NegationQueriesOnHashedPrefix) {
     assertSolutionExists(
         "{fetch: {filter: {x: {$eq: null}}, node: {ixscan: {pattern: {x: 'hashed', y: 1, z: -1}, "
         "bounds: {x: [" +
-        getHashedBound(BSONUndefined) + "," + getHashedBound(BSONNULL) +
+        getHashedBound(BSONNULL) +
         "], y: [['MinKey', 1, true, false], [1, 2, false, false], [2,'MaxKey', false, true]], z: "
-        "[['MaxKey', null, true, false], [undefined, 'MinKey', false, true]]}}}}}");
+        "[['MaxKey', null, true, false], [null, 'MinKey', false, true]]}}}}}");
 }
 
 TEST_F(QueryPlannerHashedTest, NegationQueriesOnHashedNonPrefix) {
@@ -229,7 +238,7 @@ TEST_F(QueryPlannerHashedTest, NegationQueriesOnHashedNonPrefix) {
         "{fetch: {filter: {y: {$ne: null}}, node: {ixscan: {pattern: {x: 1, y: 'hashed', z: -1}, "
         "bounds: {x: [['MinKey', 1, true, false], [1, 2, false, false], [2,'MaxKey', false, "
         "true]], y: [['MinKey', 'MaxKey', true, true]], z: [['MaxKey', null, true, false], "
-        "[undefined, 'MinKey', false, true]]}}}}}");
+        "[null, 'MinKey', false, true]]}}}}}");
 
     runQuery(fromjson("{x: {$nin: [1, 2]}, y: {$ne: 5}, z: {$ne: null}}"));
     assertNumSolutions(1);
@@ -237,7 +246,7 @@ TEST_F(QueryPlannerHashedTest, NegationQueriesOnHashedNonPrefix) {
         "{fetch: {filter: {y: {$ne: 5}}, node: {ixscan: {pattern: {x: 1, y: 'hashed', z: -1}, "
         "bounds: {x: [['MinKey', 1, true, false], [1, 2, false, false], [2,'MaxKey', false, "
         "true]], y: [['MinKey', 'MaxKey', true, true]], z: [['MaxKey', null, true, false], "
-        "[undefined, 'MinKey', false, true]]}}}}}");
+        "[null, 'MinKey', false, true]]}}}}}");
 }
 
 TEST_F(QueryPlannerHashedTest, EqualsNullQueries) {
@@ -250,7 +259,7 @@ TEST_F(QueryPlannerHashedTest, EqualsNullQueries) {
     assertSolutionExists(
         "{fetch: {filter: {x: {$eq: null}}, node: {ixscan:{pattern: {x: 'hashed', y: 1, z: "
         "-1},bounds: {x: [" +
-        getHashedBound(BSONUndefined) + "," + getHashedBound(BSONNULL) +
+        getHashedBound(BSONNULL) +
         "],y: [['MinKey','MaxKey',true,true]], z: [['MaxKey','MinKey',true,true]]"
         "}}}}}");
 
@@ -262,7 +271,7 @@ TEST_F(QueryPlannerHashedTest, EqualsNullQueries) {
     runQuery(fromjson("{x: {$eq: null}}"));
     assertSolutionExists(
         "{fetch: {filter: {x: {$eq: null}}, node: {ixscan:{pattern: {x: 1, y: 'hashed', z: -1}, "
-        "bounds: {x:[[undefined, undefined, true, true],[null, null, true, true]], y: "
+        "bounds: {x:[[null, null, true, true]], y: "
         "[['MinKey','MaxKey',true,true]], z: [['MaxKey','MinKey',true,true]]"
         "}}}}}");
 }
@@ -278,10 +287,12 @@ TEST_F(QueryPlannerHashedTest, OrWithMultipleEqualityPredicatesOnHashedPrefixUse
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {$or: [{a: 5}, {a: 10}]}, node: {ixscan:{pattern: {a: 'hashed', b:1}, "
-        "bounds: {a:[" +
+        "{fetch: {filter: {a: {$in: [5, 10]}}, node: {ixscan:{pattern: {a: 'hashed', b:1}, "
+        "bounds: "
+        "{a: [" +
         getHashedBound(5) + "," + getHashedBound(10) +
-        "], b: [['MinKey','MaxKey',true,true]] }}}}}");
+        + "], "
+        " b: [['MinKey','MaxKey',true,true]] }}}}}");
 }
 
 TEST_F(QueryPlannerHashedTest,
@@ -446,7 +457,7 @@ TEST_F(QueryPlannerHashedTest, CompoundHashedShardKeyWhenIndexAndShardKeyBothPro
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"
                       << "z" << -1));
-    params.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("x" << 1 << "y"
                                << "hashed");
 
@@ -465,7 +476,7 @@ TEST_F(QueryPlannerHashedTest,
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"
                       << "z" << -1));
-    params.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("x" << 1 << "y"
                                << "hashed");
 
@@ -494,7 +505,7 @@ TEST_F(QueryPlannerHashedTest,
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"
                       << "z" << -1));
-    params.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
 
     // Can cover the query when index provides range value for a field ('z'), but the corresponding
     // shard key field is hashed.
@@ -512,7 +523,7 @@ TEST_F(QueryPlannerHashedTest,
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"
                       << "z" << -1));
-    params.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
 
     // Cannot cover the query when index provides hashed value for a field ('y'), but the
     // corresponding shard key field is a range field.
@@ -531,7 +542,7 @@ TEST_F(QueryPlannerHashedTest, CompoundHashedShardKeyWhenIndexDoesNotHaveAllShar
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"
                       << "z" << -1));
-    params.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
 
     // Cannot cover the query when one of the shard key field ('newField') is not in the index.
     params.shardKey = BSON("x" << 1 << "y"
@@ -1019,7 +1030,7 @@ TEST_F(QueryPlannerHashedTest, ExprEqCanUseIndex) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {$and: [{x: {$_internalExprEq: 1}}, {$expr: {$eq: ['$x', {$const: "
+        "{fetch: {filter: {$and: [{$expr: {$eq: ['$x', {$const: "
         "1}]}}]}, node: {ixscan: {pattern: {x: 'hashed', y: 1}, bounds: {x : [" +
         getHashedBound(1) + "], y: [['MinKey','MaxKey',true,true]] } }}}}");
 }

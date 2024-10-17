@@ -5,15 +5,22 @@
 // may be routed to a secondary.
 //
 // @tags: [
+//     # The test runs commands that are not allowed with security token: top.
+//     not_allowed_with_signed_security_token,
 //     assumes_read_preference_unchanged,
-//
-//     # top command is not available on embedded
-//     incompatible_with_embedded,
+//     assumes_unsharded_collection,
+//     # This test depends on hardcoded database name equality.
+//     tenant_migration_incompatible,
+//     does_not_support_repeated_reads,
 // ]
 
-(function() {
-"use strict";
-load("jstests/libs/stats.js");
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    assertHistogramDiffEq,
+    assertTopDiffEq,
+    getHistogramStats,
+    getTop
+} from "jstests/libs/stats.js";
 
 let viewsDB = db.getSiblingDB("views_stats");
 assert.commandWorked(viewsDB.dropDatabase());
@@ -27,47 +34,45 @@ assert.commandWorked(coll.insert({val: 'TestValue'}));
 // Check the histogram counters.
 let lastHistogram = getHistogramStats(view);
 view.aggregate([{$match: {}}]);
-lastHistogram = assertHistogramDiffEq(view, lastHistogram, 1, 0, 0);
+lastHistogram = assertHistogramDiffEq(viewsDB, view, lastHistogram, 1, 0, 0);
 
 // Check that failed inserts, updates, and deletes are counted.
 assert.writeError(view.insert({}));
-lastHistogram = assertHistogramDiffEq(view, lastHistogram, 0, 1, 0);
+lastHistogram = assertHistogramDiffEq(viewsDB, view, lastHistogram, 0, 1, 0);
 
 assert.writeError(view.remove({}));
-lastHistogram = assertHistogramDiffEq(view, lastHistogram, 0, 1, 0);
+lastHistogram = assertHistogramDiffEq(viewsDB, view, lastHistogram, 0, 1, 0);
 
 assert.writeError(view.update({}, {}));
-lastHistogram = assertHistogramDiffEq(view, lastHistogram, 0, 1, 0);
+lastHistogram = assertHistogramDiffEq(viewsDB, view, lastHistogram, 0, 1, 0);
 
-let helloResponse = assert.commandWorked(viewsDB.runCommand("hello"));
-const isMongos = (helloResponse.msg === "isdbgrid");
-if (isMongos) {
+if (FixtureHelpers.isMongos(viewsDB)) {
     jsTest.log("Tests are being run on a mongos; skipping top tests.");
-    return;
+    quit();
 }
 
 // Check the top counters.
 let lastTop = getTop(view);
 if (lastTop === undefined) {
-    return;
+    quit();
 }
 
 view.aggregate([{$match: {}}]);
-lastTop = assertTopDiffEq(view, lastTop, "commands", 1);
+lastTop = assertTopDiffEq(viewsDB, view, lastTop, "commands", 1);
 
 assert.writeError(view.insert({}));
-lastTop = assertTopDiffEq(view, lastTop, "insert", 1);
+lastTop = assertTopDiffEq(viewsDB, view, lastTop, "insert", 1);
 
 assert.writeError(view.remove({}));
-lastTop = assertTopDiffEq(view, lastTop, "remove", 1);
+lastTop = assertTopDiffEq(viewsDB, view, lastTop, "remove", 1);
 
 assert.writeError(view.update({}, {}));
-lastTop = assertTopDiffEq(view, lastTop, "update", 1);
+lastTop = assertTopDiffEq(viewsDB, view, lastTop, "update", 1);
 
 // Check that operations on the backing collection do not modify the view stats.
 lastTop = getTop(view);
 if (lastTop === undefined) {
-    return;
+    quit();
 }
 
 lastHistogram = getHistogramStats(view);
@@ -76,8 +81,7 @@ assert.commandWorked(coll.update({}, {$set: {x: 1}}));
 coll.aggregate([{$match: {}}]);
 assert.commandWorked(coll.remove({}));
 
-assertTopDiffEq(view, lastTop, "insert", 0);
-assertTopDiffEq(view, lastTop, "update", 0);
-assertTopDiffEq(view, lastTop, "remove", 0);
-assertHistogramDiffEq(view, lastHistogram, 0, 0, 0);
-}());
+assertTopDiffEq(viewsDB, view, lastTop, "insert", 0);
+assertTopDiffEq(viewsDB, view, lastTop, "update", 0);
+assertTopDiffEq(viewsDB, view, lastTop, "remove", 0);
+assertHistogramDiffEq(viewsDB, view, lastHistogram, 0, 0, 0);

@@ -27,10 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_mock.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -100,7 +108,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual ~TransactionHistoryIteratorMock() {}
+    ~TransactionHistoryIteratorMock() override {}
 
     bool hasNext() const override {
         return !_nextOpTime.isNull();

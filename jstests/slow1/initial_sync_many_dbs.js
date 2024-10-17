@@ -2,14 +2,7 @@
  * Runs initial sync on a node with many databases.
  */
 
-(function() {
-// Skip this test if running with --nojournal and WiredTiger.
-if (jsTest.options().noJournal &&
-    (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
-    print("Skipping test because running WiredTiger without journaling isn't a valid" +
-          " replica set configuration");
-    return;
-}
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var name = 'initial_sync_many_dbs';
 var num_dbs = 32;
@@ -44,11 +37,11 @@ replSet.reInitiate();
 replSet.awaitSecondaryNodes(30 * 60 * 1000);
 var secondary = replSet.getSecondary();
 jsTestLog('New node has transitioned to secondary. Checking collection sizes');
-for (var i = 0; i < num_dbs; i++) {
-    var dbname = name + '_db' + i;
-    for (var j = 0; j < (i % max_colls + 1); j++) {
-        var collname = name + '_coll' + j;
-        var coll = secondary.getDB(dbname)[collname];
+for (let i = 0; i < num_dbs; i++) {
+    let dbname = name + '_db' + i;
+    for (let j = 0; j < (i % max_colls + 1); j++) {
+        let collname = name + '_coll' + j;
+        let coll = secondary.getDB(dbname)[collname];
         assert.eq(
             num_docs,
             coll.find().itcount(),
@@ -57,4 +50,3 @@ for (var i = 0; i < num_dbs; i++) {
 }
 
 replSet.stopSet();
-})();

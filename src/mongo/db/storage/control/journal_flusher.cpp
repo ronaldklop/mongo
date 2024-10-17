@@ -27,20 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <utility>
 
-#include "mongo/db/storage/control/journal_flusher.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
-#include "mongo/stdx/future.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -48,6 +66,7 @@ namespace {
 
 const auto getJournalFlusher = ServiceContext::declareDecoration<std::unique_ptr<JournalFlusher>>();
 
+MONGO_FAIL_POINT_DEFINE(pauseJournalFlusherBeforeFlush);
 MONGO_FAIL_POINT_DEFINE(pauseJournalFlusherThread);
 
 }  // namespace
@@ -74,49 +93,74 @@ void JournalFlusher::set(ServiceContext* serviceCtx, std::unique_ptr<JournalFlus
 }
 
 void JournalFlusher::run() {
-    ThreadClient tc(name(), getGlobalServiceContext());
+    ThreadClient tc(name(), getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     LOGV2_DEBUG(4584701, 1, "starting {name} thread", "name"_attr = name());
 
     // The thread must not run and access the service context to create an opCtx while unit test
     // infrastructure is still being set up and expects sole access to the service context (there is
     // no conurrency control on the service context during this phase).
     if (_disablePeriodicFlushes) {
-        stdx::unique_lock<Latch> lk(_stateMutex);
+        stdx::unique_lock<stdx::mutex> lk(_stateMutex);
         _flushJournalNowCV.wait(lk,
                                 [&] { return _flushJournalNow || _needToPause || _shuttingDown; });
     }
 
-    // Initialize the thread's opCtx.
-    _uniqueCtx.emplace(tc->makeOperationContext());
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+    auto setUpOpCtx = [&](WithLock lk) {
+        // Initialize the thread's opCtx.
+        _uniqueCtx.emplace(tc->makeOperationContext());
 
-    // Updates to a non-replicated collection, oplogTruncateAfterPoint, are made by this thread.
-    // Non-replicated writes will not contribute to replication lag and can be safely excluded
-    // from Flow Control.
-    _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
+        // Updates to a non-replicated collection, oplogTruncateAfterPoint, are made by this thread.
+        // As this operation is critical for data durability we mark it as having Immediate priority
+        // to skip ticket and flow control.
+        admissionPriority.emplace(_uniqueCtx->get(), AdmissionContext::Priority::kExempt);
+    };
+
+    auto tearDownOpCtx = [&](WithLock lk) {
+        admissionPriority.reset();
+        _uniqueCtx.reset();
+    };
+
+    {
+        stdx::lock_guard<stdx::mutex> lk(_opCtxMutex);
+        setUpOpCtx(lk);
+    }
+
     while (true) {
+        pauseJournalFlusherBeforeFlush.pauseWhileSet();
         try {
-            ON_BLOCK_EXIT([&] {
-                // We do not want to miss an interrupt for the next round. Therefore, the opCtx
-                // will be reset after a flushing round finishes.
-                //
-                // It is fine if the opCtx is signaled between finishing and resetting because
-                // state changes will be seen before the next round. We want to catch any
-                // interrupt signals that occur after state is checked at the start of a round:
-                // the time during or before the next flush.
-                stdx::lock_guard<Latch> lk(_opCtxMutex);
-                _uniqueCtx.reset();
-                _uniqueCtx.emplace(tc->makeOperationContext());
-                _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
-            });
-
-            _uniqueCtx->get()->recoveryUnit()->waitUntilDurable(_uniqueCtx->get());
+            tc->getServiceContext()->getStorageEngine()->waitUntilDurable(_uniqueCtx->get());
 
             // Signal the waiters that a round completed.
             _currentSharedPromise->emplaceValue();
+
+            // Release snapshot before we start the next round.
+            shard_role_details::getRecoveryUnit(_uniqueCtx->get())->abandonSnapshot();
         } catch (const AssertionException& e) {
-            invariant(ErrorCodes::isShutdownError(e.code()) ||
-                          e.code() == ErrorCodes::InterruptedDueToReplStateChange,
-                      e.toString());
+            {
+                // Reset opCtx if we get an error.
+                stdx::lock_guard<stdx::mutex> lk(_opCtxMutex);
+                tearDownOpCtx(lk);
+                setUpOpCtx(lk);
+            }
+
+            // Can be caused by killOp or stepdown.
+            if (ErrorCodes::isInterruption(e.code())) {
+                // When this thread is interrupted it will immediately restart the journal flush
+                // without sending errors to waiting callers. The opCtx error should already be
+                // cleared of the interrupt by the ON_BLOCK_EXIT handling above.
+                LOGV2_DEBUG(5574501,
+                            1,
+                            "The JournalFlusher got interrupted, retrying",
+                            "error"_attr = e.toString());
+                continue;
+            }
+
+            // We want to log errors for debugability.
+            LOGV2_WARNING(
+                6148401,
+                "The JournalFlusher encountered an error attempting to flush data to disk",
+                "JournalFlusherError"_attr = e.toString());
 
             // Signal the waiters that the fsync was interrupted.
             _currentSharedPromise->setError(e.toStatus());
@@ -129,7 +173,7 @@ void JournalFlusher::run() {
         auto deadline =
             Date_t::now() + Milliseconds(storageGlobalParams.journalCommitIntervalMs.load());
 
-        stdx::unique_lock<Latch> lk(_stateMutex);
+        stdx::unique_lock<stdx::mutex> lk(_stateMutex);
 
         MONGO_IDLE_THREAD_BLOCK;
         if (_disablePeriodicFlushes || MONGO_unlikely(pauseJournalFlusherThread.shouldFail())) {
@@ -164,8 +208,8 @@ void JournalFlusher::run() {
             _state = States::ShutDown;
             _stateChangeCV.notify_all();
 
-            stdx::lock_guard<Latch> lk(_opCtxMutex);
-            _uniqueCtx.reset();
+            stdx::lock_guard<stdx::mutex> lk(_opCtxMutex);
+            tearDownOpCtx(lk);
             return;
         }
 
@@ -178,7 +222,7 @@ void JournalFlusher::run() {
 void JournalFlusher::shutdown(const Status& reason) {
     LOGV2(22320, "Shutting down journal flusher thread");
     {
-        stdx::lock_guard<Latch> lk(_stateMutex);
+        stdx::lock_guard<stdx::mutex> lk(_stateMutex);
         _shuttingDown = true;
         _shutdownReason = reason;
         _flushJournalNowCV.notify_one();
@@ -190,7 +234,7 @@ void JournalFlusher::shutdown(const Status& reason) {
 void JournalFlusher::pause() {
     LOGV2(5142500, "Pausing journal flusher thread");
     {
-        stdx::unique_lock<Latch> lk(_stateMutex);
+        stdx::unique_lock<stdx::mutex> lk(_stateMutex);
         _needToPause = true;
         _stateChangeCV.wait(lk,
                             [&] { return _state == States::Paused || _state == States::ShutDown; });
@@ -201,54 +245,42 @@ void JournalFlusher::pause() {
 void JournalFlusher::resume() {
     LOGV2(5142502, "Resuming journal flusher thread");
     {
-        stdx::lock_guard<Latch> lk(_stateMutex);
+        stdx::lock_guard<stdx::mutex> lk(_stateMutex);
         _needToPause = false;
         _flushJournalNowCV.notify_one();
     }
     LOGV2(5142503, "Resumed journal flusher thread");
 }
 
-void JournalFlusher::triggerJournalFlush() {
-    stdx::lock_guard<Latch> lk(_stateMutex);
-    if (!_flushJournalNow) {
-        _flushJournalNow = true;
-        _flushJournalNowCV.notify_one();
-    }
+void JournalFlusher::waitForJournalFlush(Interruptible* interruptible) {
+    auto myFuture = [&]() {
+        stdx::lock_guard<stdx::mutex> lk(_stateMutex);
+        _triggerJournalFlush(lk);
+        return _nextSharedPromise->getFuture();
+    }();
+
+    // Throws on error if the flusher thread is shutdown.
+    myFuture.get(interruptible);
 }
 
-void JournalFlusher::waitForJournalFlush() {
-    while (true) {
-        try {
-            _waitForJournalFlushNoRetry();
-            break;
-        } catch (const ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>&) {
-            // Do nothing and let the while-loop retry the operation.
-            LOGV2_DEBUG(4814901,
-                        3,
-                        "Retrying waiting for durability interrupted by replication state change");
-        }
-    }
+void JournalFlusher::triggerJournalFlush() {
+    stdx::unique_lock<stdx::mutex> lk(_stateMutex);
+    _triggerJournalFlush(lk);
 }
 
 void JournalFlusher::interruptJournalFlusherForReplStateChange() {
-    stdx::lock_guard<Latch> lk(_opCtxMutex);
+    stdx::lock_guard<stdx::mutex> lk(_opCtxMutex);
     if (_uniqueCtx) {
         stdx::lock_guard<Client> lk(*_uniqueCtx->get()->getClient());
         _uniqueCtx->get()->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
     }
 }
 
-void JournalFlusher::_waitForJournalFlushNoRetry() {
-    auto myFuture = [&]() {
-        stdx::unique_lock<Latch> lk(_stateMutex);
-        if (!_flushJournalNow) {
-            _flushJournalNow = true;
-            _flushJournalNowCV.notify_one();
-        }
-        return _nextSharedPromise->getFuture();
-    }();
-    // Throws on error if the flusher round is interrupted or the flusher thread is shutdown.
-    myFuture.get();
+void JournalFlusher::_triggerJournalFlush(WithLock lk) {
+    if (!_flushJournalNow) {
+        _flushJournalNow = true;
+        _flushJournalNowCV.notify_one();
+    }
 }
 
 }  // namespace mongo

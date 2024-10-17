@@ -7,12 +7,9 @@
  * opening a connection to the database.
  * @tags: [requires_majority_read_concern]
  */
-
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/rollback_test.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 const dbName = "test";
 const collName = "not_primary_errors_returned_during_rollback_if_helloOk";
@@ -25,7 +22,8 @@ assert.commandWorked(rollbackTest.getPrimary().getDB(dbName)[collName].insert({}
 
 let rollbackNode = rollbackTest.transitionToRollbackOperations();
 
-setFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
+const failPointAfterTransition =
+    configureFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
 
 // Start rollback.
 rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
@@ -34,13 +32,21 @@ rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 jsTestLog("Reconnecting to " + rollbackNode.host + " after rollback");
 reconnect(rollbackNode.getDB(dbName));
 
-// Wait for rollback to hang.
-checkLog.contains(rollbackNode, "rollbackHangAfterTransitionToRollback fail point enabled.");
+// Wait for rollback to hang. We continuously retry the wait command since the rollback node
+// might reject new connections initially, causing the command to fail.
+assert.soon(() => {
+    try {
+        failPointAfterTransition.wait();
+        return true;
+    } catch (e) {
+        return false;
+    }
+});
 
 // Make sure we can't read during rollback. Since we want to exercise the real check for
 // primary in the 'find' command, we have to disable the best-effort check for primary in service
 // entry point.
-setFailPoint(rollbackNode, "skipCheckingForNotPrimaryInCommandDispatch");
+configureFailPoint(rollbackNode, "skipCheckingForNotPrimaryInCommandDispatch");
 jsTestLog("Reading during rollback returns not master error message");
 let res = assert.commandFailedWithCode(rollbackNode.getDB(dbName).runCommand({"find": collName}),
                                        ErrorCodes.NotPrimaryOrSecondary,
@@ -69,8 +75,7 @@ res = assert.commandFailedWithCode(rollbackNode.getDB(dbName).runCommand({"find"
 assert(res.errmsg.includes("not primary or secondary"), res);
 assert(!res.errmsg.includes("not master"), res);
 
-clearFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
+failPointAfterTransition.off();
 
 rollbackTest.transitionToSteadyStateOperations();
 rollbackTest.stop();
-}());

@@ -28,18 +28,28 @@
  */
 
 #pragma once
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_set>
+#include <vector>
 
-#include "boost/optional/optional.hpp"
-
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/client/sdam/election_id_set_version_pair.h"
 #include "mongo/client/sdam/sdam_configuration.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/platform/basic.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo::sdam {
 class TopologyDescription : public std::enable_shared_from_this<TopologyDescription> {
@@ -58,17 +68,15 @@ public:
     static TopologyDescriptionPtr create(SdamConfiguration config);
 
     /**
-     * Copy the given TopologyDescription and set the topologyDescription of all contained server
-     * descriptions to point to this instance.
+     * Deep copy the given TopologyDescription. The copy constructor won't work in this scenario
+     * because shared_from_this cannot be used from within a constructor.
      */
-    static TopologyDescriptionPtr clone(TopologyDescriptionPtr source);
+    static TopologyDescriptionPtr clone(const TopologyDescription& source);
 
     const UUID& getId() const;
     TopologyType getType() const;
     const boost::optional<std::string>& getSetName() const;
-
-    const boost::optional<int>& getMaxSetVersion() const;
-    const boost::optional<OID>& getMaxElectionId() const;
+    ElectionIdSetVersionPair getMaxElectionIdSetVersionPair() const;
 
     const std::vector<ServerDescriptionPtr>& getServers() const;
 
@@ -78,7 +86,7 @@ public:
     const boost::optional<int>& getLogicalSessionTimeoutMinutes() const;
     const Milliseconds& getHeartBeatFrequency() const;
 
-    const boost::optional<ServerDescriptionPtr> findServerByAddress(HostAndPort address) const;
+    boost::optional<ServerDescriptionPtr> findServerByAddress(HostAndPort address) const;
     bool containsServerAddress(const HostAndPort& address) const;
     std::vector<ServerDescriptionPtr> findServers(
         std::function<bool(const ServerDescriptionPtr&)> predicate) const;
@@ -102,15 +110,13 @@ private:
     friend bool operator==(const TopologyDescription& lhs, const TopologyDescription& rhs) {
         return std::tie(lhs._setName,
                         lhs._type,
-                        lhs._maxSetVersion,
-                        lhs._maxElectionId,
+                        lhs._maxElectionIdSetVersionPair,
                         lhs._servers,
                         lhs._compatible,
                         lhs._logicalSessionTimeoutMinutes) ==
             std::tie(rhs._setName,
                      rhs._type,
-                     rhs._maxSetVersion,
-                     rhs._maxElectionId,
+                     rhs._maxElectionIdSetVersionPair,
                      rhs._servers,
                      rhs._compatible,
                      rhs._logicalSessionTimeoutMinutes);
@@ -131,7 +137,7 @@ private:
      * Source:
      * https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst
      */
-    const std::string minimumRequiredMongoVersionString(int version);
+    std::string minimumRequiredMongoVersionString(int version);
 
     /**
      * From Server Discovery and Monitoring:
@@ -144,7 +150,7 @@ private:
      */
     void calculateLogicalSessionTimeout();
 
-    static void associateServerDescriptions(const TopologyDescriptionPtr& topologyDescription);
+    void updateMaxElectionIdSetVersionPair(const ElectionIdSetVersionPair& pair);
 
     // unique id for this topology
     UUID _id = UUID::gen();
@@ -155,13 +161,12 @@ private:
     // setName: the replica set name. Default null.
     boost::optional<std::string> _setName;
 
-    // maxSetVersion: an integer or null. The largest setVersion ever reported by a primary.
-    // Default null.
-    boost::optional<int> _maxSetVersion;
-
-    // maxElectionId: an ObjectId or null. The largest electionId ever reported by a primary.
-    // Default null.
-    boost::optional<OID> _maxElectionId;
+    // The tuple consisting of:
+    // maxSetVersion: an integer or none. The largest setVersion ever reported by a primary.
+    // Note: maxSetVersion can go backwards.
+    // maxElectionId: an ObjectId or none. The largest electionId ever reported by a primary.
+    // Default {none, none}.
+    ElectionIdSetVersionPair _maxElectionIdSetVersionPair;
 
     // servers: a set of ServerDescription instances. Default contains one server:
     // "localhost:27017", ServerType Unknown.

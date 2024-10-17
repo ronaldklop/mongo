@@ -29,7 +29,19 @@
 
 #pragma once
 
+#include <deque>
+#include <list>
+#include <memory>
+#include <utility>
+#include <vector>
+
+
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/memory_token_container_util.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -44,43 +56,49 @@ public:
     }
 
     explicit WindowFunctionPush(ExpressionContext* const expCtx) : WindowFunctionState(expCtx) {
-        _memUsageBytes = sizeof(*this);
+        _memUsageTracker.set(sizeof(*this));
     }
 
     void add(Value value) override {
-        _memUsageBytes += value.getApproximateSize();
-        _values.push_back(std::move(value));
+        if (value.missing()) {
+            return;
+        }
+        _values.emplace_back(SimpleMemoryUsageToken{value.getApproximateSize(), &_memUsageTracker},
+                             std::move(value));
     }
 
     /**
      * This should only remove the first/lowest element in the window.
      */
     void remove(Value value) override {
+        if (value.missing()) {
+            return;
+        }
+
         tassert(5423801, "Can't remove from an empty WindowFunctionPush", _values.size() != 0);
-        auto valToRemove = _values.front();
+        auto valToRemove = _values.front().value();
         tassert(
             5414202,
             "Attempted to remove an element other than the first element from WindowFunctionPush",
             _expCtx->getValueComparator().evaluate(valToRemove == value));
         _values.pop_front();
-        _memUsageBytes -= value.getApproximateSize();
     }
 
     void reset() override {
         _values.clear();
-        _memUsageBytes = sizeof(*this);
+        _memUsageTracker.set(sizeof(*this));
     }
 
     Value getValue() const override {
-        std::vector<Value> output;
-        if (_values.empty())
+        if (_values.empty()) {
             return kDefault;
-
-        return Value{std::vector<Value>(_values.begin(), _values.end())};
+        }
+        return convertToValueFromMemoryTokenWithValue(
+            _values.begin(), _values.end(), _values.size());
     }
 
 private:
-    std::deque<Value> _values;
+    std::deque<SimpleMemoryUsageTokenWith<Value>> _values;
 };
 
 }  // namespace mongo

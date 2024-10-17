@@ -27,67 +27,67 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <memory>
 
-#include "mongo/db/exec/sbe/stages/collection_helpers.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo::sbe {
 
-std::pair<NamespaceString, uint64_t> acquireCollection(
-    OperationContext* opCtx,
-    CollectionUUID collUuid,
-    const LockAcquisitionCallback& lockAcquisitionCallback,
-    boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll) {
-    tassert(5071012, "cannot restore 'coll' if already held", !coll.has_value());
-    // The caller is expected to hold the appropriate db_raii object to give us a consistent view of
-    // the catalog, so the UUID must still exist.
-    auto collName = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, collUuid);
-    tassert(5071000,
-            str::stream() << "Collection uuid " << collUuid << " does not exist",
-            collName.has_value());
-
-    coll.emplace(opCtx, NamespaceStringOrUUID{collName->db().toString(), collUuid});
-    if (lockAcquisitionCallback) {
-        lockAcquisitionCallback(opCtx, *coll);
-    }
-
-    tassert(4938501,
-            str::stream() << "expected CollectionPtr for: " << *collName,
-            static_cast<bool>(coll->getCollection()));
-
-    return {*collName, CollectionCatalog::get(opCtx)->getEpoch()};
+void CollectionRef::getConsistentCollection(OperationContext* opCtx,
+                                            const DatabaseName& dbName,
+                                            const UUID& collUuid) {
+    auto timestamp = shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp();
+    _collPtr.emplace(CollectionCatalog::get(opCtx)->establishConsistentCollection(
+        opCtx, NamespaceStringOrUUID{dbName, collUuid}, timestamp));
 }
 
-void restoreCollection(OperationContext* opCtx,
-                       const NamespaceString& collName,
-                       CollectionUUID collUuid,
-                       uint64_t catalogEpoch,
-                       const LockAcquisitionCallback& lockAcquisitionCallback,
-                       boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll) {
-    tassert(5071011, "cannot restore 'coll' if already held", !coll.has_value());
-    // Reaquire the AutoGet object, looking up in the catalog by UUID. If the collection has been
-    // dropped, then this UUID lookup will fail, throwing an exception and terminating the query.
-    NamespaceStringOrUUID nssOrUuid{collName.db().toString(), collUuid};
-    try {
-        coll.emplace(opCtx, nssOrUuid);
-    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
-        ex.addContext(str::stream() << "collection dropped: '" << collName << "'");
-        throw;
+void CollectionRef::acquireCollection(OperationContext* opCtx,
+                                      const DatabaseName& dbName,
+                                      const UUID& collUuid) {
+    // The collection is either locked at a higher level or a snapshot of the catalog (consistent
+    // with the storage engine snapshot from which we are reading) has been stashed on the
+    // 'OperationContext'. Either way, this means that the UUID must still exist in our view of the
+    // collection catalog.
+    getConsistentCollection(opCtx, dbName, collUuid);
+    tassert(
+        5071000, str::stream() << "Collection uuid " << collUuid << " does not exist", getPtr());
+
+    _collName = getPtr()->ns();
+    _catalogEpoch = CollectionCatalog::get(opCtx)->getEpoch();
+}
+
+void CollectionRef::restoreCollection(OperationContext* opCtx,
+                                      const DatabaseName& dbName,
+                                      const UUID& collUuid) {
+    tassert(5777401, "Collection name should be initialized", _collName);
+    tassert(5777402, "Catalog epoch should be initialized", _catalogEpoch);
+
+    // Establish a consistent collection instance and restore the collection pointer. If the
+    // collection has been dropped, then this UUID lookup will result in a null pointer. If the
+    // collection has been renamed, then the resulting collection object should have a different
+    // name from the original '_collName'. In either scenario, we throw a 'QueryPlanKilled' error
+    // and terminate the query.
+    getConsistentCollection(opCtx, dbName, collUuid);
+    if (!getPtr()) {
+        PlanYieldPolicy::throwCollectionDroppedError(collUuid);
     }
 
-    if (collName != coll->getNss()) {
-        PlanYieldPolicy::throwCollectionRenamedError(collName, coll->getNss(), collUuid);
+    if (*_collName != getPtr()->ns()) {
+        PlanYieldPolicy::throwCollectionRenamedError(*_collName, getPtr()->ns(), collUuid);
     }
 
     uassert(ErrorCodes::QueryPlanKilled,
             "the catalog was closed and reopened",
-            CollectionCatalog::get(opCtx)->getEpoch() == catalogEpoch);
-
-    if (lockAcquisitionCallback) {
-        lockAcquisitionCallback(opCtx, *coll);
-    }
+            CollectionCatalog::get(opCtx)->getEpoch() == *_catalogEpoch);
 }
 
 }  // namespace mongo::sbe

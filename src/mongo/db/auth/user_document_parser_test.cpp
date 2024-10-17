@@ -31,17 +31,32 @@
  * Unit tests of the UserDocumentParser type.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <memory>
+#include <set>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/mechanism_scram.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/auth/restriction_set.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user_document_parser.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/transport/mock_session.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/socket_utils.h"
 
 #define ASSERT_NULL(EXPR) ASSERT_FALSE(EXPR)
@@ -62,9 +77,11 @@ public:
     BSONObj credentials;
     BSONObj sha1_creds, sha256_creds;
 
-    void setUp() {
-        user.reset(new User(UserName("spencer", "test")));
-        adminUser.reset(new User(UserName("admin", "admin")));
+    void setUp() override {
+        user = std::make_unique<User>(
+            std::make_unique<UserRequestGeneral>(UserName("spencer", "test"), boost::none));
+        adminUser = std::make_unique<User>(
+            std::make_unique<UserRequestGeneral>(UserName("admin", "admin"), boost::none));
 
         sha1_creds = scram::Secrets<SHA1Block>::generateCredentials(
             "a", saslGlobalParams.scramSHA1IterationCount.load());
@@ -488,9 +505,12 @@ TEST_F(V2UserDocumentParsing, V2AuthenticationRestrictionsExtractionAndRetreival
         {"127.0.0.1", "::1", false},
     };
     for (const auto& p : tests) {
-        const RestrictionEnvironment re(SockAddr(p.client, 1024, AF_UNSPEC),
-                                        SockAddr(p.server, 1025, AF_UNSPEC));
-        ASSERT_EQ(doc.validate(re).isOK(), p.valid);
+        auto session =
+            std::make_shared<transport::MockSession>(HostAndPort(),
+                                                     SockAddr::create(p.client, 1024, AF_UNSPEC),
+                                                     SockAddr::create(p.server, 1025, AF_UNSPEC),
+                                                     nullptr);
+        ASSERT_EQ(doc.validate(session->getAuthEnvironment()).isOK(), p.valid);
     }
 }
 

@@ -27,17 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
+#include <set>
 #include <vector>
 
-#include "mongo/db/pipeline/document_path_support.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/parse_number.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -80,7 +85,11 @@ void visitAllValuesAtPathHelper(Document doc,
     // positional specifications, if applicable. For example, it will consume "0" and "1" from the
     // path "a.0.1.b" if the value at "a" is an array with arrays inside it.
     while (fieldPathIndex < path.getPathLength() && nextValue.isArray()) {
-        if (auto index = str::parseUnsignedBase10Integer(path.getFieldName(fieldPathIndex))) {
+        const StringData field = path.getFieldName(fieldPathIndex);
+        // Check for a numeric component that is not prefixed by 0 (for example "1" rather than
+        // "01"). These should act as field names, not as an index into an array.
+        if (auto index = str::parseUnsignedBase10Integer(field);
+            index && FieldRef::isNumericPathComponentStrict(field)) {
             nextValue = nextValue[*index];
             ++fieldPathIndex;
         } else {
@@ -136,19 +145,18 @@ StatusWith<Value> extractElementAlongNonArrayPath(const Document& doc, const Fie
     return curValue;
 }
 
-BSONObj documentToBsonWithPaths(const Document& input, const std::set<std::string>& paths) {
-    BSONObjBuilder outputBuilder;
+void documentToBsonWithPaths(const Document& input,
+                             const OrderedPathSet& paths,
+                             BSONObjBuilder* builder) {
     for (auto&& path : paths) {
         // getNestedField does not handle dotted paths correctly, so instead of retrieving the
         // entire path, we just extract the first element of the path.
         const auto prefix = FieldPath::extractFirstFieldFromDottedPath(path);
-        if (!outputBuilder.hasField(prefix)) {
+        if (!builder->hasField(prefix)) {
             // Avoid adding the same prefix twice.
-            input.getField(prefix).addToBsonObj(&outputBuilder, prefix);
+            input.getField(prefix).addToBsonObj(builder, prefix);
         }
     }
-
-    return outputBuilder.obj();
 }
 
 }  // namespace document_path_support

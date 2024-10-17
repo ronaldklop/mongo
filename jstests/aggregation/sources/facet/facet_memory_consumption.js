@@ -3,14 +3,7 @@
  * facet's output document is large.
  *
  * This test was designed to reproduce SERVER-40317.
- *
- * Collections must be unsharded, since this test uses $lookup and sharded $lookup is not yet
- * supported.
- * @tags: [assumes_unsharded_collection]
  */
-(function() {
-"use strict";
-
 const collName = "facet_memory_consumption";
 const coll = db[collName];
 const kFacetOutputTooLargeCode = 4031700;
@@ -77,5 +70,4 @@ function cartesianProductPipeline(exponent) {
                       [{$facet: {product: cartesianProductPipeline(10)}}, {$unwind: "$product"}])
                   .toArray());
     assert.eq(result.code, kFacetOutputTooLargeCode);
-}());
 }());

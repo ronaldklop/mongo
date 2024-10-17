@@ -1,7 +1,7 @@
 // Verify that an aggregate with $geoNear always uses the index hinted to the aggregate command.
-(function() {
-"use strict";
-
+// @tags: [
+//  does_not_support_repeated_reads,
+// ]
 const collName = jsTest.name();
 const coll = db[collName];
 coll.drop();
@@ -50,4 +50,3 @@ for (const indexHint of [simpleGeoNearIndexName, compoundGeoNearIndexName]) {
         assert.eq(1, indexAccesses["ops"], indexStats);
     }
 }
-}());

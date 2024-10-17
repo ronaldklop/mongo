@@ -29,19 +29,40 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 namespace sbe {
+/**
+ * Scans a vector of BSON documents. The resulting BSON documents are placed into the
+ * given 'recordSlot', if provided.
+ *
+ * The caller can also optionally provide a vector of top-level field names, 'scanFieldNames', to
+ * extract from each BSON object. The resulting values are placed into the slots indicated by the
+ * 'scanFieldSlots' slot vector each time this stage advances. The provided 'scanFieldNames' and
+ * 'scanFieldSlots' vectors must be of equal length.
+ */
 class BSONScanStage final : public PlanStage {
 public:
-    BSONScanStage(const char* bsonBegin,
-                  const char* bsonEnd,
+    BSONScanStage(std::vector<BSONObj> bsons,
                   boost::optional<value::SlotId> recordSlot,
-                  std::vector<std::string> fields,
-                  value::SlotVector vars,
-                  PlanNodeId planNodeId);
+                  PlanNodeId planNodeId,
+                  std::vector<std::string> scanFieldNames = {},
+                  value::SlotVector scanFieldSlots = {},
+                  bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -55,21 +76,21 @@ public:
     const SpecificStats* getSpecificStats() const final;
 
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
 
 private:
-    const char* const _bsonBegin;
-    const char* const _bsonEnd;
+    const std::vector<BSONObj> _bsons;
 
     const boost::optional<value::SlotId> _recordSlot;
-    const std::vector<std::string> _fields;
-    const value::SlotVector _vars;
+    const std::vector<std::string> _scanFieldNames;
+    const value::SlotVector _scanFieldSlots;
 
     std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
 
-    value::FieldAccessorMap _fieldAccessors;
-    value::SlotAccessorMap _varAccessors;
+    value::FieldViewAccessorMap _scanFieldAccessors;
+    value::SlotAccessorMap _scanFieldAccessorsMap;
 
-    const char* _bsonCurrent;
+    std::vector<BSONObj>::const_iterator _bsonCurrent;
 
     ScanStats _specificStats;
 };

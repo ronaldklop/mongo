@@ -1,21 +1,25 @@
 // When a migration between shard0 and shard1 is about to enter the commit phase, a commit command
 // with different migration session ID is rejected.
 
-load('./jstests/libs/chunk_manipulation_util.js');
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-"use strict";
-
-var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
+var staticMongod = MongoRunner.runMongod({});
 
 var st = new ShardingTest({shards: 2});
 
-var mongos = st.s0, admin = mongos.getDB('admin'), dbName = "testDB", ns1 = dbName + ".foo",
-    coll1 = mongos.getCollection(ns1), shard0 = st.shard0, shard1 = st.shard1,
+var mongos = st.s0, admin = mongos.getDB('admin'), dbName = "testDB", ns1 = dbName + ".foo";
+assert.commandWorked(admin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+
+var coll1 = mongos.getCollection(ns1), shard0 = st.shard0, shard1 = st.shard1,
     shard0Coll1 = shard0.getCollection(ns1), shard1Coll1 = shard1.getCollection(ns1);
 
-assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(admin.runCommand({shardCollection: ns1, key: {a: 1}}));
 assert.commandWorked(coll1.insert({a: 0}));
 assert.eq(1, shard0Coll1.find().itcount());
@@ -57,4 +61,3 @@ assert.eq(1, shard1Coll1.find().itcount());
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

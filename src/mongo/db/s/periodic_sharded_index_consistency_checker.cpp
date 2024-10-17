@@ -27,24 +27,57 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include <boost/none.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/sharding_config_server_parameters_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/query/cluster_aggregate.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/query/planner/cluster_aggregate.h"
+#include "mongo/s/routing_information_cache.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
+
+static const int shardedTimeseriesShardkeyCheckIntervalMS{12 * 60 * 60 * 1000};  // 12 hours
 
 const auto getPeriodicShardedIndexConsistencyChecker =
     ServiceContext::declareDecoration<PeriodicShardedIndexConsistencyChecker>();
@@ -63,7 +96,7 @@ PeriodicShardedIndexConsistencyChecker& PeriodicShardedIndexConsistencyChecker::
 
 long long PeriodicShardedIndexConsistencyChecker::getNumShardedCollsWithInconsistentIndexes()
     const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _numShardedCollsWithInconsistentIndexes;
 }
 
@@ -76,6 +109,16 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
         "PeriodicShardedIndexConsistencyChecker",
         [this](Client* client) {
             if (!enableShardedIndexConsistencyCheck.load()) {
+                return;
+            }
+
+            auto uniqueOpCtx = client->makeOperationContext();
+            auto opCtx = uniqueOpCtx.get();
+
+            // TODO: SERVER-82965 Remove wait
+            try {
+                ShardingState::get(opCtx)->awaitClusterRoleRecovery().get(opCtx);
+            } catch (DBException&) {
                 return;
             }
 
@@ -115,22 +158,20 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
                 "{$limit: 1}], cursor: {}}");
 
-            auto uniqueOpCtx = client->makeOperationContext();
-            auto opCtx = uniqueOpCtx.get();
             auto curOp = CurOp::get(opCtx);
             curOp->ensureStarted();
             ON_BLOCK_EXIT([&] { curOp->done(); });
 
             try {
                 long long numShardedCollsWithInconsistentIndexes = 0;
-                auto collections = Grid::get(opCtx)->catalogClient()->getCollections(
-                    opCtx, {}, repl::ReadConcernLevel::kLocalReadConcern);
+                const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+                auto collections =
+                    catalogClient->getShardedCollections(opCtx,
+                                                         DatabaseName::kEmpty,
+                                                         repl::ReadConcernLevel::kLocalReadConcern,
+                                                         {} /*sort*/);
 
                 for (const auto& coll : collections) {
-                    if (coll.getDropped()) {
-                        continue;
-                    }
-
                     auto nss = coll.getNss();
 
                     // The only sharded collection in the config database with indexes is
@@ -141,28 +182,39 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                         continue;
                     }
 
+                    BSONObjBuilder requestBuilder;
+                    requestBuilder.append("aggregate", nss.coll());
+                    requestBuilder.append("$db",
+                                          DatabaseNameUtil::serialize(
+                                              nss.dbName(), SerializationContext::stateDefault()));
+                    requestBuilder.appendElements(aggRequestBSON);
                     auto request = aggregation_request_helper::parseFromBSON(
-                        nss, aggRequestBSON, boost::none, false);
+                        requestBuilder.obj(), auth::ValidatedTenancyScope::get(opCtx), boost::none);
 
-                    auto catalogCache = Grid::get(opCtx)->catalogCache();
+                    auto routingInfoCache = RoutingInformationCache::get(opCtx);
                     shardVersionRetry(
                         opCtx,
-                        catalogCache,
+                        routingInfoCache,
                         nss,
                         "pipeline to detect inconsistent sharded indexes"_sd,
                         [&] {
                             BSONObjBuilder responseBuilder;
+                            auto cri = uassertStatusOK(
+                                RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx,
+                                                                                              nss));
                             auto status = ClusterAggregate::runAggregate(
                                 opCtx,
                                 ClusterAggregate::Namespaces{nss, nss},
                                 request,
                                 LiteParsedPipeline{request},
                                 PrivilegeVector(),
+                                cri,
                                 &responseBuilder);
 
                             // Stop counting if the agg command failed for one of the collections
                             // to avoid recording a false count.
-                            uassertStatusOKWithContext(status, str::stream() << "nss " << nss);
+                            uassertStatusOKWithContext(
+                                status, str::stream() << "nss " << nss.toStringForErrorMsg());
 
                             if (!responseBuilder.obj()["cursor"]["firstBatch"].Array().empty()) {
                                 numShardedCollsWithInconsistentIndexes++;
@@ -172,8 +224,6 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
                 if (numShardedCollsWithInconsistentIndexes) {
                     LOGV2_WARNING(22051,
-                                  "Found {numShardedCollectionsWithInconsistentIndexes} sharded "
-                                  "collection(s) with inconsistent indexes",
                                   "Found sharded collections with inconsistent indexes",
                                   "numShardedCollectionsWithInconsistentIndexes"_attr =
                                       numShardedCollsWithInconsistentIndexes);
@@ -182,25 +232,64 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                 // Update the count if this node is still primary. This is necessary because a
                 // stepdown may complete while this job is running and the count should always be
                 // zero on a non-primary node.
-                stdx::lock_guard<Latch> lk(_mutex);
+                stdx::lock_guard<stdx::mutex> lk(_mutex);
                 if (_isPrimary) {
                     _numShardedCollsWithInconsistentIndexes =
                         numShardedCollsWithInconsistentIndexes;
                 }
             } catch (DBException& ex) {
                 LOGV2(22052,
-                      "Checking sharded index consistency failed with {error}",
                       "Error while checking sharded index consistency",
                       "error"_attr = ex.toStatus());
             }
         },
-        Milliseconds(shardedIndexConsistencyCheckIntervalMS));
+        Milliseconds(shardedIndexConsistencyCheckIntervalMS),
+        // TODO(SERVER-74658): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/);
     _shardedIndexConsistencyChecker = periodicRunner->makeJob(std::move(job));
     _shardedIndexConsistencyChecker.start();
 }
 
+void PeriodicShardedIndexConsistencyChecker::_launchOrResumeShardedTimeseriesShardkeyChecker(
+    WithLock, ServiceContext* serviceContext) {
+    auto periodicRunner = serviceContext->getPeriodicRunner();
+    invariant(periodicRunner);
+
+    if (_shardedTimeseriesShardkeyChecker.isValid()) {
+        _shardedTimeseriesShardkeyChecker.resume();
+        return;
+    }
+
+    PeriodicRunner::PeriodicJob job(
+        "PeriodicShardedTimeseriesShardkeyChecker",
+        [this](Client* client) {
+            auto uniqueOpCtx = client->makeOperationContext();
+            auto opCtx = uniqueOpCtx.get();
+
+            // TODO: SERVER-82965 Remove wait
+            try {
+                ShardingState::get(opCtx)->awaitClusterRoleRecovery().get(opCtx);
+            } catch (DBException&) {
+                return;
+            }
+
+            try {
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->checkTimeseriesShardKeys(opCtx));
+            } catch (const DBException& ex) {
+                LOGV2(9406000,
+                      "Error while checking timeseries sharded index consistency",
+                      "error"_attr = ex.toStatus());
+            }
+        },
+        Milliseconds(shardedTimeseriesShardkeyCheckIntervalMS),
+        false);
+    _shardedTimeseriesShardkeyChecker = periodicRunner->makeJob(std::move(job));
+    _shardedTimeseriesShardkeyChecker.start();
+}
+
 void PeriodicShardedIndexConsistencyChecker::onStepUp(ServiceContext* serviceContext) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (!_isPrimary) {
         _isPrimary = true;
         if (!_shardedIndexConsistencyChecker.isValid()) {
@@ -211,11 +300,12 @@ void PeriodicShardedIndexConsistencyChecker::onStepUp(ServiceContext* serviceCon
             // If we're stepping up again after having stepped down, just resume the existing task.
             _shardedIndexConsistencyChecker.resume();
         }
+        _launchOrResumeShardedTimeseriesShardkeyChecker(lk, serviceContext);
     }
 }
 
 void PeriodicShardedIndexConsistencyChecker::onStepDown() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_isPrimary) {
         _isPrimary = false;
         invariant(_shardedIndexConsistencyChecker.isValid());
@@ -223,6 +313,7 @@ void PeriodicShardedIndexConsistencyChecker::onStepDown() {
         // running, otherwise this would deadlock when the index check tries to lock _mutex when
         // updating the inconsistent index count.
         _shardedIndexConsistencyChecker.pause();
+        _shardedTimeseriesShardkeyChecker.pause();
         // Clear the counter to prevent a secondary from reporting an out-of-date count.
         _numShardedCollsWithInconsistentIndexes = 0;
     }
@@ -231,6 +322,9 @@ void PeriodicShardedIndexConsistencyChecker::onStepDown() {
 void PeriodicShardedIndexConsistencyChecker::onShutDown() {
     if (_shardedIndexConsistencyChecker.isValid()) {
         _shardedIndexConsistencyChecker.stop();
+    }
+    if (_shardedTimeseriesShardkeyChecker.isValid()) {
+        _shardedTimeseriesShardkeyChecker.stop();
     }
 }
 

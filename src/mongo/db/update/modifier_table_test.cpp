@@ -31,13 +31,13 @@
 
 #include <memory>
 
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
 using namespace mongo::modifiertable;
 
-using std::unique_ptr;
 
 TEST(getType, Normal) {
     ASSERT_EQUALS(getType("$set"), MOD_SET);

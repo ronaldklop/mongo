@@ -27,18 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/catalog/index_key_validate.h"
-
+#include <boost/move/utility_core.hpp>
+#include <climits>
+#include <fmt/format.h>
 #include <limits>
+#include <memory>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 
@@ -238,17 +241,17 @@ TEST(IndexKeyValidateTest, KeyElementNameWildcardSucceeds) {
     ASSERT_OK(validateKeyPattern(BSON("$**" << 1), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, WildcardIndexNumericKeyElementValueFailsIfNotPositive) {
+TEST(IndexKeyValidateTest, WildcardIndexNumericKeyElementValueFailsIfZero) {
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
               validateKeyPattern(BSON("$**" << 0.0), IndexVersion::kV2));
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
               validateKeyPattern(BSON("$**" << -0.0), IndexVersion::kV2));
-    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateKeyPattern(BSON("$**" << -0.1), IndexVersion::kV2));
-    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateKeyPattern(BSON("$**" << -1), IndexVersion::kV2));
-    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateKeyPattern(BSON("$**" << INT_MIN), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, WildcardIndexNumericKeyElementValueSucceedsIfNotPositive) {
+    ASSERT_OK(validateKeyPattern(BSON("$**" << -0.1), IndexVersion::kV2));
+    ASSERT_OK(validateKeyPattern(BSON("$**" << -1), IndexVersion::kV2));
+    ASSERT_OK(validateKeyPattern(BSON("$**" << INT_MIN), IndexVersion::kV2));
 }
 
 TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnRepeat) {
@@ -263,10 +266,10 @@ TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnSubPathRepeat) {
     ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
 }
 
-TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnCompound) {
-    auto status = validateKeyPattern(BSON("$**" << 1 << "a" << 1), IndexVersion::kV2);
-    ASSERT_NOT_OK(status);
-    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+TEST(IndexKeyValidateTest, KeyElementNameWildcardSucceedsOnCompound) {
+    ASSERT_OK(validateKeyPattern(BSON("$**" << 1 << "a" << 1), IndexVersion::kV2));
+    ASSERT_OK(validateKeyPattern(BSON("a" << 1 << "$**" << 1), IndexVersion::kV2));
+    ASSERT_OK(validateKeyPattern(BSON("a" << 1 << "$**" << -1 << "b" << 1), IndexVersion::kV2));
 }
 
 TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnIncorrectValue) {
@@ -280,7 +283,6 @@ TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsWhenValueIsPluginNameWithI
                                           << "wildcard"),
                                      IndexVersion::kV2);
     ASSERT_NOT_OK(status);
-    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
 }
 
 TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsWhenValueIsPluginNameWithValidKeyName) {
@@ -318,5 +320,185 @@ TEST(IndexKeyValidateTest, Background) {
         nullptr, fromjson("{key: {a: 1}, name: 'index', background: []}")));
 }
 
+TEST(IndexKeyValidateTest, RemoveUnkownFieldsFromIndexSpecs) {
+    ASSERT(fromjson("{key: {a: 1}, name: 'index'}")
+               .binaryEqual(index_key_validate::removeUnknownFields(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', safe: true, force: true}"))));
+}
+
+TEST(IndexKeyValidateTest, UpdateTTLIndexNaNExpireAfterSeconds) {
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max()
+                      << IndexDescriptor::kIndexVersionFieldName << IndexVersion::kV2)
+               .binaryEqual(unittest::assertGet(index_key_validate::validateIndexSpec(
+                   nullptr, fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}")))));
+}
+
+TEST(IndexKeyValidateTest, ValidateAfterSecondsAcceptsFloatingPointNumber) {
+    auto spec = unittest::assertGet(index_key_validate::validateIndexSpec(
+        nullptr, fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 123.456}")));
+
+    // TTLMonitor extracts 'expireAfterSeconds' using BSONElement::safeNumberLong().
+    ASSERT_EQUALS(spec["expireAfterSeconds"].safeNumberLong(), 123LL);
+}
+
+TEST(IndexKeyValidateTest, NormalizeExpireAfterSecondsDetectsInvalidValues) {
+    auto specs = {
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}"),
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 1E300}"),
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: -1E300}"),
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: -3600}"),
+    };
+
+    for (auto&& spec : specs) {
+        auto res = index_key_validate::normalizeExpireAfterSeconds(spec["expireAfterSeconds"]);
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQUALS(
+            res.value(),
+            durationCount<Seconds>(index_key_validate::kExpireAfterSecondsForInactiveTTLIndex));
+    }
+}
+
+TEST(IndexKeyValidateTest, NormalizeExpireAfterSecondsDetectsValidNonIntegerValues) {
+    auto specs = {
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 123.456}"),
+    };
+
+    for (auto&& spec : specs) {
+        auto res = index_key_validate::normalizeExpireAfterSeconds(spec["expireAfterSeconds"]);
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQUALS(res.value(), spec["expireAfterSeconds"].safeNumberInt());
+    }
+}
+
+TEST(IndexKeyValidateTest, NormalizeExpireAfterSecondsHandlesValidIntegerValues) {
+    auto specs = {
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 2147483646}"),
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 3600}"),
+        fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 0}"),
+    };
+
+    for (auto&& spec : specs) {
+        auto res = index_key_validate::normalizeExpireAfterSeconds(spec["expireAfterSeconds"]);
+        ASSERT_FALSE(res.has_value());
+    }
+}
+
+TEST(IndexKeyValidateTest, RepairIndexSpecs) {
+    ASSERT(fromjson("{key: {a: 1}, name: 'index'}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', safe: true, force: true}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', background: '1'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true, background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true', background: '1'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true, background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true', background: '1', safe: "
+                            "true, force: true}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index'}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', weights: {key: 1, name: 1}}"))));
+
+    ASSERT(fromjson("{key: {'a': 'text'}, name: 'index', weights: {key: 1, name: 1}}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {'a': 'text'}, name: 'index', weights: {key: 1, name: 1}}"))));
+
+    ASSERT(fromjson("{key: {'$**': 'text'}, name: 'index', weights: {key: 1, name: 1}}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {'$**': 'text'}, name: 'index', weights: {key: 1, name: 1}}"))));
+
+    ASSERT(fromjson("{key: {'data.loc' : '2dsphere_bucket'}, 'name': 'loc_2dsphere', "
+                    "'2dsphereIndexVersion' : 3}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {'data.loc' : '2dsphere_bucket'}, 'name': 'loc_2dsphere', "
+                            "'2dsphereIndexVersion' : 3}"))));
+
+    ASSERT(
+        fromjson("{key: {a: 1, 'name': 'text'}, name: 'index', weights: {key: 1, name: 1}}")
+            .binaryEqual(index_key_validate::repairIndexSpec(
+                NamespaceString::createNamespaceString_forTest("coll"),
+                fromjson(
+                    "{key: {a: 1, 'name': 'text'}, name: 'index', weights: {key: 1, name: 1}}"))));
+
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max())
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}"))));
+
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max())
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: '123'}"))));
+
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "background" << true)
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString::createNamespaceString_forTest("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', background: true, background: true}"))));
+}
+
+TEST(IndexKeyValidateTest, GeoIndexSpecs) {
+    ASSERT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':5}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':'string','"
+                 "coarsestIndexedLevel':'string'}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':'string'}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':'string','"
+                 "coarsestIndexedLevel':5}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':true,'"
+                 "coarsestIndexedLevel':true}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':true}")));
+
+    ASSERT_NOT_OK(index_key_validate::validateIndexSpec(
+        nullptr,
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':true,'"
+                 "coarsestIndexedLevel':5}")));
+}
 }  // namespace
 }  // namespace mongo

@@ -29,21 +29,36 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
 #include <set>
 #include <string>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/container_size_helper.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 class CollatorInterface;
 class MatchExpression;
-class WildcardProjection;
+
+class IndexPathProjection;
+using WildcardProjection = IndexPathProjection;
 
 /**
  * A CoreIndexInfo is a representation of an index in the catalog with parsed information which is
@@ -60,16 +75,17 @@ struct CoreIndexInfo {
                   Identifier ident,
                   const MatchExpression* fe = nullptr,
                   const CollatorInterface* ci = nullptr,
-                  const WildcardProjection* wildcardProj = nullptr)
+                  const IndexPathProjection* indexPathProj = nullptr)
         : identifier(std::move(ident)),
           keyPattern(kp),
           filterExpr(fe),
           type(type),
           sparse(sp),
           collator(ci),
-          wildcardProjection(wildcardProj) {
-        // We always expect a projection executor for $** indexes, and none otherwise.
-        invariant((type == IndexType::INDEX_WILDCARD) == (wildcardProjection != nullptr));
+          indexPathProjection(indexPathProj) {
+        // If a projection executor exists, we always expect a $** index
+        if (indexPathProjection != nullptr)
+            invariant(type == IndexType::INDEX_WILDCARD);
     }
 
     virtual ~CoreIndexInfo() = default;
@@ -121,6 +137,10 @@ struct CoreIndexInfo {
         std::string disambiguator;
     } identifier;
 
+    // Describes the keys of this index. Each BSONElement in 'keyPattern' describes one key part.
+    // Its name is the path to the field indexed by this part, and its value is the type of indexing
+    // done on that field, e.g. double 1.0/-1.0 for ascending/descending or string "hashed" for
+    // hashing.
     BSONObj keyPattern;
 
     const MatchExpression* filterExpr;
@@ -137,7 +157,7 @@ struct CoreIndexInfo {
 
     // For $** indexes, a pointer to the projection executor owned by the index access method. Null
     // unless this IndexEntry represents a wildcard index, in which case this is always non-null.
-    const WildcardProjection* wildcardProjection = nullptr;
+    const IndexPathProjection* indexPathProjection = nullptr;
 };
 
 /**
@@ -152,7 +172,7 @@ struct IndexEntry : CoreIndexInfo {
                IndexType type,
                IndexDescriptor::IndexVersion version,
                bool mk,
-               const MultikeyPaths& mkp,
+               MultikeyPaths mkp,
                std::set<FieldRef> multikeyPathSet,
                bool sp,
                bool unq,
@@ -160,16 +180,18 @@ struct IndexEntry : CoreIndexInfo {
                const MatchExpression* fe,
                const BSONObj& io,
                const CollatorInterface* ci,
-               const WildcardProjection* wildcardProjection)
+               const WildcardProjection* wildcardProjection,
+               size_t wildcardPos = 0)
         : CoreIndexInfo(kp, type, sp, std::move(ident), fe, ci, wildcardProjection),
           version(version),
           multikey(mk),
-          multikeyPaths(mkp),
-          multikeyPathSet(std::move(multikeyPathSet)),
           unique(unq),
-          infoObj(io) {
+          multikeyPaths(std::move(mkp)),
+          multikeyPathSet(std::move(multikeyPathSet)),
+          infoObj(io),
+          wildcardFieldPos(wildcardPos) {
         // The caller must not supply multikey metadata in two different formats.
-        invariant(multikeyPaths.empty() || multikeyPathSet.empty());
+        invariant(this->multikeyPaths.empty() || this->multikeyPathSet.empty());
     }
 
     IndexEntry(const IndexEntry&) = default;
@@ -178,7 +200,7 @@ struct IndexEntry : CoreIndexInfo {
     IndexEntry& operator=(const IndexEntry&) = default;
     IndexEntry& operator=(IndexEntry&&) = default;
 
-    ~IndexEntry() {
+    ~IndexEntry() override {
         // An IndexEntry should never have both formats of multikey metadata simultaneously.
         invariant(multikeyPaths.empty() || multikeyPathSet.empty());
     }
@@ -229,6 +251,7 @@ struct IndexEntry : CoreIndexInfo {
 
     IndexDescriptor::IndexVersion version;
     bool multikey;
+    bool unique;
 
     // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in the
     // index key pattern. Each element in the vector is an ordered set of positions (starting at 0)
@@ -248,10 +271,12 @@ struct IndexEntry : CoreIndexInfo {
     // 'multikeyPathSet' must be empty.
     std::set<FieldRef> multikeyPathSet;
 
-    bool unique;
-
     // Geo indices have extra parameters.  We need those available to plan correctly.
     BSONObj infoObj;
+
+    // Position of the replaced wildcard index field in the keyPattern, applied to Wildcard Indexes
+    // only.
+    size_t wildcardFieldPos;
 };
 
 std::ostream& operator<<(std::ostream& stream, const IndexEntry::Identifier& ident);

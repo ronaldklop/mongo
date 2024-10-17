@@ -6,10 +6,8 @@
 // 5. Restart replication on the SECONDARY.
 // 6. Wait for PRIMARY to StepDown.
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = "stepDownWithLongWait";
 var replSet = new ReplSetTest({name: name, nodes: 3});
@@ -26,6 +24,9 @@ replSet.initiate({
 
 replSet.waitForState(replSet.nodes[0], ReplSetTest.State.PRIMARY);
 var primary = replSet.getPrimary();
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 var secondary = replSet.getSecondary();
 jsTestLog('Disable replication on the SECONDARY ' + secondary.host);
@@ -73,4 +74,3 @@ var exitCode = stepDowner();
 jsTestLog("Wait for SECONDARY " + secondary.host + " to become PRIMARY");
 replSet.waitForState(secondary, ReplSetTest.State.PRIMARY);
 replSet.stopSet();
-})();

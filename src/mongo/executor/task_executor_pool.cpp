@@ -27,19 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <utility>
 
 #include "mongo/executor/task_executor_pool.h"
-
-#include <algorithm>
-
-#include "mongo/executor/task_executor_pool_parameters_gen.h"
-#include "mongo/util/processinfo.h"
+#include "mongo/executor/task_executor_pool_parameters_gen.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/processinfo.h"  // IWYU pragma: keep
 
 namespace mongo {
 namespace executor {
 
 size_t TaskExecutorPool::getSuggestedPoolSize() {
+#if (defined __linux__)
+    // Always use a pool of size 1 on Linux machines running mongo v4.2 and higher.
+    // Changing it past the default value can cause performance regressions.
+    return 1;
+#else
     auto poolSize = taskExecutorPoolSize.load();
     if (poolSize > 0) {
         return poolSize;
@@ -50,6 +54,7 @@ size_t TaskExecutorPool::getSuggestedPoolSize() {
 
     // Never suggest a number outside the range [4, 64].
     return std::max<size_t>(4U, std::min<size_t>(64U, numCores));
+#endif  //__linux__
 }
 
 void TaskExecutorPool::startup() {
@@ -67,6 +72,20 @@ void TaskExecutorPool::shutdownAndJoin() {
     _fixedExecutor->join();
     for (auto&& exec : _executors) {
         exec->shutdown();
+        exec->join();
+    }
+}
+
+void TaskExecutorPool::shutdown_forTest() {
+    _fixedExecutor->shutdown();
+    for (auto&& exec : _executors) {
+        exec->shutdown();
+    }
+}
+
+void TaskExecutorPool::join_forTest() {
+    _fixedExecutor->join();
+    for (auto&& exec : _executors) {
         exec->join();
     }
 }
@@ -98,6 +117,13 @@ void TaskExecutorPool::appendConnectionStats(ConnectionPoolStats* stats) const {
     // Get stats from our pooled executors.
     for (auto&& executor : _executors) {
         executor->appendConnectionStats(stats);
+    }
+}
+
+void TaskExecutorPool::appendNetworkInterfaceStats(BSONObjBuilder& bob) const {
+    _fixedExecutor->appendNetworkInterfaceStats(bob);
+    for (auto&& executor : _executors) {
+        executor->appendNetworkInterfaceStats(bob);
     }
 }
 

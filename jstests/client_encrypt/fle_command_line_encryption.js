@@ -1,11 +1,7 @@
 /*
  * This file tests an encrypted shell started using command line parameters.
- *
- * @tags: [live_record_incompatible]
  */
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
+import {CA_CERT, CLIENT_CERT, SERVER_CERT} from "jstests/ssl/libs/ssl_helpers.js";
 
 const x509_options = {
     sslMode: "requireSSL",
@@ -43,4 +39,3 @@ const testFiles = [
 for (const file of testFiles) {
     runMongoProgram(...shellOpts, file);
 }
-}());

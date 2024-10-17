@@ -29,14 +29,41 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
 #include <deque>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -55,6 +82,13 @@ public:
     enum class CursorType { kRegular, kEmptyDocuments };
 
     /**
+     * Indicates whether we are tracking resume information from an oplog query (e.g. for
+     * change streams), from a non-oplog query (natural order scan using recordId information)
+     * or neither.
+     */
+    enum class ResumeTrackingType { kNone, kOplog, kNonOplog };
+
+    /**
      * Create a document source based on a passed-in PlanExecutor. 'exec' must be a yielding
      * PlanExecutor, and must be registered with the associated collection's CursorManager.
      *
@@ -63,15 +97,19 @@ public:
      * $cursor stage can return a sequence of empty documents for the caller to count.
      */
     static boost::intrusive_ptr<DocumentSourceCursor> create(
-        const CollectionPtr& collection,
+        const MultipleCollectionAccessor& collections,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         CursorType cursorType,
-        bool trackOplogTimestamp = false);
+        ResumeTrackingType resumeTrackingType = ResumeTrackingType::kNone);
 
     const char* getSourceName() const override;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kCursor;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -125,16 +163,32 @@ public:
         return _exec->getPlanExplainer().getVersion();
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const {
+        return _queryFramework;
+    }
+
+    BSONObj serializeToBSONForDebug() const final {
+        // Feel free to add any useful information here. For now this has not been useful for
+        // debugging so is left empty.
+        return BSON(kStageName << "{}");
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // The assumption is that dependency analysis and non-correlated prefix analysis happens
+        // before a $cursor is attached to a pipeline.
+        MONGO_UNREACHABLE;
+    }
+
 protected:
-    DocumentSourceCursor(const CollectionPtr& collection,
+    DocumentSourceCursor(const MultipleCollectionAccessor& collections,
                          std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                          const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                          CursorType cursorType,
-                         bool trackOplogTimestamp = false);
+                         ResumeTrackingType resumeTrackingType = ResumeTrackingType::kNone);
 
     GetNextResult doGetNext() final;
 
-    ~DocumentSourceCursor();
+    ~DocumentSourceCursor() override;
 
     /**
      * Disposes of '_exec' if it hasn't been disposed already. This involves taking a collection
@@ -164,8 +218,10 @@ private:
 
         /**
          * Adds a new document to the batch.
+         * The resume token is used to track the resume token for this document for non-oplog
+         * queries.
          */
-        void enqueue(Document&& doc);
+        void enqueue(Document&& doc, boost::optional<BSONObj> resumeToken);
 
         /**
          * Removes the first document from the batch.
@@ -193,6 +249,18 @@ private:
             return _batchOfDocs.front();
         }
 
+        const BSONObj& peekFrontResumeToken() const {
+            invariant(_type == CursorType::kRegular);
+            return _resumeTokens.front();
+        }
+
+        /**
+         * Returns the number of documents currently in the batch.
+         */
+        size_t count() const {
+            return _type == CursorType::kRegular ? _batchOfDocs.size() : _count;
+        }
+
     private:
         // If 'kEmptyDocuments', then dependency analysis has indicated that all we need to execute
         // the query is a count of the incoming documents.
@@ -200,6 +268,10 @@ private:
 
         // Used only if '_type' is 'kRegular'. A deque of the documents comprising the batch.
         std::deque<Document> _batchOfDocs;
+
+        // Used only if '_type' is 'kRegular' and this is a resumable query for a non-oplog
+        // collection
+        std::deque<BSONObj> _resumeTokens;
 
         // Used only if '_type' is 'kEmptyDocuments'. In this case, we don't need to keep the
         // documents themselves, only a count of the number of documents in the batch.
@@ -230,6 +302,22 @@ private:
      */
     void _updateOplogTimestamp();
 
+    /**
+     * If we are tracking resume tokens for non-oplog scans, this method updates our cached resume
+     * token.
+     */
+    void _updateNonOplogResumeToken();
+
+    /**
+     * Initialize the exponential growth batch size which allows for batching a small number of
+     * documents when no $limit is pushed down into underlying executor. This approach can offer a
+     * performance benefit when only a limited amount of data is required. However, small batching
+     * may necessitate multiple yields in a potentially fast query, that's why we avoid to do so
+     * when $limit is pushed down. Note that we still maintain a separate size limit in bytes
+     * controlled by 'internalDocumentSourceCursorBatchSizeBytes' parameter.
+     */
+    void initializeBatchSizeCounts();
+
     // Batches results returned from the underlying PlanExecutor.
     Batch _currentBatch;
 
@@ -249,15 +337,27 @@ private:
     // wipe out its own copy of the winning plan's statistics, so they need to be saved here.
     boost::optional<PlanExplainer::PlanStatsDetails> _winningPlanTrialStats;
 
-    // True if we are tracking the latest observed oplog timestamp, false otherwise.
-    bool _trackOplogTS = false;
+    // Whether we are tracking the latest observed oplog timestamp, the resume token from the
+    // (non-oplog) scan, or neither.
+    ResumeTrackingType _resumeTrackingType = ResumeTrackingType::kNone;
 
     // If we are tracking the latest observed oplog time, this is the latest timestamp seen in the
     // oplog. Otherwise, this is a null timestamp.
     Timestamp _latestOplogTimestamp;
 
+    // If we are tracking a non-oplog resume token, the resume token for the last document we
+    // returned, or the current resume token at EOF.
+    BSONObj _latestNonOplogResumeToken;
+
     // Specific stats for $cursor stage.
     DocumentSourceCursorStats _stats;
+
+    PlanExecutor::QueryFramework _queryFramework;
+
+    // The size of each batch, grows exponentially. 0 means unlimited.
+    size_t _batchSizeCount = 0;
+    // The size limit in bytes of each batch.
+    size_t _batchSizeBytes = 0;
 };
 
 }  // namespace mongo

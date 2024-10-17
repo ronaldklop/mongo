@@ -27,108 +27,101 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/catalog/collection_compact.h"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/views/view_catalog.h"
+#include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(pauseCompactCommandBeforeWTCompact);
+
 using logv2::LogComponent;
 
-namespace {
-
-CollectionPtr getCollectionForCompact(OperationContext* opCtx,
-                                      Database* database,
-                                      const NamespaceString& collectionNss) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collectionNss, MODE_IX));
-
-    auto collectionCatalog = CollectionCatalog::get(opCtx);
-    CollectionPtr collection = collectionCatalog->lookupCollectionByNamespace(opCtx, collectionNss);
-
-    if (!collection) {
-        std::shared_ptr<const ViewDefinition> view =
-            ViewCatalog::get(database)->lookup(opCtx, collectionNss.ns());
-        uassert(ErrorCodes::CommandNotSupportedOnView, "can't compact a view", !view);
-        uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
-    }
-
-    return collection;
-}
-
-}  // namespace
-
 StatusWith<int64_t> compactCollection(OperationContext* opCtx,
-                                      const NamespaceString& collectionNss) {
-    AutoGetDb autoDb(opCtx, collectionNss.db(), MODE_IX);
-    Database* database = autoDb.getDb();
-    uassert(ErrorCodes::NamespaceNotFound, "database does not exist", database);
-
-    // The collection lock will be downgraded to an intent lock if the record store supports
-    // online compaction.
-    boost::optional<Lock::CollectionLock> collLk;
-    collLk.emplace(opCtx, collectionNss, MODE_X);
-
-    CollectionPtr collection = getCollectionForCompact(opCtx, database, collectionNss);
+                                      const CompactOptions& options,
+                                      const CollectionPtr& collection) {
     DisableDocumentValidation validationDisabler(opCtx);
 
+    auto collectionNss = collection->ns();
     auto recordStore = collection->getRecordStore();
-
-    OldClientContext ctx(opCtx, collectionNss.ns());
 
     if (!recordStore->compactSupported())
         return Status(ErrorCodes::CommandNotSupported,
                       str::stream() << "cannot compact collection with record store: "
                                     << recordStore->name());
 
-    if (recordStore->supportsOnlineCompaction()) {
-        // Storage engines that allow online compaction should do so using an intent lock on the
-        // collection.
-        collLk.emplace(opCtx, collectionNss, MODE_IX);
+    LOGV2_OPTIONS(20284, {LogComponent::kCommand}, "Compact begin", logAttrs(collectionNss));
 
-        // Ensure the collection was not dropped during the re-lock.
-        collection = getCollectionForCompact(opCtx, database, collectionNss);
-        recordStore = collection->getRecordStore();
-    }
-
-    LOGV2_OPTIONS(20284,
-                  {LogComponent::kCommand},
-                  "compact {namespace} begin",
-                  "Compact begin",
-                  "namespace"_attr = collectionNss);
-
-    auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+    auto bytesBefore = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
     auto indexCatalog = collection->getIndexCatalog();
 
-    Status status = recordStore->compact(opCtx);
-    if (!status.isOK())
-        return status;
+    pauseCompactCommandBeforeWTCompact.pauseWhileSet();
+
+    auto compactCollectionStatus = recordStore->compact(opCtx, options);
+    if (!compactCollectionStatus.isOK())
+        return compactCollectionStatus;
 
     // Compact all indexes (not including unfinished indexes)
-    status = indexCatalog->compactIndexes(opCtx);
-    if (!status.isOK())
-        return status;
+    auto compactIndexesStatus = indexCatalog->compactIndexes(opCtx, options);
+    if (!compactIndexesStatus.isOK())
+        return compactIndexesStatus;
 
-    auto totalSizeDiff =
-        oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
-    LOGV2(20286,
-          "compact {namespace} end, bytes freed: {freedBytes}",
-          "Compact end",
-          "namespace"_attr = collectionNss,
-          "freedBytes"_attr = totalSizeDiff);
-    return totalSizeDiff;
+    // The compact operation might grow the file size if there is little free space left, because
+    // running a compact also triggers a checkpoint, which requires some space. Additionally, it is
+    // possible for concurrent writes and index builds to cause the size to grow while compact is
+    // running. So it is possible for the size after a compact to be larger than before it.
+    if (options.dryRun) {
+        // When a dry run is triggered, each compact call returns an estimated number of bytes that
+        // can be reclaimed.
+        int64_t estimatedBytes =
+            compactCollectionStatus.getValue() + compactIndexesStatus.getValue();
+        LOGV2(8352600,
+              "Compact end",
+              logAttrs(collectionNss),
+              "estimatedBytes"_attr = estimatedBytes);
+        return estimatedBytes;
+    } else {
+        auto bytesAfter = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+        auto bytesDiff = static_cast<int64_t>(bytesBefore) - static_cast<int64_t>(bytesAfter);
+        LOGV2(7386700,
+              "Compact end",
+              logAttrs(collectionNss),
+              "bytesBefore"_attr = bytesBefore,
+              "bytesAfter"_attr = bytesAfter,
+              "bytesDiff"_attr = bytesDiff);
+        return bytesDiff;
+    }
 }
 
 }  // namespace mongo

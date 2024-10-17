@@ -29,10 +29,24 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/query/plan_enumerator_explain_info.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_cache/plan_cache_debug_info.h"
+#include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_builder/classic_stage_builder.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 /**
@@ -46,20 +60,33 @@ class PlanExplainerImpl final : public PlanExplainer {
 public:
     PlanExplainerImpl(PlanStage* root, const PlanEnumeratorExplainInfo& explainInfo)
         : PlanExplainer{explainInfo}, _root{root} {}
-    PlanExplainerImpl(PlanStage* root) : _root{root} {}
-
+    PlanExplainerImpl(PlanStage* root,
+                      boost::optional<size_t> cachedPlanHash,
+                      QueryPlanner::CostBasedRankerResult cbrResult,
+                      stage_builder::PlanStageToQsnMap planStageQsnMap,
+                      std::vector<std::unique_ptr<PlanStage>> cbrRejectedPlanStages)
+        : _root{root},
+          _cachedPlanHash(cachedPlanHash),
+          _cbrResult(std::move(cbrResult)),
+          _planStageQsnMap(std::move(planStageQsnMap)),
+          _cbrRejectedPlanStages(std::move(cbrRejectedPlanStages)) {}
     const ExplainVersion& getVersion() const final;
     bool isMultiPlan() const final;
     std::string getPlanSummary() const final;
     void getSummaryStats(PlanSummaryStats* statsOut) const final;
     PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
+    PlanStatsDetails getWinningPlanTrialStats() const final;
     std::vector<PlanStatsDetails> getRejectedPlansStats(
         ExplainOptions::Verbosity verbosity) const final;
-    std::vector<PlanStatsDetails> getCachedPlanStats(const PlanCacheEntry::DebugInfo&,
-                                                     ExplainOptions::Verbosity) const final;
+    std::vector<PlanStatsDetails> getCachedPlanStats(const plan_cache_debug_info::DebugInfo&,
+                                                     ExplainOptions::Verbosity) const;
 
 private:
     PlanStage* const _root;
+    boost::optional<size_t> _cachedPlanHash;
+    QueryPlanner::CostBasedRankerResult _cbrResult;
+    stage_builder::PlanStageToQsnMap _planStageQsnMap;
+    std::vector<std::unique_ptr<PlanStage>> _cbrRejectedPlanStages;
 };
 
 /**
@@ -67,6 +94,21 @@ private:
  * found.
  */
 PlanStage* getStageByType(PlanStage* root, StageType type);
+
+/**
+ * Returns filtered plan stats from the debugInfo object for different verbosity levels.
+ */
+std::vector<PlanExplainer::PlanStatsDetails> getCachedPlanStats(
+    const plan_cache_debug_info::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity);
+
+
+/**
+ * Collects and aggregates execution stats summary (totalKeysExamined and totalDocsExamined) by
+ * traversing the stats tree. Skips the top-level MultiPlanStage when it is at the top of the plan,
+ * and extracts stats from its child according to 'planIdx'.
+ */
+PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
+                                              boost::optional<size_t> planIdx);
 
 /**
  * Adds the path-level multikey information to the explain output in a field called "multiKeyPaths".

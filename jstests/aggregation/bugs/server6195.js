@@ -1,8 +1,10 @@
 // ensure $concat asserts on string
 
-load('jstests/aggregation/extras/utils.js');
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-c = db.s6570;
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+
+let c = db.s6570;
 c.drop();
 c.save({v: "$", w: ".", x: "foo", y: "bar", z: "z\0z"});
 

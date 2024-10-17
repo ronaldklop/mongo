@@ -29,12 +29,23 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -56,33 +67,32 @@ public:
                                  boost::intrusive_ptr<Expression> position,
                                  boost::intrusive_ptr<Expression> time,
                                  WindowBounds bounds,
-                                 boost::optional<TimeUnit> outputUnit)
-        : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kEndpointsOnly)),
+                                 boost::optional<TimeUnit> unit,
+                                 MemoryUsageTracker::Impl* memTracker)
+        : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kEndpoints),
+                             memTracker),
           _position(std::move(position)),
           _time(std::move(time)),
           _bounds(std::move(bounds)),
-          _outputUnitMillis([&]() -> boost::optional<long long> {
-              if (!outputUnit)
+          _unitMillis([&]() -> boost::optional<long long> {
+              if (!unit)
                   return boost::none;
 
-              auto status = timeUnitTypicalMilliseconds(*outputUnit);
-              tassert(status);
-              return status.getValue();
+              auto milliseconds = timeUnitTypicalMilliseconds(*unit);
+              tassert(7823403,
+                      "TimeUnit must be less than or equal to a 'week' ",
+                      milliseconds <= timeUnitTypicalMilliseconds(TimeUnit::week));
+              return milliseconds;
           }()) {}
 
     Value getNext() final;
     void reset() final {}
 
-    // This executor does not store any documents as it processes.
-    size_t getApproximateSize() const final {
-        return 0;
-    }
-
 private:
     boost::intrusive_ptr<Expression> _position;
     boost::intrusive_ptr<Expression> _time;
     WindowBounds _bounds;
-    boost::optional<long long> _outputUnitMillis;
+    boost::optional<long long> _unitMillis;
 };
 
 }  // namespace mongo

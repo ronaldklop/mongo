@@ -29,14 +29,22 @@
 
 #pragma once
 
+#include <cstddef>
 #include <map>
+#include <memory>
 #include <string>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_cpu_timer.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -89,7 +97,10 @@ public:
          * when the unit size is large. This is desired behavior, and the extent to which small
          * datums are overstated is tunable by the unit size of the implementor.
          */
-        void observeOne(size_t datumBytes);
+        MONGO_COMPILER_ALWAYS_INLINE void observeOne(int64_t datumBytes) {
+            _units += std::ceil(datumBytes / static_cast<float>(unitSize()));
+            _bytes += datumBytes;
+        }
 
     protected:
         /**
@@ -113,6 +124,35 @@ public:
         int unitSize() const final;
     };
 
+    /** TotalUnitWriteCounter records the number of units of document plus associated indexes
+     * observed. */
+    class TotalUnitWriteCounter {
+    public:
+        void observeOneDocument(int64_t datumBytes);
+        void observeOneIndexEntry(int64_t datumBytes);
+
+        TotalUnitWriteCounter& operator+=(TotalUnitWriteCounter other) {
+            // Flush the accumulators, in case there is anything still pending.
+            other.observeOneDocument(0);
+            observeOneDocument(0);
+            _units += other._units;
+            return *this;
+        }
+
+        long long units() const {
+            // Flush the accumulators, in case there is anything still pending.
+            TotalUnitWriteCounter copy(*this);
+            copy.observeOneDocument(0);
+            return copy._units;
+        }
+
+    private:
+        int unitSize() const;
+        long long _accumulatedDocumentBytes = 0;
+        long long _accumulatedIndexBytes = 0;
+        long long _units = 0;
+    };
+
     /** ReadMetrics maintains metrics for read operations. */
     class ReadMetrics {
     public:
@@ -122,9 +162,6 @@ public:
             docsRead += other.docsRead;
             idxEntriesRead += other.idxEntriesRead;
             docsReturned += other.docsReturned;
-            keysSorted += other.keysSorted;
-            sorterSpills += other.sorterSpills;
-            cursorSeeks += other.cursorSeeks;
         }
 
         ReadMetrics& operator+=(const ReadMetrics& other) {
@@ -143,13 +180,6 @@ public:
         IdxEntryUnitCounter idxEntriesRead;
         // Number of document units returned by a query
         DocumentUnitCounter docsReturned;
-
-        // Number of keys sorted for query operations
-        long long keysSorted = 0;
-        // Number of individual spills of data to disk by the sorter
-        long long sorterSpills = 0;
-        // Number of cursor seeks
-        long long cursorSeeks = 0;
     };
 
     /* WriteMetrics maintains metrics for write operations. */
@@ -158,6 +188,7 @@ public:
         void add(const WriteMetrics& other) {
             docsWritten += other.docsWritten;
             idxEntriesWritten += other.idxEntriesWritten;
+            totalWritten += other.totalWritten;
         }
 
         WriteMetrics& operator+=(const WriteMetrics& other) {
@@ -174,6 +205,8 @@ public:
         DocumentUnitCounter docsWritten;
         // Number of index entries written
         IdxEntryUnitCounter idxEntriesWritten;
+        // Number of total units written
+        TotalUnitWriteCounter totalWritten;
     };
 
     /**
@@ -187,6 +220,7 @@ public:
          * Reports all metrics on a BSONObjBuilder.
          */
         void toBson(BSONObjBuilder* builder) const;
+        BSONObj toBson() const;
 
         /**
          * Reports metrics on a BSONObjBuilder. Only non-zero fields are reported.
@@ -198,7 +232,7 @@ public:
         WriteMetrics writeMetrics;
 
         // Records CPU time consumed by this operation.
-        OperationCPUTimer* cpuTimer = nullptr;
+        boost::optional<OperationCPUTimer> cpuTimer;
     };
 
     /**
@@ -248,9 +282,10 @@ public:
         static MetricsCollector& get(OperationContext* opCtx);
 
         /**
-         * When called, resource consumption metrics should be recorded for this operation.
+         * When called, resource consumption metrics should be recorded for this operation. Clears
+         * any metrics from previous collection periods.
          */
-        void beginScopedCollecting(OperationContext* opCtx, const std::string& dbName);
+        void beginScopedCollecting(OperationContext* opCtx, const DatabaseName& dbName);
 
         /**
          * When called, sets state that a ScopedMetricsCollector is in scope, but is not recording
@@ -259,7 +294,7 @@ public:
          */
         void beginScopedNotCollecting() {
             invariant(!isInScope());
-            _collecting = ScopedCollectionState::kInScopeNotCollecting;
+            _collecting |= ScopedCollectionState::kInScope;
         }
 
         /**
@@ -269,12 +304,11 @@ public:
         bool endScopedCollecting();
 
         bool isCollecting() const {
-            return _collecting == ScopedCollectionState::kInScopeCollecting;
+            return !isPaused() && (_collecting & ScopedCollectionState::kCollecting);
         }
 
         bool isInScope() const {
-            return _collecting == ScopedCollectionState::kInScopeCollecting ||
-                _collecting == ScopedCollectionState::kInScopeNotCollecting;
+            return _collecting & ScopedCollectionState::kInScope;
         }
 
         /**
@@ -285,7 +319,7 @@ public:
             return _hasCollectedMetrics;
         }
 
-        const std::string& getDbName() const {
+        const DatabaseName& getDbName() const {
             return _dbName;
         }
 
@@ -294,48 +328,49 @@ public:
          * Metrics due to the Collector stopping without being associated with any database yet.
          */
         OperationMetrics& getMetrics() {
-            invariant(!_dbName.empty(), "observing Metrics before a dbName has been set");
+            invariant(!_dbName.isEmpty(), "observing Metrics before a dbName has been set");
             return _metrics;
         }
 
         const OperationMetrics& getMetrics() const {
-            invariant(!_dbName.empty(), "observing Metrics before a dbName has been set");
+            invariant(!_dbName.isEmpty(), "observing Metrics before a dbName has been set");
             return _metrics;
-        }
-
-        void reset() {
-            invariant(!isInScope());
-            *this = {};
         }
 
         /**
          * This should be called once per document read with the number of bytes read for that
          * document.  This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneDocRead(size_t docBytesRead);
+        void incrementOneDocRead(StringData uri, int64_t docBytesRead) {
+            if (!isCollecting()) {
+                return;
+            }
+
+            _incrementOneDocRead(uri, docBytesRead);
+        }
 
         /**
          * This should be called once per index entry read with the number of bytes read for that
          * entry. This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneIdxEntryRead(size_t idxEntryBytesRead);
+        void incrementOneIdxEntryRead(StringData uri, int64_t bytesRead) {
+            if (!isCollecting()) {
+                return;
+            }
 
-        /**
-         * Increments the number of keys sorted for a query operation. This is a no-op when metrics
-         * collection is disabled on this operation.
-         */
-        void incrementKeysSorted(size_t keysSorted);
-
-        /**
-         * Increments the number of number of individual spills to disk by the sorter for query
-         * operations. This is a no-op when metrics collection is disabled on this operation.
-         */
-        void incrementSorterSpills(size_t spills);
+            _incrementOneIdxEntryRead(uri, bytesRead);
+        }
 
         /**
          * Increments the number of document units returned in the command response.
          */
-        void incrementDocUnitsReturned(DocumentUnitCounter docUnitsReturned);
+        void incrementDocUnitsReturned(StringData ns, DocumentUnitCounter docUnits) {
+            if (!isCollecting()) {
+                return;
+            }
+
+            _incrementDocUnitsReturned(ns, docUnits);
+        }
 
         /**
          * This should be called once per document written with the number of bytes written for that
@@ -343,21 +378,49 @@ public:
          * function should not be called when the operation is a write to the oplog. The metrics are
          * only for operations that are not oplog writes.
          */
-        void incrementOneDocWritten(size_t docBytesWritten);
+        void incrementOneDocWritten(StringData uri, int64_t bytesWritten) {
+            if (!isCollecting()) {
+                return;
+            }
+
+            _incrementOneDocWritten(uri, bytesWritten);
+        }
 
         /**
          * This should be called once per index entry written with the number of bytes written for
          * that entry. This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneIdxEntryWritten(size_t idxEntryBytesWritten);
+        void incrementOneIdxEntryWritten(StringData uri, int64_t bytesWritten) {
+            if (!isCollecting()) {
+                return;
+            }
+
+            _incrementOneIdxEntryWritten(uri, bytesWritten);
+        }
 
         /**
-         * This should be called once every time the storage engine successfully does a cursor seek.
-         * Note that if it takes multiple attempts to do a successful seek, this function should
-         * only be called once. If the seek does not find anything, this function should not be
-         * called.
+         * Pause metrics collection, overriding kInScopeCollecting status. The scope status may be
+         * changed during a pause, but will not come into effect until resume() is called.
          */
-        void incrementOneCursorSeek();
+        void pause() {
+            invariant(!isPaused());
+            _collecting |= ScopedCollectionState::kPaused;
+        }
+
+        /**
+         * Resume metrics collection. Trying to resume a non-paused object will invariant.
+         */
+        void resume() {
+            invariant(isPaused());
+            _collecting &= ~ScopedCollectionState::kPaused;
+        }
+
+        /**
+         * Returns if the current object is in paused state.
+         */
+        bool isPaused() const {
+            return _collecting & ScopedCollectionState::kPaused;
+        }
 
     private:
         // Privatize copy constructors to prevent callers from accidentally copying when this is
@@ -365,26 +428,31 @@ public:
         MetricsCollector(const MetricsCollector&) = default;
         MetricsCollector& operator=(const MetricsCollector&) = default;
 
-        /**
-         * Helper function that calls the Func when this collector is currently collecting metrics.
-         */
-        template <typename Func>
-        void _doIfCollecting(Func&& func);
+        // These internal helpers allow us to inline the public functions when we aren't collecting
+        // metrics and calls these costlier implementations when we are.
+        void _incrementOneDocRead(StringData uri, int64_t docBytesRead);
+        void _incrementOneIdxEntryRead(StringData uri, int64_t bytesRead);
+        void _incrementDocUnitsReturned(StringData ns, DocumentUnitCounter docUnits);
+        void _incrementOneDocWritten(StringData uri, int64_t bytesWritten);
+        void _incrementOneIdxEntryWritten(StringData uri, int64_t bytesWritten);
 
         /**
          * Represents the ScopedMetricsCollector state.
          */
-        enum class ScopedCollectionState {
-            // No ScopedMetricsCollector is in scope
-            kInactive,
-            // A ScopedMetricsCollector is in scope but not collecting metrics
-            kInScopeNotCollecting,
-            // A ScopedMetricsCollector is in scope and collecting metrics
-            kInScopeCollecting
+        struct ScopedCollectionState {
+            // A ScopedMetricsCollector is NOT in scope
+            static constexpr int kInactive = 0;
+            // A ScopedMetricsCollector is collecting metrics.
+            static constexpr int kCollecting = 1;
+            // A ScopedMetricsCollector is in scope
+            static constexpr int kInScope = 1 << 1;
+            // A ScopedMetricsCollector is paused
+            static constexpr int kPaused = 1 << 2;
         };
-        ScopedCollectionState _collecting = ScopedCollectionState::kInactive;
+
+        int _collecting = ScopedCollectionState::kInactive;
         bool _hasCollectedMetrics = false;
-        std::string _dbName;
+        DatabaseName _dbName;
         OperationMetrics _metrics;
     };
 
@@ -396,9 +464,9 @@ public:
     class ScopedMetricsCollector {
     public:
         ScopedMetricsCollector(OperationContext* opCtx,
-                               const std::string& dbName,
+                               const DatabaseName& dbName,
                                bool commandCollectsMetrics);
-        ScopedMetricsCollector(OperationContext* opCtx, const std::string& dbName)
+        ScopedMetricsCollector(OperationContext* opCtx, const DatabaseName& dbName)
             : ScopedMetricsCollector(opCtx, dbName, true) {}
         ~ScopedMetricsCollector();
 
@@ -408,11 +476,42 @@ public:
     };
 
     /**
+     * RAII-style class to temporarily pause the MetricsCollector in the OperationContext. This
+     * applies even if the MetricsCollector is started explicitly in lower levels.
+     *
+     * Exception: CPU metrics are not paused.
+     */
+    class PauseMetricsCollectorBlock {
+        PauseMetricsCollectorBlock(const PauseMetricsCollectorBlock&) = delete;
+        PauseMetricsCollectorBlock& operator=(const PauseMetricsCollectorBlock&) = delete;
+
+    public:
+        explicit PauseMetricsCollectorBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+            auto& metrics = MetricsCollector::get(_opCtx);
+            _wasPaused = metrics.isPaused();
+            if (!_wasPaused) {
+                metrics.pause();
+            }
+        }
+
+        ~PauseMetricsCollectorBlock() {
+            if (!_wasPaused) {
+                auto& metrics = MetricsCollector::get(_opCtx);
+                metrics.resume();
+            }
+        }
+
+    private:
+        OperationContext* _opCtx;
+        bool _wasPaused;
+    };
+
+    /**
      * Returns whether the database's metrics should be collected.
      */
-    static bool shouldCollectMetricsForDatabase(StringData dbName) {
-        if (dbName == NamespaceString::kAdminDb || dbName == NamespaceString::kConfigDb ||
-            dbName == NamespaceString::kLocalDb) {
+    static bool shouldCollectMetricsForDatabase(const DatabaseName& dbName) {
+        if (dbName == DatabaseName::kAdmin || dbName == DatabaseName::kConfig ||
+            dbName == DatabaseName::kLocal) {
             return false;
         }
         return true;
@@ -441,7 +540,9 @@ public:
      *
      * The database name must not be an empty string.
      */
-    void merge(OperationContext* opCtx, const std::string& dbName, const OperationMetrics& metrics);
+    void merge(OperationContext* opCtx,
+               const DatabaseName& dbName,
+               const OperationMetrics& metrics);
 
     /**
      * Returns a copy of the per-database metrics map.
@@ -452,7 +553,7 @@ public:
     /**
      *  Returns the number of databases with aggregated metrics.
      */
-    size_t getNumDbMetrics() const;
+    int64_t getNumDbMetrics() const;
 
     /**
      * Returns the per-database metrics map and then clears the contents. This attempts to swap and
@@ -472,7 +573,7 @@ public:
 
 private:
     // Protects _dbMetrics and _cpuTime
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ResourceConsumption::_mutex");
+    mutable stdx::mutex _mutex;
     MetricsMap _dbMetrics;
     Nanoseconds _cpuTime;
 };

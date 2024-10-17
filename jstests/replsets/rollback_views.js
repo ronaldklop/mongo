@@ -14,14 +14,12 @@
  * 7. The contents of A and B are compared to ensure the rollback results in consistent nodes,
  *    and have the expected collections and views..
  */
-load("jstests/replsets/rslib.js");
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {awaitOpTime} from "jstests/replsets/rslib.js";
 
 // Run a command, return the result if it worked, or assert with a message otherwise.
 let checkedRunCommand = (db, cmd) =>
-    ((res, msg) => (assert.commandWorked(res, msg), res))(db.runCommand(cmd), tojson(cmd));
+    ((res, msg) => ((assert.commandWorked(res, msg), res)))(db.runCommand(cmd), tojson(cmd));
 
 // Like db.getCollectionNames, but allows a filter.
 let getCollectionNames = (db, filter) => checkedRunCommand(db, {listCollections: 1, filter})
@@ -64,6 +62,10 @@ let nodeA = conns[0];
 let nodeB = conns[1];
 let arbiter = conns[2];
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(nodeA.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 let a1 = nodeA.getDB("test1");
 let b1 = nodeB.getDB("test1");
 
@@ -98,6 +100,8 @@ nodeB.disconnect(arbiter);
 replTest.awaitNoPrimary();
 nodeA.reconnect(arbiter);
 assert.soon(() => replTest.getPrimary() == nodeA, "nodeA did not become primary as expected");
+// Ensure that the arbiter recognizes nodeA as primary.
+replTest.awaitNodesAgreeOnPrimary(replTest.kDefaultTimeoutMS, [nodeA, arbiter], nodeA);
 
 // A is now primary and will perform writes that must be copied by B after rollback.
 assert.eq(a1.coll.find().itcount(), 2, "expected two documents in test1.coll");
@@ -135,4 +139,3 @@ replTest.checkReplicatedDataHashes();
 replTest.checkOplogs();
 
 replTest.stopSet();
-}());

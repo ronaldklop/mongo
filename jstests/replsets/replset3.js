@@ -1,5 +1,6 @@
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var doTest = function(signal) {
-    "use strict";
     // Test replica set step down
 
     // Replica set testing API

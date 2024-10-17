@@ -1,8 +1,7 @@
 /**
  * Tests the format of 'electionMetrics' serverStatus section.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Verifies that the 'electionMetrics' serverStatus section has the given field.
 function verifyElectionMetricsField(serverStatusResponse, fieldName) {
@@ -57,4 +56,3 @@ verifyElectionMetricsSSS(serverStatusResponse);
 
 // Stop the replica set.
 rst.stopSet();
-}());

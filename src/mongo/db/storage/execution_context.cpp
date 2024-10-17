@@ -28,16 +28,15 @@
  */
 
 #include "mongo/db/storage/execution_context.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
+
+#include <utility>
+
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 const OperationContext::Decoration<StorageExecutionContext> StorageExecutionContext::get =
     OperationContext::declareDecoration<StorageExecutionContext>();
 
-StorageExecutionContext::StorageExecutionContext()
-    : _pooledBufferBuilder(
-          gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
-          SharedBufferFragmentBuilder::DoubleGrowStrategy(
-              gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024))) {}
+StorageExecutionContext::StorageExecutionContext() {}
 
 }  // namespace mongo

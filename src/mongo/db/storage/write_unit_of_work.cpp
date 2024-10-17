@@ -27,30 +27,41 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+#include <ostream>
+#include <string>
 
-#include "mongo/db/storage/write_unit_of_work.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
-#include "mongo/db/catalog/uncommitted_collections.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/time_support.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DEFINE(sleepBeforeCommit);
+WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx, OplogEntryGroupType groupOplogEntries)
+    : _opCtx(opCtx),
+      _toplevel(opCtx->_ruState == RecoveryUnitState::kNotInUnitOfWork),
+      _groupOplogEntries(groupOplogEntries) {  // Grouping oplog entries doesn't support WUOW
+                                               // nesting (e.g. multi-doc transactions).
+    invariant(_toplevel || !_isGroupingOplogEntries());
 
-WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx)
-    : _opCtx(opCtx), _toplevel(opCtx->_ruState == RecoveryUnitState::kNotInUnitOfWork) {
-    uassert(ErrorCodes::IllegalOperation,
-            "Cannot execute a write operation in read-only mode",
-            !storageGlobalParams.readOnly);
-    _opCtx->lockState()->beginWriteUnitOfWork();
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteStart(_opCtx);
+    }
+
+    shard_role_details::getLocker(_opCtx)->beginWriteUnitOfWork();
     if (_toplevel) {
-        _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
+        shard_role_details::getRecoveryUnit(_opCtx)->beginUnitOfWork(_opCtx->readOnly());
         _opCtx->_ruState = RecoveryUnitState::kActiveUnitOfWork;
     }
     // Make sure we don't silently proceed after a previous WriteUnitOfWork under the same parent
@@ -59,16 +70,28 @@ WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx)
 }
 
 WriteUnitOfWork::~WriteUnitOfWork() {
-    dassert(!storageGlobalParams.readOnly);
     if (!_released && !_committed) {
         invariant(_opCtx->_ruState != RecoveryUnitState::kNotInUnitOfWork);
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->abortUnitOfWork();
-            _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
+        if (!_opCtx->readOnly()) {
+            if (_toplevel) {
+                // Abort unit of work and execute rollback handlers
+                shard_role_details::getRecoveryUnit(_opCtx)->abortUnitOfWork();
+                _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
+            } else {
+                _opCtx->_ruState = RecoveryUnitState::kFailedUnitOfWork;
+            }
         } else {
-            _opCtx->_ruState = RecoveryUnitState::kFailedUnitOfWork;
+            // Clear the readOnly state and execute rollback handlers in readOnly mode.
+            shard_role_details::getRecoveryUnit(_opCtx)->endReadOnlyUnitOfWork();
+            shard_role_details::getRecoveryUnit(_opCtx)->abortRegisteredChanges();
         }
-        _opCtx->lockState()->endWriteUnitOfWork();
+        shard_role_details::getLocker(_opCtx)->endWriteUnitOfWork();
+    }
+
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteAbort(_opCtx);
     }
 }
 
@@ -99,7 +122,7 @@ void WriteUnitOfWork::prepare() {
     invariant(_toplevel);
     invariant(_opCtx->_ruState == RecoveryUnitState::kActiveUnitOfWork);
 
-    _opCtx->recoveryUnit()->prepareUnitOfWork();
+    shard_role_details::getRecoveryUnit(_opCtx)->prepareUnitOfWork();
     _prepared = true;
 }
 
@@ -107,16 +130,28 @@ void WriteUnitOfWork::commit() {
     invariant(!_committed);
     invariant(!_released);
     invariant(_opCtx->_ruState == RecoveryUnitState::kActiveUnitOfWork);
+
+    if (_isGroupingOplogEntries()) {
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteCommit(_opCtx, _groupOplogEntries);
+    }
     if (_toplevel) {
-        if (MONGO_unlikely(sleepBeforeCommit.shouldFail())) {
-            sleepFor(Milliseconds(100));
+        // Execute preCommit hooks before committing the transaction. This is an opportunity to
+        // throw or do any last changes before committing.
+        shard_role_details::getRecoveryUnit(_opCtx)->runPreCommitHooks(_opCtx);
+        if (!_opCtx->readOnly()) {
+            // Commit unit of work and execute commit or rollback handlers depending on whether the
+            // commit was successful.
+            shard_role_details::getRecoveryUnit(_opCtx)->commitUnitOfWork();
+        } else {
+            // Just execute commit handlers in readOnly mode
+            shard_role_details::getRecoveryUnit(_opCtx)->commitRegisteredChanges(boost::none);
         }
 
-        _opCtx->recoveryUnit()->runPreCommitHooks(_opCtx);
-        _opCtx->recoveryUnit()->commitUnitOfWork();
         _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
     }
-    _opCtx->lockState()->endWriteUnitOfWork();
+    shard_role_details::getLocker(_opCtx)->endWriteUnitOfWork();
     _committed = true;
 }
 

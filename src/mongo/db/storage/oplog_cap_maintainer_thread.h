@@ -31,32 +31,39 @@
 
 #include <string>
 
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/background.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/thread.h"
 
 namespace mongo {
 
 /**
- * Responsible for deleting oplog stones once their max capacity has been reached.
+ * Responsible for deleting oplog truncate markers once their max capacity has been reached.
  */
-class OplogCapMaintainerThread : public BackgroundJob {
+class OplogCapMaintainerThread {
 public:
-    OplogCapMaintainerThread() : BackgroundJob(true /* deleteSelf */) {}
+    static OplogCapMaintainerThread* get(ServiceContext* serviceCtx);
 
-    virtual std::string name() const {
-        return _name;
-    }
+    /**
+     * Create the maintainer thread. Must be called at most once.
+     */
+    void start();
 
-    virtual void run();
+    /**
+     * Waits until the maintainer thread finishes. Must not be called concurrently with start().
+     */
+    void shutdown();
 
 private:
+    void _run();
+
     /**
      * Returns true iff there was an oplog to delete from.
      */
-    bool _deleteExcessDocuments();
+    bool _deleteExcessDocuments(OperationContext* opCtx);
 
-    std::string _name =
-        std::string("OplogCapMaintainerThread-") + NamespaceString::kRsOplogNamespace.toString();
+    stdx::thread _thread;
 };
 
 }  // namespace mongo

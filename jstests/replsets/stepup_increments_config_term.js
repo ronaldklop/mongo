@@ -1,10 +1,8 @@
 /**
  * Test that step-up increments the config term via reconfig.
  */
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 var name = 'stepup_increments_config_term';
 var replTest = new ReplSetTest({name: name, nodes: 3, settings: {chainingAllowed: false}});
@@ -38,4 +36,3 @@ assert.eq(originalConfig.version, config.version, msg);
 assert.eq(originalConfig.term + 1, config.term, msg);
 
 replTest.stopSet();
-}());

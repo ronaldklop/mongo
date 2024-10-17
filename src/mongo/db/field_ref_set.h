@@ -29,11 +29,18 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/field_ref.h"
 
 namespace mongo {
@@ -56,11 +63,11 @@ class FieldRefSet {
         bool operator()(const FieldRef* lhs, const FieldRef* rhs) const;
     };
 
-    typedef std::set<const FieldRef*, FieldRefPtrLessThan> FieldSet;
+    typedef std::set<const FieldRef*, FieldRefPtrLessThan> SetType;
 
 public:
-    using iterator = FieldSet::iterator;
-    using const_iterator = FieldSet::const_iterator;
+    using iterator = SetType::iterator;
+    using const_iterator = SetType::const_iterator;
 
     FieldRefSet();
 
@@ -71,6 +78,10 @@ public:
     /** Returns 'true' if the set is empty */
     bool empty() const {
         return _fieldSet.empty();
+    }
+
+    size_t size() const {
+        return _fieldSet.size();
     }
 
     inline const_iterator begin() const {
@@ -131,7 +142,7 @@ public:
      *
      * Return true if conflicts were found.
      */
-    bool findConflicts(const FieldRef* toCheck, FieldRefSet* conflicts) const;
+    StatusWith<bool> checkForConflictsAndPrefix(const FieldRef* toCheck) const;
 
     void clear() {
         _fieldSet.clear();
@@ -144,11 +155,11 @@ public:
     /**
      * A debug/log-able string
      */
-    const std::string toString() const;
+    std::string toString() const;
 
 private:
     // A set of field_ref pointers, none of which is owned here.
-    FieldSet _fieldSet;
+    SetType _fieldSet;
 };
 
 /**

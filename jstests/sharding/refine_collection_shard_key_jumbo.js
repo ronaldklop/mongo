@@ -2,12 +2,13 @@
 // Jumbo tests for refineCollectionShardKey.
 //
 
-(function() {
-'use strict';
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
-load("jstests/sharding/libs/find_chunks_util.js");
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-const st = new ShardingTest({mongos: 1, shards: 2, other: {chunkSize: 1, enableAutoSplit: true}});
+const st = new ShardingTest({mongos: 1, shards: 2, other: {chunkSize: 1}});
 const primaryShard = st.shard0.shardName;
 const secondaryShard = st.shard1.shardName;
 const kDbName = 'test';
@@ -15,7 +16,6 @@ const kCollName = 'foo';
 const kNestedCollName = 'nested_foo';
 const kNsName = kDbName + '.' + kCollName;
 const kNestedNsName = kDbName + '.' + kNestedCollName;
-const kConfigChunks = 'config.chunks';
 const kZoneName = 'testZone';
 
 function generateJumboChunk(ns, isForNestedCase) {
@@ -133,8 +133,7 @@ jsTestLog('********** BALANCER JUMBO TEST **********');
 //
 
 // NOTE: The current shard key is {x: 1}.
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
+assert.commandWorked(st.s.adminCommand({enableSharding: kDbName, primaryShard: primaryShard}));
 assert.commandWorked(st.s.adminCommand({shardCollection: kNsName, key: {x: 1}}));
 
 generateJumboChunk(kNsName, false /* isForNestedCase */);
@@ -159,8 +158,6 @@ assert(st.s.getCollection(kNsName).drop());
 // With a nested shard key.
 //
 
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
 assert.commandWorked(st.s.adminCommand({shardCollection: kNestedNsName, key: {x: 1}}));
 
 generateJumboChunk(kNestedNsName, true /* isForNestedCase */);
@@ -191,8 +188,6 @@ jsTestLog('********** MANUAL (i.e. MOVE CHUNK) JUMBO TEST **********');
 //
 
 // NOTE: The current shard key is {x: 1}.
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
 assert.commandWorked(st.s.adminCommand({shardCollection: kNsName, key: {x: 1}}));
 
 generateJumboChunk(kNsName, false /* isForNestedCase */);
@@ -210,9 +205,6 @@ assert(st.s.getCollection(kNsName).drop());
 //
 // With a nested shard key.
 //
-
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
 assert.commandWorked(st.s.adminCommand({shardCollection: kNestedNsName, key: {x: 1}}));
 
 generateJumboChunk(kNestedNsName, true /* isForNestedCase */);
@@ -225,4 +217,3 @@ assert.commandWorked(
 validateMoveChunkAfterRefine(kNestedNsName, "y.z");
 
 st.stop();
-})();

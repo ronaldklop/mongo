@@ -29,16 +29,37 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/duplicate_key_tracker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index/skipped_record_tracker.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/db/yieldable.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -48,12 +69,14 @@ class OperationContext;
 
 class IndexBuildInterceptor {
 public:
+    using RetrySkippedRecordMode = SkippedRecordTracker::RetrySkippedRecordMode;
+
     /**
      * Determines if we will yield locks while draining the side tables.
      */
     enum class DrainYieldPolicy { kNoYield, kYield };
 
-    enum class Op { kInsert, kDelete };
+    enum class Op { kInsert, kDelete, kUpdate };
 
     /**
      * Indicates whether to record duplicate keys that have been inserted into the index. When set
@@ -66,32 +89,25 @@ public:
      * Creates a temporary table for writes during an index build. Additionally creates a temporary
      * table to store any duplicate key constraint violations found during the build, if the index
      * being built has uniqueness constraints.
-     *
-     * finalizeTemporaryTables() must be called before destruction to delete or keep the temporary
-     * tables.
      */
-    IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry);
+    IndexBuildInterceptor(OperationContext* opCtx, const IndexCatalogEntry* entry);
 
     /**
      * Finds the temporary table associated with storing writes during this index build. Only used
      * Only used when resuming an index build and the temporary table already exists on disk.
-     * Additionally will find the tmeporary table associated with storing duplicate key constraint
+     * Additionally will find the temporary table associated with storing duplicate key constraint
      * violations found during the build, if the index being built has uniqueness constraints.
-     *
-     * finalizeTemporaryTable() must be called before destruction.
      */
     IndexBuildInterceptor(OperationContext* opCtx,
-                          IndexCatalogEntry* entry,
+                          const IndexCatalogEntry* entry,
                           StringData sideWritesIdent,
                           boost::optional<StringData> duplicateKeyTrackerIdent,
                           boost::optional<StringData> skippedRecordTrackerIdent);
 
     /**
-     * Deletes or keeps the temporary side writes and duplicate key constraint violations tables.
-     * Must be called before object destruction.
+     * Keeps the temporary side writes and duplicate key constraint violations tables.
      */
-    void finalizeTemporaryTables(OperationContext* opCtx,
-                                 TemporaryRecordStore::FinalizationAction action);
+    void keepTemporaryTables();
 
     /**
      * Client writes that are concurrent with an index build will have their index updates written
@@ -101,25 +117,29 @@ public:
      * On success, `numKeysOut` if non-null will contain the number of keys added or removed.
      */
     Status sideWrite(OperationContext* opCtx,
+                     const IndexCatalogEntry* indexCatalogEntry,
                      const KeyStringSet& keys,
                      const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths,
-                     RecordId loc,
                      Op op,
-                     int64_t* const numKeysOut);
+                     int64_t* numKeysOut);
+
 
     /**
      * Given a duplicate key, record the key for later verification by a call to
      * checkDuplicateKeyConstraints();
      */
-    Status recordDuplicateKey(OperationContext* opCtx, const KeyString::Value& key) const;
+    Status recordDuplicateKey(OperationContext* opCtx,
+                              const IndexCatalogEntry* indexCatalogEntry,
+                              const key_string::Value& key) const;
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been
      * resolved for the index. Returns a DuplicateKey error if there are still duplicate key
      * constraint violations on the index.
      */
-    Status checkDuplicateKeyConstraints(OperationContext* opCtx) const;
+    Status checkDuplicateKeyConstraints(OperationContext* opCtx,
+                                        const IndexCatalogEntry* indexCatalogEntry) const;
 
 
     /**
@@ -132,6 +152,7 @@ public:
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
                                 const CollectionPtr& coll,
+                                const IndexCatalogEntry* indexCatalogEntry,
                                 const InsertDeleteOptions& options,
                                 TrackDuplicates trackDups,
                                 DrainYieldPolicy drainYieldPolicy);
@@ -145,17 +166,29 @@ public:
     }
 
     /**
-     * Tries to index previously skipped records. For each record, if the new indexing attempt is
-     * successful, keys are written directly to the index. Unsuccessful key generation or writes
-     * will return errors.
+     * By default, tries to generate keys and insert previously skipped records in the index. For
+     * each record, if the new indexing attempt is successful, keys are written directly to the
+     * index. Unsuccessful key generation or writes will return errors.
+     *
+     * The behaviour can be modified by specifying a RetrySkippedRecordMode.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const IndexCatalogEntry* indexCatalogEntry,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
-     * Returns 'true' if there are no visible records remaining to be applied from the side writes
-     * table. Ensure that this returns 'true' when an index build is completed.
+     * Returns whether there are no visible records remaining to be applied from the side writes
+     * table.
      */
     bool areAllWritesApplied(OperationContext* opCtx) const;
+
+    /**
+     * Invariants that there are no visible records remaining to be applied from the side writes
+     * table.
+     */
+    void invariantAllWritesApplied(OperationContext* opCtx) const;
 
     /**
      * When an index builder wants to commit, use this to retrieve any recorded multikey paths
@@ -175,26 +208,32 @@ public:
 private:
     using SideWriteRecord = std::pair<RecordId, BSONObj>;
 
-
     Status _applyWrite(OperationContext* opCtx,
                        const CollectionPtr& coll,
+                       const IndexCatalogEntry* indexCatalogEntry,
                        const BSONObj& doc,
                        const InsertDeleteOptions& options,
                        TrackDuplicates trackDups,
-                       int64_t* const keysInserted,
-                       int64_t* const keysDeleted);
+                       int64_t* keysInserted,
+                       int64_t* keysDeleted);
+
+    bool _checkAllWritesApplied(OperationContext* opCtx, bool fatal) const;
 
     /**
      * Yield lock manager locks and abandon the current storage engine snapshot.
      */
-    void _yield(OperationContext* opCtx, const Yieldable* yieldable);
+    void _yield(OperationContext* opCtx,
+                const IndexCatalogEntry* indexCatalogEntry,
+                const Yieldable* yieldable);
 
     void _checkDrainPhaseFailPoint(OperationContext* opCtx,
+                                   const IndexCatalogEntry* indexCatalogEntry,
                                    FailPoint* fp,
                                    long long iteration) const;
 
-    // The entry for the index that is being built.
-    IndexCatalogEntry* _indexCatalogEntry;
+    Status _finishSideWrite(OperationContext* opCtx,
+                            const IndexCatalogEntry* indexCatalogEntry,
+                            const std::vector<BSONObj>& toInsert);
 
     // This temporary record store records intercepted keys that will be written into the index by
     // calling drainWritesIntoIndex(). It is owned by the interceptor and dropped along with it.
@@ -220,9 +259,7 @@ private:
     // index builds that were resumed.
     const bool _skipNumAppliedCheck = false;
 
-    mutable Mutex _multikeyPathMutex =
-        MONGO_MAKE_LATCH("IndexBuildInterceptor::_multikeyPathMutex");
+    mutable stdx::mutex _multikeyPathMutex;
     boost::optional<MultikeyPaths> _multikeyPaths;
 };
-
 }  // namespace mongo

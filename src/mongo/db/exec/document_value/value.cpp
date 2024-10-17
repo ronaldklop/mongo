@@ -27,21 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/document_value/value.h"
-
-#include <boost/functional/hash.hpp>
+#include <absl/hash/hash.h>
+#include <boost/container_hash/extensions.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/numeric/conversion/converter_policies.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <ostream>
+#include <type_traits>
+#include <typeinfo>
+
+#include <absl/strings/string_view.h>
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_type_endian.h"
-#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bson_depth.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/hex.h"
@@ -59,64 +73,13 @@ using std::stringstream;
 using std::vector;
 using namespace std::string_literals;
 
-void ValueStorage::verifyRefCountingIfShould() const {
-    switch (type) {
-        case MinKey:
-        case MaxKey:
-        case jstOID:
-        case Date:
-        case bsonTimestamp:
-        case EOO:
-        case jstNULL:
-        case Undefined:
-        case Bool:
-        case NumberInt:
-        case NumberLong:
-        case NumberDouble:
-            // the above types never reference external data
-            verify(!refCounter);
-            break;
-
-        case String:
-        case RegEx:
-        case Code:
-        case Symbol:
-            // If this is using the short-string optimization, it must not have a ref-counted
-            // pointer.
-            invariant(!shortStr || !refCounter);
-
-            // If this is _not_ using the short string optimization, it must be storing a
-            // ref-counted pointer. One exception: in the BSONElement constructor of Value, it is
-            // possible for this ValueStorage to get constructed as a type but never initialized;
-            // the ValueStorage gets left as a nullptr and not marked as ref-counted, which is ok
-            // (SERVER-43205).
-            invariant(shortStr || (refCounter || !genericRCPtr));
-            break;
-
-        case NumberDecimal:
-        case BinData:  // TODO this should probably support short-string optimization
-        case Array:    // TODO this should probably support empty-is-NULL optimization
-        case DBRef:
-        case CodeWScope:
-            // the above types always reference external data.
-            invariant(refCounter);
-            invariant(bool(genericRCPtr));
-            break;
-
-        case Object:
-            // Objects either hold a NULL ptr or should be ref-counting
-            invariant(refCounter == bool(genericRCPtr));
-            break;
-    }
-}
-
 void ValueStorage::putString(StringData s) {
     // Note: this also stores data portion of BinData
     const size_t sizeNoNUL = s.size();
     if (sizeNoNUL <= sizeof(shortStrStorage)) {
         shortStr = true;
         shortStrSize = s.size();
-        s.copyTo(shortStrStorage, false);  // no NUL
+        s.copy(shortStrStorage, s.size());
 
         // All memory is zeroed before this is called, so we know that
         // the nulTerminator field will definitely contain a NUL byte.
@@ -131,7 +94,11 @@ void ValueStorage::putDocument(const Document& d) {
     putRefCountable(d._storage);
 }
 
-void ValueStorage::putVector(boost::intrusive_ptr<RCVector>&& vec) {
+void ValueStorage::putDocument(Document&& d) {
+    putRefCountable(std::move(d._storage));
+}
+
+void ValueStorage::putVector(boost::intrusive_ptr<RCVector<Value>>&& vec) {
     fassert(16485, bool(vec));
     putRefCountable(std::move(vec));
 }
@@ -143,8 +110,9 @@ void ValueStorage::putRegEx(const BSONRegEx& re) {
 
     // Need to copy since putString doesn't support scatter-gather.
     std::unique_ptr<char[]> buf(new char[totalLen]);
-    re.pattern.copyTo(buf.get(), true);
-    re.flags.copyTo(buf.get() + patternLen + 1, false);  // no NUL
+    auto dest = buf.get();
+    dest = str::copyAsCString(dest, re.pattern);
+    re.flags.copy(dest, re.flags.size());  // NUL added automatically by putString()
     putString(StringData(buf.get(), totalLen));
 }
 
@@ -159,7 +127,14 @@ Document ValueStorage::getDocument() const {
 
 // not in header because document is fwd declared
 Value::Value(const BSONObj& obj) : _storage(Object, Document(obj.getOwned())) {}
+
+// An option of providing 'Value(Document)' was rejected in favor of 'Value(const Document&)' and
+// 'Value(Document&&)' overloads, and lvalue/rvalue reference overloads of callees, since
+// 'Value(Document)' option with a lvalue parameter would result in one extra move operation in
+// 'ValueStorage::putDocument()'.
 Value::Value(const Document& doc) : _storage(Object, doc.isOwned() ? doc : doc.getOwned()) {}
+Value::Value(Document&& doc)
+    : _storage(Object, doc.isOwned() ? std::move(doc) : std::move(doc).getOwned()) {}
 
 Value::Value(const BSONElement& elem) : _storage(elem.type()) {
     switch (elem.type()) {
@@ -187,7 +162,7 @@ Value::Value(const BSONElement& elem) : _storage(elem.type()) {
         }
 
         case Array: {
-            auto vec = make_intrusive<RCVector>();
+            auto vec = make_intrusive<RCVector<Value>>();
             BSONForEach(sub, elem.embeddedObject()) {
                 vec->vec.push_back(Value(sub));
             }
@@ -249,7 +224,7 @@ Value::Value(const BSONElement& elem) : _storage(elem.type()) {
 }
 
 Value::Value(const BSONArray& arr) : _storage(Array) {
-    auto vec = make_intrusive<RCVector>();
+    auto vec = make_intrusive<RCVector<Value>>();
     BSONForEach(sub, arr) {
         vec->vec.push_back(Value(sub));
     }
@@ -257,7 +232,7 @@ Value::Value(const BSONArray& arr) : _storage(Array) {
 }
 
 Value::Value(const vector<BSONObj>& vec) : _storage(Array) {
-    auto storageVec = make_intrusive<RCVector>();
+    auto storageVec = make_intrusive<RCVector<Value>>();
     storageVec->vec.reserve(vec.size());
     for (auto&& obj : vec) {
         storageVec->vec.push_back(Value(obj));
@@ -266,12 +241,33 @@ Value::Value(const vector<BSONObj>& vec) : _storage(Array) {
 }
 
 Value::Value(const vector<Document>& vec) : _storage(Array) {
-    auto storageVec = make_intrusive<RCVector>();
+    auto storageVec = make_intrusive<RCVector<Value>>();
     storageVec->vec.reserve(vec.size());
     for (auto&& obj : vec) {
         storageVec->vec.push_back(Value(obj));
     }
     _storage.putVector(std::move(storageVec));
+}
+
+Value::Value(const SafeNum& value) : _storage(value.type()) {
+    switch (value.type()) {
+        case EOO:
+            break;
+        case NumberInt:
+            _storage.intValue = value._value.int32Val;
+            break;
+        case NumberLong:
+            _storage.longValue = value._value.int64Val;
+            break;
+        case NumberDouble:
+            _storage.doubleValue = value._value.doubleVal;
+            break;
+        case NumberDecimal:
+            _storage.putDecimal(Decimal128(value._value.decimalVal));
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 Value Value::createIntOrLong(long long longValue) {
@@ -306,12 +302,12 @@ double Value::getDouble() const {
     if (type == NumberDecimal)
         return _storage.getDecimal().toDouble();
 
-    verify(type == NumberDouble);
+    MONGO_verify(type == NumberDouble);
     return _storage.doubleValue;
 }
 
 Document Value::getDocument() const {
-    verify(getType() == Object);
+    MONGO_verify(getType() == Object);
     return _storage.getDocument();
 }
 
@@ -389,7 +385,7 @@ BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Value& val)
             return builder.builder();
         }
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
 void Value::addToBsonObj(BSONObjBuilder* builder,
@@ -476,7 +472,7 @@ bool Value::coerceToBool() const {
         case NumberDecimal:
             return !_storage.getDecimal().isZero();
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
 namespace {
@@ -634,7 +630,7 @@ string Value::coerceToString() const {
 
         case Date:
             return uassertStatusOKWithContext(
-                TimeZoneDatabase::utcZone().formatDate(kISOFormatString, getDate()),
+                TimeZoneDatabase::utcZone().formatDate(kIsoFormatStringZ, getDate()),
                 "failed while coercing date to string");
 
         case EOO:
@@ -677,9 +673,7 @@ inline static int cmp(const T& left, const T& right) {
     }
 }
 
-int Value::compare(const Value& rL,
-                   const Value& rR,
-                   const StringData::ComparatorInterface* stringComparator) {
+int Value::compare(const Value& rL, const Value& rR, const StringDataComparator* stringComparator) {
     // Note, this function needs to behave identically to BSONElement::compareElements().
     // Additionally, any changes here must be replicated in hash_combine().
     BSONType lType = rL.getType();
@@ -851,11 +845,21 @@ int Value::compare(const Value& rL,
             return l->scope.woCompare(r->scope);
         }
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
-void Value::hash_combine(size_t& seed,
-                         const StringData::ComparatorInterface* stringComparator) const {
+namespace {
+/**
+ * Hashes the given 'StringData', combines the resulting hash with 'seed', and returns the result.
+ */
+size_t hashStringData(StringData sd, size_t seed) {
+    size_t strHash = absl::Hash<absl::string_view>{}(absl::string_view(sd.rawData(), sd.size()));
+    boost::hash_combine(seed, strHash);
+    return seed;
+}
+}  // namespace
+
+void Value::hash_combine(size_t& seed, const StringDataComparator* stringComparator) const {
     BSONType type = getType();
 
     boost::hash_combine(seed, canonicalizeBSONType(type));
@@ -897,6 +901,7 @@ void Value::hash_combine(size_t& seed,
             // Else, fall through and convert the decimal to a double and hash.
             // At this point the decimal fits into the range of doubles, is infinity, or is NaN,
             // which doubles have a cheaper representation for.
+            [[fallthrough]];
         }
         // This converts all numbers to doubles, which ignores the low-order bits of
         // NumberLongs > 2**53 and precise decimal numbers without double representations,
@@ -924,7 +929,7 @@ void Value::hash_combine(size_t& seed,
         case Code:
         case Symbol: {
             StringData sd = getRawData();
-            MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
+            seed = hashStringData(sd, seed);
             break;
         }
 
@@ -933,7 +938,7 @@ void Value::hash_combine(size_t& seed,
             if (stringComparator) {
                 stringComparator->hash_combine(seed, sd);
             } else {
-                MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
+                seed = hashStringData(sd, seed);
             }
             break;
         }
@@ -957,20 +962,20 @@ void Value::hash_combine(size_t& seed,
 
         case BinData: {
             StringData sd = getRawData();
-            MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
+            seed = hashStringData(sd, seed);
             boost::hash_combine(seed, _storage.binDataType());
             break;
         }
 
         case RegEx: {
             StringData sd = getRawData();
-            MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
+            seed = hashStringData(sd, seed);
             break;
         }
 
         case CodeWScope: {
             intrusive_ptr<const RCCodeWScope> cws = _storage.getCodeWScope();
-            SimpleStringDataComparator::kInstance.hash_combine(seed, cws->code);
+            simpleStringDataComparator.hash_combine(seed, cws->code);
             SimpleBSONObjComparator::kInstance.hash_combine(seed, cws->scope);
             break;
         }
@@ -1060,6 +1065,36 @@ bool Value::integral() const {
     }
 }
 
+bool Value::isNaN() const {
+    switch (getType()) {
+        case NumberInt:
+        case NumberLong:
+        case NumberDouble: {
+            const double dbl = getDouble();
+            return std::isnan(dbl);
+        }
+        case NumberDecimal: {
+            return _storage.getDecimal().isNaN();
+        }
+
+        default:
+            return false;
+    }
+}
+
+bool Value::isInfinite() const {
+    switch (getType()) {
+        case NumberDouble:
+            return (_storage.doubleValue == std::numeric_limits<double>::infinity() ||
+                    _storage.doubleValue == -std::numeric_limits<double>::infinity());
+        case NumberDecimal:
+            return _storage.getDecimal().isInfinite();
+
+        default:
+            return false;
+    }
+}
+
 bool Value::integral64Bit() const {
     switch (getType()) {
         case NumberInt:
@@ -1095,7 +1130,7 @@ size_t Value::getApproximateSize() const {
 
         case Array: {
             size_t size = sizeof(Value);
-            size += sizeof(RCVector);
+            size += sizeof(RCVector<Value>);
             const size_t n = getArray().size();
             for (size_t i = 0; i < n; ++i) {
                 size += getArray()[i].getApproximateSize();
@@ -1128,7 +1163,7 @@ size_t Value::getApproximateSize() const {
         case Undefined:
             return sizeof(Value);
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
 string Value::toString() const {
@@ -1172,7 +1207,7 @@ ostream& operator<<(ostream& out, const Value& val) {
             return out << "undefined";
         case Date:
             return out << [&] {
-                if (auto string = TimeZoneDatabase::utcZone().formatDate(kISOFormatString,
+                if (auto string = TimeZoneDatabase::utcZone().formatDate(kIsoFormatStringZ,
                                                                          val.coerceToDate());
                     string.isOK())
                     return string.getValue();
@@ -1209,7 +1244,20 @@ ostream& operator<<(ostream& out, const Value& val) {
     }
 
     // Not in default case to trigger better warning if a case is missing
-    verify(false);
+    MONGO_verify(false);
+}
+
+Value Value::shred() const {
+    if (isObject()) {
+        return Value(getDocument().shred());
+    } else if (isArray()) {
+        std::vector<Value> values;
+        for (auto&& val : getArray()) {
+            values.push_back(val.shred());
+        }
+        return Value(values);
+    }
+    return Value(*this);
 }
 
 void Value::serializeForSorter(BufBuilder& buf) const {
@@ -1255,7 +1303,7 @@ void Value::serializeForSorter(BufBuilder& buf) const {
         case Code: {
             StringData str = getRawData();
             buf.appendNum(int(str.size()));
-            buf.appendStr(str, /*NUL byte*/ false);
+            buf.appendStrBytes(str);
             break;
         }
 
@@ -1263,13 +1311,13 @@ void Value::serializeForSorter(BufBuilder& buf) const {
             StringData str = getRawData();
             buf.appendChar(_storage.binDataType());
             buf.appendNum(int(str.size()));
-            buf.appendStr(str, /*NUL byte*/ false);
+            buf.appendStrBytes(str);
             break;
         }
 
         case RegEx:
-            buf.appendStr(getRegex(), /*NUL byte*/ true);
-            buf.appendStr(getRegexFlags(), /*NUL byte*/ true);
+            buf.appendCStr(getRegex());
+            buf.appendCStr(getRegexFlags());
             break;
 
         case Object:
@@ -1278,13 +1326,13 @@ void Value::serializeForSorter(BufBuilder& buf) const {
 
         case DBRef:
             buf.appendStruct(_storage.getDBRef()->oid);
-            buf.appendStr(_storage.getDBRef()->ns, /*NUL byte*/ true);
+            buf.appendCStr(_storage.getDBRef()->ns);
             break;
 
         case CodeWScope: {
             intrusive_ptr<const RCCodeWScope> cws = _storage.getCodeWScope();
             buf.appendNum(int(cws->code.size()));
-            buf.appendStr(cws->code, /*NUL byte*/ false);
+            buf.appendStrBytes(cws->code);
             cws->scope.serializeForSorter(buf);
             break;
         }
@@ -1380,7 +1428,7 @@ Value Value::deserializeForSorter(BufReader& buf, const SorterDeserializeSetting
             return Value(std::move(array));
         }
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
 void Value::serializeForIDL(StringData fieldName, BSONObjBuilder* builder) const {
@@ -1393,6 +1441,12 @@ void Value::serializeForIDL(BSONArrayBuilder* builder) const {
 
 Value Value::deserializeForIDL(const BSONElement& element) {
     return Value(element);
+}
+
+BSONObj Value::wrap(StringData newName) const {
+    BSONObjBuilder b(getApproximateSize() + 6 + newName.size());
+    addToBsonObj(&b, newName);
+    return b.obj();
 }
 
 }  // namespace mongo

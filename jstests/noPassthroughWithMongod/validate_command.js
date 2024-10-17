@@ -1,6 +1,5 @@
 // Tests that the basic values returned from the validate command are correct
 
-(function() {
 // Set the number of documents to insert
 var count = 10;
 
@@ -20,7 +19,7 @@ function testValidate(output) {
 // Test to confirm that validate is working as expected.
 
 // SETUP DATA
-t = db.jstests_validate;
+let t = db.jstests_validate;
 t.drop();
 
 for (var i = 0; i < count; i++) {
@@ -37,4 +36,3 @@ testValidate(output);
 // TEST FULL
 var output = t.validate({full: true});
 testValidate(output);
-}());

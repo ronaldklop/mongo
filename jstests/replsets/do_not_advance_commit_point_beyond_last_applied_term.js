@@ -4,12 +4,9 @@
  * committed.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");  // for [stop|restart]ServerReplication.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -24,6 +21,11 @@ config.settings = {
     electionTimeoutMillis: 12 * 60 * 60 * 1000
 };
 rst.initiate(config);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 
 const nodeA = rst.nodes[0];
 const nodeB = rst.nodes[1];
@@ -71,6 +73,7 @@ assert.soon(() => {
 });
 assert.commandWorked(
     nodeA.getDB(dbName)[collName].insert({term: 3}, {writeConcern: {w: "majority"}}));
+rst.awaitReplication(1000, undefined, [nodeA, nodeC, nodeD], undefined, nodeA);
 assert.eq(1, nodeC.getDB(dbName)[collName].find({term: 3}).itcount());
 assert.eq(1, nodeD.getDB(dbName)[collName].find({term: 3}).itcount());
 
@@ -114,4 +117,3 @@ assert.eq(0, nodeE.getDB(dbName)[collName].find({term: 2}).itcount());
 assert.eq(1, nodeE.getDB(dbName)[collName].find({term: 3}).itcount());
 
 rst.stopSet();
-}());

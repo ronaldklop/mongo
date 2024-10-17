@@ -1,10 +1,8 @@
 /**
  * Perform basic tests for the split command against mongos.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var st = new ShardingTest({mongos: 2, shards: 2, other: {chunkSize: 1}});
 var configDB = st.s0.getDB('config');
@@ -18,8 +16,7 @@ assert.commandFailed(configDB.adminCommand({split: 'user', key: {_id: 1}}));
 // split on unsharded collection (db is not sharding enabled).
 assert.commandFailed(configDB.adminCommand({split: 'test.user', key: {_id: 1}}));
 
-assert.commandWorked(configDB.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', shard0);
+assert.commandWorked(configDB.adminCommand({enableSharding: 'test', primaryShard: shard0}));
 
 // split on unsharded collection (db is sharding enabled).
 assert.commandFailed(configDB.adminCommand({split: 'test.user', key: {_id: 1}}));
@@ -40,10 +37,9 @@ assert.commandFailed(configDB.adminCommand({split: 'test.user', find: {x: 100}})
 assert.commandFailed(
     configDB.adminCommand({split: 'test.user', bounds: [{x: MinKey}, {x: MaxKey}]}));
 
-// Insert documents large enough to fill up a chunk, but do it directly in the shard in order
-// to bypass the auto-split logic.
+// Insert documents large enough to fill up a chunk
 var kiloDoc = new Array(1024).join('x');
-var testDB = st.rs0.getPrimary().getDB('test');
+var testDB = st.s.getDB('test');
 var bulk = testDB.user.initializeUnorderedBulkOp();
 for (var x = -1200; x < 1200; x++) {
     bulk.insert({_id: x, val: kiloDoc});
@@ -91,6 +87,10 @@ assert.neq(null, findChunksUtil.findOneChunkByNs(configDB, 'test.compound', {min
 
 // cannot split on existing chunk boundary.
 assert.commandFailed(configDB.adminCommand({split: 'test.compound', middle: {x: 0, y: 0}}));
+assert.commandFailed(
+    configDB.adminCommand({split: 'test.compound', middle: {x: MinKey, y: MinKey}}));
+assert.commandFailed(
+    configDB.adminCommand({split: 'test.compound', middle: {x: MaxKey, y: MaxKey}}));
 
 bulk = testDB.compound.initializeUnorderedBulkOp();
 for (x = -1200; x < 1200; x++) {
@@ -116,4 +116,3 @@ assert.gt(
     1);
 
 st.stop();
-})();

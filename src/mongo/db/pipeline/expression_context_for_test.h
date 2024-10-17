@@ -57,7 +57,8 @@ public:
      * Defaults to using a namespace of "test.namespace".
      */
     ExpressionContextForTest()
-        : ExpressionContextForTest(NamespaceString{"test"_sd, "namespace"_sd}) {}
+        : ExpressionContextForTest(
+              NamespaceString::createNamespaceString_forTest("test"_sd, "namespace"_sd)) {}
     /**
      * If there is a global ServiceContext available, this constructor will adopt it. Otherwise, it
      * will internally create an owned QueryTestServiceContext. Similarly, if an OperationContext
@@ -67,7 +68,7 @@ public:
     ExpressionContextForTest(NamespaceString nss)
         : ExpressionContext(nullptr,      // opCtx, nullptr while base class is constructed.
                             boost::none,  // explain
-                            false,        // fromMongos,
+                            false,        // fromRouter,
                             false,        // needsMerge,
                             false,        // allowDiskUse,
                             false,        // bypassDocumentValidation,
@@ -76,11 +77,11 @@ public:
                             LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
                             {},  // collator
                             std::make_shared<StubMongoProcessInterface>(),
-                            {},    // resolvedNamespaces
-                            {},    // collUUID
-                            {},    // let
-                            false  // mayDbProfile
-          ) {
+                            {},     // resolvedNamespaces
+                            {},     // collUUID
+                            {},     // let
+                            false,  // mayDbProfile
+                            SerializationContext()) {
         // If there is an existing global ServiceContext, adopt it. Otherwise, create a new context.
         // Similarly, we create a new OperationContext or adopt an existing context as appropriate.
         if (hasGlobalServiceContext()) {
@@ -90,7 +91,7 @@ public:
             }
         } else {
             _serviceContext = std::make_unique<QueryTestServiceContext>();
-            _testOpCtx = stdx::get<std::unique_ptr<QueryTestServiceContext>>(_serviceContext)
+            _testOpCtx = get<std::unique_ptr<QueryTestServiceContext>>(_serviceContext)
                              ->makeOperationContext();
         }
 
@@ -109,7 +110,8 @@ public:
      * Defaults to using a namespace of "test.namespace".
      */
     ExpressionContextForTest(OperationContext* opCtx)
-        : ExpressionContextForTest(opCtx, NamespaceString{"test"_sd, "namespace"_sd}) {}
+        : ExpressionContextForTest(
+              opCtx, NamespaceString::createNamespaceString_forTest("test"_sd, "namespace"_sd)) {}
 
     /**
      * Constructor which sets the given OperationContext on the ExpressionContextForTest. This will
@@ -118,7 +120,7 @@ public:
     ExpressionContextForTest(OperationContext* opCtx, NamespaceString nss)
         : ExpressionContext(opCtx,
                             boost::none,  // explain
-                            false,        // fromMongos,
+                            false,        // fromRouter,
                             false,        // needsMerge,
                             false,        // allowDiskUse,
                             false,        // bypassDocumentValidation,
@@ -127,11 +129,38 @@ public:
                             LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
                             {},  // collator
                             std::make_shared<StubMongoProcessInterface>(),
-                            {},    // resolvedNamespaces
-                            {},    // collUUID
-                            {},    // let
-                            false  // mayDbProfile
-                            ),
+                            {},     // resolvedNamespaces
+                            {},     // collUUID
+                            {},     // let
+                            false,  // mayDbProfile
+                            SerializationContext()),
+          _serviceContext(opCtx->getServiceContext()) {
+        // Resolve the TimeZoneDatabase to be used by this ExpressionContextForTest.
+        _setTimeZoneDatabase();
+    }
+
+    /**
+     * Constructor which sets the given OperationContext and SerializationContext on the
+     * ExpressionContextForTest. This will also resolve the ExpressionContextForTest's
+     * ServiceContext from the OperationContext.
+     */
+    ExpressionContextForTest(OperationContext* opCtx, NamespaceString nss, SerializationContext sc)
+        : ExpressionContext(opCtx,
+                            boost::none,  // explain
+                            false,        // fromRouter,
+                            false,        // needsMerge,
+                            false,        // allowDiskUse,
+                            false,        // bypassDocumentValidation,
+                            false,        // isMapReduce
+                            nss,
+                            LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
+                            {},  // collator
+                            std::make_shared<StubMongoProcessInterface>(),
+                            {},     // resolvedNamespaces
+                            {},     // collUUID
+                            {},     // let
+                            false,  // mayDbProfile
+                            sc),
           _serviceContext(opCtx->getServiceContext()) {
         // Resolve the TimeZoneDatabase to be used by this ExpressionContextForTest.
         _setTimeZoneDatabase();
@@ -160,7 +189,7 @@ public:
                              const boost::optional<BSONObj>& letParameters = boost::none)
         : ExpressionContext(opCtx,
                             boost::none,  // explain
-                            false,        // fromMongos,
+                            false,        // fromRouter,
                             false,        // needsMerge,
                             false,        // allowDiskUse,
                             false,        // bypassDocumentValidation,
@@ -172,8 +201,8 @@ public:
                             {},  // resolvedNamespaces
                             {},  // collUUID
                             letParameters,
-                            false  // mayDbProfile
-                            ),
+                            false,  // mayDbProfile
+                            SerializationContext()),
           _serviceContext(opCtx->getServiceContext()) {
         // Resolve the TimeZoneDatabase to be used by this ExpressionContextForTest.
         _setTimeZoneDatabase();
@@ -195,25 +224,21 @@ public:
                 return ctx->getServiceContext();
             }
         };
-        return stdx::visit(Visitor{}, _serviceContext);
+        return visit(Visitor{}, _serviceContext);
     }
 
 private:
     // In cases when there is a ServiceContext, if there already exists a TimeZoneDatabase
     // associated with the ServiceContext, adopt it. Otherwise, create a new one.
     void _setTimeZoneDatabase() {
-        // In some cases, e.g. the user uses an OperationContextNoop which does _not_ provide a
-        // ServiceContext to create this ExpressionContextForTest, then it shouldn't resolve any
-        // timeZoneDatabase.
-        if (auto* serviceContext = getServiceContext()) {
-            if (!TimeZoneDatabase::get(serviceContext)) {
-                TimeZoneDatabase::set(serviceContext, std::make_unique<TimeZoneDatabase>());
-            }
-            timeZoneDatabase = TimeZoneDatabase::get(serviceContext);
+        auto* serviceContext = getServiceContext();
+        if (!TimeZoneDatabase::get(serviceContext)) {
+            TimeZoneDatabase::set(serviceContext, std::make_unique<TimeZoneDatabase>());
         }
+        timeZoneDatabase = TimeZoneDatabase::get(serviceContext);
     }
 
-    stdx::variant<ServiceContext*, std::unique_ptr<QueryTestServiceContext>> _serviceContext;
+    std::variant<ServiceContext*, std::unique_ptr<QueryTestServiceContext>> _serviceContext;
     ServiceContext::UniqueOperationContext _testOpCtx;
 };
 

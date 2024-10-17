@@ -27,10 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/catalog/sharding_catalog_client.h"
-
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
@@ -45,5 +42,9 @@ const WriteConcernOptions ShardingCatalogClient::kMajorityWriteConcern(
 
 const WriteConcernOptions ShardingCatalogClient::kLocalWriteConcern(
     1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
+
+// An empty namespace is used as a reserved value to persist initialization metadata of
+// config.placementHistory.
+const NamespaceString ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker{};
 
 }  // namespace mongo

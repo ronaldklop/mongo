@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
+#include <ostream>
 
-#include "mongo/logv2/redaction.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/logv2/log_util.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -48,10 +52,13 @@ constexpr auto kRedactionDefaultMask = "###"_sd;
 
 BSONObj redact(const BSONObj& objectToRedact) {
     if (!logv2::shouldRedactLogs()) {
-        return objectToRedact;
+        if (!logv2::shouldRedactBinDataEncrypt()) {
+            return objectToRedact.redact(BSONObj::RedactLevel::sensitiveOnly);
+        }
+        return objectToRedact.redact(BSONObj::RedactLevel::encryptedAndSensitive);
     }
 
-    return objectToRedact.redact();
+    return objectToRedact.redact(BSONObj::RedactLevel::all);
 }
 
 StringData redact(StringData stringToRedact) {

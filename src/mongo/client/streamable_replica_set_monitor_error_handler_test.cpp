@@ -26,15 +26,27 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 #include "mongo/client/streamable_replica_set_monitor_error_handler.h"
 
-#include <boost/optional/optional_io.hpp>
+#include <boost/none.hpp>
+#include <functional>
+#include <memory>
+#include <vector>
 
-#include "mongo/client/sdam/sdam.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/basic.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 using HandshakeStage = StreamableReplicaSetMonitorErrorHandler::HandshakeStage;
@@ -200,7 +212,7 @@ TEST_F(StreamableReplicaSetMonitorErrorHandlerTestFixture, MonitoringNonNetworkE
 }
 
 TEST_F(StreamableReplicaSetMonitorErrorHandlerTestFixture,
-       ApplicationNonNetworkIsMasterOrRecoveringError) {
+       ApplicationNonNetworkHelloOrRecoveringError) {
     testScenario(
         HandshakeStage::kPostHandshake,
         kMonitoringOperation,

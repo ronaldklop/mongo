@@ -27,17 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <limits>
+#include <list>
 
-#include "mongo/db/pipeline/document_source_skip.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document_source_limit.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -50,7 +55,7 @@ DocumentSourceSkip::DocumentSourceSkip(const intrusive_ptr<ExpressionContext>& p
 REGISTER_DOCUMENT_SOURCE(skip,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceSkip::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 constexpr StringData DocumentSourceSkip::kStageName;
 
@@ -71,8 +76,8 @@ DocumentSource::GetNextResult DocumentSourceSkip::doGetNext() {
     return pSource->getNext();
 }
 
-Value DocumentSourceSkip::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(getSourceName() << _nToSkip));
+Value DocumentSourceSkip::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << opts.serializeLiteral(_nToSkip)));
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceSkip::optimize() {
@@ -108,11 +113,10 @@ intrusive_ptr<DocumentSourceSkip> DocumentSourceSkip::create(
 
 intrusive_ptr<DocumentSource> DocumentSourceSkip::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15972,
-            str::stream() << "Argument to $skip must be a number not a " << typeName(elem.type()),
-            elem.isNumber());
-    auto nToSkip = elem.safeNumberLong();
-
-    return DocumentSourceSkip::create(pExpCtx, nToSkip);
+    const auto nToSkip = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107200,
+            str::stream() << "invalid argument to $skip stage: " << nToSkip.getStatus().reason(),
+            nToSkip.isOK());
+    return DocumentSourceSkip::create(pExpCtx, nToSkip.getValue());
 }
 }  // namespace mongo

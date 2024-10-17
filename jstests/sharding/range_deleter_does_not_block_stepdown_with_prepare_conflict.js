@@ -14,10 +14,8 @@
  *
  * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
-(function() {
-"use strict";
-
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {waitForFailpoint} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
@@ -31,11 +29,11 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-const st = new ShardingTest({shards: [{verbose: 1}, {verbose: 1}], config: 1});
+const st = new ShardingTest({shards: [{verbose: 1}, {verbose: 1}]});
 
 // Set up sharded collection with two chunks - [-inf, 0), [0, inf)
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 
@@ -78,4 +76,3 @@ assert.commandWorked(
     st.rs0.getPrimary().adminCommand(addTxnFieldsToCmd({abortTransaction: 1}, lsid, txnNumber)));
 
 st.stop();
-})();

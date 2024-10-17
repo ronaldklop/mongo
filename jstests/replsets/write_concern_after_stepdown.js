@@ -2,12 +2,9 @@
  * Tests that heartbeats containing writes from a different branch of history can't cause a stale
  * primary to incorrectly acknowledge a w:majority write that's about to be rolled back.
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = "writeConcernStepDownAndBackUp";
 var dbName = "wMajorityCheck";
@@ -37,6 +34,12 @@ jsTestLog("Make sure node 0 is primary.");
 var primary = rst.getPrimary();
 var secondaries = rst.getSecondaries();
 assert.eq(nodes[0], primary);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
+
 // Wait for all data bearing nodes to get up to date.
 assert.commandWorked(nodes[0].getDB(dbName).getCollection(collName).insert(
     {a: 1}, {writeConcern: {w: 3, wtimeout: rst.kDefaultTimeoutMS}}));
@@ -111,4 +114,3 @@ jsTestLog("Waiting for node 0 to roll back the failed write.");
 rst.awaitReplication();
 
 rst.stopSet();
-}());

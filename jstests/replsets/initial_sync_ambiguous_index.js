@@ -6,10 +6,8 @@
  * insert oplog entry.
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = 'test';
 const collectionName = 'coll';
@@ -73,4 +71,3 @@ rst.awaitSecondaryNodes();
 assert.eq(initialDocs + 1, secondaryColl.find().itcount());
 
 rst.stopSet();
-})();

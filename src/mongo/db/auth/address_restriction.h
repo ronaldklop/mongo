@@ -29,18 +29,25 @@
 
 #pragma once
 
+#include <fmt/format.h>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/restriction.h"
 #include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/auth/restriction_set.h"
 #include "mongo/util/net/cidr.h"
-
-#include <memory>
-#include <string>
-#include <vector>
 
 namespace mongo {
 
@@ -68,7 +75,7 @@ public:
     /**
      * Construct an empty AddressRestriction.
      * Note that an empty AddressRestriciton will not validate
-     * against any addresses, since nothing has been whitelisted.
+     * against any addresses, since nothing has been allowlisted.
      */
     AddressRestriction() = default;
 
@@ -92,7 +99,15 @@ public:
      * satisfies this restriction set.
      */
     Status validate(const RestrictionEnvironment& environment) const override {
+        using namespace fmt::literals;
+
         auto const addr = T::addr(environment);
+        if (addr.getType() == AF_UNSPEC) {
+            // GRPCTransportLayer doesn't know server local address.
+            return {ErrorCodes::AuthenticationRestrictionUnmet,
+                    "{} restriction can not be verified when address is unknown"_format(T::label)};
+        }
+
         if (!addr.isIP()) {
             std::ostringstream s;
             s << T::label << " is not an IP address: " << addr.getAddr();

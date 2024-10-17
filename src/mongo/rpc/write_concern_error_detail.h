@@ -29,10 +29,15 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
+#include <utility>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -82,5 +87,15 @@ private:
     BSONObj _errInfo;
     bool _isErrInfoSet;
 };
+
+/**
+ * Creates and returns a WriteConcernErrorDetail object from a BSONObj.
+ */
+std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(const BSONObj& obj);
+
+/**
+ * Constructs a WriteConcernErrorDetail by parsing the given BSONElement.
+ */
+WriteConcernErrorDetail getWriteConcernErrorDetail(const BSONElement& wcErrorElem);
 
 }  // namespace mongo

@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <ostream>
+#include <vector>
 
-#include "mongo/db/exec/document_value/document_metadata_fields.h"
 
+#include "mongo/base/data_type_endian.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 
 namespace mongo {
 
@@ -45,7 +48,10 @@ DocumentMetadataFields::DocumentMetadataFields(const DocumentMetadataFields& oth
     : _holder(other._holder ? std::make_unique<MetadataHolder>(*other._holder) : nullptr) {}
 
 DocumentMetadataFields& DocumentMetadataFields::operator=(const DocumentMetadataFields& other) {
-    _holder = other._holder ? std::make_unique<MetadataHolder>(*other._holder) : nullptr;
+    if (this != &other) {
+        _holder = other._holder ? std::make_unique<MetadataHolder>(*other._holder) : nullptr;
+        _modified = true;
+    }
     return *this;
 }
 
@@ -54,6 +60,7 @@ DocumentMetadataFields::DocumentMetadataFields(DocumentMetadataFields&& other)
 
 DocumentMetadataFields& DocumentMetadataFields::operator=(DocumentMetadataFields&& other) {
     _holder = std::move(other._holder);
+    _modified = true;
     return *this;
 }
 
@@ -85,6 +92,24 @@ void DocumentMetadataFields::mergeWith(const DocumentMetadataFields& other) {
     if (!hasSearchScoreDetails() && other.hasSearchScoreDetails()) {
         setSearchScoreDetails(other.getSearchScoreDetails());
     }
+    if (!hasSearchSequenceToken() && other.hasSearchSequenceToken()) {
+        setSearchSequenceToken(other.getSearchSequenceToken());
+    }
+    if (!hasTimeseriesBucketMinTime() && other.hasTimeseriesBucketMinTime()) {
+        setTimeseriesBucketMinTime(other.getTimeseriesBucketMinTime());
+    }
+    if (!hasTimeseriesBucketMaxTime() && other.hasTimeseriesBucketMaxTime()) {
+        setTimeseriesBucketMaxTime(other.getTimeseriesBucketMaxTime());
+    }
+    if (!hasSearchSortValues() && other.hasSearchSortValues()) {
+        setSearchSortValues(other.getSearchSortValues());
+    }
+    if (!hasVectorSearchScore() && other.hasVectorSearchScore()) {
+        setVectorSearchScore(other.getVectorSearchScore());
+    }
+    if (!hasScore() && other.hasScore()) {
+        setScore(other.getScore());
+    }
 }
 
 void DocumentMetadataFields::copyFrom(const DocumentMetadataFields& other) {
@@ -115,6 +140,24 @@ void DocumentMetadataFields::copyFrom(const DocumentMetadataFields& other) {
     if (other.hasSearchScoreDetails()) {
         setSearchScoreDetails(other.getSearchScoreDetails());
     }
+    if (other.hasSearchSequenceToken()) {
+        setSearchSequenceToken(other.getSearchSequenceToken());
+    }
+    if (other.hasTimeseriesBucketMinTime()) {
+        setTimeseriesBucketMinTime(other.getTimeseriesBucketMinTime());
+    }
+    if (other.hasTimeseriesBucketMaxTime()) {
+        setTimeseriesBucketMaxTime(other.getTimeseriesBucketMaxTime());
+    }
+    if (other.hasSearchSortValues()) {
+        setSearchSortValues(other.getSearchSortValues());
+    }
+    if (other.hasVectorSearchScore()) {
+        setVectorSearchScore(other.getVectorSearchScore());
+    }
+    if (other.hasScore()) {
+        setScore(other.getScore());
+    }
 }
 
 size_t DocumentMetadataFields::getApproximateSize() const {
@@ -136,7 +179,8 @@ size_t DocumentMetadataFields::getApproximateSize() const {
     size -= sizeof(_holder->searchHighlights);
     size += _holder->indexKey.objsize();
     size += _holder->searchScoreDetails.objsize();
-
+    size += _holder->searchSortValues.objsize();
+    size -= sizeof(_holder->searchSequenceToken);
     return size;
 }
 
@@ -184,6 +228,30 @@ void DocumentMetadataFields::serializeForSorter(BufBuilder& buf) const {
         buf.appendNum(static_cast<char>(MetaType::kSearchScoreDetails + 1));
         getSearchScoreDetails().appendSelfToBufBuilder(buf);
     }
+    if (hasSearchSequenceToken()) {
+        buf.appendNum(static_cast<char>(MetaType::kSearchSequenceToken + 1));
+        getSearchSequenceToken().serializeForSorter(buf);
+    }
+    if (hasTimeseriesBucketMinTime()) {
+        buf.appendNum(static_cast<char>(MetaType::kTimeseriesBucketMinTime + 1));
+        buf.appendNum(getTimeseriesBucketMinTime().toMillisSinceEpoch());
+    }
+    if (hasTimeseriesBucketMaxTime()) {
+        buf.appendNum(static_cast<char>(MetaType::kTimeseriesBucketMaxTime + 1));
+        buf.appendNum(getTimeseriesBucketMaxTime().toMillisSinceEpoch());
+    }
+    if (hasSearchSortValues()) {
+        buf.appendNum(static_cast<char>(MetaType::kSearchSortValues + 1));
+        getSearchSortValues().appendSelfToBufBuilder(buf);
+    }
+    if (hasVectorSearchScore()) {
+        buf.appendNum(static_cast<char>(MetaType::kVectorSearchScore + 1));
+        buf.appendNum(getVectorSearchScore());
+    }
+    if (hasScore()) {
+        buf.appendNum(static_cast<char>(MetaType::kScore + 1));
+        buf.appendNum(getScore());
+    }
     buf.appendNum(static_cast<char>(0));
 }
 
@@ -215,6 +283,22 @@ void DocumentMetadataFields::deserializeForSorter(BufReader& buf, DocumentMetada
         } else if (marker == static_cast<char>(MetaType::kSearchScoreDetails) + 1) {
             out->setSearchScoreDetails(
                 BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings()));
+        } else if (marker == static_cast<char>(MetaType::kTimeseriesBucketMinTime) + 1) {
+            out->setTimeseriesBucketMinTime(
+                Date_t::fromMillisSinceEpoch(buf.read<LittleEndian<long long>>()));
+        } else if (marker == static_cast<char>(MetaType::kTimeseriesBucketMaxTime) + 1) {
+            out->setTimeseriesBucketMaxTime(
+                Date_t::fromMillisSinceEpoch(buf.read<LittleEndian<long long>>()));
+        } else if (marker == static_cast<char>(MetaType::kSearchSortValues) + 1) {
+            out->setSearchSortValues(
+                BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings()));
+        } else if (marker == static_cast<char>(MetaType::kVectorSearchScore) + 1) {
+            out->setVectorSearchScore(buf.read<LittleEndian<double>>());
+        } else if (marker == static_cast<char>(MetaType::kSearchSequenceToken) + 1) {
+            out->setSearchSequenceToken(
+                Value::deserializeForSorter(buf, Value::SorterDeserializeSettings()));
+        } else if (marker == static_cast<char>(MetaType::kScore) + 1) {
+            out->setScore(buf.read<LittleEndian<double>>());
         } else {
             uasserted(28744, "Unrecognized marker, unable to deserialize buffer");
         }
@@ -270,6 +354,18 @@ const char* DocumentMetadataFields::typeNameToDebugString(DocumentMetadataFields
             return "text score";
         case DocumentMetadataFields::kSearchScoreDetails:
             return "$search score details";
+        case DocumentMetadataFields::kTimeseriesBucketMinTime:
+            return "timeseries bucket min time";
+        case DocumentMetadataFields::kTimeseriesBucketMaxTime:
+            return "timeseries bucket max time";
+        case DocumentMetadataFields::kSearchSortValues:
+            return "$search sort values";
+        case DocumentMetadataFields::kSearchSequenceToken:
+            return "$search sequence token";
+        case DocumentMetadataFields::kVectorSearchScore:
+            return "$vectorSearch distance";
+        case DocumentMetadataFields::kScore:
+            return "$score score";
         default:
             MONGO_UNREACHABLE;
     }

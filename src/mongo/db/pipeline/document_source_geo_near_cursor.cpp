@@ -27,37 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
-
-#include <boost/intrusive_ptr.hpp>
-#include <boost/optional.hpp>
-#include <list>
 #include <memory>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/base/string_data.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 boost::intrusive_ptr<DocumentSourceGeoNearCursor> DocumentSourceGeoNearCursor::create(
-    const CollectionPtr& collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     FieldPath distanceField,
     boost::optional<FieldPath> locationField,
     double distanceMultiplier) {
-    return {new DocumentSourceGeoNearCursor(collection,
+    return {new DocumentSourceGeoNearCursor(collections,
                                             std::move(exec),
                                             expCtx,
                                             std::move(distanceField),
@@ -66,14 +65,14 @@ boost::intrusive_ptr<DocumentSourceGeoNearCursor> DocumentSourceGeoNearCursor::c
 }
 
 DocumentSourceGeoNearCursor::DocumentSourceGeoNearCursor(
-    const CollectionPtr& collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     FieldPath distanceField,
     boost::optional<FieldPath> locationField,
     double distanceMultiplier)
     : DocumentSourceCursor(
-          collection, std::move(exec), expCtx, DocumentSourceCursor::CursorType::kRegular),
+          collections, std::move(exec), expCtx, DocumentSourceCursor::CursorType::kRegular),
       _distanceField(std::move(distanceField)),
       _locationField(std::move(locationField)),
       _distanceMultiplier(distanceMultiplier) {

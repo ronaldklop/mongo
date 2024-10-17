@@ -66,19 +66,16 @@ configs:
         description: 'arg is <setname>[/<optionalseedhostlist>]'
         short_name: replSet
         arg_vartype: String
-        source: [ cli, ini ]
     'replication.replSetName':
         section: 'Replica set options'
         description: 'arg is <setname>'
+        short_name: replSetName
         arg_vartype: String
-        source: yaml
         validator:
             callback: validateReplicaSetNameSetting
-    'replication.enableMajorityReadConcern':
-        section: 'Replica set options'
-        description: 'Enables majority readConcern. enableMajorityReadConcern=false is no longer supported'
-        short_name: enableMajorityReadConcern
+    'replication.serverless':
+        section: 'Serverless mode'
+        description: 'Serverless mode implies replication is enabled, cannot be used with replSet or replSetName.'
         arg_vartype: Bool
-        default: true
-        implicit: true
-
+        short_name: serverless
+        source: [ yaml, cli ]

@@ -29,10 +29,15 @@
 
 #pragma once
 
+#include <cstddef>
 #include <deque>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
 
 namespace mongo {
@@ -55,18 +60,18 @@ public:
     IndexTag(size_t i, size_t p, bool canCombineBounds_)
         : index(i), pos(p), canCombineBounds(canCombineBounds_) {}
 
-    virtual ~IndexTag() {}
+    ~IndexTag() override {}
 
-    virtual void debugString(StringBuilder* builder) const {
+    void debugString(StringBuilder* builder) const override {
         *builder << " || Selected Index #" << index << " pos " << pos << " combine "
-                 << canCombineBounds;
+                 << canCombineBounds << "\n";
     }
 
-    virtual MatchExpression::TagData* clone() const {
+    MatchExpression::TagData* clone() const override {
         return new IndexTag(index, pos, canCombineBounds);
     }
 
-    virtual Type getType() const {
+    Type getType() const override {
         return Type::IndexTag;
     }
 
@@ -118,7 +123,7 @@ public:
     // compound two predicates sharing a path prefix.
     std::string pathPrefix;
 
-    virtual void debugString(StringBuilder* builder) const {
+    void debugString(StringBuilder* builder) const override {
         *builder << " || First: ";
         for (size_t i = 0; i < first.size(); ++i) {
             *builder << first[i] << " ";
@@ -127,17 +132,17 @@ public:
         for (size_t i = 0; i < notFirst.size(); ++i) {
             *builder << notFirst[i] << " ";
         }
-        *builder << "full path: " << path;
+        *builder << "full path: " << path << "\n";
     }
 
-    virtual MatchExpression::TagData* clone() const {
+    MatchExpression::TagData* clone() const override {
         RelevantTag* ret = new RelevantTag();
         ret->first = first;
         ret->notFirst = notFirst;
         return ret;
     }
 
-    virtual Type getType() const {
+    Type getType() const override {
         return Type::RelevantTag;
     }
 };

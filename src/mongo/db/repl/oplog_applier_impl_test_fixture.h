@@ -29,15 +29,50 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -74,26 +109,31 @@ public:
      * This function is called whenever OplogApplierImpl inserts documents into a collection.
      */
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   const std::vector<RecordId>& recordIds,
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * This function is called whenever OplogApplierImpl deletes a document from a collection.
      */
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  OptionalCollectionUUID uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * This function is called whenever OplogApplierImpl updates a document in a collection.
      */
-    void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override;
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * Called when OplogApplierImpl creates a collection.
@@ -103,27 +143,59 @@ public:
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
-                            const OplogSlot& createOpTime) override;
+                            const OplogSlot& createOpTime,
+                            bool fromMigrate) override;
 
     /**
-     * Called when OplogApplierImpl creates an index
+     * Called when OplogApplierImpl renames a collection.
+     */
+    void onRenameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            const UUID& uuid,
+                            const boost::optional<UUID>& dropTargetUUID,
+                            std::uint64_t numRecords,
+                            bool stayTemp,
+                            bool markFromMigrate) override;
+
+    /**
+     * Called when OplogApplierImpl creates an index.
      */
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
-                       CollectionUUID uuid,
+                       const UUID& uuid,
                        BSONObj indexDoc,
                        bool fromMigrate) override;
-    // Hooks for OpObserver functions. Defaults to a no-op function but may be overridden to check
-    // actual documents mutated.
+
+    /**
+     * Called when OplogApplierImpl drops an index.
+     */
+    void onDropIndex(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     const UUID& uuid,
+                     const std::string& indexName,
+                     const BSONObj& idxDescriptor) override;
+
+    /**
+     * Called when OplogApplierImpl performs a CollMod.
+     */
+    void onCollMod(OperationContext* opCtx,
+                   const NamespaceString& nss,
+                   const UUID& uuid,
+                   const BSONObj& collModCmd,
+                   const CollectionOptions& oldCollOptions,
+                   boost::optional<IndexCollModInfo> indexInfo) override;
+
+    // Hooks for OpObserver functions. Defaults to a no-op function but may be overridden to
+    // check actual documents mutated.
     std::function<void(OperationContext*, const NamespaceString&, const std::vector<BSONObj>&)>
         onInsertsFn;
 
     std::function<void(OperationContext*,
-                       const NamespaceString&,
-                       OptionalCollectionUUID,
+                       const CollectionPtr&,
                        StmtId,
-                       bool,
-                       const boost::optional<BSONObj>&)>
+                       const BSONObj&,
+                       const OplogDeleteEntryArgs&)>
         onDeleteFn;
 
     std::function<void(OperationContext*, const OplogUpdateEntryArgs&)> onUpdateFn;
@@ -134,19 +206,44 @@ public:
                        const CollectionOptions&,
                        const BSONObj&)>
         onCreateCollectionFn;
-    std::function<void(OperationContext*, const NamespaceString&, CollectionUUID, BSONObj, bool)>
+
+    std::function<void(OperationContext*,
+                       const NamespaceString&,
+                       const NamespaceString&,
+                       boost::optional<UUID>,
+                       boost::optional<UUID>,
+                       std::uint64_t,
+                       bool,
+                       bool)>
+        onRenameCollectionFn;
+
+    std::function<void(OperationContext*, const NamespaceString&, UUID, BSONObj, bool)>
         onCreateIndexFn;
+
+    std::function<void(OperationContext*,
+                       const NamespaceString&,
+                       boost::optional<UUID>,
+                       const std::string&,
+                       const BSONObj&)>
+        onDropIndexFn;
+
+    std::function<void(OperationContext*,
+                       const NamespaceString&,
+                       const UUID&,
+                       const BSONObj&,
+                       const CollectionOptions&,
+                       boost::optional<IndexCollModInfo>)>
+        onCollModFn;
 };
 
 class OplogApplierImplTest : public ServiceContextMongoDTest {
-public:
-    OplogApplierImplTest(){};
-    OplogApplierImplTest(std::string storageEngine)
-        : ServiceContextMongoDTest(std::move(storageEngine)){};
-
 protected:
+    explicit OplogApplierImplTest(Options options = {})
+        : ServiceContextMongoDTest(options.useReplSettings(true)) {}
+
     void _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::Error expectedError,
                                                            const OplogEntry& op,
+                                                           const NamespaceString& targetNss,
                                                            bool expectedApplyOpCalled);
 
     Status _applyOplogEntryOrGroupedInsertsWrapper(OperationContext* opCtx,
@@ -157,6 +254,11 @@ protected:
     std::unique_ptr<ReplicationConsistencyMarkers> _consistencyMarkers;
     ServiceContext* serviceContext;
     OplogApplierImplOpObserver* _opObserver = nullptr;
+
+    template <typename T>
+    inline void setServerParameter(const std::string& name, T value) {
+        _serverParamControllers.push_back(ServerParameterControllerForTest(name, value));
+    }
 
     OpTime nextOpTime() {
         static long long lastSecond = 1;
@@ -177,6 +279,22 @@ protected:
     Status runOpsInitialSync(std::vector<OplogEntry> ops);
 
     UUID kUuid{UUID::gen()};
+
+    std::vector<ServerParameterControllerForTest> _serverParamControllers;
+};
+
+class OplogApplierImplWithFastAutoAdvancingClockTest : public OplogApplierImplTest {
+protected:
+    OplogApplierImplWithFastAutoAdvancingClockTest()
+        : OplogApplierImplTest(
+              Options{}.useMockClock(true, Milliseconds{serverGlobalParams.slowMS.load() * 10})) {}
+};
+
+class OplogApplierImplWithSlowAutoAdvancingClockTest : public OplogApplierImplTest {
+protected:
+    OplogApplierImplWithSlowAutoAdvancingClockTest()
+        : OplogApplierImplTest(
+              Options{}.useMockClock(true, Milliseconds{serverGlobalParams.slowMS.load() / 10})) {}
 };
 
 // Utility class to allow easily scanning a collection.  Scans in forward order, returns
@@ -211,21 +329,32 @@ bool docExists(OperationContext* opCtx, const NamespaceString& nss, const BSONOb
  */
 OplogEntry makeOplogEntry(OpTypeEnum opType,
                           NamespaceString nss,
-                          OptionalCollectionUUID uuid,
+                          const boost::optional<UUID>& uuid,
                           BSONObj o,
-                          boost::optional<BSONObj> o2 = boost::none);
+                          boost::optional<BSONObj> o2 = boost::none,
+                          boost::optional<bool> fromMigrate = boost::none);
 
-OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid);
+OplogEntry makeOplogEntry(OpTime opTime,
+                          OpTypeEnum opType,
+                          NamespaceString nss,
+                          const boost::optional<UUID>& uuid,
+                          BSONObj o,
+                          boost::optional<BSONObj> o2 = boost::none,
+                          boost::optional<bool> fromMigrate = boost::none,
+                          OperationSessionInfo sessionInfo = OperationSessionInfo(),
+                          boost::optional<RetryImageEnum> needsRetryImage = boost::none);
+
+OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, boost::optional<UUID> uuid);
 
 /**
  * Creates collection options suitable for oplog.
  */
 CollectionOptions createOplogCollectionOptions();
 
-/*
- * Creates collection options for recording pre-images for testing deletes.
+/**
+ * Creates collection options for recording change stream pre-images for testing deletes.
  */
-CollectionOptions createRecordPreImageCollectionOptions();
+CollectionOptions createRecordChangeStreamPreAndPostImagesCollectionOptions();
 
 /**
  * Create test collection.
@@ -247,6 +376,14 @@ void createDatabase(OperationContext* opCtx, StringData dbName);
  * Returns true if collection exists.
  */
 bool collectionExists(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Create index on a collection.
+ */
+void createIndex(OperationContext* opCtx,
+                 const NamespaceString& nss,
+                 UUID collUUID,
+                 const BSONObj& spec);
 
 }  // namespace repl
 }  // namespace mongo

@@ -27,26 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uncommitted_collections.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/catalog/uncommitted_catalog_updates.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/durable_catalog.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
 bool collectionExists(OperationContext* opCtx, NamespaceString nss) {
-    return CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) != nullptr;
+    return static_cast<bool>(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
 }
 
 class ConcurrentCreateCollectionTest {
@@ -54,22 +60,22 @@ public:
     void run() {
         auto serviceContext = getGlobalServiceContext();
 
-        NamespaceString competingNss("test.competingCollection");
+        NamespaceString competingNss =
+            NamespaceString::createNamespaceString_forTest("test.competingCollection");
 
-        auto client1 = serviceContext->makeClient("client1");
-        auto client2 = serviceContext->makeClient("client2");
+        auto client1 = serviceContext->getService()->makeClient("client1");
+        auto client2 = serviceContext->getService()->makeClient("client2");
 
         auto op1 = client1->makeOperationContext();
         auto op2 = client2->makeOperationContext();
 
-
-        Lock::DBLock dbLk1(op1.get(), competingNss.db(), LockMode::MODE_IX);
+        Lock::DBLock dbLk1(op1.get(), competingNss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLk1(op1.get(), competingNss, LockMode::MODE_IX);
-        Lock::DBLock dbLk2(op2.get(), competingNss.db(), LockMode::MODE_IX);
+        Lock::DBLock dbLk2(op2.get(), competingNss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLk2(op2.get(), competingNss, LockMode::MODE_IX);
 
         Database* db =
-            DatabaseHolder::get(op1.get())->openDb(op1.get(), competingNss.db(), nullptr);
+            DatabaseHolder::get(op1.get())->openDb(op1.get(), competingNss.dbName(), nullptr);
 
         {
             WriteUnitOfWork wuow1(op1.get());
@@ -83,8 +89,14 @@ public:
 
                 ASSERT_TRUE(collectionExists(op1.get(), competingNss));
                 ASSERT_TRUE(collectionExists(op2.get(), competingNss));
-                ASSERT_NOT_EQUALS(UncommittedCollections::getForTxn(op1.get(), competingNss),
-                                  UncommittedCollections::getForTxn(op2.get(), competingNss));
+
+                auto [found1, collection1, newColl1] =
+                    UncommittedCatalogUpdates::lookupCollection(op1.get(), competingNss);
+                auto [found2, collection2, newColl2] =
+                    UncommittedCatalogUpdates::lookupCollection(op2.get(), competingNss);
+                ASSERT_EQUALS(found1, found2);
+                ASSERT_EQUALS(newColl1, newColl2);
+                ASSERT_NOT_EQUALS(collection1, collection2);
                 wuow2.commit();
             }
             ASSERT_THROWS(wuow1.commit(), WriteConflictException);
@@ -106,7 +118,7 @@ public:
         addNameCallback(nameForTestClass<T>(), [] { T().run(); });
     }
 
-    void setupTests() {
+    void setupTests() override {
         add<ConcurrentCreateCollectionTest>();
     }
 };

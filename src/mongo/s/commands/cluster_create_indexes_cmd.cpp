@@ -27,18 +27,50 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <set>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/create_indexes_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/collection_routing_info_targeter.h"
+#include "mongo/s/collection_uuid_mismatch.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -64,51 +96,85 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::createIndex));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::createIndex)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return true;
     }
 
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& dbName,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
-                              const RequestParser&,
+                              const RequestParser& requestParser,
                               BSONObjBuilder& output) final {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOGV2_DEBUG(22750,
-                    1,
-                    "createIndexes: {namespace} cmd: {command}",
-                    "CMD: createIndexes",
-                    "namespace"_attr = nss,
-                    "command"_attr = redact(cmdObj));
+        LOGV2_DEBUG(22750, 1, "CMD: createIndexes", logAttrs(nss), "command"_attr = redact(cmdObj));
 
-        cluster::createDatabase(opCtx, dbName);
+        auto targeter = CollectionRoutingInfoTargeter(opCtx, nss);
+        auto routingInfo = targeter.getRoutingInfo();
+        auto cmdToBeSent = cmdObj;
+        if (targeter.timeseriesNamespaceNeedsRewrite(nss)) {
+            const auto& request = requestParser.request();
+            if (auto uuid = request.getCollectionUUID()) {
+                auto status = Status(CollectionUUIDMismatchInfo(
+                                         nss.dbName(), *uuid, nss.coll().toString(), boost::none),
+                                     "'collectionUUID' is specified for a time-series view "
+                                     "namespace; views do not have UUIDs");
+                uassertStatusOK(populateCollectionUUIDMismatch(opCtx, status));
+                MONGO_UNREACHABLE_TASSERT(8549600);
+            }
 
-        auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+            cmdToBeSent = timeseries::makeTimeseriesCommand(
+                cmdToBeSent, nss, getName(), CreateIndexesCommand::kIsTimeseriesNamespaceFieldName);
+        }
+
         auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
-            nss.db(),
-            nss,
+            nss.dbName(),
+            targeter.getNS(),
             routingInfo,
             CommandHelpers::filterCommandRequestForPassthrough(
-                applyReadWriteConcern(opCtx, this, cmdObj)),
+                applyReadWriteConcern(opCtx, this, cmdToBeSent)),
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             Shard::RetryPolicy::kNoRetry,
-            BSONObj() /* query */,
-            BSONObj() /* collation */);
+            BSONObj() /*query*/,
+            BSONObj() /*collation*/,
+            boost::none /*letParameters*/,
+            boost::none /*runtimeConstants*/);
 
+        BSONObjBuilder rawResBuilder;
         std::string errmsg;
+        bool isShardedCollection = routingInfo.cm.isSharded();
         const bool ok =
-            appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses)).responseOK;
-        if (!errmsg.empty()) {
-            CommandHelpers::appendSimpleCommandStatus(output, ok, errmsg);
+            appendRawResponses(opCtx, &errmsg, &rawResBuilder, shardResponses, isShardedCollection)
+                .responseOK;
+
+        if (!isShardedCollection && ok) {
+            CommandHelpers::filterCommandReplyForPassthrough(
+                shardResponses[0].swResponse.getValue().data, &output);
         }
+
+        output.appendElements(rawResBuilder.obj());
+        CommandHelpers::appendSimpleCommandStatus(output, ok, errmsg);
+
+        if (ok) {
+            LOGV2(5706400, "Indexes created", logAttrs(nss));
+        }
+
         return ok;
     }
 
@@ -119,7 +185,7 @@ public:
      * 'code' & 'codeName' are permitted in either scenario, but non-zero 'code' indicates "not ok".
      */
     void validateResult(const BSONObj& result) final {
-        auto ctx = IDLParserErrorContext("createIndexesReply");
+        auto ctx = IDLParserContext("createIndexesReply");
         if (checkIsErrorStatus(result, ctx)) {
             return;
         }
@@ -138,7 +204,7 @@ public:
             return;
         }
 
-        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        auto rawCtx = IDLParserContext(kRawFieldName, &ctx);
         for (const auto& element : rawData.Obj()) {
             if (!rawCtx.checkAndAssertType(element, Object)) {
                 return;
@@ -154,7 +220,8 @@ public:
     const AuthorizationContract* getAuthorizationContract() const final {
         return &::mongo::CreateIndexesCommand::kAuthorizationContract;
     }
-} createIndexesCmd;
+};
+MONGO_REGISTER_COMMAND(CreateIndexesCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

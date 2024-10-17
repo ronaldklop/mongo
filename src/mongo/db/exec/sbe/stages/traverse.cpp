@@ -27,9 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/traverse.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo::sbe {
 TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
@@ -41,8 +51,10 @@ TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
                              std::unique_ptr<EExpression> foldExpr,
                              std::unique_ptr<EExpression> finalExpr,
                              PlanNodeId planNodeId,
-                             boost::optional<size_t> nestedArraysDepth)
-    : PlanStage("traverse"_sd, planNodeId),
+                             boost::optional<size_t> nestedArraysDepth,
+                             bool participateInTrialRunTracking)
+    : PlanStage(
+          "traverse"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inField(inField),
       _outField(outField),
       _outFieldInner(outFieldInner),
@@ -68,7 +80,8 @@ std::unique_ptr<PlanStage> TraverseStage::clone() const {
                                            _fold ? _fold->clone() : nullptr,
                                            _final ? _final->clone() : nullptr,
                                            _commonStats.nodeId,
-                                           _nestedArraysDepth);
+                                           _nestedArraysDepth,
+                                           participateInTrialRunTracking());
 }
 
 void TraverseStage::prepare(CompileCtx& ctx) {
@@ -144,11 +157,10 @@ void TraverseStage::openInner(value::TypeTags tag, value::Value val) {
 PlanState TraverseStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    auto state = _children[0]->getNext();
+    auto state = getNextOuterSide();
     if (state != PlanState::ADVANCED) {
         return trackPlanState(state);
     }
-
     [[maybe_unused]] auto earlyExit = traverse(_inFieldAccessor, &_outFieldOutputAccessor, 0);
 
     return trackPlanState(PlanState::ADVANCED);
@@ -163,8 +175,8 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
 
     if (value::isArray(tag)) {
         // If it is an array then we have to traverse it.
-        value::ArrayAccessor inArrayAccessor;
-        inArrayAccessor.reset(tag, val);
+        auto& inArrayAccessor = _inArrayAccessors.emplace_back(value::ArrayAccessor{});
+        inArrayAccessor.reset(inFieldAccessor);
         value::Array* arrOut{nullptr};
 
         if (!_foldCode) {
@@ -175,6 +187,14 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
             outFieldOutputAccessor->reset(true, tag, val);
         } else {
             outFieldOutputAccessor->reset(false, value::TypeTags::Nothing, 0);
+        }
+
+        if (level == 0 && inArrayAccessor.atEnd()) {
+            // If we are "traversing" an empty array then the inner side of the traverse stage is
+            // not entered as we do not have any value to process there. However, the inner side
+            // holds now "stale" state from the previous traversal and we must not access it if the
+            // query yields.
+            _children[1]->disableSlotAccess(true);
         }
 
         // Loop over all elements of array.
@@ -207,11 +227,11 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
                         // We have to copy (or move optimization) the value to the array
                         // as by definition all composite values (arrays, objects) own their
                         // constituents.
-                        auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                        auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                         arrOut->push_back(tag, val);
                     } else {
                         if (firstValue) {
-                            auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                            auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                             outFieldOutputAccessor->reset(true, tag, val);
                             firstValue = false;
                         } else {
@@ -236,14 +256,15 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
                 }
             }
         }
+
+        _inArrayAccessors.pop_back();
     } else {
         // For non-arrays we simply execute the inner side once.
+        outFieldOutputAccessor->reset();
         openInner(tag, val);
         auto state = _children[1]->getNext();
 
-        if (state == PlanState::IS_EOF) {
-            outFieldOutputAccessor->reset();
-        } else {
+        if (state == PlanState::ADVANCED) {
             auto [tag, val] = _outFieldInputAccessor->getViewOfValue();
             // We don't have to copy the value.
             outFieldOutputAccessor->reset(false, tag, val);
@@ -256,7 +277,7 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
 void TraverseStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 
     if (_reOpenInner) {
         _children[1]->close();
@@ -265,6 +286,35 @@ void TraverseStage::close() {
     }
 
     _children[0]->close();
+}
+
+void TraverseStage::doSaveState(bool relinquishCursor) {
+    if (_isReadingLeftSide) {
+        // If we yield while reading the left side, there is no need to prepareForYielding() data
+        // held in the right side, since we will have to re-open it anyway.
+        const bool recursive = true;
+        _children[1]->disableSlotAccess(recursive);
+
+        // As part of reading the left side we're about to reset the out field accessor anyway.
+        // No point in keeping its data around.
+        _outFieldOutputAccessor.reset();
+    }
+
+    if (!relinquishCursor) {
+        return;
+    }
+
+    prepareForYielding(_outFieldOutputAccessor, slotsAccessible());
+}
+
+void TraverseStage::doRestoreState(bool relinquishCursor) {
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    for (auto& accessor : _inArrayAccessors) {
+        accessor.refresh();
+    }
 }
 
 std::unique_ptr<PlanStageStats> TraverseStage::getStats(bool includeDebugInfo) const {
@@ -279,7 +329,7 @@ std::unique_ptr<PlanStageStats> TraverseStage::getStats(bool includeDebugInfo) c
         bob.appendNumber("inputSlot", static_cast<long long>(_inField));
         bob.appendNumber("outputSlot", static_cast<long long>(_outField));
         bob.appendNumber("outputSlotInner", static_cast<long long>(_outFieldInner));
-        bob.append("correlatedSlots", _correlatedSlots);
+        bob.append("correlatedSlots", _correlatedSlots.begin(), _correlatedSlots.end());
         if (_nestedArraysDepth) {
             bob.appendNumber("nestedArraysDepth", static_cast<long long>(*_nestedArraysDepth));
         }
@@ -331,6 +381,10 @@ std::vector<DebugPrinter::Block> TraverseStage::debugPrint() const {
     }
     ret.emplace_back("`}");
 
+    if (_nestedArraysDepth) {
+        ret.emplace_back(std::to_string(*_nestedArraysDepth));
+    }
+
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addIdentifier(ret, "from");
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
@@ -343,5 +397,15 @@ std::vector<DebugPrinter::Block> TraverseStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     return ret;
+}
+
+size_t TraverseStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_correlatedSlots);
+    size += _fold ? _fold->estimateSize() : 0;
+    size += _final ? _final->estimateSize() : 0;
+    size += size_estimator::estimate(_specificStats);
+    return size;
 }
 }  // namespace mongo::sbe

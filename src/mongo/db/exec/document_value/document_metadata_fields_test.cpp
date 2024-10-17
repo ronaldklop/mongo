@@ -27,14 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <functional>
+#include <string>
 
-#include "mongo/bson/bsonobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 
@@ -50,6 +54,9 @@ TEST(DocumentMetadataFieldsTest, AllMetadataRoundtripsThroughSerialization) {
     metadata.setIndexKey(BSON("b" << 1));
     metadata.setSearchScoreDetails(BSON("scoreDetails"
                                         << "foo"));
+    metadata.setSearchSortValues(BSON("a" << 1));
+    metadata.setVectorSearchScore(7.6);
+    metadata.setScore(8.1);
 
     BufBuilder builder;
     metadata.serializeForSorter(builder);
@@ -69,6 +76,9 @@ TEST(DocumentMetadataFieldsTest, AllMetadataRoundtripsThroughSerialization) {
     ASSERT_BSONOBJ_EQ(deserialized.getSearchScoreDetails(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(deserialized.getSearchSortValues(), BSON("a" << 1));
+    ASSERT_EQ(deserialized.getVectorSearchScore(), 7.6);
+    ASSERT_EQ(deserialized.getScore(), 8.1);
 }
 
 TEST(DocumentMetadataFieldsTest, HasMethodsReturnFalseForEmptyMetadata) {
@@ -83,6 +93,9 @@ TEST(DocumentMetadataFieldsTest, HasMethodsReturnFalseForEmptyMetadata) {
     ASSERT_FALSE(metadata.hasSearchHighlights());
     ASSERT_FALSE(metadata.hasIndexKey());
     ASSERT_FALSE(metadata.hasSearchScoreDetails());
+    ASSERT_FALSE(metadata.hasSearchSortValues());
+    ASSERT_FALSE(metadata.hasVectorSearchScore());
+    ASSERT_FALSE(metadata.hasScore());
 }
 
 TEST(DocumentMetadataFieldsTest, HasMethodsReturnTrueForInitializedMetadata) {
@@ -125,6 +138,18 @@ TEST(DocumentMetadataFieldsTest, HasMethodsReturnTrueForInitializedMetadata) {
     metadata.setSearchScoreDetails(BSON("scoreDetails"
                                         << "foo"));
     ASSERT_TRUE(metadata.hasSearchScoreDetails());
+
+    ASSERT_FALSE(metadata.hasSearchSortValues());
+    metadata.setSearchSortValues(BSON("a" << 1));
+    ASSERT_TRUE(metadata.hasSearchSortValues());
+
+    ASSERT_FALSE(metadata.hasVectorSearchScore());
+    metadata.setVectorSearchScore(7.6);
+    ASSERT_TRUE(metadata.hasVectorSearchScore());
+
+    ASSERT_FALSE(metadata.hasScore());
+    metadata.setScore(8.1);
+    ASSERT_TRUE(metadata.hasScore());
 }
 
 TEST(DocumentMetadataFieldsTest, MoveConstructor) {
@@ -139,6 +164,9 @@ TEST(DocumentMetadataFieldsTest, MoveConstructor) {
     metadata.setIndexKey(BSON("b" << 1));
     metadata.setSearchScoreDetails(BSON("scoreDetails"
                                         << "foo"));
+    metadata.setSearchSortValues(BSON("a" << 1));
+    metadata.setVectorSearchScore(7.6);
+    metadata.setScore(8.1);
 
     DocumentMetadataFields moveConstructed(std::move(metadata));
     ASSERT_TRUE(moveConstructed);
@@ -154,6 +182,9 @@ TEST(DocumentMetadataFieldsTest, MoveConstructor) {
     ASSERT_BSONOBJ_EQ(moveConstructed.getSearchScoreDetails(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(moveConstructed.getSearchSortValues(), BSON("a" << 1));
+    ASSERT_EQ(moveConstructed.getVectorSearchScore(), 7.6);
+    ASSERT_EQ(moveConstructed.getScore(), 8.1);
 
     ASSERT_FALSE(metadata);  // NOLINT(bugprone-use-after-move)
 }
@@ -170,6 +201,9 @@ TEST(DocumentMetadataFieldsTest, MoveAssignmentOperator) {
     metadata.setIndexKey(BSON("b" << 1));
     metadata.setSearchScoreDetails(BSON("scoreDetails"
                                         << "foo"));
+    metadata.setSearchSortValues(BSON("a" << 1));
+    metadata.setVectorSearchScore(7.6);
+    metadata.setScore(8.1);
 
     DocumentMetadataFields moveAssigned;
     moveAssigned.setTextScore(12.3);
@@ -188,6 +222,9 @@ TEST(DocumentMetadataFieldsTest, MoveAssignmentOperator) {
     ASSERT_BSONOBJ_EQ(moveAssigned.getSearchScoreDetails(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(moveAssigned.getSearchSortValues(), BSON("a" << 1));
+    ASSERT_EQ(moveAssigned.getVectorSearchScore(), 7.6);
+    ASSERT_EQ(moveAssigned.getScore(), 8.1);
 
     ASSERT_FALSE(metadata);  // NOLINT(bugprone-use-after-move)
 }
@@ -241,6 +278,9 @@ TEST(DocumentMetadataFieldsTest, MergeWithOnlyCopiesMetadataThatDestinationDoesN
     ASSERT_FALSE(destination.hasSearchHighlights());
     ASSERT_FALSE(destination.hasIndexKey());
     ASSERT_FALSE(destination.hasSearchScoreDetails());
+    ASSERT_FALSE(destination.hasSearchSortValues());
+    ASSERT_FALSE(destination.hasVectorSearchScore());
+    ASSERT_FALSE(destination.hasScore());
 }
 
 TEST(DocumentMetadataFieldsTest, CopyFromCopiesAllMetadataThatSourceHas) {
@@ -266,6 +306,175 @@ TEST(DocumentMetadataFieldsTest, CopyFromCopiesAllMetadataThatSourceHas) {
     ASSERT_FALSE(destination.hasSearchHighlights());
     ASSERT_FALSE(destination.hasIndexKey());
     ASSERT_FALSE(destination.hasSearchScoreDetails());
+    ASSERT_FALSE(destination.hasSearchSortValues());
+    ASSERT_FALSE(destination.hasVectorSearchScore());
+    ASSERT_FALSE(destination.hasScore());
+}
+
+TEST(DocumentMetadataFieldsTest, GetTimeseriesBucketMinTimeExists) {
+    DocumentMetadataFields source;
+    Date_t time;
+    source.setTimeseriesBucketMinTime(time);
+    ASSERT_EQ(source.getTimeseriesBucketMinTime(), time);
+}
+
+TEST(DocumentMetadataFieldsTest, GetTimeseriesBucketMaxTimeExists) {
+    DocumentMetadataFields source;
+    Date_t time;
+    source.setTimeseriesBucketMaxTime(time);
+    ASSERT_EQ(source.getTimeseriesBucketMaxTime(), time);
+}
+
+TEST(DocumentMetadataFieldsTest, MetadataIsMarkedModifiedOnSetMetadataField) {
+    // Test setting metadata fields directly.
+
+    auto testFieldSetter = [](std::function<void(DocumentMetadataFields&)> invokeSetter) {
+        DocumentMetadataFields metadata;
+        ASSERT_FALSE(metadata.isModified());
+        invokeSetter(metadata);
+        ASSERT_TRUE(metadata.isModified());
+    };
+
+    testFieldSetter([](DocumentMetadataFields& md) { md.setTextScore(10.0); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setRandVal(20.0); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setSortKey(Value(30), true); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setGeoNearDistance(40.0); });
+    testFieldSetter(
+        [](DocumentMetadataFields& md) { md.setGeoNearPoint(Value{BSON_ARRAY(1 << 2)}); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setSearchScore(50.0); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setSearchHighlights(Value{"foo"_sd}); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setIndexKey(BSON("b" << 1)); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setRecordId(RecordId{6}); });
+    testFieldSetter([](DocumentMetadataFields& md) {
+        md.setSearchScoreDetails(BSON("scoreDetails"
+                                      << "foo"));
+    });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setTimeseriesBucketMinTime(Date_t()); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setTimeseriesBucketMaxTime(Date_t()); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setSearchSortValues(BSON("a" << 1)); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setVectorSearchScore(60.0); });
+    testFieldSetter([](DocumentMetadataFields& md) { md.setScore(80.0); });
+}
+
+TEST(DocumentMetadataFieldsTest, MetadataIsConstructedUnmodified) {
+    // We consider new instances as unmodified for all constructors (default, copy, move) even when
+    // the original metadata has the 'modified' flag set.
+
+    // Testing the default constructor.
+    DocumentMetadataFields metadata1;
+    ASSERT_FALSE(metadata1.isModified());
+    metadata1.setTextScore(10.0);
+    ASSERT_TRUE(metadata1.isModified());
+
+    // Testing the copy-constructor.
+    DocumentMetadataFields metadata2(metadata1);
+    ASSERT_FALSE(metadata2.isModified());
+
+    // Testing the move-constructor.
+    DocumentMetadataFields metadata3(std::move(metadata1));
+    ASSERT_FALSE(metadata3.isModified());
+}
+
+TEST(DocumentMetadataFieldsTest, CopyAssignmentIsModification) {
+    // We consider copy-assignment as modification even when the instances are equal and the copied
+    // metadata does not have the 'modified' flag set.
+
+    DocumentMetadataFields metadata1;
+    ASSERT_FALSE(metadata1.isModified());
+
+    DocumentMetadataFields metadata2;
+    ASSERT_FALSE(metadata2.isModified());
+
+    // Testing copy-assignment to empty object (metadata2 == metadata1).
+    metadata2 = metadata1;
+    ASSERT_TRUE(metadata2.isModified());
+
+    // Testing copy-assignment in a more common case (metadata1 is empty, metadata2 is not empty).
+    metadata2.setTextScore(10.0);
+    metadata2.setModified(false);
+    ASSERT_FALSE(metadata2.isModified());
+    metadata1 = metadata2;
+    ASSERT_TRUE(metadata1.isModified());
+    ASSERT_EQ(metadata2.getTextScore(), metadata1.getTextScore());
+}
+
+TEST(DocumentMetadataFieldsTest, MoveAssignmentIsModification) {
+    // We consider move-assignment as modification even when the instances are equal and the moved
+    // metadata does not have the 'modified' flag set.
+
+    DocumentMetadataFields metadata1;
+    ASSERT_FALSE(metadata1.isModified());
+
+    DocumentMetadataFields metadata2;
+    ASSERT_FALSE(metadata2.isModified());
+
+    // Testing move-assignment to empty object (metadata2 == metadata1).
+    metadata2 = std::move(metadata1);
+    ASSERT_TRUE(metadata2.isModified());
+
+    // Testing move-assignment in a more common case (metadata3 is empty, metadata2 is not empty).
+    metadata2.setTextScore(10.0);
+    metadata2.setModified(false);
+    ASSERT_FALSE(metadata2.isModified());
+
+    DocumentMetadataFields metadata3;
+    ASSERT_FALSE(metadata3.isModified());
+
+    metadata3 = std::move(metadata2);
+    ASSERT_TRUE(metadata3.isModified());
+    ASSERT_EQ(10.0, metadata3.getTextScore());
+}
+
+TEST(DocumentMetadataFieldsTest, MetadataIsMarkedModifiedOnCopyFrom) {
+    DocumentMetadataFields metadata1;
+    metadata1.setRandVal(20.0);
+    ASSERT_TRUE(metadata1.isModified());
+
+    // Testing 'setModified(false)'.
+    metadata1.setModified(false);
+    ASSERT_FALSE(metadata1.isModified());
+
+    // Calling 'copyFrom(metadata1)' modifies metadata2 even when metadata2 == metadata1 and
+    // metadata1 is not marked as modified.
+    DocumentMetadataFields metadata2(metadata1);
+    ASSERT_FALSE(metadata2.isModified());
+    metadata2.copyFrom(metadata1);
+    ASSERT_TRUE(metadata2.isModified());
+}
+
+TEST(DocumentMetadataFieldsTest, MetadataIsMarkedModifiedOnMergeWith) {
+    DocumentMetadataFields metadata1;
+    metadata1.setRandVal(20.0);
+    ASSERT_TRUE(metadata1.isModified());
+
+    metadata1.setModified(false);
+    ASSERT_FALSE(metadata1.isModified());
+
+    // Calling 'mergeWith(metadata1)' modifies metadata2 only when metadata1 has fields not set in
+    // metadata1.
+    DocumentMetadataFields metadata2(metadata1);
+    ASSERT_FALSE(metadata2.isModified());
+    metadata2.mergeWith(metadata1);
+    ASSERT_FALSE(metadata2.isModified());
+
+    DocumentMetadataFields metadata3;
+    ASSERT_FALSE(metadata3.isModified());
+    metadata3.mergeWith(metadata2);
+    ASSERT_TRUE(metadata3.isModified());
+}
+
+DEATH_TEST_REGEX(DocumentMetadataFieldsTest,
+                 GetTimeseriesBucketMinTimeDoesntExist,
+                 "Tripwire assertion.*6850100") {
+    DocumentMetadataFields source;
+    source.getTimeseriesBucketMinTime();
+}
+
+DEATH_TEST_REGEX(DocumentMetadataFieldsTest,
+                 GetTimeseriesBucketMaxTimeDoesntExist,
+                 "Tripwire assertion.*6850101") {
+    DocumentMetadataFields source;
+    source.getTimeseriesBucketMaxTime();
 }
 
 }  // namespace mongo

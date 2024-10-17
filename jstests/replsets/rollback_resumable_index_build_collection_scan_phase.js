@@ -3,15 +3,17 @@
  * the collection scan phase.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The rollback can be slow on certain build variants (such as macOS and code coverage), which
+ *   # can cause the targeted log messages to fall off the log buffer before we search for them.
+ *   incompatible_with_gcov,
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/replsets/libs/rollback_resumable_index_build.js');
+import {
+    RollbackResumableIndexBuildTest
+} from "jstests/replsets/libs/rollback_resumable_index_build.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 
@@ -38,7 +40,7 @@ const runRollbackTo = function(rollbackEndFailPointName, rollbackEndFailPointLog
                 0,  // rollbackEndFailPointsIteration
                 ["setYieldAllLocksHang", "setYieldAllLocksHangSecond"],
                 ["collection scan"],
-                [{numScannedAferResume: 1}],
+                [{numScannedAfterResume: 1}],
                 [{a: 6}, {a: 7}]);
         };
 
@@ -66,4 +68,3 @@ runRollbackTo("hangAfterSettingUpIndexBuild", 20387);
 runRollbackTo("hangIndexBuildDuringCollectionScanPhaseAfterInsertion", 20386);
 
 rollbackTest.stop();
-})();

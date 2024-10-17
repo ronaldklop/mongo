@@ -1,14 +1,11 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 let s = new ShardingTest({shards: 2, mongos: 2});
 let s2 = s.s1;
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {num: 1}}));
 
-// Ensure that the second mongos will see the movePrimary
 s.configRS.awaitLastOpCommitted();
 
 s.s0.getDB("test").foo.save({num: 1});
@@ -57,4 +54,3 @@ for (var i = 0; i < 10; i++) {
 }
 
 s.stop();
-})();

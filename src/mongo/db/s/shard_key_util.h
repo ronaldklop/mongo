@@ -29,9 +29,23 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/shard_util.h"
 
 namespace mongo {
@@ -51,12 +65,14 @@ public:
     virtual void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                               const BSONObj& proposedKey) const = 0;
 
-    virtual void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const = 0;
+    virtual void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                              std::string* errMsg) const = 0;
 
     virtual void createShardKeyIndex(const NamespaceString& nss,
                                      const BSONObj& proposedKey,
                                      const boost::optional<BSONObj>& defaultCollation,
-                                     bool unique) const = 0;
+                                     bool unique,
+                                     boost::optional<TimeseriesOptions> tsOpts) const = 0;
 };
 
 /**
@@ -64,50 +80,89 @@ public:
  */
 class ValidationBehaviorsShardCollection final : public ShardKeyValidationBehaviors {
 public:
-    ValidationBehaviorsShardCollection(OperationContext* opCtx)
-        : _localClient(std::make_unique<DBDirectClient>(opCtx)) {}
+    ValidationBehaviorsShardCollection(OperationContext* opCtx, const ShardId& dataShard)
+        : _opCtx(opCtx),
+          _localClient(std::make_unique<DBDirectClient>(opCtx)),
+          _dataShard(
+              uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dataShard))) {}
 
     std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
 
     void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                       const BSONObj& proposedKey) const override;
 
-    void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const override;
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
 
     void createShardKeyIndex(const NamespaceString& nss,
                              const BSONObj& proposedKey,
                              const boost::optional<BSONObj>& defaultCollation,
-                             bool unique) const override;
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
 
 private:
+    OperationContext* _opCtx;
     std::unique_ptr<DBDirectClient> _localClient;
+    std::shared_ptr<Shard> _dataShard;
 };
 
 /**
- * Implementation of steps for validating a shard key for refineCollectionShardKey.
+ * Implementation of steps for validating a shard key for refineCollectionShardKey locally.
  */
-class ValidationBehaviorsRefineShardKey final : public ShardKeyValidationBehaviors {
+class ValidationBehaviorsLocalRefineShardKey final : public ShardKeyValidationBehaviors {
 public:
-    ValidationBehaviorsRefineShardKey(OperationContext* opCtx, const NamespaceString& nss);
+    ValidationBehaviorsLocalRefineShardKey(OperationContext* opCtx, const CollectionPtr& coll);
 
     std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
 
     void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                       const BSONObj& proposedKey) const override;
 
-    void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const override;
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
 
     void createShardKeyIndex(const NamespaceString& nss,
                              const BSONObj& proposedKey,
                              const boost::optional<BSONObj>& defaultCollation,
-                             bool unique) const override;
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
 
 private:
     OperationContext* _opCtx;
 
-    ChunkManager _cm;
+    const CollectionPtr& _coll;
+};
 
-    std::shared_ptr<Shard> _indexShard;
+/**
+ * Implementation of steps for validating a shard key for resharding building indexes after cloning.
+ */
+class ValidationBehaviorsReshardingBulkIndex final : public ShardKeyValidationBehaviors {
+public:
+    class RecipientStateMachineExternalState;
+    ValidationBehaviorsReshardingBulkIndex();
+
+    std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
+
+    void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                      const BSONObj& proposedKey) const override;
+
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
+
+    void createShardKeyIndex(const NamespaceString& nss,
+                             const BSONObj& proposedKey,
+                             const boost::optional<BSONObj>& defaultCollation,
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
+
+    void setOpCtxAndCloneTimestamp(OperationContext* opCtx, Timestamp cloneTimestamp);
+
+    boost::optional<BSONObj> getShardKeyIndexSpec() const;
+
+private:
+    OperationContext* _opCtx;
+    Timestamp _cloneTimestamp;
+    mutable boost::optional<BSONObj> _shardKeyIndexSpec;
 };
 
 /**
@@ -135,20 +190,30 @@ private:
  * 3. If the proposed shard key is specified as unique, there must exist a useful,
  *    unique index exactly equal to the proposedKey (not just a prefix).
  *
+ * 4. If the request concerns a timeseries collection, 'nss' must refer to the buckets namespace,
+ *    'tsOpts' must have a value, and 'shardKeyPattern' must already be buckets-encoded.
+ *    TODO (SERVER-79304): Remove 'updatedToHandleTimeseriesIndex' once 8.0 becomes last LTS. We
+ *    will only rewrite the index if 'updatedToHandleTimeseriesIndex' is true.
+ *
  * After validating these constraints:
  *
- * 4. If there is no useful index, and the collection is non-empty or we are refining the
+ * 5. If there is no useful index, and the collection is non-empty or we are refining the
  *    collection's shard key, we must fail.
  *
- * 5. If the collection is empty and we are not refining the collection's shard key, and it's
+ * 6. If the collection is empty and we are not refining the collection's shard key, and it's
  *    still possible to create an index on the proposed key, we go ahead and do so.
+ *
+ * Returns true if the index has been created, false otherwise.
  */
-void validateShardKeyIndexExistsOrCreateIfPossible(OperationContext* opCtx,
+bool validateShardKeyIndexExistsOrCreateIfPossible(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    const ShardKeyPattern& shardKeyPattern,
                                                    const boost::optional<BSONObj>& defaultCollation,
                                                    bool unique,
-                                                   const ShardKeyValidationBehaviors& behaviors);
+                                                   bool enforceUniquenessCheck,
+                                                   const ShardKeyValidationBehaviors& behaviors,
+                                                   boost::optional<TimeseriesOptions> tsOpts,
+                                                   bool updatedToHandleTimeseriesIndex);
 /**
  * Compares the proposed shard key with the collection's existing indexes to ensure they are a legal
  * combination.
@@ -161,7 +226,23 @@ bool validShardKeyIndexExists(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const ShardKeyPattern& shardKeyPattern,
                               const boost::optional<BSONObj>& defaultCollation,
-                              bool unique,
-                              const ShardKeyValidationBehaviors& behaviors);
+                              bool requiresUnique,
+                              const ShardKeyValidationBehaviors& behaviors,
+                              std::string* errMsg = nullptr);
+
+void validateShardKeyIsNotEncrypted(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    const ShardKeyPattern& shardKeyPattern);
+
+/**
+ * Validates a user provided shard key for timeseries collections.
+ * - Key pattern only contains meta field/sub-fields of meta field/time field.
+ * - If meta field is present, it can be ranged or hashed.
+ * - If time field is present, it must be ranged and at the end of the key pattern.
+ */
+void validateTimeseriesShardKey(StringData timeFieldName,
+                                boost::optional<StringData> metaFieldName,
+                                const BSONObj& shardKeyPattern);
+
 }  // namespace shardkeyutil
 }  // namespace mongo

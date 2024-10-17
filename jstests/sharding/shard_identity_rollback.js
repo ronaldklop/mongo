@@ -1,22 +1,25 @@
 /**
  * Tests that rolling back the insertion of the shardIdentity document on a shard causes the node
  * rolling it back to shut down.
- * @tags: [multiversion_incompatible, requires_persistence, requires_journaling]
+ * @tags: [multiversion_incompatible, requires_persistence]
  */
-
-(function() {
-"use strict";
 
 // This test triggers an unclean shutdown (an fassert), which may cause inaccurate fast counts.
 TestData.skipEnforceFastCountOnValidate = true;
 
-load('jstests/libs/write_concern_util.js');
+import {stopServerReplication, restartServerReplication} from "jstests/libs/write_concern_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 1});
 
 var replTest = new ReplSetTest({nodes: 3});
-var nodes = replTest.startSet({shardsvr: ''});
+replTest.startSet({shardsvr: ''});
 replTest.initiate();
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 var priConn = replTest.getPrimary();
 var secondaries = replTest.getSecondaries();
@@ -87,7 +90,7 @@ priConn = replTest.start(priConn, {waitForConnect: false}, true);
 // have shut itself down during the rollback.
 jsTest.log("Waiting for original primary to rollback and shut down");
 // Wait until the node shuts itself down during the rollback. We will hit the first assertion if
-// we rollback using 'recoverToStableTimestamp' and the second if using 'rollbackViaRefetch'.
+// we rollback using 'recoverToStableTimestamp'.
 assert.soon(() => {
     return (rawMongoProgramOutput().search(/Fatal assertion.*(40498|50712)/) !== -1);
 });
@@ -123,4 +126,3 @@ assert.eq(null, priConn.getDB('admin').system.version.findOne({_id: 'shardIdenti
 replTest.stopSet();
 
 st.stop();
-})();

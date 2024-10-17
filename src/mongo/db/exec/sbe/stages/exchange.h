@@ -29,12 +29,27 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/future.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
 
@@ -42,7 +57,7 @@ namespace mongo::sbe {
 class ExchangeConsumer;
 class ExchangeProducer;
 
-enum class ExchangePolicy { broadcast, roundrobin, partition };
+enum class ExchangePolicy { broadcast, roundrobin, hashpartition, rangepartition };
 
 // A unit of exchange between a consumer and a producer
 class ExchangeBuffer {
@@ -128,7 +143,7 @@ public:
     void putFullBuffer(std::unique_ptr<ExchangeBuffer>);
 
 private:
-    Mutex _mutex = MONGO_MAKE_LATCH("ExchangePipe::_mutex");
+    stdx::mutex _mutex;
     stdx::condition_variable _cond;
 
     std::vector<std::unique_ptr<ExchangeBuffer>> _fullBuffers;
@@ -215,7 +230,14 @@ public:
     auto& fields() const {
         return _fields;
     }
+
+    auto partitionExpr() const {
+        return _partition.get();
+    }
+
     ExchangePipe* pipe(size_t consumerTid, size_t producerTid);
+
+    size_t estimateCompileTimeSize() const;
 
 private:
     const ExchangePolicy _policy;
@@ -237,11 +259,11 @@ private:
 
     // This is verbose and heavyweight. Recondsider something lighter
     // at minimum try to share a single mutex (i.e. _stateMutex) if safe
-    mongo::Mutex _consumerOpenMutex;
+    stdx::mutex _consumerOpenMutex;
     stdx::condition_variable _consumerOpenCond;
     size_t _consumerOpen{0};
 
-    mongo::Mutex _consumerCloseMutex;
+    stdx::mutex _consumerCloseMutex;
     stdx::condition_variable _consumerCloseCond;
     size_t _consumerClose{0};
 };
@@ -254,9 +276,12 @@ public:
                      ExchangePolicy policy,
                      std::unique_ptr<EExpression> partition,
                      std::unique_ptr<EExpression> orderLess,
-                     PlanNodeId planNodeId);
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
-    ExchangeConsumer(std::shared_ptr<ExchangeState> state, PlanNodeId planNodeId);
+    ExchangeConsumer(std::shared_ptr<ExchangeState> state,
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -271,6 +296,7 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
     ExchangePipe* pipe(size_t producerTid);
+    size_t estimateCompileTimeSize() const final;
 
 private:
     ExchangeBuffer* getBuffer(size_t producerId);
@@ -303,7 +329,8 @@ class ExchangeProducer final : public PlanStage {
 public:
     ExchangeProducer(std::unique_ptr<PlanStage> input,
                      std::shared_ptr<ExchangeState> state,
-                     PlanNodeId planNodeId);
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
     static void start(OperationContext* opCtx,
                       CompileCtx& ctx,
@@ -320,6 +347,12 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
 
+    // This function should never be executed
+    // since ExchangeProducer is not created in compile time.
+    size_t estimateCompileTimeSize() const final {
+        MONGO_UNREACHABLE;
+    }
+
 private:
     ExchangeBuffer* getBuffer(size_t consumerId);
     void putBuffer(size_t consumerId);
@@ -330,6 +363,11 @@ private:
     std::shared_ptr<ExchangeState> _state;
     size_t _tid{0};
     size_t _roundRobinCounter{0};
+
+    // A partitiong function (either hash or range) to distribute rows.
+    std::unique_ptr<vm::CodeFragment> _partition;
+
+    vm::ByteCode _bytecode;
 
     std::vector<value::SlotAccessor*> _incoming;
 

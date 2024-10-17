@@ -27,64 +27,46 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/catalog_cache_loader.h"
 
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+
 namespace mongo {
-namespace {
-
-const auto catalogCacheLoaderDecoration =
-    ServiceContext::declareDecoration<std::unique_ptr<CatalogCacheLoader>>();
-
-}  // namespace
 
 CatalogCacheLoader::CollectionAndChangedChunks::CollectionAndChangedChunks() = default;
 
 CatalogCacheLoader::CollectionAndChangedChunks::CollectionAndChangedChunks(
-    OID collEpoch,
-    boost::optional<Timestamp> collCreationTime,
+    OID epoch,
+    Timestamp timestamp,
     UUID collUuid,
+    bool unsplittable,
     const BSONObj& collShardKeyPattern,
     const BSONObj& collDefaultCollation,
     bool collShardKeyIsUnique,
+    boost::optional<TypeCollectionTimeseriesFields> collTimeseriesFields,
     boost::optional<TypeCollectionReshardingFields> collReshardingFields,
     bool allowMigrations,
     std::vector<ChunkType> chunks)
-    : epoch(std::move(collEpoch)),
-      creationTime(std::move(collCreationTime)),
+    : epoch(std::move(epoch)),
+      timestamp(std::move(timestamp)),
       uuid(std::move(collUuid)),
+      unsplittable(unsplittable),
       shardKeyPattern(collShardKeyPattern),
       defaultCollation(collDefaultCollation),
       shardKeyIsUnique(collShardKeyIsUnique),
+      timeseriesFields(std::move(collTimeseriesFields)),
       reshardingFields(std::move(collReshardingFields)),
       allowMigrations(allowMigrations),
       changedChunks(std::move(chunks)) {}
 
-void CatalogCacheLoader::set(ServiceContext* serviceContext,
-                             std::unique_ptr<CatalogCacheLoader> loader) {
-    auto& catalogCacheLoader = catalogCacheLoaderDecoration(serviceContext);
-    invariant(!catalogCacheLoader);
+CatalogCacheLoader::CatalogCacheLoader() = default;
 
-    catalogCacheLoader = std::move(loader);
-}
-
-void CatalogCacheLoader::clearForTests(ServiceContext* serviceContext) {
-    auto& catalogCacheLoader = catalogCacheLoaderDecoration(serviceContext);
-    invariant(catalogCacheLoader);
-
-    catalogCacheLoader.reset();
-}
-
-CatalogCacheLoader& CatalogCacheLoader::get(ServiceContext* serviceContext) {
-    auto& catalogCacheLoader = catalogCacheLoaderDecoration(serviceContext);
-    invariant(catalogCacheLoader);
-
-    return *catalogCacheLoader;
-}
-
-CatalogCacheLoader& CatalogCacheLoader::get(OperationContext* opCtx) {
-    return get(opCtx->getServiceContext());
-}
+CatalogCacheLoader::~CatalogCacheLoader() = default;
 
 }  // namespace mongo

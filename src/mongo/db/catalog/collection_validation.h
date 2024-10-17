@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/namespace_string.h"
 
@@ -43,7 +46,14 @@ class Status;
 namespace CollectionValidation {
 
 enum class ValidateMode {
+    // Only performs validation on the collection metadata.
+    kMetadata,
+    // Does the above, plus checks a collection's data and indexes for correctness in a non-blocking
+    // manner using an intent collection lock.
     kBackground,
+    // Does the above, plus checks BSON documents more thoroughly.
+    kBackgroundCheckBSON,
+    // Does the above, but in a blocking manner using an exclusive collection lock.
     kForeground,
 
     // The standard foreground validation above, plus a full validation of the underlying
@@ -53,13 +63,18 @@ enum class ValidateMode {
     // This mode is only used by repair to avoid revalidating the record store.
     kForegroundFullIndexOnly,
 
-    // The full index validation above, plus a full validation of the underlying record store using
-    // the storage engine's validation functionality. For WiredTiger, this results in a call to
+    // The standard foreground validation above, plus a more thorough BSON document validation.
+    kForegroundCheckBSON,
+
+    // The full index validation and more thorough BSON document validation above, plus a full
+    // validation of the underlying record store using the storage engine's validation
+    // functionality. For WiredTiger, this results in a call to
     // verify().
     kForegroundFull,
 
-    // The full index and record store validation above, plus enforce that the fast count is equal
-    // to the number of records (as opposed to correcting the fast count if it is incorrect).
+    // The full index, BSON document, and record store validation above, plus enforce that the fast
+    // count is equal to the number of records (as opposed to correcting the fast count if it is
+    // incorrect).
     kForegroundFullEnforceFastCount,
 };
 
@@ -82,11 +97,88 @@ enum class RepairMode {
 };
 
 /**
+ * Additional validation options that can run in any mode.
+ */
+class ValidationOptions {
+public:
+    ValidationOptions(ValidateMode validateMode,
+                      RepairMode repairMode,
+                      bool logDiagnostics,
+                      bool enforceTimeseriesBucketsAreAlwaysCompressed = false,
+                      ValidationVersion validationVersion = currentValidationVersion);
+
+    virtual ~ValidationOptions() = default;
+
+    bool isMetadataValidation() const {
+        return _validateMode == ValidateMode::kMetadata;
+    }
+
+    bool isBackground() const {
+        return _validateMode == ValidateMode::kBackground ||
+            _validateMode == ValidateMode::kBackgroundCheckBSON;
+    }
+
+    bool isFullValidation() const {
+        return _validateMode == ValidateMode::kForegroundFull ||
+            _validateMode == ValidateMode::kForegroundFullEnforceFastCount;
+    }
+
+    bool isFullIndexValidation() const {
+        return isFullValidation() || _validateMode == ValidateMode::kForegroundFullIndexOnly;
+    }
+
+    bool isBSONConformanceValidation() const {
+        return isFullValidation() || _validateMode == ValidateMode::kBackgroundCheckBSON ||
+            _validateMode == ValidateMode::kForegroundCheckBSON;
+    }
+
+    /**
+     * Returns true iff the validation was *asked* to enforce the fast count, whether it actually
+     * does depends on what collection is being validated and what the other options are. See
+     * ValidateState::shouldEnforceFastCount().
+     */
+    bool enforceFastCountRequested() const {
+        return _validateMode == ValidateMode::kForegroundFullEnforceFastCount;
+    }
+
+    bool fixErrors() const {
+        return _repairMode == RepairMode::kFixErrors;
+    }
+
+    bool adjustMultikey() const {
+        return _repairMode == RepairMode::kFixErrors || _repairMode == RepairMode::kAdjustMultikey;
+    }
+
+    /**
+     * Indicates whether extra logging should occur during validation.
+     */
+    bool logDiagnostics() {
+        return _logDiagnostics;
+    }
+
+    bool enforceTimeseriesBucketsAreAlwaysCompressed() const {
+        return _enforceTimeseriesBucketsAreAlwaysCompressed;
+    }
+
+    ValidationVersion validationVersion() const {
+        return _validationVersion;
+    }
+
+private:
+    const ValidateMode _validateMode;
+
+    const RepairMode _repairMode;
+
+    // Can be set to obtain better insight into what validate sees/does.
+    const bool _logDiagnostics;
+
+    const bool _enforceTimeseriesBucketsAreAlwaysCompressed;
+
+    const ValidationVersion _validationVersion;
+};
+
+/**
  * Expects the caller to hold no locks.
- *
- * Background validation does not support any type of full validation above.
- * The combination of background = true and options of anything other than kNoFullValidation is
- * prohibited.
  *
  * @return OK if the validate run successfully
  *         OK will be returned even if corruption is found
@@ -94,11 +186,8 @@ enum class RepairMode {
  */
 Status validate(OperationContext* opCtx,
                 const NamespaceString& nss,
-                ValidateMode mode,
-                RepairMode repairMode,
-                ValidateResults* results,
-                BSONObjBuilder* output,
-                bool turnOnExtraLoggingForTest = false);
+                ValidationOptions options,
+                ValidateResults* results);
 
 /**
  * Checks whether a failpoint has been hit in the above validate() code..

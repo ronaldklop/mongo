@@ -1,9 +1,7 @@
 // Test that if an afterClusterTime query is issued to a node in initial sync that has not yet
 // created its oplog, the node returns an error rather than crashing.
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({nodes: 1});
 
@@ -28,4 +26,3 @@ replSet.awaitReplication();
 replSet.awaitSecondaryNodes();
 
 replSet.stopSet();
-})();

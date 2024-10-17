@@ -6,14 +6,14 @@
  * reflects the transaction. If the operations are replayed, this will cause a BSONTooLarge
  * exception.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/rollback_test.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 const collName = "commit_transaction_rollback_recovery_data_already_applied";
@@ -71,14 +71,12 @@ assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp)
 // BSONTooLarge exception.
 rollbackTest.transitionToRollbackOperations();
 rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
-try {
-    rollbackTest.transitionToSyncSourceOperationsDuringRollback();
-} finally {
-    assert.commandWorked(primary.adminCommand(
-        {configureFailPoint: 'holdStableTimestampAtSpecificTimestamp', mode: 'off'}));
-}
-
+rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 rollbackTest.transitionToSteadyStateOperations();
+
+// Now that the system is stable, release the pin on the stable timestamp.
+assert.commandWorked(primary.adminCommand(
+    {configureFailPoint: 'holdStableTimestampAtSpecificTimestamp', mode: 'off'}));
 
 primary = rollbackTest.getPrimary();
 
@@ -99,4 +97,3 @@ assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp)
 assert.eq(testDB[collName].findOne({_id: 1}), {_id: 1, a: 1});
 
 rollbackTest.stop();
-}());

@@ -10,12 +10,10 @@
 // 6. Unpause the thread performing the insert from step 1. If it continues to insert batches even
 //    though there was a rollback, those inserts will violate the {ordered: true} option.
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallelTester.js');
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = "interrupted_batch_insert";
 var replTest = new ReplSetTest({name: name, nodes: 3, useBridge: true});
@@ -32,6 +30,10 @@ replTest.initiate({
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
 var primary = replTest.nodes[0];
 var collName = primary.getDB("db")[name].getFullName();
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 
 var getParameterResult =
     primary.getDB("admin").runCommand({getParameter: 1, internalInsertMaxBatchSize: 1});
@@ -116,4 +118,3 @@ conns[1].reconnect(conns[2]);
 restartServerReplication(conns[1]);
 
 replTest.stopSet(15);
-}());

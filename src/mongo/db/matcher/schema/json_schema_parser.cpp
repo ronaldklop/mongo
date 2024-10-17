@@ -27,20 +27,40 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/schema/json_schema_parser.h"
-
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <algorithm>
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <memory>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/matcher/doc_validation_util.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_type.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/matcher/matcher_type_set.h"
 #include "mongo/db/matcher/schema/encrypt_schema_gen.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
@@ -59,10 +79,20 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_root_doc_eq.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_unique_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
-#include "mongo/db/matcher/schema/json_pointer.h"
+#include "mongo/db/matcher/schema/json_schema_parser.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -564,7 +594,8 @@ StatusWithMatchExpression parseProperties(const boost::intrusive_ptr<ExpressionC
         nestedSchemaMatch.getValue()->setErrorAnnotation(doc_validation_error::createAnnotation(
             expCtx,
             "_property",
-            BSON("propertyName" << property.fieldNameStringData().toString())));
+            BSON("propertyName" << property.fieldNameStringData().toString()),
+            property.Obj()));
         if (requiredProperties.find(property.fieldNameStringData()) != requiredProperties.end()) {
             // The field name for which we created the nested schema is a required property. This
             // property must exist and therefore must match 'nestedSchemaMatch'.
@@ -654,7 +685,8 @@ StatusWithMatchExpression parseAdditionalProperties(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement additionalPropertiesElt,
     AllowedFeatureSet allowedFeatures,
-    bool ignoreUnknownKeywords) {
+    bool ignoreUnknownKeywords,
+    bool topLevelRequiredMissingID) {
     if (!additionalPropertiesElt) {
         // The absence of the 'additionalProperties' keyword is identical in meaning to the presence
         // of 'additionalProperties' with a value of true.
@@ -675,6 +707,12 @@ StatusWithMatchExpression parseAdditionalProperties(
         if (additionalPropertiesElt.boolean()) {
             return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
         } else {
+            if (topLevelRequiredMissingID) {
+                LOGV2_WARNING(3216000,
+                              "$jsonSchema validator does not allow '_id' field. This validator "
+                              "will reject all "
+                              "documents, consider adding '_id' to the allowed fields.");
+            }
             return {std::make_unique<AlwaysFalseMatchExpression>(std::move(annotation))};
         }
     }
@@ -705,7 +743,8 @@ StatusWithMatchExpression parseAllowedProperties(
     BSONElement additionalPropertiesElt,
     InternalSchemaTypeExpression* typeExpr,
     AllowedFeatureSet allowedFeatures,
-    bool ignoreUnknownKeywords) {
+    bool ignoreUnknownKeywords,
+    bool requiredMissingID) {
     // Collect the set of properties named by the 'properties' keyword.
     StringDataSet propertyNames;
     if (propertiesElt) {
@@ -722,8 +761,21 @@ StatusWithMatchExpression parseAllowedProperties(
         return patternProperties.getStatus();
     }
 
+    auto patternPropertiesVec = std::move(patternProperties.getValue());
+
+    // If one of the patterns in pattern properties matches '_id', no need to warn about a schema
+    // that can't match documents.
+    if (requiredMissingID) {
+        for (const auto& pattern : patternPropertiesVec) {
+            if (pattern.first.regex->matchView("_id", pcre::ANCHORED | pcre::ENDANCHORED)) {
+                requiredMissingID = false;
+                break;
+            }
+        }
+    }
+
     auto otherwiseExpr = parseAdditionalProperties(
-        expCtx, additionalPropertiesElt, allowedFeatures, ignoreUnknownKeywords);
+        expCtx, additionalPropertiesElt, allowedFeatures, ignoreUnknownKeywords, requiredMissingID);
     if (!otherwiseExpr.isOK()) {
         return otherwiseExpr.getStatus();
     }
@@ -743,7 +795,7 @@ StatusWithMatchExpression parseAllowedProperties(
     auto allowedPropertiesExpr = std::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
         std::move(propertyNames),
         kNamePlaceholder,
-        std::move(patternProperties.getValue()),
+        std::move(patternPropertiesVec),
         std::move(otherwiseWithPlaceholder),
         std::move(annotation));
 
@@ -927,9 +979,17 @@ StatusWithMatchExpression parseDependencies(const boost::intrusive_ptr<Expressio
     }
 
     auto andExpr = std::make_unique<AndMatchExpression>(doc_validation_error::createAnnotation(
-        expCtx, dependencies.fieldNameStringData().toString(), BSONObj()));
+        expCtx, dependencies.fieldNameStringData().toString(), BSONObj(), dependencies.Obj()));
     for (auto&& dependency : dependencies.embeddedObject()) {
         if (dependency.type() != BSONType::Object && dependency.type() != BSONType::Array) {
+            // Allow JSON Schema annotations under "dependency" keyword.
+            const auto isSchemaAnnotation =
+                dependency.fieldNameStringData() == JSONSchemaParser::kSchemaTitleKeyword ||
+                dependency.fieldNameStringData() == JSONSchemaParser::kSchemaDescriptionKeyword;
+            if (dependency.type() == BSONType::String && isSchemaAnnotation) {
+                continue;
+            }
+
             return {ErrorCodes::TypeMismatch,
                     str::stream() << "property '" << dependency.fieldNameStringData()
                                   << "' in $jsonSchema keyword '"
@@ -1343,6 +1403,11 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
             keywordMap[JSONSchemaParser::kSchemaAdditionalPropertiesKeyword];
 
         if (patternPropertiesElt || additionalPropertiesElt) {
+            // If a top level 'required' field does not contain '_id' and 'additionalProperties' is
+            // false, no documents will be permitted. Calculate whether we need to warn the user
+            // later in parsing.
+            bool requiredMissingID = expCtx->isParsingCollectionValidator && path.empty() &&
+                !requiredProperties.contains("_id");
             auto allowedPropertiesExpr = parseAllowedProperties(expCtx,
                                                                 path,
                                                                 propertiesElt,
@@ -1350,7 +1415,8 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
                                                                 additionalPropertiesElt,
                                                                 typeExpr,
                                                                 allowedFeatures,
-                                                                ignoreUnknownKeywords);
+                                                                ignoreUnknownKeywords,
+                                                                requiredMissingID);
             if (!allowedPropertiesExpr.isOK()) {
                 return allowedPropertiesExpr.getStatus();
             }
@@ -1547,7 +1613,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
                                   << "' cannot be an empty object "};
         }
 
-        const IDLParserErrorContext ctxt("encryptMetadata");
+        const IDLParserContext ctxt("encryptMetadata");
         try {
             // Discard the result as we are only concerned with validation.
             EncryptionMetadata::parse(ctxt, encryptMetadataElt.embeddedObject());
@@ -1566,7 +1632,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
 
         try {
             // This checks the types of all the fields. Will throw on any parsing error.
-            const IDLParserErrorContext encryptCtxt("encrypt");
+            const IDLParserContext encryptCtxt("encrypt");
             auto encryptInfo = EncryptionInfo::parse(encryptCtxt, encryptElt.embeddedObject());
             auto infoType = encryptInfo.getBsonType();
 
@@ -1748,7 +1814,7 @@ StatusWithMatchExpression _parse(const boost::intrusive_ptr<ExpressionContext>& 
     // to '$jsonSchema', the caller is responsible for providing this information by overwriting
     // this annotation.
     auto andExpr = std::make_unique<AndMatchExpression>(
-        doc_validation_error::createAnnotation(expCtx, "_subschema", BSONObj()));
+        doc_validation_error::createAnnotation(expCtx, "_subschema", BSONObj(), schema));
 
     auto translationStatus =
         translateScalarKeywords(expCtx, keywordMap, path, typeExpr.get(), andExpr.get());
@@ -1857,7 +1923,6 @@ StatusWithMatchExpression JSONSchemaParser::parse(
     bool ignoreUnknownKeywords) {
     LOGV2_DEBUG(20728,
                 5,
-                "Parsing JSON Schema: {schema}",
                 "Parsing JSON Schema",
                 "schema"_attr = schema.jsonString(JsonStringFormat::LegacyStrict));
     try {
@@ -1866,7 +1931,6 @@ StatusWithMatchExpression JSONSchemaParser::parse(
             translation.isOK()) {
             LOGV2_DEBUG(20729,
                         5,
-                        "Translated schema match expression: {expression}",
                         "Translated schema match expression",
                         "expression"_attr = translation.getValue()->debugString());
         }
@@ -1874,11 +1938,11 @@ StatusWithMatchExpression JSONSchemaParser::parse(
         if (translation.isOK()) {
             if (auto topLevelAnnotation = translation.getValue()->getErrorAnnotation()) {
                 auto oldAnnotation = topLevelAnnotation->annotation;
-                translation.getValue()->setErrorAnnotation(
-                    doc_validation_error::createAnnotation(expCtx, "$jsonSchema", oldAnnotation));
+                translation.getValue()->setErrorAnnotation(doc_validation_error::createAnnotation(
+                    expCtx, "$jsonSchema", oldAnnotation, schema));
             }
         }
-        expCtx->sbeCompatible = false;
+        expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
         return translation;
     } catch (const DBException& ex) {
         return {ex.toStatus()};

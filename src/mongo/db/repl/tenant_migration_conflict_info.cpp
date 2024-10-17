@@ -27,28 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
 
 namespace mongo {
 
 namespace {
 
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(TenantMigrationConflictInfo);
+MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(NonRetryableTenantMigrationConflictInfo);
 
-constexpr StringData kTenantIdFieldName = "tenantId"_sd;
+constexpr StringData kMigrationIdFieldName = "migrationId"_sd;
 
 }  // namespace
 
-void TenantMigrationConflictInfo::serialize(BSONObjBuilder* bob) const {
-    bob->append(kTenantIdFieldName, _tenantId);
+void TenantMigrationConflictInfoBase::serialize(BSONObjBuilder* bob) const {
+    _migrationId.appendToBuilder(bob, kMigrationIdFieldName);
 }
 
-std::shared_ptr<const ErrorExtraInfo> TenantMigrationConflictInfo::parse(const BSONObj& obj) {
-    return std::make_shared<TenantMigrationConflictInfo>(obj[kTenantIdFieldName].String());
+std::shared_ptr<const ErrorExtraInfo> TenantMigrationConflictInfoBase::parse(const BSONObj& obj) {
+    auto uuid = uassertStatusOK(UUID::parse(obj[kMigrationIdFieldName]));
+    return std::make_shared<TenantMigrationConflictInfoBase>(std::move(uuid));
 }
 
 }  // namespace mongo

@@ -1,7 +1,7 @@
 // should check that election happens in priority order
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 var nodenames = replTest.nodeList();
 
@@ -52,4 +52,3 @@ for (i = 0; i < 1000; i++) {
     assert(primary.getDB("bar").baz.findOne({i: i}) != null, 'checking ' + i);
 }
 replTest.stopSet();
-}());

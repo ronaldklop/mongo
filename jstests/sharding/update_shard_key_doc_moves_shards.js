@@ -1,34 +1,67 @@
-/*
+/**
  * Tests that changing the shard key value of a document using update and findAndModify works
  * correctly when the doc will change shards.
- * @tags: [requires_find_command, uses_transactions, uses_multi_shard_transaction]
+ * @tags: [
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision,
+    isUpdateDocumentShardKeyUsingTransactionApiEnabled,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {
+    assertCannotUpdate_id,
+    assertCannotUpdate_idDottedPath,
+    assertCannotUpdateInBulkOpWhenDocsMoveShards,
+    assertCannotUpdateSKToArray,
+    assertCannotUpdateWithMultiTrue,
+    assertCanUnsetSKField,
+    assertCanUpdateDottedPath,
+    assertCanUpdatePartialShardKey,
+    assertCanUpdatePrimitiveShardKey,
+    assertCanUpdatePrimitiveShardKeyHashedChangeShards,
+    runFindAndModifyCmdFail,
+    runFindAndModifyCmdSuccess,
+    runUpdateCmdFail,
+    runUpdateCmdSuccess,
+    shardCollectionMoveChunks,
+} from "jstests/sharding/libs/update_shard_key_helpers.js";
 
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/update_shard_key_helpers.js");
+const st = new ShardingTest({
+    mongos: 1,
+    shards: {rs0: {nodes: 3}, rs1: {nodes: 3}},
+    rsOptions:
+        {setParameter: {maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS}}
+});
 
-const st = new ShardingTest({mongos: 1, shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
 const kDbName = 'db';
 const mongos = st.s0;
 const shard0 = st.shard0.shardName;
-const shard1 = st.shard1.shardName;
 const ns = kDbName + '.foo';
 
+const updateDocumentShardKeyUsingTransactionApiEnabled =
+    isUpdateDocumentShardKeyUsingTransactionApiEnabled(st.s);
+
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, shard0);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: shard0}));
 
-function changeShardKeyWhenFailpointsSet(session, sessionDB, runInTxn, isFindAndModify) {
-    let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
-    shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
+function changeShardKeyWhenFailpointsSet(session,
+                                         sessionDB,
+                                         runInTxn,
+                                         isFindAndModify,
+                                         updateDocumentShardKeyUsingTransactionApiEnabled) {
+    const docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
+    const splitDoc = {x: 100};
+    shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, splitDoc, {"x": 300});
 
-    // Assert that the document is not updated when the delete fails
+    // Assert that the document is updated when the delete fails.
     assert.commandWorked(st.rs1.getPrimary().getDB(kDbName).adminCommand({
         configureFailPoint: "failCommand",
-        mode: "alwaysOn",
+        mode: {times: 2},
         data: {
             errorCode: ErrorCodes.WriteConflict,
             failCommands: ["delete"],
@@ -36,25 +69,56 @@ function changeShardKeyWhenFailpointsSet(session, sessionDB, runInTxn, isFindAnd
         }
     }));
     if (isFindAndModify) {
-        runFindAndModifyCmdFail(
-            st, kDbName, session, sessionDB, runInTxn, {"x": 300}, {"$set": {"x": 30}}, false);
+        if (!runInTxn && updateDocumentShardKeyUsingTransactionApiEnabled) {
+            // Internal transactions will retry internally with the transaction API.
+            runFindAndModifyCmdSuccess(st,
+                                       kDbName,
+                                       session,
+                                       sessionDB,
+                                       runInTxn,
+                                       [{x: 300}],
+                                       [{$set: {x: 30}}],
+                                       false /* upsert */,
+                                       false /* returnNew */,
+                                       splitDoc);
+        } else {
+            runFindAndModifyCmdFail(
+                st, kDbName, session, sessionDB, runInTxn, {x: 300}, {$set: {x: 30}}, false);
+        }
     } else {
-        runUpdateCmdFail(st,
-                         kDbName,
-                         session,
-                         sessionDB,
-                         runInTxn,
-                         {"x": 300},
-                         {"$set": {"x": 30}},
-                         false,
-                         ErrorCodes.WriteConflict);
+        if (!runInTxn && updateDocumentShardKeyUsingTransactionApiEnabled) {
+            // Internal transactions will retry internally with the transaction API.
+            runUpdateCmdSuccess(st,
+                                kDbName,
+                                session,
+                                sessionDB,
+                                runInTxn,
+                                [{x: 300}],
+                                [{$set: {x: 30}}],
+                                false /* upsert */,
+                                splitDoc);
+        } else {
+            runUpdateCmdFail(st,
+                             kDbName,
+                             session,
+                             sessionDB,
+                             runInTxn,
+                             {x: 300},
+                             {$set: {x: 30}},
+                             false,
+                             ErrorCodes.WriteConflict);
+        }
     }
     assert.commandWorked(st.rs1.getPrimary().getDB(kDbName).adminCommand({
         configureFailPoint: "failCommand",
         mode: "off",
     }));
 
-    // Assert that the document is not updated when the insert fails
+    // Reset the collection's documents.
+    assert.commandWorked(st.s.getDB(kDbName).foo.remove({}));
+    assert.commandWorked(st.s.getDB(kDbName).foo.insert(docsToInsert));
+
+    // Assert that the document is not updated when the insert fails for a non transient reason.
     assert.commandWorked(st.rs0.getPrimary().getDB(kDbName).adminCommand({
         configureFailPoint: "failCommand",
         mode: "alwaysOn",
@@ -82,6 +146,10 @@ function changeShardKeyWhenFailpointsSet(session, sessionDB, runInTxn, isFindAnd
         configureFailPoint: "failCommand",
         mode: "off",
     }));
+
+    // Reset the collection's documents.
+    assert.commandWorked(st.s.getDB(kDbName).foo.remove({}));
+    assert.commandWorked(st.s.getDB(kDbName).foo.insert(docsToInsert));
 
     // Assert that the shard key update is not committed when there are no write errors and the
     // transaction is explicity aborted.
@@ -194,7 +262,12 @@ changeShardKeyOptions.forEach(function(updateConfig) {
             assertCannotUpdateWithMultiTrue(
                 st, kDbName, ns, session, sessionDB, runInTxn, {"x": 300}, {"$set": {"x": 30}});
         }
-        changeShardKeyWhenFailpointsSet(session, sessionDB, runInTxn, isFindAndModify);
+
+        changeShardKeyWhenFailpointsSet(session,
+                                        sessionDB,
+                                        runInTxn,
+                                        isFindAndModify,
+                                        updateDocumentShardKeyUsingTransactionApiEnabled);
     }
 });
 
@@ -357,6 +430,45 @@ assert.commandWorked(st.rs0.getPrimary().getDB(kDbName).adminCommand({
 
 mongos.getDB(kDbName).foo.drop();
 
+// ----Assert write result reports error when the internal transaction fails to commit----
+
+shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
+
+// Set this failpoint on the coordinator shard so that sending prepareTransaction to
+// participating shards will fail.
+assert.commandWorked(st.rs0.getPrimary().getDB(kDbName).adminCommand({
+    configureFailPoint: "failRemoteTransactionCommand",
+    mode: "alwaysOn",
+    data: {command: "prepareTransaction", code: ErrorCodes.TransactionTooOld}
+}));
+
+res = sessionDB.foo.update({x: 4}, {$set: {x: 1000}});
+
+// For update, we should have reported the error in the write errors field and the top-level
+// fields should reflect that no update was performed.
+assert.writeErrorWithCode(res, ErrorCodes.TransactionTooOld);
+assert.eq(res.nModified, 0);
+assert.eq(res.nMatched, 0);
+assert.eq(res.nUpserted, 0);
+
+res = sessionDB.runCommand({
+    findAndModify: 'foo',
+    query: {x: 78},
+    update: {$set: {x: 250}},
+    lsid: {id: UUID()},
+    txnNumber: NumberLong(1),
+});
+
+// findAndModify reports the failure as a top-level error.
+assert.commandFailedWithCode(res, ErrorCodes.TransactionTooOld);
+
+assert.commandWorked(st.rs0.getPrimary().getDB(kDbName).adminCommand({
+    configureFailPoint: "failRemoteTransactionCommand",
+    mode: "off",
+}));
+
+mongos.getDB(kDbName).foo.drop();
+
 // ----Assert that updating the shard key in a batch with size > 1 fails----
 
 assertCannotUpdateInBulkOpWhenDocsMoveShards(st, kDbName, ns, session, sessionDB, false, true);
@@ -425,4 +537,3 @@ assert.eq(1, sessionDB.foo.find({"x": 1}).toArray().length);
 mongos.getDB(kDbName).foo.drop();
 
 st.stop();
-})();

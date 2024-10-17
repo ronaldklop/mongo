@@ -27,28 +27,33 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands/rwc_defaults_commands_gen.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 namespace {
 
 class ReadWriteConcernDefaultsServerStatus final : public ServerStatusSection {
 public:
-    ReadWriteConcernDefaultsServerStatus() : ServerStatusSection("defaultRWConcern") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
-        return serverGlobalParams.clusterRole != ClusterRole::ShardServer;
+        return !serverGlobalParams.clusterRole.isShardOnly();
     }
 
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override {
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-            !repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
+        if (serverGlobalParams.clusterRole.isShardOnly() ||
+            !repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet()) {
             return {};
         }
 
@@ -58,8 +63,9 @@ public:
         response.setLocalUpdateWallClockTime(rwcDefault.localUpdateWallClockTime());
         return response.toBSON();
     }
-
-} defaultRWConcernServerStatus;
-
+};
+auto defaultRWConcernServerStatus =
+    *ServerStatusSectionBuilder<ReadWriteConcernDefaultsServerStatus>("defaultRWConcern")
+         .forShard();
 }  // namespace
 }  // namespace mongo

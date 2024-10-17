@@ -14,7 +14,7 @@ if (ss.storageEngine.name !== "wiredTiger") {
     var admin = conn.getDB("admin");
 
     function reconfigure(str) {
-        ret = admin.runCommand({setParameter: 1, "wiredTigerEngineRuntimeConfig": str});
+        let ret = admin.runCommand({setParameter: 1, "wiredTigerEngineRuntimeConfig": str});
         print("ret: " + tojson(ret));
         return ret;
     }
@@ -31,7 +31,8 @@ if (ss.storageEngine.name !== "wiredTiger") {
         "cache_size=81M",
         admin.adminCommand({getParameter: 1,
                             "wiredTigerEngineRuntimeConfig": 1})["wiredTigerEngineRuntimeConfig"]);
-    assert.commandWorked(reconfigure("eviction_dirty_target=82"));
+    assert.commandWorked(reconfigure(
+        "eviction_dirty_target=19"));  // must be lower than eviction_dirty_trigger (default 20)
     assert.commandWorked(reconfigure("shared_cache=(chunk=11MB, name=bar, reserve=12MB, size=1G)"));
 
     // Negative tests - bad input to mongod

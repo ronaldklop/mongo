@@ -30,17 +30,20 @@
 #pragma once
 
 #include <array>
+#include <boost/noncopyable.hpp>
+#include <compare>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
-#include <boost/noncopyable.hpp>
-
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace dns {
@@ -88,7 +91,7 @@ struct SRVHostEntry {
  * found and `ErrorCodes::DNSProtocolError` as the status value if the DNS lookup fails, for any
  * other reason
  */
-std::vector<SRVHostEntry> lookupSRVRecords(const std::string& service);
+std::vector<std::pair<SRVHostEntry, Seconds>> lookupSRVRecords(const std::string& service);
 
 /**
  * Returns a group of strings containing text from DNS TXT entries for a specified service.
@@ -107,12 +110,16 @@ std::vector<std::string> lookupTXTRecords(const std::string& service);
 std::vector<std::string> getTXTRecords(const std::string& service);
 
 /**
+ * Returns a vector of pairs (string, Seconds), where each pair is: a string containing address
+ * entries for a specified servie, and the corresponding records time to live for a record.
+
  * Returns a group of strings containing Address entries for a specified service.
+
  * THROWS: `DBException` with `ErrorCodes::DNSHostNotFound` as the status value if the entry is not
  * found and `ErrorCodes::DNSProtocolError` as the status value if the DNS lookup fails, for any
  * other reason.
  * NOTE: This function mostly exists to provide an easy test of the OS DNS APIs in our test driver.
  */
-std::vector<std::string> lookupARecords(const std::string& service);
+std::vector<std::pair<std::string, Seconds>> lookupARecords(const std::string& service);
 }  // namespace dns
 }  // namespace mongo

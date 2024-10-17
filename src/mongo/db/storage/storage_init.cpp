@@ -27,8 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/operation_context.h"
@@ -42,7 +48,7 @@ namespace {
 
 class StorageSSS : public ServerStatusSection {
 public:
-    StorageSSS() : ServerStatusSection("storageEngine") {}
+    using ServerStatusSection::ServerStatusSection;
 
     ~StorageSSS() override = default;
 
@@ -59,26 +65,22 @@ public:
 
         BSONObjBuilder bob;
         bob.append("name", storageGlobalParams.engine);
-        bob.append("supportsCommittedReads", engine->supportsReadConcernMajority());
+        bob.append("supportsCommittedReads", true);
         bob.append("oldestRequiredTimestampForCrashRecovery",
                    oldestRequiredTimestampForCrashRecovery
                        ? *oldestRequiredTimestampForCrashRecovery
                        : Timestamp());
-        bob.append("supportsPendingDrops", engine->supportsPendingDrops());
-        bob.append("dropPendingIdents",
-                   static_cast<long long>(engine->getDropPendingIdents().size()));
+        bob.append("supportsPendingDrops", true);
+        bob.append("dropPendingIdents", static_cast<long long>(engine->getNumDropPendingIdents()));
         bob.append("supportsSnapshotReadConcern", engine->supportsReadConcernSnapshot());
-        bob.append("readOnly", storageGlobalParams.readOnly);
+        bob.append("readOnly", !opCtx->getServiceContext()->userWritesAllowed());
         bob.append("persistent", !engine->isEphemeral());
         bob.append("backupCursorOpen", backupCursorHooks->isBackupCursorOpen());
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized()) {
-            bob.append("supportsResumableIndexBuilds", engine->supportsResumableIndexBuilds());
-        }
 
         return bob.obj();
     }
-
-} storageSSS;
+};
+auto& storageSSS = *ServerStatusSectionBuilder<StorageSSS>("storageEngine").forShard();
 
 }  // namespace
 }  // namespace mongo

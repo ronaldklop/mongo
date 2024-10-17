@@ -27,31 +27,45 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/cached_plan.h"
 
 #include <memory>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/plan_cache_util.h"
-#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/trial_period_utils.h"
-#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/collection_query_info.h"
-#include "mongo/db/query/explain.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/query/stage_builder_util.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_proxy.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
-#include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -59,24 +73,22 @@ namespace mongo {
 const char* CachedPlanStage::kStageType = "CACHED_PLAN";
 
 CachedPlanStage::CachedPlanStage(ExpressionContext* expCtx,
-                                 const CollectionPtr& collection,
+                                 VariantCollectionPtrOrAcquisition collection,
                                  WorkingSet* ws,
                                  CanonicalQuery* cq,
-                                 const QueryPlannerParams& params,
                                  size_t decisionWorks,
                                  std::unique_ptr<PlanStage> root)
     : RequiresAllIndicesStage(kStageType, expCtx, collection),
       _ws(ws),
       _canonicalQuery(cq),
-      _plannerParams(params),
       _decisionWorks(decisionWorks) {
     _children.emplace_back(std::move(root));
 }
 
-Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
-    // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
-    // execution work that happens here, so this is needed for the time accounting to
-    // make sense.
+Status CachedPlanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
+                                     PlanYieldPolicy* yieldPolicy) {
+    // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of execution
+    // work that happens here, so this is needed for the time accounting to make sense.
     auto optTimer = getOptTimer();
 
     // During plan selection, the list of indices we are using to plan must remain stable, so the
@@ -120,7 +132,8 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
                         "status"_attr = redact(ex.toStatus()));
 
             const bool shouldCache = false;
-            return replan(yieldPolicy,
+            return replan(plannerParams,
+                          yieldPolicy,
                           shouldCache,
                           str::stream() << "cached plan returned: " << ex.toStatus());
         }
@@ -134,15 +147,20 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
             if (_results.size() >= numResults) {
                 // Once a plan returns enough results, stop working. There is no need to replan.
+                _bestPlanChosen = true;
                 return Status::OK();
             }
         } else if (PlanStage::IS_EOF == state) {
             // Cached plan hit EOF quickly enough. No need to replan.
+            _bestPlanChosen = true;
             return Status::OK();
         } else if (PlanStage::NEED_YIELD == state) {
             invariant(id == WorkingSet::INVALID_ID);
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
             if (!yieldPolicy->canAutoYield()) {
-                throw WriteConflictException();
+                throwWriteConflictException("Write conflict during best plan selection period.");
             }
 
             if (yieldPolicy->canAutoYield()) {
@@ -171,6 +189,7 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     const bool shouldCache = true;
     return replan(
+        plannerParams,
         yieldPolicy,
         shouldCache,
         str::stream()
@@ -193,7 +212,11 @@ Status CachedPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     return Status::OK();
 }
 
-Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, std::string reason) {
+Status CachedPlanStage::replan(const QueryPlannerParams& plannerParams,
+                               PlanYieldPolicy* yieldPolicy,
+                               bool shouldCache,
+                               std::string reason) {
+    planCacheCounters.incrementClassicReplannedCounter();
     // We're going to start over with a new plan. Clear out info from our old plan.
     {
         std::queue<WorkingSetID> emptyQueue;
@@ -206,18 +229,19 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
 
     if (shouldCache) {
         // Deactivate the current cache entry.
-        PlanCache* cache = CollectionQueryInfo::get(collection()).getPlanCache();
-        cache->deactivate(*_canonicalQuery);
+        auto cache = CollectionQueryInfo::get(collectionPtr()).getPlanCache();
+        cache->deactivate(
+            plan_cache_key_factory::make<PlanCacheKey>(*_canonicalQuery, collectionPtr()));
     }
 
     // Use the query planning module to plan the whole query.
-    auto statusWithSolutions = QueryPlanner::plan(*_canonicalQuery, _plannerParams);
-    if (!statusWithSolutions.isOK()) {
-        return statusWithSolutions.getStatus().withContext(
-            str::stream() << "error processing query: " << _canonicalQuery->toString()
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*_canonicalQuery, plannerParams);
+    if (!statusWithMultiPlanSolns.isOK()) {
+        return statusWithMultiPlanSolns.getStatus().withContext(
+            str::stream() << "error processing query: " << _canonicalQuery->toStringForErrorMsg()
                           << " planner returned error");
     }
-    auto solutions = std::move(statusWithSolutions.getValue());
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
 
     if (1 == solutions.size()) {
         // Only one possible plan. Build the stages from the solution.
@@ -235,20 +259,26 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
             "query"_attr = redact(_canonicalQuery->toStringShort()),
             "planSummary"_attr = explainer->getPlanSummary(),
             "shouldCache"_attr = (shouldCache ? "yes" : "no"));
+        _bestPlanChosen = true;
         return Status::OK();
     }
 
-    // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
-    // and so on. The working set will be shared by all candidate plans.
-    auto cachingMode = shouldCache ? PlanCachingMode::AlwaysCache : PlanCachingMode::NeverCache;
-    _children.emplace_back(
-        new MultiPlanStage(expCtx(), collection(), _canonicalQuery, cachingMode));
+    // Many solutions. Create a MultiPlanStage to pick the best, update the cache, and so on. The
+    // working set will be shared by all candidate plans.
+    _children.emplace_back(std::make_unique<MultiPlanStage>(
+        expCtx(),
+        collection(),
+        _canonicalQuery,
+        plan_cache_util::ConditionalClassicPlanCacheWriter{
+            plan_cache_util::ConditionalClassicPlanCacheWriter::alwaysOrNeverCacheMode(shouldCache),
+            opCtx(),
+            collection(),
+            false /* executeInSbe */},
+        _specificStats.replanReason));
     MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
 
     for (size_t ix = 0; ix < solutions.size(); ++ix) {
-        if (solutions[ix]->cacheData.get()) {
-            solutions[ix]->cacheData->indexFilterApplied = _plannerParams.indexFiltersApplied;
-        }
+        solutions[ix]->indexFilterApplied = plannerParams.indexFiltersApplied;
 
         auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
             expCtx()->opCtx, collection(), *_canonicalQuery, *solutions[ix], _ws);
@@ -269,6 +299,7 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
                 "query"_attr = redact(_canonicalQuery->toStringShort()),
                 "planSummary"_attr = explainer->getPlanSummary(),
                 "shouldCache"_attr = (shouldCache ? "yes" : "no"));
+    _bestPlanChosen = true;
     return Status::OK();
 }
 

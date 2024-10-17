@@ -1,12 +1,5 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [assumes_unsharded_collection]
-
 // In MongoDB 3.4, $graphLookup was introduced. In this file, we test $graphLookup as applied to the
 // Socialite schema example available here: https://github.com/mongodb-labs/socialite
-
-(function() {
-"use strict";
 
 var follower = db.followers;
 var users = db.users;
@@ -51,4 +44,3 @@ var res = users
 
 // "djw" is followed, directly or indirectly, by "jsr" and "bmw".
 assert.eq(res.length, 2);
-}());

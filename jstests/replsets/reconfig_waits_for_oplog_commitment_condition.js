@@ -3,10 +3,9 @@
  * previous config to be committed in the current config.
  *
  */
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {isConfigCommitted, isMemberNewlyAdded, reconnect} from "jstests/replsets/rslib.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -18,6 +17,10 @@ rst.initiate();
 const primary = rst.getPrimary();
 const secondary = rst.getSecondary();
 const coll = primary.getDB(dbName)[collName];
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // This makes the test run faster.
 assert.commandWorked(secondary.adminCommand(
@@ -36,7 +39,7 @@ let singleNodeConfig = Object.assign({}, origConfig);
 singleNodeConfig.members = singleNodeConfig.members.slice(0, 1);  // Remove the second node.
 singleNodeConfig.version++;
 assert.commandWorked(primary.adminCommand({replSetReconfig: singleNodeConfig}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 
 //
 // Below we start out in config C1 = {n0}, try to reconfig to C2 = {n0,n1}, and then to C3 =
@@ -92,7 +95,7 @@ rst.awaitReplication();
 
 // Now that we can commit the op in the new config, reconfig should succeed.
 assert.commandWorked(primary.adminCommand({replSetReconfig: C3}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 rst.awaitReplication();
 
 //
@@ -110,12 +113,12 @@ stopServerReplication(secondary);
 // config.
 config.version++;
 assert.commandWorked(primary.adminCommand({replSetReconfig: config}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 
 jsTestLog("Stepping down the primary.");
 // Step down the primary and then step it back up so that it writes a log entry in a newer term.
 // This new op won't become committed yet, though, since we have paused replication.
-assert.commandWorked(primary.adminCommand({replSetStepDown: 1, force: 1}));
+assert.commandWorked(primary.adminCommand({replSetStepDown: 5, force: 1}));
 assert.commandWorked(primary.adminCommand({replSetFreeze: 0}));  // end the stepdown period.
 
 jsTestLog("Stepping the primary back up.");
@@ -140,6 +143,5 @@ rst.awaitLastOpCommitted();
 // Reconfig should now succeed.
 config.version++;
 assert.commandWorked(primary.adminCommand({replSetReconfig: config}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 rst.stopSet();
-}());

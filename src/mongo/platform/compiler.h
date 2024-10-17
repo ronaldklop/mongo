@@ -52,15 +52,6 @@
  *   Correct: MONGO_COMPILER_NORETURN void myAbortFunction();
  *
  *
- * MONGO_COMPILER_VARIABLE_UNUSED
- *
- *   Instructs the compiler not to warn if it detects no use of the decorated variable.
- *   Typically only useful for variables that are always declared but only used in
- *   conditionally-compiled code.
- *
- *   Correct: MONGO_COMPILER_VARIABLE_UNUSED int ignored;
- *
- *
  * MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT)
  *
  *   Instructs the compiler to use the given minimum alignment for the decorated type.
@@ -165,13 +156,81 @@
  *    Tells the compiler that a function returns a value for which consuming the result is
  *    necessary.  Functions thus defined are "must check results" style functions.  Preview of the
  *    `[[nodiscard]]` C++17 attribute.
+ *
+ *
+ * MONGO_COMPILER_RETURNS_NONNULL
+ *
+ *    Tells the compiler that the function always returns a non-null value, potentially allowing
+ *    additional optimizations at call sites.
+ *
+ *
+ * MONGO_COMPILER_MALLOC
+ *
+ *    Tells the compiler that the function is "malloc like", in that the return value points
+ *    to uninitialized memory which does not alias any other valid pointers.
+ *
+ *
+ * MONGO_COMPILER_ALLOC_SIZE(varindex)
+ *
+ *    Tells the compiler that the parameter indexed by `varindex`
+ *    provides the size of the allocated region that a "malloc like"
+ *    function will return a pointer to, potentially allowing static
+ *    analysis of use of the region when the argument to the
+ *    allocation function is a constant expression.
+ *
+ *
+ * MONGO_COMPILER_NO_UNIQUE_ADDRESS
+ *
+ *    Tells the compiler that this data member is permitted to be overlapped with other non-static
+ *    data members or base class subobjects of its class via subsituting in the
+ *    [[no_unique_address]] attribute. On Windows, the [[msvc::no_unique_address]] attribute is
+ *    substitued to prevent ABI-breaking changes and maintain backwards compatibility when
+ *    compiling with MSVC. Older versions of MSVC will not take action based on the attribute,
+ *    since the MSVC compiler ignores attributes it does not recognize.
+ *
+ *
+ * MONGO_COMPILER_USED
+ *
+ *    Do not optimize the function, static variable, or class template static data member, even if
+ *    it is unused. Expands to `[[gnu::used]]` on GCC and Clang, and is ignored on MSVC.
+ *
+ *    Example:
+ *        namespace {
+ *        MONGO_COMPILER_USED int64_t locaInteger = 8675309;
+ *        MONGO_COMPILER_USED void localFunction() {}
+ *        template <typename T>
+ *        struct someTemplatedStruct {
+ *            MONGO_COMPILER_USED static inline int32_t classStaticInteger = 24601;
+ *            MONGO_COMPILER_USED static constexpr auto classStaticString = "Unused string.";
+ *        };
+ *        }  // namespace
+ *
+ *    See:
+ *    -
+ * https://gcc.gnu.org/onlinedocs/gcc/Common-Variable-Attributes.html#index-used-variable-attribute
+ *    -
+ * https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-used-function-attribute
+ *
+ *
+ * MONGO_GSL_POINTER
+ *
+ *    Hints to the compiler that this type is a gsl::Pointer type,
+ *    which will produce a compiler warning if this type is assigned
+ *    a temporary (xvalue) gsl::Owner type (such as std::string). This
+ *    matches the annotation libc++ uses for std::string_view.
  */
 
 
 #if defined(_MSC_VER)
-#include "mongo/platform/compiler_msvc.h"
+#include "mongo/platform/compiler_msvc.h"  // IWYU pragma: export
 #elif defined(__GNUC__)
-#include "mongo/platform/compiler_gcc.h"
+#include "mongo/platform/compiler_gcc.h"  // IWYU pragma: export
 #else
 #error "Unsupported compiler family"
+#endif
+
+// Define clang's has_feature macro for other compilers
+// See https://clang.llvm.org/docs/LanguageExtensions.html#has-feature-and-has-extension
+#if !defined(__has_feature)
+#define __has_feature(x) 0
 #endif

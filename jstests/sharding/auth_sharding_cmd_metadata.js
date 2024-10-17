@@ -2,13 +2,11 @@
  * Tests that only the internal user will be able to advance the config server opTime.
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // The index consistency checker doesn't take into account that
 // authentication is needed for contacting shard0 of this cluster
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
-
-(function() {
-
-"use strict";
 
 function getConfigOpTime() {
     var srvStatus = assert.commandWorked(shardTestDB.serverStatus());
@@ -28,26 +26,26 @@ st.adminCommand({shardCollection: 'test.user', key: {x: 1}});
 const shardAdminDB = st.rs0.getPrimary().getDB('admin');
 const shardTestDB = st.rs0.getPrimary().getDB('test');
 
-// ConfigOpTime can't be advanced without the correct permissions
+// ConfigOpTime can't be advanced from external clients
+if (TestData.configShard) {
+    // We've already used up the localhost bypass in config shard mode, so we have to log in to
+    // create the user below.
+    shardAdminDB.auth('foo', 'bar');
+}
 shardAdminDB.createUser({user: 'user', pwd: 'pwd', roles: jsTest.adminUserRoles});
+if (TestData.configShard) {
+    shardAdminDB.logout();
+}
 shardAdminDB.auth('user', 'pwd');
 const newTimestamp = Timestamp(getConfigOpTime().getTime() + 1000, 0);
-const metadata = {
-    $configServerState: {opTime: {ts: newTimestamp, t: -1}}
-};
-var res = shardTestDB.runCommandWithMetadata({ping: 1}, metadata);
-assert.commandFailedWithCode(res.commandReply, ErrorCodes.Unauthorized);
+assert.commandWorked(shardTestDB.runCommand({ping: 1, $configTime: newTimestamp}));
 assert(timestampCmp(getConfigOpTime(), newTimestamp) < 0, "Unexpected ConfigOpTime advancement");
 
-// Advance configOpTime
 shardAdminDB.createUser({user: 'internal', pwd: 'pwd', roles: ['__system']});
 shardAdminDB.auth('internal', 'pwd');
-res = shardTestDB.runCommandWithMetadata({ping: 1}, metadata);
-assert.commandWorked(res.commandReply);
-assert(timestampCmp(getConfigOpTime(), newTimestamp) >= 0,
-       "ConfigOpTime did not advanced as expected");
+assert.commandWorked(shardTestDB.runCommand({ping: 1, $configTime: newTimestamp}));
+assert(timestampCmp(getConfigOpTime(), newTimestamp) < 0, "Unexpected ConfigOpTime advancement");
 
 mongosAdminDB.logout();
 shardAdminDB.logout();
 st.stop();
-})();

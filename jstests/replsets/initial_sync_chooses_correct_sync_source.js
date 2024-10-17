@@ -3,13 +3,11 @@
  * initialSyncReadPreference.
  *
  * @tags: [
- *   requires_fcv_47,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {assertSyncSourceMatchesSoon} from "jstests/replsets/libs/sync_source.js";
 
 const waitForHeartbeats = initialSyncNode => {
     // Hang the node before it undergoes sync source selection.
@@ -19,13 +17,15 @@ const waitForHeartbeats = initialSyncNode => {
         maxTimeMS: kDefaultWaitForFailPointTimeout
     }));
 
-    // Wait for heartbeats from the primary to increase the ping time.
+    // Wait until the initial sync node knows who the primary is, and for heartbeats from the
+    // primary to increase the ping time.
     assert.soon(() => {
         const replSetGetStatus =
             assert.commandWorked(initialSyncNode.adminCommand({replSetGetStatus: 1}));
         // The primary should always be node 0, since node 1 has priority 0.
         const primaryPingTime = replSetGetStatus.members[0].pingMs;
-        return (primaryPingTime > 60);
+        const primaryState = replSetGetStatus.members[0].state;
+        return (primaryState == 1 && primaryPingTime > 60);
     });
 
     // Allow the node to advance past the sync source selection stage.
@@ -42,13 +42,17 @@ const restartAndWaitForHeartbeats = (rst, initialSyncNode, setParameterOpts = {}
     setParameterOpts['failpoint.initialSyncHangBeforeChoosingSyncSource'] =
         tojson({mode: 'alwaysOn'});
     setParameterOpts['failpoint.initialSyncHangBeforeCreatingOplog'] = tojson({mode: 'alwaysOn'});
-    setParameterOpts['numInitialSyncAttempts'] = 1;
 
     rst.restart(initialSyncNode, {
         startClean: true,
         setParameter: setParameterOpts,
     });
 
+    // Wait for the restarted node to hit initial sync, then wait for heartbeats. This is to
+    // prevent a potential race where we wait for heartbeats in startup recovery, which satisfies
+    // the JS test, but then restart heartbeats and treat the other nodes as DOWN when entering
+    // initial sync.
+    rst.waitForState(initialSyncNode, ReplSetTest.State.STARTUP_2);
     waitForHeartbeats(initialSyncNode);
 };
 
@@ -84,7 +88,6 @@ const initialSyncNode = rst.add({
     setParameter: {
         'failpoint.initialSyncHangBeforeChoosingSyncSource': tojson({mode: 'alwaysOn'}),
         'failpoint.initialSyncHangBeforeCreatingOplog': tojson({mode: 'alwaysOn'}),
-        'numInitialSyncAttempts': 1
     }
 });
 primary.delayMessagesFrom(initialSyncNode, delayMillis);
@@ -176,12 +179,8 @@ initialSyncNode.adminCommand(
 
 // Once we become secondary, the secondary read preference no longer matters and we choose the
 // primary because chaining is disallowed.
-assert.soon(function() {
-    let res = assert.commandWorked(initialSyncNode.adminCommand({replSetGetStatus: 1}));
-    return res.syncSourceHost == primary.host;
-});
+assertSyncSourceMatchesSoon(initialSyncNode, primary.host);
 
 primary.delayMessagesFrom(initialSyncNode, 0);
 TestData.skipCollectionAndIndexValidation = false;
 rst.stopSet();
-})();

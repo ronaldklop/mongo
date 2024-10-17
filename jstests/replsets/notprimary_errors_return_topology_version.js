@@ -4,8 +4,7 @@
  * quiesce_mode.js)
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -106,4 +105,3 @@ otherErrorCodes.forEach(function(code) {
     runFailInRunCommand(code);
 });
 rst.stopSet();
-})();

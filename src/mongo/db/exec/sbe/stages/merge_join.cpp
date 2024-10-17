@@ -27,11 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <tuple>
 
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/merge_join.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -45,7 +53,8 @@ value::MaterializedRow materializeCopyOfRow(std::vector<value::SlotAccessor*>& a
 
     size_t idx = 0;
     for (auto& accessor : accessors) {
-        auto [tag, val] = accessor->copyOrMoveValue();
+        auto [tag, val] = accessor->getViewOfValue();
+        std::tie(tag, val) = value::copyValue(tag, val);
         row.reset(idx++, true, tag, val);
     }
     return row;
@@ -74,8 +83,9 @@ MergeJoinStage::MergeJoinStage(std::unique_ptr<PlanStage> outer,
                                value::SlotVector innerKeys,
                                value::SlotVector innerProjects,
                                std::vector<value::SortDirection> sortDirs,
-                               PlanNodeId planNodeId)
-    : PlanStage("mj"_sd, planNodeId),
+                               PlanNodeId planNodeId,
+                               bool participateInTrialRunTracking)
+    : PlanStage("mj"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _outerKeys(std::move(outerKeys)),
       _outerProjects(std::move(outerProjects)),
       _innerKeys(std::move(innerKeys)),
@@ -102,7 +112,8 @@ std::unique_ptr<PlanStage> MergeJoinStage::clone() const {
                                             _innerKeys,
                                             _innerProjects,
                                             _dirs,
-                                            _commonStats.nodeId);
+                                            _commonStats.nodeId,
+                                            participateInTrialRunTracking());
 }
 
 void MergeJoinStage::prepare(CompileCtx& ctx) {
@@ -240,7 +251,7 @@ PlanState MergeJoinStage::getNext() {
                     _currentInnerKey = materializeCopyOfRow(_innerKeyAccessors);
                     _currentInnerProject = materializeCopyOfRow(_innerProjectAccessors);
 
-                    return PlanState::ADVANCED;
+                    return trackPlanState(PlanState::ADVANCED);
                 } else {
                     // Since iterated over all of the elements in the buffer and are currently
                     // pointing to the end of the buffer, need to reset the buffer to the beginning
@@ -314,10 +325,20 @@ PlanState MergeJoinStage::getNext() {
 void MergeJoinStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _children[0]->close();
     _children[1]->close();
     _outerProjectsBuffer.clear();
+}
+
+void MergeJoinStage::doSaveState(bool relinquishCursor) {
+    if (!relinquishCursor) {
+        return;
+    }
+
+    // We only have to save shallow non-owning materialized rows.
+    prepareForYielding(_currentOuterKey, true);
+    prepareForYielding(_currentInnerKey, true);
 }
 
 std::unique_ptr<PlanStageStats> MergeJoinStage::getStats(bool includeDebugInfo) const {
@@ -325,10 +346,10 @@ std::unique_ptr<PlanStageStats> MergeJoinStage::getStats(bool includeDebugInfo) 
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.append("outerKeys", _outerKeys);
-        bob.append("outerProjects", _outerProjects);
-        bob.append("innerKeys", _innerKeys);
-        bob.append("innerProjects", _innerProjects);
+        bob.append("outerKeys", _outerKeys.begin(), _outerKeys.end());
+        bob.append("outerProjects", _outerProjects.begin(), _outerProjects.end());
+        bob.append("innerKeys", _innerKeys.begin(), _innerKeys.end());
+        bob.append("innerProjects", _innerProjects.begin(), _innerProjects.end());
         bob.append("sortDirs", _dirs);
         ret->debugInfo = bob.obj();
     }
@@ -347,8 +368,6 @@ std::vector<DebugPrinter::Block> MergeJoinStage::debugPrint() const {
 
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
 
-    DebugPrinter::addKeyword(ret, "outer");
-
     ret.emplace_back(DebugPrinter::Block("[`"));
     for (size_t idx = 0; idx < _dirs.size(); idx++) {
         if (idx) {
@@ -358,6 +377,8 @@ std::vector<DebugPrinter::Block> MergeJoinStage::debugPrint() const {
                                     _dirs[idx] == value::SortDirection::Ascending ? "asc" : "desc");
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
+
+    DebugPrinter::addKeyword(ret, "left");
 
     ret.emplace_back(DebugPrinter::Block("[`"));
     for (size_t idx = 0; idx < _outerKeys.size(); ++idx) {
@@ -383,7 +404,7 @@ std::vector<DebugPrinter::Block> MergeJoinStage::debugPrint() const {
     DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
-    DebugPrinter::addKeyword(ret, "inner");
+    DebugPrinter::addKeyword(ret, "right");
     ret.emplace_back(DebugPrinter::Block("[`"));
     for (size_t idx = 0; idx < _innerKeys.size(); ++idx) {
         if (idx) {
@@ -411,6 +432,17 @@ std::vector<DebugPrinter::Block> MergeJoinStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     return ret;
+}
+
+size_t MergeJoinStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_outerKeys);
+    size += size_estimator::estimate(_outerProjects);
+    size += size_estimator::estimate(_innerKeys);
+    size += size_estimator::estimate(_innerProjects);
+    size += size_estimator::estimate(_dirs);
+    return size;
 }
 }  // namespace sbe
 }  // namespace mongo

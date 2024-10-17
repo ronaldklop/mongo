@@ -27,25 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/config.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace ExpressionTests {
 namespace {
-using boost::intrusive_ptr;
 using std::string;
 
 /**
@@ -694,7 +703,7 @@ TEST(ExpressionTrimTest, DoesAddInputDependencies) {
                                                                  << "$inputField")),
                                             expCtx.variablesParseState);
     DepsTracker deps;
-    trim->addDependencies(&deps);
+    expression::addDependencies(trim.get(), &deps);
     ASSERT_EQ(deps.fields.count("inputField"), 1u);
     ASSERT_EQ(deps.fields.size(), 1u);
 }
@@ -709,7 +718,7 @@ TEST(ExpressionTrimTest, DoesAddCharsDependencies) {
                                                                  << "$$CURRENT.a")),
                                             expCtx.variablesParseState);
     DepsTracker deps;
-    trim->addDependencies(&deps);
+    expression::addDependencies(trim.get(), &deps);
     ASSERT_EQ(deps.fields.count("inputField"), 1u);
     ASSERT_EQ(deps.fields.count("a"), 1u);
     ASSERT_EQ(deps.fields.size(), 2u);
@@ -722,14 +731,17 @@ TEST(ExpressionTrimTest, DoesSerializeCorrectly) {
                                             BSON("$trim" << BSON("input"
                                                                  << " abc ")),
                                             expCtx.variablesParseState);
-    ASSERT_VALUE_EQ(trim->serialize(false), trim->serialize(true));
     ASSERT_VALUE_EQ(
-        trim->serialize(false),
+        trim->serialize(),
+        trim->serialize(SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+    ASSERT_VALUE_EQ(
+        trim->serialize(),
         Value(Document{{"$trim", Document{{"input", Document{{"$const", " abc "_sd}}}}}}));
 
     // Make sure we can re-parse it and evaluate it.
     auto reparsedTrim = Expression::parseExpression(
-        &expCtx, trim->serialize(false).getDocument().toBson(), expCtx.variablesParseState);
+        &expCtx, trim->serialize().getDocument().toBson(), expCtx.variablesParseState);
     ASSERT_VALUE_EQ(reparsedTrim->evaluate({}, &expCtx.variables), Value("abc"_sd));
 
     // Use $ltrim, and specify the 'chars' option.
@@ -740,12 +752,12 @@ TEST(ExpressionTrimTest, DoesSerializeCorrectly) {
                                                              << "$$CURRENT.a")),
                                        expCtx.variablesParseState);
     ASSERT_VALUE_EQ(
-        trim->serialize(false),
+        trim->serialize(),
         Value(Document{{"$ltrim", Document{{"input", "$inputField"_sd}, {"chars", "$a"_sd}}}}));
 
     // Make sure we can re-parse it and evaluate it.
     reparsedTrim = Expression::parseExpression(
-        &expCtx, trim->serialize(false).getDocument().toBson(), expCtx.variablesParseState);
+        &expCtx, trim->serialize().getDocument().toBson(), expCtx.variablesParseState);
     ASSERT_VALUE_EQ(reparsedTrim->evaluate(Document{{"inputField", " , 4"_sd}, {"a", " ,"_sd}},
                                            &expCtx.variables),
                     Value("4"_sd));

@@ -1,14 +1,6 @@
 /**
  * Tests that unique indexes can be built with a large number of unique values.
- *
- * @tags: [
- *  // This workload is too impactful on ephemeralForTest
- *  requires_wiredtiger,
- * ]
  */
-
-(function() {
-"use strict";
 
 let coll = db.stress_test_unique_index_unique;
 coll.drop();
@@ -24,7 +16,7 @@ function loadCollectionWithDocs(collection, numDocs) {
         for (let i = 0; i < kMaxChunkSize && inserted + docs.length < numDocs; i++) {
             docs.push({"a": inserted + i});
         }
-        collection.insertMany(docs);
+        assert.commandWorked(collection.insertMany(docs, {ordered: false}));
         inserted += docs.length;
     }
 }
@@ -32,4 +24,3 @@ function loadCollectionWithDocs(collection, numDocs) {
 loadCollectionWithDocs(coll, kNumDocs);
 
 assert.commandWorked(coll.createIndex({a: 1}, {unique: true}));
-})();

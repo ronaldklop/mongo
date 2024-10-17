@@ -27,26 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#include <memory>
+#include <string>
 
-#include "mongo/platform/basic.h"
-
-#include <vector>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/remove_shard_from_zone_request_type.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
@@ -73,11 +82,11 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -85,19 +94,21 @@ public:
         return "removes a shard from the zone";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        auto* as = AuthorizationSession::get(client);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const final {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
 
-        if (as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                 ActionType::enableSharding)) {
+        if (as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()),
+                ActionType::enableSharding)) {
             return Status::OK();
         }
 
         // Fallback on permissions to directly modify the shard config.
         if (!as->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(ShardType::ConfigNS), ActionType::update)) {
+                ResourcePattern::forExactNamespace(NamespaceString::kConfigsvrShardsNamespace),
+                ActionType::update)) {
             return {ErrorCodes::Unauthorized, "Unauthorized"};
         }
 
@@ -109,10 +120,10 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         auto parsedRequest =
             uassertStatusOK(RemoveShardFromZoneRequest::parseFromMongosCommand(cmdObj));
 
@@ -124,14 +135,14 @@ public:
         auto cmdResponseStatus = uassertStatusOK(
             configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
-                                                          "admin",
+                                                          DatabaseName::kAdmin,
                                                           cmdBuilder.obj(),
                                                           Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(cmdResponseStatus.commandStatus);
         return true;
     }
-
-} removeShardFromZoneCmd;
+};
+MONGO_REGISTER_COMMAND(RemoveShardFromZoneCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

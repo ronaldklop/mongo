@@ -32,7 +32,10 @@
 #include <algorithm>
 #include <boost/algorithm/searching/boyer_moore.hpp>
 #include <boost/version.hpp>
+#include <utility>
 
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/fts/unicode/byte_vector.h"
 #include "mongo/platform/bits.h"
 #include "mongo/shell/linenoise_utf8.h"
@@ -136,7 +139,9 @@ StringData String::substrToBufWithTransform(StackBufBuilder* buffer,
 }
 
 StringData String::substrToBuf(StackBufBuilder* buffer, size_t pos, size_t len) const {
-    const auto identityFunc = [](char32_t ch) { return ch; };
+    const auto identityFunc = [](char32_t ch) {
+        return ch;
+    };
     return substrToBufWithTransform(buffer, pos, len, identityFunc);
 }
 
@@ -144,7 +149,9 @@ StringData String::toLowerToBuf(StackBufBuilder* buffer,
                                 CaseFoldMode mode,
                                 size_t pos,
                                 size_t len) const {
-    const auto toLower = [mode](char32_t ch) { return codepointToLower(ch, mode); };
+    const auto toLower = [mode](char32_t ch) {
+        return codepointToLower(ch, mode);
+    };
     return substrToBufWithTransform(buffer, pos, len, toLower);
 }
 
@@ -233,7 +240,7 @@ StringData String::caseFoldAndStripDiacritics(StackBufBuilder* buffer,
             // utf-8. We make no guarantees about what results will be returned in this case.
             uassert(ErrorCodes::BadValue,
                     "text contains invalid UTF-8",
-                    leadingOnes > 1 && leadingOnes <= 4 && inputIt + leadingOnes - 1 <= endIt);
+                    leadingOnes > 1 && leadingOnes <= 4 && inputIt + (leadingOnes - 1) <= endIt);
 
             codepoint = firstByte & (0xff >> leadingOnes);  // mask off the size indicator.
             for (int subByteIx = 1; subByteIx < leadingOnes; subByteIx++) {

@@ -27,23 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <utility>
 
-#include "mongo/base/status.h"
-#include "mongo/db/range_arithmetic.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/sharding_test_fixture_common.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
-const NamespaceString kNss("test.foo");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 const ShardId kThisShard("thisShard");
 const ShardId kOtherShard("otherShard");
 
@@ -52,48 +64,59 @@ CollectionMetadata makeCollectionMetadataImpl(
     const std::vector<std::pair<BSONObj, BSONObj>>& thisShardsChunks,
     bool staleChunkManager,
     UUID uuid = UUID::gen(),
+    Timestamp timestamp = Timestamp(1, 1),
     boost::optional<TypeCollectionReshardingFields> reshardingFields = boost::none) {
 
     const OID epoch = OID::gen();
 
-    const Timestamp kRouting(100, 0);
-    const Timestamp kChunkManager(staleChunkManager ? 99 : 100, 0);
+    const Timestamp kOnCurrentShardSince(100, 0);
+    const boost::optional<Timestamp> kChunkManager(staleChunkManager, Timestamp{99, 0});
 
     std::vector<ChunkType> allChunks;
     auto nextMinKey = shardKeyPattern.globalMin();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    ChunkVersion version({epoch, timestamp}, {1, 0});
     for (const auto& myNextChunk : thisShardsChunks) {
         if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < myNextChunk.first)) {
             // Need to add a chunk to the other shard from nextMinKey to myNextChunk.first.
             allChunks.emplace_back(
-                kNss, ChunkRange{nextMinKey, myNextChunk.first}, version, kOtherShard);
-            allChunks.back().setHistory({ChunkHistory(kRouting, kOtherShard)});
+                uuid, ChunkRange{nextMinKey, myNextChunk.first}, version, kOtherShard);
+            auto& chunk = allChunks.back();
+            chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+            chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
+
             version.incMajor();
         }
         allChunks.emplace_back(
-            kNss, ChunkRange{myNextChunk.first, myNextChunk.second}, version, kThisShard);
-        allChunks.back().setHistory({ChunkHistory(kRouting, kThisShard)});
+            uuid, ChunkRange{myNextChunk.first, myNextChunk.second}, version, kThisShard);
+        auto& chunk = allChunks.back();
+        chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
+
         version.incMajor();
         nextMinKey = myNextChunk.second;
     }
 
     if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < shardKeyPattern.globalMax())) {
         allChunks.emplace_back(
-            kNss, ChunkRange{nextMinKey, shardKeyPattern.globalMax()}, version, kOtherShard);
-        allChunks.back().setHistory({ChunkHistory(kRouting, kOtherShard)});
+            uuid, ChunkRange{nextMinKey, shardKeyPattern.globalMax()}, version, kOtherShard);
+        auto& chunk = allChunks.back();
+        chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
     }
 
     return CollectionMetadata(
         ChunkManager(kThisShard,
-                     DatabaseVersion(uuid),
+                     DatabaseVersion(uuid, timestamp),
                      ShardingTestFixtureCommon::makeStandaloneRoutingTableHistory(
                          RoutingTableHistory::makeNew(kNss,
                                                       uuid,
                                                       shardKeyPattern,
+                                                      false, /* unsplittable */
                                                       nullptr,
                                                       false,
                                                       epoch,
-                                                      boost::none /* timestamp */,
+                                                      timestamp,
+                                                      boost::none /* timeseriesFields */,
                                                       std::move(reshardingFields),
                                                       true,
                                                       allChunks)),
@@ -116,25 +139,23 @@ protected:
         TypeCollectionReshardingFields reshardingFields{reshardingUuid};
         reshardingFields.setState(state);
 
-        if (state == CoordinatorStateEnum::kDecisionPersisted) {
+        if (state == CoordinatorStateEnum::kCommitting) {
             TypeCollectionRecipientFields recipientFields{
                 {kThisShard, kOtherShard}, existingUuid, kNss, 5000};
             reshardingFields.setRecipientFields(std::move(recipientFields));
         } else if (state == CoordinatorStateEnum::kBlockingWrites) {
             TypeCollectionDonorFields donorFields{
-                constructTemporaryReshardingNss(kNss.db(), existingUuid),
+                resharding::constructTemporaryReshardingNss(kNss, existingUuid),
                 KeyPattern{BSON("newKey" << 1)},
                 {kThisShard, kOtherShard}};
             reshardingFields.setDonorFields(std::move(donorFields));
         }
 
-        auto metadataUuid = (state >= CoordinatorStateEnum::kDecisionPersisted &&
-                             state != CoordinatorStateEnum::kError)
-            ? reshardingUuid
-            : existingUuid;
+        auto metadataUuid =
+            (state >= CoordinatorStateEnum::kCommitting) ? reshardingUuid : existingUuid;
 
         return makeCollectionMetadataImpl(
-            KeyPattern(BSON("a" << 1)), {}, false, metadataUuid, reshardingFields);
+            KeyPattern(BSON("a" << 1)), {}, false, metadataUuid, Timestamp(1, 1), reshardingFields);
     }
 };
 
@@ -203,78 +224,6 @@ TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
 
     ConstructedRangeMap pending;
     ASSERT(!metadata.getNextOrphanRange(pending, metadata.getMaxKey()));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // Writes should be disallowed if the collection metadata's UUID matches the original
-    // collection's UUID.
-    ASSERT(metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, AllowWritesInDecisionPersistedWithReshardingUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // Writes should NOT be disallowed when the UUID matches the temp collection's
-    // UUID.
-    ASSERT(!metadata.disallowWritesForResharding(reshardingUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedThrows) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-    UUID rogueUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // If the collection's UUID matches neither the original UUID nor the resharding UUID,
-    // expect an exception.
-    ASSERT_THROWS_CODE(metadata.disallowWritesForResharding(rogueUUID),
-                       AssertionException,
-                       ErrorCodes::InvalidUUID);
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInApplyingWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kApplying);
-
-    // Writes should NOT be disallowed if the coordinator state is applying.
-    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInBlockingWritesWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kBlockingWrites);
-
-    // Writes should be disallowed if the coordinator state is blocking-writes.
-    ASSERT(metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInErrorWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kError);
-
-    // Writes should NOT be disallowed if the coordinator state is error.
-    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
 }
 
 /**
@@ -367,7 +316,7 @@ TEST_F(SingleChunkMinMaxCompoundKeyFixture, KeyBelongsToMe) {
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MINKEY << "b" << 10)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 10 << "b" << 20)));
 
-    ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY << "b" << MAXKEY)));
+    ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY << "b" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSONObj()));
 }
@@ -449,10 +398,10 @@ TEST_F(ThreeChunkWithRangeGapFixture, KeyBelongsToMe) {
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 10)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 30)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 40)));
+    ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << 20)));
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << 25)));
-    ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSONObj()));
 }

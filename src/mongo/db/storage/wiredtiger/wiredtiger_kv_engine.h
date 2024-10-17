@@ -29,23 +29,50 @@
 
 #pragma once
 
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
-
-#include <boost/filesystem/path.hpp>
+#include <vector>
 #include <wiredtiger.h>
 
-#include "mongo/bson/ordering.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/import_options.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/backup_block.h"
+#include "mongo/db/storage/journal_listener.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_event_handler.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/elapsed_tracker.h"
 
@@ -53,10 +80,32 @@ namespace mongo {
 
 class ClockSource;
 class JournalListener;
+
 class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
+
 class WiredTigerEngineRuntimeConfigParameter;
+
+/**
+ * With the absolute path to an ident and the parent dbpath, return the ident.
+ *
+ * Note that the ident can have 4 different forms depending on the combination
+ * of server parameters present (directoryperdb / wiredTigerDirectoryForIndexes).
+ * With any one of these server parameters enabled, a directory could be included
+ * in the returned ident.
+ * See the unit test WiredTigerKVEngineTest::ExtractIdentFromPath for example usage.
+ *
+ * Note (2) idents use unix-style separators (always, see
+ * durable_catalog.cpp:generateUniqueIdent) but ident paths are platform-dependant.
+ * This method returns the unix-style "/" separators always.
+ */
+std::string extractIdentFromPath(const boost::filesystem::path& dbpath,
+                                 const boost::filesystem::path& identAbsolutePath);
+
+
+Status validateExtraDiagnostics(const std::vector<std::string>& value,
+                                const boost::optional<TenantId>& tenantId);
 
 struct WiredTigerFileVersion {
     // MongoDB 4.4+ will not open on datafiles left behind by 4.2.5 and earlier. MongoDB 4.4
@@ -64,8 +113,12 @@ struct WiredTigerFileVersion {
     // (IS_44_FCV_42). MongoDB 4.2.x always writes out IS_42.
     enum class StartupVersion { IS_42, IS_44_FCV_42, IS_44_FCV_44 };
 
+    inline static const std::string kLastLTSWTRelease = "compatibility=(release=10.0)";
+    inline static const std::string kLastContinuousWTRelease = "compatibility=(release=10.0)";
+    inline static const std::string kLatestWTRelease = "compatibility=(release=10.0)";
+
     StartupVersion _startupVersion;
-    bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
+    bool shouldDowngrade(bool hasRecoveryTimestamp);
     std::string getDowngradeString();
 };
 
@@ -77,14 +130,65 @@ struct WiredTigerBackup {
 
     // 'wtBackupCursorMutex' provides concurrency control between beginNonBlockingBackup(),
     // endNonBlockingBackup(), and getNextBatch() because we stream the output of the backup cursor.
-    Mutex wtBackupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupCursorMutex");
+    stdx::mutex wtBackupCursorMutex;
 
     // 'wtBackupDupCursorMutex' provides concurrency control between getNextBatch() and
     // extendBackupCursor() because WiredTiger only allows one duplicate cursor to be open at a
     // time. extendBackupCursor() blocks on condition variable 'wtBackupDupCursorCV' if a duplicate
     // cursor is already open.
-    Mutex wtBackupDupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupDupCursorMutex");
+    stdx::mutex wtBackupDupCursorMutex;
     stdx::condition_variable wtBackupDupCursorCV;
+
+    // This file flags there was an ongoing backup when an unclean shutdown happened.
+    inline static const std::string kOngoingBackupFile = "ongoingBackup.lock";
+};
+
+/**
+ * A StatsCollectionPermit attempts to acquire a permit to collect WT statistics. If the WT
+ * connection is ready, conn() returns a non-null WT_CONNECTION that can be used to collect
+ * statistics safely.
+
+ * Statistics can be safely collected while the permit is held, but storage engine shutdown is
+ * blocked while any oustanding permits are held.
+ *
+ * Destruction releases the permit and allows shutdown to proceed.
+ */
+class StatsCollectionPermit {
+public:
+    explicit StatsCollectionPermit(WiredTigerEventHandler* eventHandler)
+        : _eventHandler(eventHandler), _conn(_eventHandler->getStatsCollectionPermit()) {}
+
+    StatsCollectionPermit(const StatsCollectionPermit&) = delete;
+    StatsCollectionPermit(StatsCollectionPermit&& other) noexcept {
+        _eventHandler = other._eventHandler;
+        _conn = other._conn;
+        other._eventHandler = nullptr;
+        other._conn = nullptr;
+    }
+
+    /**
+     * Returns the WT connection for this permit, and nullptr if this permit is not valid.
+     */
+    WT_CONNECTION* conn() {
+        return _conn;
+    }
+
+    /**
+     * When the section generation activity for a reader is done, this destructor is called (one of
+     * the permits is released). The destructor call releases the section generation activity
+     * permit. If it is a _eventHandler is NULL (the object is stale, the permit is tranferred) or
+     * _permitActive is false (no permit was issued), releaseStatsCollectionPermit is not called. If
+     * all the permits are released WT connection is allowed to shut down cleanly.
+     */
+    ~StatsCollectionPermit() {
+        if (_eventHandler && _conn) {
+            _eventHandler->releaseStatsCollectionPermit();
+        }
+    }
+
+private:
+    WiredTigerEventHandler* _eventHandler;
+    WT_CONNECTION* _conn{nullptr};
 };
 
 class WiredTigerKVEngine final : public KVEngine {
@@ -97,24 +201,38 @@ public:
                        const std::string& extraOpenOptions,
                        size_t cacheSizeMB,
                        size_t maxHistoryFileSizeMB,
-                       bool durable,
                        bool ephemeral,
-                       bool repair,
-                       bool readOnly);
+                       bool repair);
 
-    ~WiredTigerKVEngine();
+    ~WiredTigerKVEngine() override;
 
-    void notifyStartupComplete() override;
+    void notifyStorageStartupRecoveryComplete() override;
+    void notifyReplStartupRecoveryComplete(OperationContext* opCtx) override;
 
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
     bool supportsDirectoryPerDB() const override;
 
+    /**
+     * WiredTiger supports checkpoints when it isn't running in memory.
+     */
+    bool supportsCheckpoints() const override {
+        return !isEphemeral();
+    }
+
     void checkpoint() override;
 
-    bool isDurable() const override {
-        return _durable;
+    // Force a WT checkpoint, this will not update internal timestamps.
+    void forceCheckpoint(bool useStableTimestamp);
+
+    StorageEngine::CheckpointIteration getCheckpointIteration() const override {
+        return StorageEngine::CheckpointIteration{_currentCheckpointIteration.load()};
+    }
+
+    bool hasDataBeenCheckpointed(
+        StorageEngine::CheckpointIteration checkpointIteration) const override {
+        return _ephemeral || _finishedCheckpointIteration.load() > checkpointIteration;
     }
 
     bool isEphemeral() const override {
@@ -127,36 +245,45 @@ public:
     RecoveryUnit* newRecoveryUnit() override;
 
     Status createRecordStore(OperationContext* opCtx,
-                             StringData ns,
+                             const NamespaceString& ns,
                              StringData ident,
-                             const CollectionOptions& options) override;
+                             const CollectionOptions& options,
+                             KeyFormat keyFormat = KeyFormat::Long) override;
 
     std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
-                                                StringData ns,
+                                                const NamespaceString& nss,
                                                 StringData ident,
                                                 const CollectionOptions& options) override;
 
+    std::unique_ptr<RecordStore> getTemporaryRecordStore(OperationContext* opCtx,
+                                                         StringData ident,
+                                                         KeyFormat keyFormat) override;
+
     std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
-                                                          StringData ident) override;
+                                                          StringData ident,
+                                                          KeyFormat keyFormat) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const NamespaceString& ns,
                                      const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override;
-
     std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
+        const NamespaceString& nss,
         const CollectionOptions& collOptions,
         StringData ident,
         const IndexDescriptor* desc) override;
 
     Status importRecordStore(OperationContext* opCtx,
                              StringData ident,
-                             const BSONObj& storageMetadata) override;
+                             const BSONObj& storageMetadata,
+                             const ImportOptions& importOptions) override;
 
     Status importSortedDataInterface(OperationContext* opCtx,
                                      StringData ident,
-                                     const BSONObj& storageMetadata) override;
+                                     const BSONObj& storageMetadata,
+                                     const ImportOptions& importOptions) override;
 
     /**
      * Drops the specified ident for resumable index builds.
@@ -165,15 +292,16 @@ public:
 
     Status dropIdent(RecoveryUnit* ru,
                      StringData ident,
-                     StorageEngine::DropIdentCallback&& onDrop = nullptr) override;
+                     const StorageEngine::DropIdentCallback& onDrop = nullptr) override;
 
     void dropIdentForImport(OperationContext* opCtx, StringData ident) override;
 
-    Status okToRename(OperationContext* opCtx,
-                      StringData fromNS,
-                      StringData toNS,
-                      StringData ident,
-                      const RecordStore* originalRecordStore) const override;
+    void alterIdentMetadata(OperationContext* opCtx,
+                            StringData ident,
+                            const IndexDescriptor* desc,
+                            bool isForceUpdateMetadata) override;
+
+    Status alterMetadata(StringData uri, StringData config);
 
     void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
 
@@ -188,8 +316,7 @@ public:
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::vector<std::string>> extendBackupCursor(
-        OperationContext* opCtx) override;
+    StatusWith<std::deque<std::string>> extendBackupCursor(OperationContext* opCtx) override;
 
     int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
@@ -251,15 +378,25 @@ public:
 
     Timestamp getAllDurableTimestamp() const override;
 
-    bool supportsClusteredIdIndex() const final override {
-        return true;
-    }
+    bool supportsReadConcernSnapshot() const final;
 
-    bool supportsReadConcernSnapshot() const final override;
+    bool supportsOplogTruncateMarkers() const final;
 
-    bool supportsOplogStones() const final override;
+    Status oplogDiskLocRegister(OperationContext* opCtx,
+                                RecordStore* oplogRecordStore,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override;
 
-    bool supportsReadConcernMajority() const final;
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 RecordStore* oplogRecordStore) const override;
+
+    bool waitUntilDurable(OperationContext* opCtx) override;
+
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) override;
+
+    Timestamp getStableTimestamp() const override;
+    Timestamp getOldestTimestamp() const override;
+    Timestamp getCheckpointTimestamp() const override;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -269,10 +406,6 @@ public:
     WT_CONNECTION* getConnection() {
         return _conn;
     }
-    void dropSomeQueuedIdents();
-    std::list<WiredTigerCachedCursor> filterCursorsWithQueuedDrops(
-        std::list<WiredTigerCachedCursor>* cache);
-    bool haveDropsQueued() const;
 
     void syncSizeInfo(bool sync) const;
 
@@ -301,11 +434,50 @@ public:
         return _oplogManager.get();
     }
 
-    static void appendGlobalStats(BSONObjBuilder& b);
+    /**
+     * Specifies what data will get flushed to disk in a WiredTigerSessionCache::waitUntilDurable()
+     * call.
+     */
+    enum class Fsync {
+        // Flushes only the journal (oplog) to disk.
+        // If journaling is disabled, checkpoints all of the data.
+        kJournal,
+        // Checkpoints data up to the stable timestamp.
+        // If journaling is disabled, checkpoints all of the data.
+        kCheckpointStableTimestamp,
+        // Checkpoints all of the data.
+        kCheckpointAll,
+    };
 
-    Timestamp getStableTimestamp() const override;
-    Timestamp getOldestTimestamp() const override;
-    Timestamp getCheckpointTimestamp() const override;
+    /**
+     * Controls whether or not WiredTigerSessionCache::waitUntilDurable() updates the
+     * JournalListener.
+     */
+    enum class UseJournalListener { kUpdate, kSkip };
+
+    /**
+     * Waits until all commits that happened before this call are made durable.
+     *
+     * Specifying Fsync::kJournal will flush only the (oplog) journal to disk. Callers are
+     * serialized by a mutex and will return early if it is discovered that another thread started
+     * and completed a flush while they slept.
+     *
+     * Specifying Fsync::kCheckpointStableTimestamp will take a checkpoint up to and including the
+     * stable timestamp.
+     *
+     * Specifying Fsync::kCheckpointAll, or if journaling is disabled with kJournal or
+     * kCheckpointStableTimestamp, causes a checkpoint to be taken of all of the data.
+     *
+     * Taking a checkpoint has the benefit of persisting unjournaled writes.
+     *
+     * 'useListener' controls whether or not the JournalListener is updated with the last durable
+     * value of the timestamp that it tracks. The JournalListener's token is fetched before writing
+     * out to disk and set afterwards to update the repl layer durable timestamp. The
+     * JournalListener operations can throw write interruption errors.
+     *
+     * Uses a temporary session. Safe to call without any locks, even during shutdown.
+     */
+    void waitUntilDurable(OperationContext* opCtx, Fsync syncType, UseJournalListener useListener);
 
     /**
      * Returns the data file path associated with an ident on disk. Returns boost::none if the data
@@ -318,7 +490,7 @@ public:
      * Returns the minimum possible Timestamp value in the oplog that replication may need for
      * recovery in the event of a rollback. This value depends on the timestamp passed to
      * `setStableTimestamp` and on the set of active MongoDB transactions. Returns an error if it
-     * times out querying the active transctions.
+     * times out querying the active transactions.
      */
     StatusWith<Timestamp> getOplogNeededForRollback() const;
 
@@ -351,16 +523,80 @@ public:
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) override;
 
+    Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) override;
+
 private:
     StatusWith<Timestamp> _pinOldestTimestamp(WithLock,
                                               const std::string& requestingServiceName,
                                               Timestamp requestedTimestamp,
                                               bool roundUpIfTooOld);
 
+    Status _dropIdent(RecoveryUnit* ru,
+                      StringData ident,
+                      const char* config,
+                      const StorageEngine::DropIdentCallback& onDrop = nullptr);
+
 public:
     void unpinOldestTimestamp(const std::string& requestingServiceName) override;
 
     std::map<std::string, Timestamp> getPinnedTimestampRequests();
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
+
+    void dump() const override;
+
+    Status reconfigureLogging() override;
+
+    StatusWith<BSONObj> getStorageMetadata(StringData ident) const override;
+
+    KeyFormat getKeyFormat(OperationContext* opCtx, StringData ident) const override;
+
+    size_t getCacheSizeMB() const override;
+
+    // TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
+    BSONObj getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const override;
+
+    /**
+     * Flushes any WiredTigerSizeStorer updates to the storage engine if enough time has elapsed, as
+     * dictated by the _sizeStorerSyncTracker.
+     */
+    void sizeStorerPeriodicFlush();
+
+    /**
+     * WiredTiger statistics cursors can be used if the WT connection is ready and it is not
+     * shutting down or starting up. In that case, a tryGetStatsCollectionPermit call returns a
+     * StatsCollectionPermit object indcating that the caller may safely open statistics cursors,
+     * but the storage engine shutdown will be prevented from invalidating the underlying WT
+     * connection until the caller is done. When the WT connection is not ready, a
+     * tryGetStatsCollectionPermit call returns boost::none. ~StatsCollectionPermit releases the
+     * permit.
+     */
+    boost::optional<StatsCollectionPermit> tryGetStatsCollectionPermit() {
+        StatsCollectionPermit permit(&_eventHandler);
+        if (permit.conn()) {
+            return permit;
+        }
+        return boost::none;
+    }
+
+    /**
+     * Returns the number of active statistics readers that are blocking shutdown.
+     */
+    int32_t getActiveStatsReaders() {
+        return _eventHandler.getActiveStatsReaders();
+    }
+
+    /**
+     * If the WT connection is ready for statistics collection, returns true. This function is
+     * unsafe because the connection can close immediately after this check returns true. By calling
+     * tryGetStatsCollectionPermit(), a permit for statistics collection can be acquired and it can
+     * be made sure that the connection is open and will not close until the permit goes out of
+     * scope and the destructor for the permit releases it.
+     */
+    bool isWtConnReadyForStatsCollection_UNSAFE() const {
+        return _eventHandler.isWtConnReadyForStatsCollection();
+    }
 
 private:
     class WiredTigerSessionSweeper;
@@ -369,6 +605,10 @@ private:
         std::string uri;
         StorageEngine::DropIdentCallback callback;
     };
+
+    void _checkpoint(WT_SESSION* session);
+
+    void _checkpoint(WT_SESSION* session, bool useTimestamp);
 
     /**
      * Opens a connection on the WiredTiger database 'path' with the configuration 'wtOpenConfig'.
@@ -420,8 +660,15 @@ private:
 
     std::uint64_t _getCheckpointTimestamp() const;
 
-    mutable Mutex _oldestActiveTransactionTimestampCallbackMutex =
-        MONGO_MAKE_LATCH("::_oldestActiveTransactionTimestampCallbackMutex");
+    /**
+     * Looks up the journal listener under a mutex along.
+     * Returns JournalListener along with an optional token if requested
+     * by the UseJournalListener value.
+     */
+    std::pair<JournalListener*, boost::optional<JournalListener::Token>>
+    _getJournalListenerWithToken(OperationContext* opCtx, UseJournalListener useListener);
+
+    mutable stdx::mutex _oldestActiveTransactionTimestampCallbackMutex;
     StorageEngine::OldestActiveTransactionTimestampCallback
         _oldestActiveTransactionTimestampCallback;
 
@@ -432,7 +679,7 @@ private:
     ClockSource* const _clockSource;
 
     // Mutex to protect use of _oplogRecordStore by this instance of KV engine.
-    mutable Mutex _oplogManagerMutex = MONGO_MAKE_LATCH("::_oplogManagerMutex");
+    mutable stdx::mutex _oplogManagerMutex;
     const WiredTigerRecordStore* _oplogRecordStore = nullptr;
     std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
@@ -443,34 +690,20 @@ private:
     std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
     std::string _sizeStorerUri;
     mutable ElapsedTracker _sizeStorerSyncTracker;
+    mutable stdx::mutex _sizeStorerSyncTrackerMutex;
 
-    bool _durable;
     bool _ephemeral;  // whether we are using the in-memory mode of the WT engine
     const bool _inRepairMode;
-    bool _readOnly;
-
-    // If _keepDataHistory is true, then the storage engine keeps all history after the stable
-    // timestamp, and WiredTigerKVEngine is responsible for advancing the oldest timestamp. If
-    // _keepDataHistory is false (i.e. majority reads are disabled), then we only keep history after
-    // the "no holes point", and WiredTigerOplogManager is responsible for advancing the oldest
-    // timestamp.
-    const bool _keepDataHistory = true;
 
     std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
 
     std::string _rsOptions;
     std::string _indexOptions;
 
-    mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
-    std::list<IdentToDrop> _identToDrop;
-
-    mutable Date_t _previousCheckedDropsQueued;
-
     std::unique_ptr<WiredTigerSession> _backupSession;
     WiredTigerBackup _wtBackup;
 
-    mutable Mutex _oplogPinnedByBackupMutex =
-        MONGO_MAKE_LATCH("WiredTigerKVEngine::_oplogPinnedByBackupMutex");
+    mutable stdx::mutex _oplogPinnedByBackupMutex;
     boost::optional<Timestamp> _oplogPinnedByBackup;
     Timestamp _recoveryTimestamp;
 
@@ -484,14 +717,48 @@ private:
 
     AtomicWord<std::uint64_t> _oplogNeededForCrashRecovery;
 
-    std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
-
-    mutable Mutex _highestDurableTimestampMutex =
-        MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");
-    mutable unsigned long long _highestSeenDurableTimestamp = StorageEngine::kMinimumTimestamp;
-
-    mutable Mutex _oldestTimestampPinRequestsMutex =
-        MONGO_MAKE_LATCH("WiredTigerKVEngine::_oldestTimestampPinRequestsMutex");
+    mutable stdx::mutex _oldestTimestampPinRequestsMutex;
     std::map<std::string, Timestamp> _oldestTimestampPinRequests;
+
+    // Pins the oplog so that OplogTruncateMarkers will not truncate oplog history equal or newer to
+    // this timestamp.
+    AtomicWord<std::uint64_t> _pinnedOplogTimestamp;
+
+    stdx::mutex _checkpointMutex;
+
+    // The amount of memory alloted for the WiredTiger cache.
+    size_t _cacheSizeMB;
+
+    // Counters used for computing whether a checkpointIteration has lapsed or not.
+    //
+    // We use two counters because one isn't sufficient to prove correctness. With two counters we
+    // first increase the first one in order to inform later operations that they will be part of
+    // the next checkpoint. The second one is there to inform waiters on whether they've
+    // successfully been checkpointed or not.
+    //
+    // This is valid because durability is a state all operations will converge to eventually.
+    AtomicWord<std::uint64_t> _currentCheckpointIteration{0};
+    AtomicWord<std::uint64_t> _finishedCheckpointIteration{0};
+
+    // Protects getting and setting the _journalListener below.
+    stdx::mutex _journalListenerMutex;
+
+    // Notified when we commit to the journal.
+    //
+    // This variable should be accessed under the _journalListenerMutex above and saved in a local
+    // variable before use. That way, we can avoid holding a mutex across calls on the object. It is
+    // only allowed to be set once, in order to ensure the memory to which a copy of the pointer
+    // points is always valid.
+    JournalListener* _journalListener = nullptr;
+
+    // Counter and critical section mutex for waitUntilDurable
+    AtomicWord<unsigned> _lastSyncTime;
+    stdx::mutex _lastSyncMutex;
+
+    // owned, and never explicitly closed (uses connection close to clean up)
+    WT_SESSION* _waitUntilDurableSession = nullptr;
+
+    // Tracks the time since the last _waitUntilDurableSession reset().
+    Timer _timeSinceLastDurabilitySessionReset;
 };
 }  // namespace mongo

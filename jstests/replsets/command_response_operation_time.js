@@ -4,8 +4,7 @@
  * and local reads and writes return the last applied optime's timestamp.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function assertCorrectOperationTime(operationTime, expectedTimestamp, opTimeType) {
     assert.eq(0,
@@ -17,8 +16,7 @@ function assertCorrectOperationTime(operationTime, expectedTimestamp, opTimeType
 
 var name = "command_response_operation_time";
 
-var replTest = new ReplSetTest(
-    {name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ""}, waitForKeys: true});
+var replTest = new ReplSetTest({name: name, nodes: 3, waitForKeys: true});
 replTest.startSet();
 replTest.initiate();
 
@@ -52,4 +50,3 @@ statusRes = assert.commandWorked(testDB.adminCommand({replSetGetStatus: 1}));
 assertCorrectOperationTime(res.operationTime, statusRes.optimes.appliedOpTime.ts, "applied");
 
 replTest.stopSet();
-})();

@@ -30,48 +30,74 @@ Generate a file containing a list of disabled feature flags.
 Used by resmoke.py to run only feature flag tests.
 """
 
-import argparse
 import os
 import sys
-
 from typing import List
 
 import yaml
 
 # Permit imports from "buildscripts".
-sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), '../../..')))
+sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), "../../..")))
 
 # pylint: disable=wrong-import-position
-import buildscripts.idl.lib as lib
+from buildscripts.idl import lib
+from buildscripts.idl.idl import parser
 
 
-def gen_all_feature_flags(idl_dir: str, import_dirs: List[str]):
-    """Generate a list of all feature flags."""
-    all_flags = []
-    for idl_path in sorted(lib.list_idls(idl_dir)):
-        for feature_flag in lib.parse_idl(idl_path, import_dirs).spec.feature_flags:
-            if feature_flag.default.literal != "true":
-                all_flags.append(feature_flag.name)
+def get_all_feature_flags(idl_dirs: List[str] = None):
+    """Generate a dict of all feature flags with their default value."""
+    default_idl_dirs = ["src", "buildscripts"]
 
-    force_disabled_flags = yaml.safe_load(
-        open("buildscripts/resmokeconfig/fully_disabled_feature_flags.yml"))
+    if not idl_dirs:
+        idl_dirs = default_idl_dirs
 
-    return list(set(all_flags) - set(force_disabled_flags))
+    all_flags = {}
+    for idl_dir in idl_dirs:
+        for idl_path in sorted(lib.list_idls(idl_dir)):
+            if lib.is_third_party_idl(idl_path):
+                continue
+            # Most IDL files do not contain feature flags.
+            # We can discard these quickly without expensive YAML parsing.
+            with open(idl_path) as idl_file:
+                if "feature_flags" not in idl_file.read():
+                    continue
+            with open(idl_path) as idl_file:
+                doc = parser.parse_file(idl_file, idl_path)
+            for feature_flag in doc.spec.feature_flags:
+                all_flags[feature_flag.name] = feature_flag.default.literal
+
+    return all_flags
+
+
+def get_all_feature_flags_turned_on_by_default(idl_dirs: List[str] = None):
+    """Generate a list of all feature flags that default to true."""
+    all_flags = get_all_feature_flags(idl_dirs)
+
+    return [flag for flag in all_flags if all_flags[flag] == "true"]
+
+
+def get_all_feature_flags_turned_off_by_default(idl_dirs: List[str] = None):
+    """Generate a list of all feature flags that default to false."""
+    all_flags = get_all_feature_flags(idl_dirs)
+    all_default_false_flags = [flag for flag in all_flags if all_flags[flag] != "true"]
+
+    with open("buildscripts/resmokeconfig/fully_disabled_feature_flags.yml") as fully_disabled_ffs:
+        force_disabled_flags = yaml.safe_load(fully_disabled_ffs)
+
+    return list(set(all_default_false_flags) - set(force_disabled_flags))
+
+
+def gen_all_feature_flags_file(filename: str = "all_feature_flags.txt"):
+    flags = get_all_feature_flags_turned_off_by_default()
+    with open(filename, "w") as output_file:
+        output_file.write("\n".join(flags))
+        print("Generated: ", os.path.realpath(output_file.name))
 
 
 def main():
     """Run the main function."""
-    arg_parser = argparse.ArgumentParser(description=__doc__)
-    arg_parser.add_argument("--import-dir", dest="import_dirs", type=str, action="append",
-                            help="Directory to search for IDL import files")
-
-    args = arg_parser.parse_args()
-
-    flags = gen_all_feature_flags(os.getcwd(), args.import_dirs)
-    with open(lib.ALL_FEATURE_FLAG_FILE, "w") as output_file:
-        for flag in flags:
-            output_file.write("%s\n" % flag)
+    gen_all_feature_flags_file()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

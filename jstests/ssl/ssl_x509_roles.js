@@ -1,9 +1,6 @@
 // Test that a client can authenicate against the server with roles.
 // Also validates RFC2253
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const SERVER_CERT = "jstests/libs/server.pem";
 const CA_CERT = "jstests/libs/ca.pem";
@@ -11,12 +8,7 @@ const CLIENT_CERT = "jstests/libs/client_roles.pem";
 const CLIENT_ESCAPE_CERT = "jstests/libs/client_escape.pem";
 const CLIENT_UTF8_CERT = "jstests/libs/client_utf8.pem";
 const CLIENT_EMAIL_CERT = "jstests/libs/client_email.pem";
-const CLIENT_TITLE_CERT = "jstests/libs/client_title.pem";
 const CLIENT_CERT_NO_ROLES = "jstests/libs/client.pem";
-
-const CLIENT_USER =
-    "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel Users,CN=Kernel Client Peer Role";
-
 const CLIENT_USER_NO_ROLES = "CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US";
 const smokeScript = 'assert(db.getSiblingDB(\'$external\').auth({ mechanism: \'MONGODB-X509\' }));';
 
@@ -28,10 +20,10 @@ function authAndTest(port, expectSuccess) {
                                   "localhost",
                                   "--port",
                                   port,
-                                  "--ssl",
-                                  "--sslCAFile",
+                                  "--tls",
+                                  "--tlsCAFile",
                                   CA_CERT,
-                                  "--sslPEMKeyFile",
+                                  "--tlsCertificateKeyFile",
                                   CLIENT_CERT_NO_ROLES,
                                   "--eval",
                                   smokeScript);
@@ -43,10 +35,10 @@ function authAndTest(port, expectSuccess) {
                                     "localhost",
                                     "--port",
                                     port,
-                                    "--ssl",
-                                    "--sslCAFile",
+                                    "--tls",
+                                    "--tlsCAFile",
                                     CA_CERT,
-                                    "--sslPEMKeyFile",
+                                    "--tlsCertificateKeyFile",
                                     cert,
                                     script);
 
@@ -69,19 +61,27 @@ function authAndTest(port, expectSuccess) {
     runTest(CLIENT_EMAIL_CERT, "jstests/ssl/libs/ssl_x509_role_auth_email.js");
 }
 
+function isConnAuthenticated(conn) {
+    const connStatus = conn.adminCommand({connectionStatus: 1, showPrivileges: true});
+    const connIsAuthenticated = connStatus.authInfo.authenticatedUsers.length > 0;
+    return connIsAuthenticated;
+}
+
 const prepConn = function(conn) {
-    const admin = conn.getDB('admin');
-    admin.createUser({user: "admin", pwd: "admin", roles: ["root"]});
-    assert(admin.auth('admin', 'admin'));
+    if (!isConnAuthenticated(conn)) {
+        const admin = conn.getDB('admin');
+        admin.createUser({user: "admin", pwd: "admin", roles: ["root"]});
+        assert(admin.auth('admin', 'admin'));
+    }
 
     const external = conn.getDB('$external');
     external.createUser({user: CLIENT_USER_NO_ROLES, roles: [{'role': 'readWrite', 'db': 'test'}]});
 };
 
 const x509_options = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
 };
 
 print("1. Testing x.509 auth to mongod");
@@ -97,7 +97,7 @@ print("1. Testing x.509 auth to mongod");
 jsTestLog("2. Testing disabling x.509 auth with roles");
 {
     const mongo = MongoRunner.runMongod(Object.merge(
-        x509_options, {auth: "", setParameter: "allowRolesFromX509Certificates=false"}));
+        x509_options, {auth: "", setParameter: {allowRolesFromX509Certificates: false}}));
 
     prepConn(mongo);
 
@@ -128,7 +128,7 @@ print("3. Testing x.509 auth to mongos");
 print("4. Testing x.509 auth to mongos with x509 roles disabled");
 {
     const localOptions =
-        Object.merge(x509_options, {setParameter: "allowRolesFromX509Certificates=false"});
+        Object.merge(x509_options, {setParameter: {allowRolesFromX509Certificates: false}});
     let st = new ShardingTest({
         shards: 1,
         mongos: 1,
@@ -145,4 +145,3 @@ print("4. Testing x.509 auth to mongos with x509 roles disabled");
     authAndTest(st.s0.port, false);
     st.stop();
 }
-}());

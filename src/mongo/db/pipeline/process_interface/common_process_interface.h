@@ -29,10 +29,32 @@
 
 #pragma once
 
+#include <memory>
+#include <set>
+#include <string>
+#include <tuple>
 #include <vector>
 
+#include <boost/exception/exception.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -43,7 +65,75 @@ namespace mongo {
 class CommonProcessInterface : public MongoProcessInterface {
 public:
     using MongoProcessInterface::MongoProcessInterface;
-    virtual ~CommonProcessInterface() = default;
+    ~CommonProcessInterface() override = default;
+
+    /**
+     * Estimates the size of writes that will be executed on the current node. Note that this
+     * does not account for the full size of an update statement because in the case of local
+     * writes, we will not have to serialize to BSON and are therefore not subject to the 16MB
+     * BSONObj size limit.
+     */
+    class LocalWriteSizeEstimator final : public WriteSizeEstimator {
+    public:
+        int estimateInsertHeaderSize(
+            const write_ops::InsertCommandRequest& insertReq) const override {
+            return 0;
+        }
+
+        int estimateUpdateHeaderSize(
+            const write_ops::UpdateCommandRequest& insertReq) const override {
+            return 0;
+        }
+
+        int estimateInsertSizeBytes(const BSONObj& insert) const override {
+            return insert.objsize();
+        }
+
+        int estimateUpdateSizeBytes(const BatchObject& batchObject,
+                                    UpsertType type) const override {
+            int size = get<write_ops::UpdateModification>(batchObject).objsize();
+            if (auto vars = get<boost::optional<BSONObj>>(batchObject)) {
+                size += vars->objsize();
+            }
+            return size;
+        }
+    };
+
+    /**
+     * Estimate the size of writes that will be sent to the replica set primary.
+     */
+    class TargetPrimaryWriteSizeEstimator final : public WriteSizeEstimator {
+    public:
+        int estimateInsertHeaderSize(
+            const write_ops::InsertCommandRequest& insertReq) const override {
+            return write_ops::getInsertHeaderSizeEstimate(insertReq);
+        }
+
+        int estimateUpdateHeaderSize(
+            const write_ops::UpdateCommandRequest& updateReq) const override {
+            return write_ops::getUpdateHeaderSizeEstimate(updateReq);
+        }
+
+        int estimateInsertSizeBytes(const BSONObj& insert) const override {
+            return insert.objsize() + write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+        }
+
+        int estimateUpdateSizeBytes(const BatchObject& batchObject,
+                                    UpsertType type) const override {
+            return getUpdateSizeEstimate(
+                       get<BSONObj>(batchObject),
+                       get<write_ops::UpdateModification>(batchObject),
+                       get<boost::optional<BSONObj>>(batchObject),
+                       type != UpsertType::kNone /* includeUpsertSupplied */,
+                       boost::none /* collation */,
+                       boost::none /* arrayFilters */,
+                       boost::none /* sort */,
+                       BSONObj() /* hint*/,
+                       boost::none /* sampleId */,
+                       false /* $_allowShardKeyUpdatesWithoutFullShardKeyInQuery */) +
+                write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+        }
+    };
 
     /**
      * Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and
@@ -53,42 +143,68 @@ public:
     static bool keyPatternNamesExactPaths(const BSONObj& keyPattern,
                                           const std::set<FieldPath>& uniqueKeyPaths);
 
+    /**
+     * Converts the fields from a ShardKeyPattern to a vector of FieldPaths, including the _id if
+     * it's not already in 'keyPatternFields'.
+     */
+    static std::vector<FieldPath> shardKeyToDocumentKeyFields(
+        const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields);
+
+    /**
+     * Utility which determines which shard owns 'nss'. More precisely, if 'nss' resides on
+     * a single shard and is not sharded (that is, it is either unsplittable or untracked), we
+     * return the id of the shard which owns 'nss'. Note that this decision is inherently racy and
+     * subject to become stale. This is okay because either choice will work correctly, we are
+     * simply applying a heuristic optimization.
+     *
+     * As written, this function can only be called in a sharded context.
+     *
+     * Note that the first overload looks up an instance of 'CatalogCache', while the second takes
+     * it as a parameter.
+     */
+    static boost::optional<ShardId> findOwningShard(OperationContext* opCtx,
+                                                    const NamespaceString& nss);
+    static boost::optional<ShardId> findOwningShard(OperationContext* opCtx,
+                                                    CatalogCache* catalogCache,
+                                                    const NamespaceString& nss);
+
+
     std::vector<BSONObj> getCurrentOps(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        CurrentOpConnectionsMode connMode,
                                        CurrentOpSessionsMode sessionMode,
                                        CurrentOpUserMode userMode,
                                        CurrentOpTruncateMode truncateMode,
-                                       CurrentOpCursorMode cursorMode,
-                                       CurrentOpBacktraceMode backtraceMode) const final;
+                                       CurrentOpCursorMode cursorMode) const final;
 
-    virtual std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
         OperationContext*, const NamespaceString&) const override;
 
-    virtual void updateClientOperationTime(OperationContext* opCtx) const final;
+    void updateClientOperationTime(OperationContext* opCtx) const final;
 
-    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+    boost::optional<ShardVersion> refreshAndGetCollectionVersion(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss) const override;
+
+    boost::optional<mongo::DatabaseVersion> refreshAndGetDatabaseVersion(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const DatabaseName& dbName) const override;
+
+    boost::optional<ShardId> determineSpecificMergeShard(
+        OperationContext* opCtx, const NamespaceString& nss) const override {
+        return boost::none;
+    };
 
     std::string getHostAndPort(OperationContext* opCtx) const override;
 
 protected:
     /**
-     * Converts the fields from a ShardKeyPattern to a vector of FieldPaths, including the _id if
-     * it's not already in 'keyPatternFields'.
-     */
-    std::vector<FieldPath> _shardKeyToDocumentKeyFields(
-        const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) const;
-
-    /**
      * Returns a BSONObj representing a report of the operation which is currently being
      * executed by the supplied client. This method is called by the getCurrentOps method of
      * CommonProcessInterface to delegate to the mongoS- or mongoD- specific implementation.
      */
-    virtual BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
+    virtual BSONObj _reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               Client* client,
-                                              CurrentOpTruncateMode truncateOps,
-                                              CurrentOpBacktraceMode backtraceMode) const = 0;
+                                              CurrentOpTruncateMode truncateOps) const = 0;
 
     /**
      * Iterates through all entries in the local SessionCatalog, and adds an entry to the 'ops'
@@ -114,6 +230,12 @@ protected:
                                                          CurrentOpConnectionsMode connMode,
                                                          CurrentOpSessionsMode sessionMode,
                                                          std::vector<BSONObj>* ops) const = 0;
+
+    /**
+     * Reports information about query sampling.
+     */
+    virtual void _reportCurrentOpsForQueryAnalysis(OperationContext* opCtx,
+                                                   std::vector<BSONObj>* ops) const = 0;
 };
 
 }  // namespace mongo

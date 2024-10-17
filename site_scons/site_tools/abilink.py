@@ -21,7 +21,6 @@
 #
 
 import SCons
-import subprocess
 
 # TODO: Make a SUFF variable for the suffix to write to
 # TODO: Prevent using abilink when -gsplit-dwarf is in play, since it doesn't work
@@ -71,7 +70,8 @@ def _add_scanner(builder):
         return new_results
 
     builder.target_scanner = SCons.Scanner.Scanner(
-        function=new_scanner, path_function=path_function
+        function=new_scanner,
+        path_function=path_function,
     )
 
 
@@ -83,12 +83,11 @@ def _add_action(builder):
 
 
 def exists(env):
-    result = _detect(env) != None
+    result = _detect(env) is not None
     return result
 
 
 def generate(env):
-
     if not exists(env):
         return
 

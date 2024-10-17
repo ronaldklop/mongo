@@ -1,14 +1,7 @@
 /**
  * Check the functionality of encrypt and decrypt functions in KeyStore.js
  */
-load("jstests/client_encrypt/lib/mock_kms.js");
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-"use strict";
-
-const mock_kms = new MockKMSServerAWS();
-mock_kms.start();
+import {CA_CERT, SERVER_CERT} from "jstests/ssl/libs/ssl_helpers.js";
 
 const x509_options = {
     sslMode: "requireSSL",
@@ -20,12 +13,6 @@ const conn = MongoRunner.runMongod(x509_options);
 const test = conn.getDB("test");
 const collection = test.coll;
 
-const awsKMS = {
-    accessKeyId: "access",
-    secretAccessKey: "secret",
-    url: mock_kms.getURL(),
-};
-
 let localKMS = {
     key: BinData(
         0,
@@ -34,14 +21,13 @@ let localKMS = {
 
 const clientSideFLEOptions = {
     kmsProviders: {
-        aws: awsKMS,
         local: localKMS,
     },
     keyVaultNamespace: "test.coll",
     schemaMap: {}
 };
 
-const kmsTypes = ["aws", "local"];
+const kmsTypes = ["local"];
 
 const randomAlgorithm = "AEAD_AES_256_CBC_HMAC_SHA_512-Random";
 const deterministicAlgorithm = "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic";
@@ -56,10 +42,9 @@ const passTestCases = [
     new Date('December 17, 1995 03:24:00'),
     BinData(0, '1234'),
     BinData(1, '1234'),
-    BinData(3, '1234'),
-    BinData(4, '1234'),
+    BinData(3, "OEJTfmD8twzaj/LPKLIVkA=="),
+    BinData(4, "OEJTfmD8twzaj/LPKLIVkA=="),
     BinData(5, '1234'),
-    BinData(6, '1234'),
     new Timestamp(1, 2),
     new ObjectId(),
     new DBPointer("mongo", new ObjectId()),
@@ -76,8 +61,15 @@ const failDeterministic = [
     Code("function() { return true; }")
 ];
 
-const failTestCases =
-    [null, undefined, MinKey(), MaxKey(), DBRef("test", "test", "test"), BinData(2, '1234')];
+const failTestCases = [
+    null,
+    undefined,
+    MinKey(),
+    MaxKey(),
+    DBRef("test", "test", "test"),
+    BinData(2, "BAAAADEyMzQ="),
+    BinData(6, '1234'),
+];
 
 const shell = Mongo(conn.host, clientSideFLEOptions);
 const keyVault = shell.getKeyVault();
@@ -118,5 +110,3 @@ for (const kmsType of kmsTypes) {
 }
 
 MongoRunner.stopMongod(conn);
-mock_kms.stop();
-}());

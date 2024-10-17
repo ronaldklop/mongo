@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/net/hostandport.h"
 
 #include <boost/functional/hash.hpp>
 
-#include "mongo/base/status.h"
+#include "mongo/base/parse_number.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
@@ -50,6 +48,13 @@ StatusWith<HostAndPort> HostAndPort::parse(StringData text) {
         return StatusWith<HostAndPort>(status);
     }
     return StatusWith<HostAndPort>(result);
+}
+
+Status validateHostAndPort(const std::string& hostAndPortStr, const boost::optional<TenantId>&) {
+    if (hostAndPortStr.empty()) {
+        return Status::OK();
+    }
+    return HostAndPort::parse(hostAndPortStr).getStatus();
 }
 
 HostAndPort::HostAndPort() : _port(-1) {}

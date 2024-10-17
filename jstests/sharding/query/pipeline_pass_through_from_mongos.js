@@ -4,15 +4,16 @@
  * exercises the fix for SERVER-41290.
  * @tags: [requires_sharding, requires_profiling]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/profiler.js");  // For profilerHas*OrThrow helper functions.
+import {
+    profilerHasSingleMatchingEntryOrThrow,
+    profilerHasZeroMatchingEntriesOrThrow,
+} from "jstests/libs/profiler.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 const mongosDB = st.s0.getDB(jsTestName());
-assert.commandWorked(st.s0.adminCommand({enableSharding: jsTestName()}));
-st.ensurePrimaryShard(jsTestName(), st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: jsTestName(), primaryShard: st.shard0.shardName}));
 const mongosColl = mongosDB.test;
 const mongosOtherColl = mongosDB.otherEmptyCollection;
 const primaryShard = st.shard0.getDB(jsTestName());
@@ -170,4 +171,3 @@ profilerHasZeroMatchingEntriesOrThrow({
 });
 
 st.stop();
-})();

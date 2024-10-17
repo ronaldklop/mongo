@@ -29,14 +29,26 @@
 
 #include "mongo/db/index/expression_params.h"
 
+#include <memory>
+#include <s2.h>
+#include <utility>
+
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/geo/geoconstants.h"
+#include "mongo/db/geo/hash.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/2d_common.h"
 #include "mongo/db/index/s2_common.h"
 #include "mongo/db/index_names.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
-#include "third_party/s2/s2.h"
 
 namespace mongo {
 
@@ -47,14 +59,14 @@ void ExpressionParams::parseTwoDParams(const BSONObj& infoObj, TwoDIndexingParam
 
     while (i.more()) {
         BSONElement e = i.next();
-        if (e.type() == String && IndexNames::GEO_2D == e.valuestr()) {
+        if (e.type() == String && IndexNames::GEO_2D == e.str()) {
             uassert(16800, "can't have 2 geo fields", out->geo.empty());
             uassert(16801, "2d has to be first in index", out->other.empty());
             out->geo = e.fieldName();
         } else {
             int order = 1;
             if (e.isNumber()) {
-                order = static_cast<int>(e.Number());
+                order = e.safeNumberInt();
             }
             out->other.emplace_back(e.fieldName(), order);
         }
@@ -68,21 +80,8 @@ void ExpressionParams::parseTwoDParams(const BSONObj& infoObj, TwoDIndexingParam
 }
 
 void ExpressionParams::parseHashParams(const BSONObj& infoObj,
-                                       HashSeed* seedOut,
                                        int* versionOut,
                                        BSONObj* keyPattern) {
-    // Default _seed to DEFAULT_HASH_SEED if "seed" is not included in the index spec
-    // or if the value of "seed" is not a number
-
-    // *** WARNING ***
-    // Choosing non-default seeds will invalidate hashed sharding
-    // Changing the seed default will break existing indexes and sharded collections
-    if (infoObj["seed"].eoo()) {
-        *seedOut = BSONElementHasher::DEFAULT_HASH_SEED;
-    } else {
-        *seedOut = infoObj["seed"].numberInt();
-    }
-
     // In case we have hashed indexes based on other hash functions in the future, we store
     // a hashVersion number. If hashVersion changes, "makeSingleHashKey" will need to change
     // accordingly.  Defaults to 0 if "hashVersion" is not included in the index spec or if
@@ -104,33 +103,6 @@ void ExpressionParams::parseHashParams(const BSONObj& infoObj,
             str::stream() << "A maximum of one index field is allowed to be hashed but found "
                           << numHashFields << " for 'key' " << *keyPattern,
             numHashFields == 1);
-}
-
-void ExpressionParams::parseHaystackParams(const BSONObj& infoObj,
-                                           std::string* geoFieldOut,
-                                           std::vector<std::string>* otherFieldsOut,
-                                           double* bucketSizeOut) {
-    BSONElement e = infoObj["bucketSize"];
-    uassert(16777, "need bucketSize", e.isNumber());
-    *bucketSizeOut = e.numberDouble();
-    uassert(16769, "bucketSize cannot be zero", *bucketSizeOut != 0.0);
-
-    // Example:
-    // db.foo.ensureIndex({ pos : "geoHaystack", type : 1 }, { bucketSize : 1 })
-    BSONObjIterator i(infoObj.getObjectField("key"));
-    while (i.more()) {
-        BSONElement e = i.next();
-        if (e.type() == String && IndexNames::GEO_HAYSTACK == e.valuestr()) {
-            uassert(16770, "can't have more than one geo field", geoFieldOut->size() == 0);
-            uassert(16771, "the geo field has to be first in index", otherFieldsOut->size() == 0);
-            *geoFieldOut = e.fieldName();
-        } else {
-            uassert(16772,
-                    "geoSearch can only have 1 non-geo field for now",
-                    otherFieldsOut->size() == 0);
-            otherFieldsOut->push_back(e.fieldName());
-        }
-    }
 }
 
 void ExpressionParams::initialize2dsphereParams(const BSONObj& infoObj,

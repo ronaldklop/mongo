@@ -27,24 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_facet.h"
-
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <algorithm>
+#include <list>
 #include <memory>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/document_source_facet.h"
 #include "mongo/db/pipeline/document_source_tee_consumer.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/tee_buffer.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -66,7 +73,7 @@ DocumentSourceFacet::DocumentSourceFacet(std::vector<FacetPipeline> facetPipelin
     for (size_t facetId = 0; facetId < _facets.size(); ++facetId) {
         auto& facet = _facets[facetId];
         facet.pipeline->addInitialSource(
-            DocumentSourceTeeConsumer::create(pExpCtx, facetId, _teeBuffer));
+            DocumentSourceTeeConsumer::create(pExpCtx, facetId, _teeBuffer, kTeeConsumerStageName));
     }
 }
 
@@ -107,6 +114,35 @@ vector<pair<string, vector<BSONObj>>> extractRawPipelines(const BSONElement& ele
     return rawFacetPipelines;
 }
 
+/**
+ * Helper function to find the stage that violates the $facet requirement. The 'source' is not
+ * allowed either directly or because of some of the sources inside its sub-pipelines.
+ */
+std::string getStageNameNotAllowedInFacet(const DocumentSource& source,
+                                          const std::string& parentName) {
+    auto* subPipeline = source.getSubPipeline();
+    const std::string& sourceName = source.getSourceName();
+    if (!subPipeline) {
+        if (!parentName.empty()) {
+            return str::stream() << sourceName << " inside of " << parentName;
+        } else {
+            return str::stream() << sourceName;
+        }
+    } else {
+        for (const auto& substage : *subPipeline) {
+            auto stageConstraints = substage->constraints();
+            if (!stageConstraints.isAllowedInsideFacetStage()) {
+                return getStageNameNotAllowedInFacet(*substage, sourceName);
+            }
+        }
+        // If we reach this point, none of the sub-stages is violating the $facet requirement. The
+        // 'source' stage itself is not allowed.
+        return str::stream() << sourceName;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8045600);
+}
+
 }  // namespace
 
 std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed::parse(
@@ -124,7 +160,7 @@ std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed
 REGISTER_DOCUMENT_SOURCE(facet,
                          DocumentSourceFacet::LiteParsed::parse,
                          DocumentSourceFacet::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 intrusive_ptr<DocumentSourceFacet> DocumentSourceFacet::create(
     std::vector<FacetPipeline> facetPipelines,
@@ -172,6 +208,7 @@ DocumentSource::GetNextResult DocumentSourceFacet::doGetNext() {
                 results[facetId].emplace_back(next.releaseDocument());
             }
             allPipelinesEOF = allPipelinesEOF && next.isEOF();
+            accumulatePipelinePlanSummaryStats(*pipeline, _stats.planSummaryStats);
         }
     }
 
@@ -184,11 +221,12 @@ DocumentSource::GetNextResult DocumentSourceFacet::doGetNext() {
     return resultDoc.freeze();
 }
 
-Value DocumentSourceFacet::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceFacet::serialize(const SerializationOptions& opts) const {
     MutableDocument serialized;
     for (auto&& facet : _facets) {
-        serialized[facet.name] = Value(explain ? facet.pipeline->writeExplainOps(*explain)
-                                               : facet.pipeline->serialize());
+        serialized[opts.serializeFieldPathFromString(facet.name)] =
+            Value(opts.verbosity ? facet.pipeline->writeExplainOps(opts)
+                                 : facet.pipeline->serialize(opts));
     }
     return Value(Document{{"$facet", serialized.freezeToValue()}});
 }
@@ -221,28 +259,47 @@ void DocumentSourceFacet::reattachToOperationContext(OperationContext* opCtx) {
     }
 }
 
-StageConstraints DocumentSourceFacet::constraints(Pipeline::SplitState) const {
-    // Currently we don't split $facet to have a merger part and a shards part (see SERVER-24154).
-    // This means that if any stage in any of the $facet pipelines needs to run on the primary shard
-    // or on mongoS, then the entire $facet stage must run there.
-    static const std::set<HostTypeRequirement> definitiveHosts = {
-        HostTypeRequirement::kMongoS, HostTypeRequirement::kPrimaryShard};
+bool DocumentSourceFacet::validateOperationContext(const OperationContext* opCtx) const {
+    return getContext()->opCtx == opCtx &&
+        std::all_of(_facets.begin(), _facets.end(), [opCtx](const auto& f) {
+               return f.pipeline->validateOperationContext(opCtx);
+           });
+}
 
+StageConstraints DocumentSourceFacet::constraints(Pipeline::SplitState state) const {
+    // Currently we don't split $facet to have a merger part and a shards part (see SERVER-24154).
+    // This means that if any stage in any of the $facet pipelines needs to run on mongoS, then the
+    // entire $facet stage must run there.
+    static const HostTypeRequirement kDefinitiveHost = HostTypeRequirement::kMongoS;
     HostTypeRequirement host = HostTypeRequirement::kNone;
+    boost::optional<ShardId> mergeShardId;
 
     // Iterate through each pipeline to determine the HostTypeRequirement for the $facet stage.
     // Because we have already validated that there are no conflicting HostTypeRequirements during
-    // parsing, if we observe any of the 'definitiveHosts' types in any of the pipelines then the
-    // entire $facet stage must run on that host and iteration can stop. At the end of this process,
-    // 'host' will be the $facet's final HostTypeRequirement.
-    for (auto fi = _facets.begin(); fi != _facets.end() && !definitiveHosts.count(host); fi++) {
+    // parsing, if we observe a host type of 'kMongos' in any of the pipelines then the entire
+    // $facet stage must run on mongos and iteration can stop. At the end of this process, 'host'
+    // will be the $facet's final HostTypeRequirement.
+    for (auto fi = _facets.begin(); fi != _facets.end() && host != kDefinitiveHost; fi++) {
         const auto& sources = fi->pipeline->getSources();
-        for (auto si = sources.begin(); si != sources.end() && !definitiveHosts.count(host); si++) {
-            const auto hostReq = (*si)->constraints().resolvedHostTypeRequirement(pExpCtx);
+        for (auto si = sources.begin(); si != sources.end() && host != kDefinitiveHost; si++) {
+            const auto subConstraints = (*si)->constraints(state);
+            const auto hostReq = subConstraints.resolvedHostTypeRequirement(pExpCtx);
+
             if (hostReq != HostTypeRequirement::kNone) {
                 host = hostReq;
             }
+
+            // Capture the first merging shard requested by a subpipeline.
+            if (!mergeShardId) {
+                mergeShardId = subConstraints.mergeShardId;
+            }
         }
+    }
+
+    // Clear the captured merging shard if 'host' is incompatible with merging on a shard.
+    if (!(host == HostTypeRequirement::kNone || host == HostTypeRequirement::kRunOnceAnyNode ||
+          host == HostTypeRequirement::kAnyShard)) {
+        mergeShardId = boost::none;
     }
 
     // Resolve the disk use, lookup, and transaction requirement of this $facet by iterating through
@@ -259,26 +316,34 @@ StageConstraints DocumentSourceFacet::constraints(Pipeline::SplitState) const {
         constraints =
             StageConstraints::getStrictestConstraints(facet.pipeline->getSources(), constraints);
     }
+
+    if (mergeShardId) {
+        constraints.mergeShardId = mergeShardId;
+    }
     return constraints;
 }
 
 bool DocumentSourceFacet::usedDisk() {
     for (auto&& facet : _facets) {
-        if (facet.pipeline->usedDisk())
-            return true;
+        if (facet.pipeline->usedDisk()) {
+            _stats.planSummaryStats.usedDisk = true;
+            break;
+        }
     }
-    return false;
+    return _stats.planSummaryStats.usedDisk;
 }
 
 DepsTracker::State DocumentSourceFacet::getDependencies(DepsTracker* deps) const {
-    const bool scopeHasVariables = pExpCtx->variablesParseState.hasDefinedVariables();
     for (auto&& facet : _facets) {
         auto subDepsTracker = facet.pipeline->getDependencies(deps->getUnavailableMetadata());
 
         deps->fields.insert(subDepsTracker.fields.begin(), subDepsTracker.fields.end());
-        deps->vars.insert(subDepsTracker.vars.begin(), subDepsTracker.vars.end());
 
         deps->needWholeDocument = deps->needWholeDocument || subDepsTracker.needWholeDocument;
+
+        // If the subpipeline needs any search metadata, the top level pipeline must know to
+        // generate it.
+        deps->searchMetadataDeps() |= subDepsTracker.searchMetadataDeps();
 
         // The text score is the only type of metadata that could be needed by $facet.
         deps->setNeedsMetadata(
@@ -286,10 +351,7 @@ DepsTracker::State DocumentSourceFacet::getDependencies(DepsTracker* deps) const
             deps->getNeedsMetadata(DocumentMetadataFields::kTextScore) ||
                 subDepsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
-        // If there are variables defined at this stage's scope, there may be dependencies upon
-        // them in subsequent pipelines. Keep enumerating.
-        if (deps->needWholeDocument && deps->getNeedsMetadata(DocumentMetadataFields::kTextScore) &&
-            !scopeHasVariables) {
+        if (deps->needWholeDocument && deps->getNeedsMetadata(DocumentMetadataFields::kTextScore)) {
             break;
         }
     }
@@ -297,6 +359,12 @@ DepsTracker::State DocumentSourceFacet::getDependencies(DepsTracker* deps) const
     // We will combine multiple documents into one, and the output document will have new fields, so
     // we will stop looking for dependencies at this point.
     return DepsTracker::State::EXHAUSTIVE_ALL;
+}
+
+void DocumentSourceFacet::addVariableRefs(std::set<Variables::Id>* refs) const {
+    for (auto&& facet : _facets) {
+        facet.pipeline->addVariableRefs(refs);
+    }
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(
@@ -309,35 +377,43 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(
     for (auto&& rawFacet : extractRawPipelines(elem)) {
         const auto facetName = rawFacet.first;
 
-        auto pipeline = Pipeline::parse(rawFacet.second, expCtx, [](const Pipeline& pipeline) {
-            auto sources = pipeline.getSources();
-            std::for_each(sources.begin(), sources.end(), [](auto& stage) {
-                auto stageConstraints = stage->constraints();
-                uassert(40600,
-                        str::stream() << stage->getSourceName()
-                                      << " is not allowed to be used within a $facet stage",
-                        stageConstraints.isAllowedInsideFacetStage());
-                // We expect a stage within a $facet stage to have these properties.
-                invariant(stageConstraints.requiredPosition ==
-                          StageConstraints::PositionRequirement::kNone);
-                invariant(!stageConstraints.isIndependentOfAnyCollection);
+        auto pipeline =
+            Pipeline::parseFacetPipeline(rawFacet.second, expCtx, [](const Pipeline& pipeline) {
+                auto sources = pipeline.getSources();
+                std::for_each(sources.begin(), sources.end(), [](auto& stage) {
+                    auto stageConstraints = stage->constraints();
+                    if (!stageConstraints.isAllowedInsideFacetStage()) {
+                        uasserted(40600,
+                                  str::stream()
+                                      << getStageNameNotAllowedInFacet(*stage, "")
+                                      << " is not allowed to be used within a $facet stage");
+                    }
+                    // We expect a stage within a $facet stage to have these properties.
+                    invariant(stageConstraints.requiredPosition ==
+                              StageConstraints::PositionRequirement::kNone);
+                    invariant(!stageConstraints.isIndependentOfAnyCollection);
+                });
             });
-        });
 
-        // Validate that none of the facet pipelines have any conflicting HostTypeRequirements. This
-        // verifies both that all stages within each pipeline are consistent, and that the pipelines
-        // are consistent with one another.
-        if (!needsShard && pipeline->needsShard()) {
-            needsShard.emplace(facetName);
+        // These checks potentially require that we check the catalog to determine where our data
+        // lives. In circumstances where we aren't actually running the query, we don't need to do
+        // this (and it can erroneously error - SERVER-83912).
+        if (expCtx->mongoProcessInterface->isExpectedToExecuteQueries()) {
+            // Validate that none of the facet pipelines have any conflicting HostTypeRequirements.
+            // This verifies both that all stages within each pipeline are consistent, and that the
+            // pipelines are consistent with one another.
+            if (!needsShard && pipeline->needsShard()) {
+                needsShard.emplace(facetName);
+            }
+            if (!needsMongoS && pipeline->needsMongosMerger()) {
+                needsMongoS.emplace(facetName);
+            }
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << "$facet pipeline '" << *needsMongoS
+                                  << "' must run on mongoS, but '" << *needsShard
+                                  << "' requires a shard",
+                    !(needsShard && needsMongoS));
         }
-        if (!needsMongoS && pipeline->needsMongosMerger()) {
-            needsMongoS.emplace(facetName);
-        }
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "$facet pipeline '" << *needsMongoS
-                              << "' must run on mongoS, but '" << *needsShard
-                              << "' requires a shard",
-                !(needsShard && needsMongoS));
 
         facetPipelines.emplace_back(facetName, std::move(pipeline));
     }

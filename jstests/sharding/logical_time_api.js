@@ -7,8 +7,8 @@
  *
  * Expects logicalTime to come in the command body from both a mongos and a mongod.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Returns true if the given object contains a logicalTime BSON object in the following format:
 // $clusterTime: {
@@ -73,6 +73,10 @@ res = assert.commandWorked(testDB.runCommand({hello: 1, $clusterTime: res.$clust
 
 st.stop();
 
+if (jsTestOptions().useAutoBootstrapProcedure) {  // TODO: SERVER-80318 Delete tests below
+    quit();
+}
+
 // A mongod from a non-sharded replica set does not return logicalTime.
 var replTest = new ReplSetTest({name: "logical_time_api_non_sharded_replset", nodes: 1});
 replTest.startSet();
@@ -96,4 +100,3 @@ assert(!containsValidLogicalTimeBson(res),
            "received: " + tojson(res));
 
 MongoRunner.stopMongod(standalone);
-})();

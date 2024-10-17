@@ -31,14 +31,18 @@
 
 #include <array>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <type_traits>
 #include <utility>
 
-#include "mongo/config.h"
-
+#include "mongo/base/data_type.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -203,11 +207,11 @@ public:
      * "200E9999999999" --> +Inf
      * "-200E9999999999" --> -Inf
      */
-    explicit Decimal128(std::string stringValue,
+    explicit Decimal128(const std::string& stringValue,
                         RoundingMode roundMode = kRoundTiesToEven,
                         size_t* charsConsumed = nullptr);
 
-    Decimal128(std::string stringValue,
+    Decimal128(const std::string& stringValue,
                std::uint32_t* signalingFlag,
                RoundingMode roundMode = kRoundTiesToEven,
                size_t* charsConsumed = nullptr);
@@ -346,12 +350,16 @@ public:
         return Decimal128(Value{_value.low64, _value.high64 ^ (std::uint64_t{1} << 63)});
     }
 
+    Decimal128 round(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 round(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
     /**
      * This set of functions converts a Decimal128 to a certain integer type with a
      * given rounding mode.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInvalid
      *
      * Note: The signaling flags for these functions only signal
@@ -371,8 +379,8 @@ public:
      * given rounding mode. The signaling flags for these functions will also signal
      * inexact computation.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kInvalid
      */
     std::int32_t toIntExact(RoundingMode roundMode = kRoundTiesToEven) const;
@@ -389,8 +397,8 @@ public:
      * These functions convert decimals to doubles and have the ability to signal
      * inexact, underflow, overflow, and invalid operation.
      *
-     * This function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kUnderflow, kOverflow, kInvalid
      */
     double toDouble(RoundingMode roundMode = kRoundTiesToEven) const;
@@ -438,8 +446,8 @@ public:
      * is performed using the supplied rounding mode (defaulting to kRoundTiesToEven).
      * NaNs and infinities are handled according to the IEEE 754-2008 specification.
      *
-     * Each function is overloaded to provide an optional signalingFlags output parameter
-     * that can be set to one of the Decimal128::SignalingFlag enumerators:
+     * Each function is overloaded to provide an optional signalingFlags input-output parameter that
+     * will be bitwise ORed with one of the following Decimal128::SignalingFlag enumerators:
      * kNoFlag, kInexact, kUnderflow, kOverflow, kInvalid
      *
      * The divide operation may also set signalingFlags to kDivideByZero
@@ -463,13 +471,14 @@ public:
     Decimal128 exponential(RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 exponential(std::uint32_t* signalingFlags,
                            RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(std::uint32_t* signalingFlags,
-                         RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(const Decimal128& other, RoundingMode roundMode = kRoundTiesToEven) const;
-    Decimal128 logarithm(const Decimal128& other,
-                         std::uint32_t* signalingFlags,
-                         RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 naturalLogarithm(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 naturalLogarithm(std::uint32_t* signalingFlags,
+                                RoundingMode roundMode = kRoundTiesToEven) const;
+    // Calculate the logarithm with the given `base`, using this number as input. Uses fast paths
+    // for base 2 and 10.
+    // TODO SERVER-91935 convert `logarithm` and others to static methods for a more clear
+    // interface.
+    Decimal128 logarithm(const Decimal128& base, RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 modulo(const Decimal128& other) const;
     Decimal128 modulo(const Decimal128& other, std::uint32_t* signalingFlags) const;
 
@@ -481,6 +490,8 @@ public:
     Decimal128 squareRoot(RoundingMode roundMode = kRoundTiesToEven) const;
     Decimal128 squareRoot(std::uint32_t* signalingFlags,
                           RoundingMode roundMode = kRoundTiesToEven) const;
+
+    Decimal128 scale(int n, RoundingMode roundMode = kRoundTiesToEven) const;
 
     /**
      * This function quantizes the current decimal given a quantum reference
@@ -630,5 +641,43 @@ inline bool operator!=(const Decimal128& lhs, const Decimal128& rhs) {
 }
 
 }  // namespace literals
+
+template <>
+struct DataType::Handler<Decimal128> {
+    static void unsafeLoad(Decimal128* valueOut, const char* ptr, size_t* advanced);
+    static void unsafeStore(const Decimal128& valueIn, char* ptr, size_t* advanced);
+
+    static Status load(Decimal128* valueOut,
+                       const char* ptr,
+                       size_t length,
+                       size_t* advanced,
+                       std::ptrdiff_t debug_offset) {
+        if (length < kSizeOfDecimal) {
+            return Status(ErrorCodes::Overflow, "Buffer too small to hold Decimal128 value");
+        }
+
+        unsafeLoad(valueOut, ptr, advanced);
+        return Status::OK();
+    }
+
+    static Status store(const Decimal128& valueIn,
+                        char* ptr,
+                        size_t length,
+                        size_t* advanced,
+                        std::ptrdiff_t debug_offset) {
+        if (length < kSizeOfDecimal) {
+            return Status(ErrorCodes::Overflow, "Buffer too small to write Decimal128 value");
+        }
+
+        unsafeStore(valueIn, ptr, advanced);
+        return Status::OK();
+    }
+
+    static Decimal128 defaultConstruct() {
+        return Decimal128();
+    }
+
+    static constexpr size_t kSizeOfDecimal = 2 * sizeof(uint64_t);
+};
 
 }  // namespace mongo

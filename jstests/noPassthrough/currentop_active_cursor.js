@@ -3,9 +3,8 @@
 // @tags: [
 //   requires_sharding,
 // ]
-(function() {
-"use strict";
-load("jstests/libs/pin_getmore_cursor.js");  // for "withPinnedCursor"
+import {withPinnedCursor} from "jstests/libs/pin_getmore_cursor.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(cursorId, coll) {
     const db = coll.getDB();
@@ -41,31 +40,8 @@ withPinnedCursor({
     sessionId: null,
     db: conn.getDB("test"),
     assertFunction: runTest,
-    runGetMoreFunc: function() {
-        const response =
-            assert.commandWorked(db.runCommand({getMore: cursorId, collection: collName}));
-    },
-    failPointName: failPointName,
-    assertEndCounts: true
-});
-
-// Test OP_GET_MORE (legacy read mode) against a mongod.
-failPointName = "waitWithPinnedCursorDuringGetMoreBatch";
-const db = conn.getDB("test");
-db.getMongo().forceReadMode("legacy");
-withPinnedCursor({
-    conn: conn,
-    sessionId: null,
-    db: db,
-    assertFunction: runTest,
-    runGetMoreFunc: function() {
-        db.getMongo().forceReadMode("legacy");
-        let cmdRes = {
-            "cursor": {"firstBatch": [], "id": cursorId, "ns": db.jstest_with_pinned_cursor},
-            "ok": 1
-        };
-        let cursor = new DBCommandCursor(db, cmdRes, 2);
-        cursor.itcount();
+    runGetMoreFunc: function(collName, cursorId) {
+        assert.commandWorked(db.runCommand({getMore: cursorId, collection: collName}));
     },
     failPointName: failPointName,
     assertEndCounts: true
@@ -80,31 +56,10 @@ withPinnedCursor({
     sessionId: null,
     db: st.s.getDB("test"),
     assertFunction: runTest,
-    runGetMoreFunc: function() {
-        const response =
-            assert.commandWorked(db.runCommand({getMore: cursorId, collection: collName}));
-    },
-    failPointName: failPointName,
-    assertEndCounts: true
-});
-
-// Test OP_GET_MORE (legacy reead mode) against a mongos.
-withPinnedCursor({
-    conn: st.s,
-    sessionId: null,
-    db: st.s.getDB("test"),
-    assertFunction: runTest,
-    runGetMoreFunc: function() {
-        db.getMongo().forceReadMode("legacy");
-        let cmdRes = {
-            "cursor": {"firstBatch": [], "id": cursorId, "ns": db.jstest_with_pinned_cursor},
-            "ok": 1
-        };
-        let cursor = new DBCommandCursor(db, cmdRes, 2);
-        cursor.itcount();
+    runGetMoreFunc: function(collName, cursorId) {
+        assert.commandWorked(db.runCommand({getMore: cursorId, collection: collName}));
     },
     failPointName: failPointName,
     assertEndCounts: true
 });
 st.stop();
-})();

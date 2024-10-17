@@ -1,16 +1,14 @@
 // @tags: [requires_sharding]
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-
 /**
  * Performs basic checks on the configureFailPoint and waitForFailPoint command.
  * Also check mongo/util/fail_point_test.cpp for unit tests.
  *
  * @param adminDB {DB} the admin database database object
  */
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 function runBasicTest(adminDB) {
     function expectFailPointState(fpState, expectedMode, expectedData) {
         assert.eq(expectedMode, fpState.mode);
@@ -94,7 +92,7 @@ function runBasicTest(adminDB) {
 
     // Test that waitForFailPoint throws an error when maxTimeMS is not provided.
     assert.commandFailedWithCode(adminDB.adminCommand({waitForFailPoint: "dummy", timesEntered: 1}),
-                                 40414);
+                                 [ErrorCodes.FailedToParse, ErrorCodes.IDLFailedToParse]);
 }
 
 // Test the parameter handling.
@@ -137,4 +135,3 @@ assert.lte(1, configureFailPointRes.count);
 joinHungWrite();
 
 st.stop();
-})();

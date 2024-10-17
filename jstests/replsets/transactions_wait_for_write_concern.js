@@ -8,11 +8,12 @@
  * duplicate operation.
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collNameBase = "coll";
@@ -187,4 +188,3 @@ runTest("majority");
 runTest("snapshot");
 
 rst.stopSet();
-}());

@@ -3,12 +3,9 @@
  * system.views when views are dropped.
  * @tags: [
  *   assumes_superuser_permissions,
- *   requires_find_command,
+ *   assumes_unsharded_collection,
  * ]
  */
-(function() {
-"use strict";
-
 let viewsDBName = "views_drop";
 let viewsDB = db.getSiblingDB(viewsDBName);
 viewsDB.dropDatabase();
@@ -24,12 +21,11 @@ assert(viewsDB.coll.drop(), "couldn't drop coll");
 assert.eq(viewsDB.view.find().toArray(), [], "view isn't empty after dropping coll");
 assert(viewsDB.view.drop(), "couldn't drop view");
 assert.eq(
-    viewsDB.system.views.find().toArray(), [], "system.views isn't empty after dropping view");
-assert(viewsDB.system.views.drop(), "couldn't drop system.views");
+    viewsDB['system.views'].find().toArray(), [], "system.views isn't empty after dropping view");
+assert(viewsDB['system.views'].drop(), "couldn't drop system.views");
 
 // Database should now be empty.
 let res = viewsDB.runCommand({listCollections: 1});
 assert.commandWorked(res);
 assert.eq(
     res.cursor.firstBatch, [], viewsDBName + " is not empty after deleting views and system.views");
-})();

@@ -26,29 +26,58 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include <fstream>
+#include <algorithm>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <fstream>  // IWYU pragma: keep
 #include <iostream>
 #include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include <boost/algorithm/string.hpp>
-#include <boost/filesystem.hpp>
-#include <boost/filesystem/operations.hpp>
-#include <boost/format.hpp>
-#include <boost/optional/optional_io.hpp>
+#include <absl/container/node_hash_set.h>
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/filesystem/path_traits.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/client/sdam/election_id_set_version_pair.h"
 #include "mongo/client/sdam/json_test_arg_parser.h"
+#include "mongo/client/sdam/sdam_configuration.h"
 #include "mongo/client/sdam/sdam_configuration_parameters_gen.h"
+#include "mongo/client/sdam/sdam_datatypes.h"
+#include "mongo/client/sdam/server_description.h"
+#include "mongo/client/sdam/topology_description.h"
 #include "mongo/client/sdam/topology_manager.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/options_parser/environment.h"
-#include "mongo/util/options_parser/option_section.h"
-#include "mongo/util/options_parser/options_parser.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/optional_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 /**
  * This program runs the Server Discover and Monitoring JSON test files located in
@@ -67,7 +96,6 @@
  */
 
 namespace fs = boost::filesystem;
-namespace moe = mongo::optionenvironment;
 using namespace mongo::sdam;
 
 namespace mongo::sdam {
@@ -82,13 +110,13 @@ public:
         for (auto& response : bsonResponses) {
             const auto pair = response.Array();
             const auto address = HostAndPort(pair[0].String());
-            const auto bsonIsMaster = pair[1].Obj();
+            const auto bsonHello = pair[1].Obj();
 
-            if (bsonIsMaster.nFields() == 0) {
-                _isMasterResponses.push_back(HelloOutcome(address, BSONObj(), "network error"));
+            if (bsonHello.nFields() == 0) {
+                _helloResponses.push_back(HelloOutcome(address, BSONObj(), "network error"));
             } else {
-                _isMasterResponses.push_back(
-                    HelloOutcome(address, bsonIsMaster, duration_cast<HelloRTT>(kLatency)));
+                _helloResponses.push_back(
+                    HelloOutcome(address, bsonHello, duration_cast<HelloRTT>(kLatency)));
             }
         }
         _topologyOutcome = phase["outcome"].Obj();
@@ -109,7 +137,7 @@ public:
     PhaseResult execute(TopologyManager& topology) const {
         PhaseResult testResult{{}, _phaseNum};
 
-        for (auto response : _isMasterResponses) {
+        for (const auto& response : _helloResponses) {
             auto descriptionStr =
                 (response.getResponse()) ? response.getResponse()->toString() : "[ Network Error ]";
             LOGV2(20202,
@@ -140,7 +168,8 @@ private:
     template <typename T, typename U>
     std::string errorMessageNotEqual(T expected, U actual) const {
         std::stringstream errorMessage;
-        errorMessage << "expected '" << actual << "' to equal '" << expected << "'";
+        errorMessage << "expected '" << optional_io::Extension{actual} << "' to equal '"
+                     << optional_io::Extension{expected} << "'";
         return errorMessage.str();
     }
 
@@ -179,91 +208,98 @@ private:
 
         std::string fieldName = expectedField.fieldName();
         if (fieldName == "type") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      auto status = parseServerType(expectedField.String());
-                                      if (!status.isOK()) {
-                                          auto errorDescription = std::make_pair(
-                                              serverDescriptionFieldName(serverDescription, "type"),
-                                              status.getStatus().toString());
-                                          result->errorDescriptions.push_back(errorDescription);
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    auto status = parseServerType(expectedField.String());
+                    if (!status.isOK()) {
+                        auto errorDescription =
+                            std::make_pair(serverDescriptionFieldName(serverDescription, "type"),
+                                           status.getStatus().toString());
+                        result->errorDescriptions.push_back(errorDescription);
 
-                                          // return the actual value since we already have reported
-                                          // an error about the parsed server type from the json
-                                          // file.
-                                          return serverDescription->getType();
-                                      }
-                                      return status.getValue();
-                                  },
-                                  serverDescription->getType());
+                        // return the actual value since we already have reported
+                        // an error about the parsed server type from the json
+                        // file.
+                        return serverDescription->getType();
+                    }
+                    return status.getValue();
+                },
+                serverDescription->getType());
 
         } else if (fieldName == "setName") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<std::string> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.String();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getSetName());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<std::string> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.String();
+                    }
+                    return result;
+                },
+                serverDescription->getSetName());
 
         } else if (fieldName == "setVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<int> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.numberInt();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getSetVersion());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<int> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.numberInt();
+                    }
+                    return result;
+                },
+                serverDescription->getElectionIdSetVersionPair().setVersion);
 
         } else if (fieldName == "electionId") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<OID> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.OID();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getElectionId());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<OID> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.OID();
+                    }
+                    return result;
+                },
+                serverDescription->getElectionIdSetVersionPair().electionId);
 
         } else if (fieldName == "logicalSessionTimeoutMinutes") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<int> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.numberInt();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getLogicalSessionTimeoutMinutes());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<int> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.numberInt();
+                    }
+                    return result;
+                },
+                serverDescription->getLogicalSessionTimeoutMinutes());
 
         } else if (fieldName == "minWireVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() { return expectedField.numberInt(); },
-                                  serverDescription->getMinWireVersion());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() { return expectedField.numberInt(); },
+                serverDescription->getMinWireVersion());
 
         } else if (fieldName == "maxWireVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() { return expectedField.numberInt(); },
-                                  serverDescription->getMaxWireVersion());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() { return expectedField.numberInt(); },
+                serverDescription->getMaxWireVersion());
 
         } else {
             MONGO_UNREACHABLE;
@@ -335,18 +371,18 @@ private:
 
         {
             constexpr auto fieldName = "setName";
-            doValidateTopologyDescriptionField(result,
-                                               fieldName,
-                                               [&]() {
-                                                   boost::optional<std::string> ret;
-                                                   auto bsonField =
-                                                       bsonTopologyDescription[fieldName];
-                                                   if (!bsonField.isNull()) {
-                                                       ret = bsonField.String();
-                                                   }
-                                                   return ret;
-                                               },
-                                               topologyDescription->getSetName());
+            doValidateTopologyDescriptionField(
+                result,
+                fieldName,
+                [&]() {
+                    boost::optional<std::string> ret;
+                    auto bsonField = bsonTopologyDescription[fieldName];
+                    if (!bsonField.isNull()) {
+                        ret = bsonField.String();
+                    }
+                    return ret;
+                },
+                topologyDescription->getSetName());
         }
 
         {
@@ -368,36 +404,36 @@ private:
         {
             constexpr auto fieldName = "maxSetVersion";
             if (bsonTopologyDescription.hasField(fieldName)) {
-                doValidateTopologyDescriptionField(result,
-                                                   fieldName,
-                                                   [&]() {
-                                                       boost::optional<int> ret;
-                                                       auto bsonField =
-                                                           bsonTopologyDescription[fieldName];
-                                                       if (!bsonField.isNull()) {
-                                                           ret = bsonField.numberInt();
-                                                       }
-                                                       return ret;
-                                                   },
-                                                   topologyDescription->getMaxSetVersion());
+                doValidateTopologyDescriptionField(
+                    result,
+                    fieldName,
+                    [&]() {
+                        boost::optional<int> ret;
+                        auto bsonField = bsonTopologyDescription[fieldName];
+                        if (!bsonField.isNull()) {
+                            ret = bsonField.numberInt();
+                        }
+                        return ret;
+                    },
+                    topologyDescription->getMaxElectionIdSetVersionPair().setVersion);
             }
         }
 
         {
             constexpr auto fieldName = "maxElectionId";
             if (bsonTopologyDescription.hasField(fieldName)) {
-                doValidateTopologyDescriptionField(result,
-                                                   fieldName,
-                                                   [&]() {
-                                                       boost::optional<OID> ret;
-                                                       auto bsonField =
-                                                           bsonTopologyDescription[fieldName];
-                                                       if (!bsonField.isNull()) {
-                                                           ret = bsonField.OID();
-                                                       }
-                                                       return ret;
-                                                   },
-                                                   topologyDescription->getMaxElectionId());
+                doValidateTopologyDescriptionField(
+                    result,
+                    fieldName,
+                    [&]() {
+                        boost::optional<OID> ret;
+                        auto bsonField = bsonTopologyDescription[fieldName];
+                        if (!bsonField.isNull()) {
+                            ret = bsonField.OID();
+                        }
+                        return ret;
+                    },
+                    topologyDescription->getMaxElectionIdSetVersionPair().electionId);
             }
         }
 
@@ -418,7 +454,7 @@ private:
 
     MongoURI _testUri;
     int _phaseNum;
-    std::vector<HelloOutcome> _isMasterResponses;
+    std::vector<HelloOutcome> _helloResponses;
     BSONObj _topologyOutcome;
 };
 
@@ -486,7 +522,7 @@ private:
             _jsonTest = fromjson(json.str());
         }
 
-        _testName = _jsonTest.getStringField("description");
+        _testName = _jsonTest.getStringField("description").toString();
         _testUri = uassertStatusOK(mongo::MongoURI::parse(_jsonTest["uri"].String()));
 
         _replicaSetName = _testUri.getOption("replicaSet");
@@ -538,7 +574,7 @@ public:
     std::vector<JsonTestCase::TestCaseResult> runTests() {
         std::vector<JsonTestCase::TestCaseResult> results;
         const auto testFiles = getTestFiles();
-        for (auto jsonTest : testFiles) {
+        for (const auto& jsonTest : testFiles) {
             auto testCase = JsonTestCase(jsonTest);
             try {
                 LOGV2(20208, "### Executing Test Case ###", "test"_attr = testCase.Name());

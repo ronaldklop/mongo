@@ -27,31 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/ftdc/collector.h"
 
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
+#include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/constants.h"
-#include "mongo/db/ftdc/util.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/replica_set_endpoint_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-void FTDCCollectorCollection::add(std::unique_ptr<FTDCCollectorInterface> collector) {
+void FTDCCollectorCollection::add(std::unique_ptr<FTDCCollectorInterface> collector,
+                                  ClusterRole role) {
     // TODO: ensure the collectors all have unique names.
-    _collectors.emplace_back(std::move(collector));
+    _collectors[role].emplace_back(std::move(collector));
 }
 
-std::tuple<BSONObj, Date_t> FTDCCollectorCollection::collect(Client* client) {
+std::tuple<BSONObj, Date_t> FTDCCollectorCollection::collect(
+    Client* client, UseMultiServiceSchema multiServiceSchema) {
+    static constexpr auto roles = std::to_array<std::pair<ClusterRole::Value, StringData>>({
+        {ClusterRole::ShardServer, "shard"_sd},
+        {ClusterRole::RouterServer, "router"_sd},
+        {ClusterRole::None, "common"_sd},
+    });
+
     // If there are no collectors, just return an empty BSONObj so that that are caller knows we did
     // not collect anything
-    if (_collectors.empty()) {
+    if (std::all_of(
+            roles.begin(), roles.end(), [&](auto r) { return _collectors[r.first].empty(); })) {
         return std::tuple<BSONObj, Date_t>(BSONObj(), Date_t());
     }
 
@@ -61,38 +75,74 @@ std::tuple<BSONObj, Date_t> FTDCCollectorCollection::collect(Client* client) {
     Date_t end;
     bool firstLoop = true;
 
-    builder.appendDate(kFTDCCollectStartField, start);
+    const auto getStartDate = [&] {
+        if (!firstLoop) {
+            return client->getServiceContext()->getPreciseClockSource()->now();
+        }
+        return start;
+    };
+
+    builder.appendDate(kFTDCCollectStartField, getStartDate());
 
     // All collectors should be ok seeing the inconsistent states in the middle of replication
     // batches. This is desirable because we want to be able to collect data in the middle of
     // batches that are taking a long time.
     auto opCtx = client->makeOperationContext();
-    ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
-    opCtx->lockState()->skipAcquireTicket();
+    opCtx->setEnforceConstraints(false);
 
-    // Ensure future transactions read without a timestamp.
-    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+    ScopedAdmissionPriority<ExecutionAdmissionContext> admissionPriority(
+        opCtx.get(), AdmissionContext::Priority::kExempt);
 
-    for (auto& collector : _collectors) {
-        BSONObjBuilder subObjBuilder(builder.subobjStart(collector->name()));
-
-        // Add a Date_t before and after each BSON is collected so that we can track timing of the
-        // collector.
-        Date_t now = start;
-
-        if (!firstLoop) {
-            now = client->getServiceContext()->getPreciseClockSource()->now();
+    for (auto&& role : roles) {
+        auto& collectorVector = _collectors[role.first];
+        if (collectorVector.empty()) {
+            continue;
         }
 
-        firstLoop = false;
+        boost::optional<BSONObjBuilder> sectionBuilder;
+        BSONObjBuilder* parent = &builder;
 
-        subObjBuilder.appendDate(kFTDCCollectStartField, now);
+        if (multiServiceSchema) {
+            sectionBuilder.emplace(builder.subobjStart(role.second));
+            sectionBuilder->appendDate(kFTDCCollectStartField, getStartDate());
+            parent = &(*sectionBuilder);
+        }
 
-        collector->collect(opCtx.get(), subObjBuilder);
+        // If we are running router collectors, we need to make sure that the opCtx points to the
+        // router service.
+        boost::optional<replica_set_endpoint::ScopedSetRouterService> scopedRouterService;
+        if (role.first == ClusterRole::RouterServer &&
+            !opCtx->getService()->role().has(ClusterRole::RouterServer)) {
+            scopedRouterService.emplace(opCtx.get());
+        }
 
-        end = client->getServiceContext()->getPreciseClockSource()->now();
-        subObjBuilder.appendDate(kFTDCCollectEndField, end);
+        for (auto& collector : collectorVector) {
+            // Skip collection if this collector has no data to return
+            if (!collector->hasData()) {
+                continue;
+            }
+
+            BSONObjBuilder subObjBuilder(parent->subobjStart(collector->name()));
+
+            // Add a Date_t before and after each BSON is collected so that we can track timing of
+            // the collector.
+            subObjBuilder.appendDate(kFTDCCollectStartField, getStartDate());
+
+            collector->collect(opCtx.get(), subObjBuilder);
+
+            end = client->getServiceContext()->getPreciseClockSource()->now();
+            subObjBuilder.appendDate(kFTDCCollectEndField, end);
+
+            // Ensure the collector did not set a read timestamp.
+            invariant(shard_role_details::getRecoveryUnit(opCtx.get())->getTimestampReadSource() ==
+                      RecoveryUnit::ReadSource::kNoTimestamp);
+
+            firstLoop = false;
+        }
+
+        if (multiServiceSchema) {
+            sectionBuilder->appendDate(kFTDCCollectEndField, end);
+        }
     }
 
     builder.appendDate(kFTDCCollectEndField, end);

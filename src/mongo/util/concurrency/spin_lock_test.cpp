@@ -27,24 +27,27 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <vector>
 
-#include <functional>
-
+#include "mongo/base/string_data.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
 namespace {
 
-using mongo::SpinLock;
-using mongo::Timer;
-
-namespace stdx = mongo::stdx;
+using namespace fmt::literals;
 
 class LockTester {
 public:
@@ -129,7 +132,6 @@ public:
         }
 
         int ms = timer.millis();
-        using namespace mongo::literals;
         LOGV2(24149, "spinlock {testName} time: {ms}", "testName"_attr = testName, "ms"_attr = ms);
 
         ASSERT_EQUALS(counter, _threads * _incs);
@@ -152,3 +154,4 @@ TEST(Concurrency, ConcurrentIncsWithTryLock) {
 }
 
 }  // namespace
+}  // namespace mongo

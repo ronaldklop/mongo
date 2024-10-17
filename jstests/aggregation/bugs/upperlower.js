@@ -1,6 +1,5 @@
-// $toUpper, $toLower tests.
-(function() {
-'use strict';
+import "jstests/libs/query/sbe_assert_error_override.js";
+
 const coll = db.jstests_aggregation_upperlower;
 coll.drop();
 assert.commandWorked(coll.insert({}));
@@ -84,4 +83,3 @@ assertResult('HELLO WORLD', 'hello world', '$nested.str');
 assertResult('\u1ebd', '\u1ebd', '$unicode');
 assertResult('A\0B\0\0Z', 'a\0b\0\0z', '$string_with_nulls_1');
 assertResult('A\0\0B\0Z', 'a\0\0b\0z', '$string_with_nulls_2');
-}());

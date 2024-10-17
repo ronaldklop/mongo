@@ -27,19 +27,44 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-#include "mongo/platform/basic.h"
-
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
+#include <mutex>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbmessage.h"
 #include "mongo/db/repl/cloner_utils.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/tenant_all_database_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 namespace repl {
@@ -59,10 +84,12 @@ TenantAllDatabaseCloner::TenantAllDatabaseCloner(TenantMigrationSharedData* shar
       _tenantId(tenantId),
       _listDatabasesStage("listDatabases", this, &TenantAllDatabaseCloner::listDatabasesStage),
       _listExistingDatabasesStage(
-          "listExistingDatabases", this, &TenantAllDatabaseCloner::listExistingDatabasesStage) {}
+          "listExistingDatabases", this, &TenantAllDatabaseCloner::listExistingDatabasesStage),
+      _initializeStatsStage(
+          "initializeStatsStage", this, &TenantAllDatabaseCloner::initializeStatsStage) {}
 
 BaseCloner::ClonerStages TenantAllDatabaseCloner::getStages() {
-    return {&_listDatabasesStage, &_listExistingDatabasesStage};
+    return {&_listDatabasesStage, &_listExistingDatabasesStage, &_initializeStatsStage};
 }
 
 void TenantAllDatabaseCloner::preStage() {
@@ -93,7 +120,7 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listDatabasesStage() {
 
     BSONObj readResult;
     BSONObj cmd = ClonerUtils::buildMajorityWaitRequest(_operationTime);
-    getClient()->runCommand("admin", cmd, readResult, QueryOption_SecondaryOk);
+    getClient()->runCommand(DatabaseName::kAdmin, cmd, readResult, QueryOption_SecondaryOk);
     uassertStatusOKWithContext(
         getStatusFromCommandResult(readResult),
         "TenantAllDatabaseCloner failed to get listDatabases result majority-committed");
@@ -130,9 +157,15 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listDatabasesStage() {
 BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesStage() {
     auto opCtx = cc().makeOperationContext();
     DBDirectClient client(opCtx.get());
+    tenantMigrationInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationInfo>(getSharedData()->getMigrationId());
 
     const BSONObj filter = ClonerUtils::makeTenantDatabaseFilter(_tenantId);
     auto databasesArray = client.getDatabaseInfos(filter, true /* nameOnly */);
+
+    long long approxTotalSizeOnDisk = 0;
+    // Use a map to figure out the size of the partially cloned database.
+    StringMap<long long> dbNameToSize;
 
     std::vector<std::string> clonedDatabases;
     for (const auto& dbBSON : databasesArray) {
@@ -148,9 +181,27 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesSta
 
         const auto& dbName = dbBSON["name"].str();
         clonedDatabases.emplace_back(dbName);
+
+        BSONObj res;
+        client.runCommand(DatabaseNameUtil::deserialize(
+                              boost::none, dbName, SerializationContext::stateDefault()),
+                          BSON("dbStats" << 1),
+                          res);
+        if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
+            LOGV2_WARNING(5522900,
+                          "Skipping recording of data size metrics for database due to failure "
+                          "in the 'dbStats' command, tenant migration stats may be inaccurate.",
+                          "db"_attr = dbName,
+                          "migrationId"_attr = getSharedData()->getMigrationId(),
+                          "tenantId"_attr = _tenantId,
+                          "status"_attr = status);
+        } else {
+            dbNameToSize[dbName] = res.getField("dataSize").safeNumberLong();
+            approxTotalSizeOnDisk += dbNameToSize[dbName];
+        }
     }
 
-    if (!getSharedData()->isResuming()) {
+    if (getSharedData()->getResumePhase() == ResumePhase::kNone) {
         uassert(ErrorCodes::NamespaceExists,
                 str::stream() << "Tenant '" << _tenantId
                               << "': databases already exist prior to data sync",
@@ -166,11 +217,18 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesSta
         const auto& startingDb =
             std::lower_bound(_databases.begin(), _databases.end(), lastClonedDb);
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             if (startingDb != _databases.end() && *startingDb == lastClonedDb) {
                 _stats.databasesClonedBeforeFailover = clonedDatabases.size() - 1;
+
+                // When the 'startingDb' matches the 'lastClonedDb', the 'startingDb' is currently
+                // partially cloned. Therefore, exclude the 'startingDb' when calculating the size,
+                // as it is counted on demand by the database cloner.
+                _stats.approxTotalBytesCopied =
+                    approxTotalSizeOnDisk - dbNameToSize.at(*startingDb);
             } else {
                 _stats.databasesClonedBeforeFailover = clonedDatabases.size();
+                _stats.approxTotalBytesCopied = approxTotalSizeOnDisk;
             }
         }
         _databases.erase(_databases.begin(), startingDb);
@@ -191,42 +249,49 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesSta
     return kContinueNormally;
 }
 
-void TenantAllDatabaseCloner::postStage() {
-    {
-        // Finish calculating the size of the databases that were either partially cloned or
-        // completely un-cloned from a previous migration. Perform this before grabbing the _mutex,
-        // as commands are being sent over the network.
-        long long approxTotalDataSize = 0;
-        for (const auto& dbName : _databases) {
-            BSONObj res;
-            getClient()->runCommand(dbName, BSON("dbStats" << 1), res);
-            if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
-                LOGV2_WARNING(5426600,
-                              "Skipping recording of data size metrics for database due to failure "
-                              "in the 'dbStats' command, tenant migration stats may be inaccurate.",
-                              "db"_attr = dbName,
-                              "migrationId"_attr = getSharedData()->getMigrationId(),
-                              "tenantId"_attr = _tenantId,
-                              "status"_attr = status);
-            } else {
-                approxTotalDataSize += res.getField("dataSize").safeNumberLong();
-            }
+BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::initializeStatsStage() {
+    // Finish calculating the size of the databases that were either partially cloned or
+    // completely un-cloned from a previous migration. Perform this before grabbing the _mutex,
+    // as commands are being sent over the network.
+    long long approxTotalDataSizeLeftOnRemote = 0;
+    for (const auto& dbName : _databases) {
+        BSONObj res;
+        getClient()->runCommand(DatabaseNameUtil::deserialize(
+                                    boost::none, dbName, SerializationContext::stateDefault()),
+                                BSON("dbStats" << 1),
+                                res);
+        if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
+            LOGV2_WARNING(5426600,
+                          "Skipping recording of data size metrics for database due to failure "
+                          "in the 'dbStats' command, tenant migration stats may be inaccurate.",
+                          "db"_attr = dbName,
+                          "migrationId"_attr = getSharedData()->getMigrationId(),
+                          "tenantId"_attr = _tenantId,
+                          "status"_attr = status);
+        } else {
+            approxTotalDataSizeLeftOnRemote += res.getField("dataSize").safeNumberLong();
         }
-
-        stdx::lock_guard<Latch> lk(_mutex);
-        _stats.databasesCloned = 0;
-        _stats.databasesToClone = _databases.size();
-        _stats.databaseStats.reserve(_databases.size());
-        for (const auto& dbName : _databases) {
-            _stats.databaseStats.emplace_back();
-            _stats.databaseStats.back().dbname = dbName;
-        }
-        _stats.approxTotalDataSize = approxTotalDataSize;
     }
 
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    // The 'approxTotalDataSize' is the sum of the size copied so far and the size left to be
+    // copied.
+    _stats.approxTotalDataSize = _stats.approxTotalBytesCopied + approxTotalDataSizeLeftOnRemote;
+    _stats.databasesCloned = 0;
+    _stats.databasesToClone = _databases.size();
+    _stats.databaseStats.reserve(_databases.size());
+    for (const auto& dbName : _databases) {
+        _stats.databaseStats.emplace_back();
+        _stats.databaseStats.back().dbname = dbName;
+    }
+
+    return kContinueNormally;
+}
+
+void TenantAllDatabaseCloner::postStage() {
     for (const auto& dbName : _databases) {
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _currentDatabaseCloner = std::make_unique<TenantDatabaseCloner>(dbName,
                                                                             getSharedData(),
                                                                             getSource(),
@@ -255,7 +320,7 @@ void TenantAllDatabaseCloner::postStage() {
             return;
         }
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
             _stats.approxTotalBytesCopied +=
                 _stats.databaseStats[_stats.databasesCloned].approxTotalBytesCopied;
@@ -266,7 +331,7 @@ void TenantAllDatabaseCloner::postStage() {
 }
 
 TenantAllDatabaseCloner::Stats TenantAllDatabaseCloner::getStats() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     TenantAllDatabaseCloner::Stats stats = _stats;
     if (_currentDatabaseCloner) {
         stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
@@ -277,7 +342,7 @@ TenantAllDatabaseCloner::Stats TenantAllDatabaseCloner::getStats() const {
 }
 
 std::string TenantAllDatabaseCloner::toString() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return str::stream() << "tenant migration --"
                          << " active:" << isActive(lk) << " status:" << getStatus(lk).toString()
                          << " source:" << getSource() << " tenantId: " << _tenantId

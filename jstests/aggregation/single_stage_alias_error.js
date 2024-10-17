@@ -1,13 +1,15 @@
 /**
  * Tests to verify that single aggregation stages that are input into an aggregation pipeline by
  * the user under an aliased name use that name when reporting errors back to the user.
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
+import {
+    assertErrMsgContains,
+    assertErrMsgDoesNotContain
+} from "jstests/aggregation/extras/utils.js";
 
-// For assertErrMessageContains and assertErrMessageDoesNotContain.
-load("jstests/aggregation/extras/utils.js");
 const coll = db.single_stage_alias_error;
 
 coll.drop();
@@ -20,7 +22,10 @@ assertErrMsgDoesNotContain(coll, pipeline, "$addFields");
 
 pipeline = [{'$addFields': {"$a.$c": 1}}];
 assertErrMsgContains(coll, pipeline, "$addFields");
-assertErrMsgDoesNotContain(coll, pipeline, "$set");
+
+// From version 5.0 on the error message suggests using $setField (which trivially
+// includes $set) so this assert should check for something that isn't a substring of $setField.
+assertErrMsgDoesNotContain(coll, pipeline, "$set ");
 
 // Assert that, despite the fact $unset is an alias for an exclusion projection, error messages
 // use only the name used by the user.
@@ -37,4 +42,3 @@ assertErrMsgDoesNotContain(coll, pipeline, "$unset");
 var doc = {'_id': 0};
 coll.insert(doc);
 pipeline = [{'$replaceWith': "abc"}];
-})();

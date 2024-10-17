@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/query/collation/collator_interface_mock.h"
-
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -70,8 +71,11 @@ CollatorInterfaceMock::CollatorInterfaceMock(MockType mockType)
       _mockType(mockType) {}
 
 std::unique_ptr<CollatorInterface> CollatorInterfaceMock::clone() const {
-    auto clone = std::make_unique<CollatorInterfaceMock>(_mockType);
-    return {std::move(clone)};
+    return std::make_unique<CollatorInterfaceMock>(_mockType);
+}
+
+std::shared_ptr<CollatorInterface> CollatorInterfaceMock::cloneShared() const {
+    return std::make_shared<CollatorInterfaceMock>(_mockType);
 }
 
 int CollatorInterfaceMock::compare(StringData left, StringData right) const {

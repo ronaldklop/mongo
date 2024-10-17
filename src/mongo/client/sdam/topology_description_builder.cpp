@@ -29,6 +29,11 @@
 
 #include "mongo/client/sdam/topology_description_builder.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/client/sdam/election_id_set_version_pair.h"
+
 namespace mongo::sdam {
 
 
@@ -55,7 +60,7 @@ TopologyDescriptionBuilder& TopologyDescriptionBuilder::withSetName(const std::s
 }
 
 TopologyDescriptionBuilder& TopologyDescriptionBuilder::withMaxSetVersion(int maxSetVersion) {
-    _instance->_maxSetVersion = maxSetVersion;
+    _instance->_maxElectionIdSetVersionPair.setVersion = maxSetVersion;
     return *this;
 }
 
@@ -67,7 +72,7 @@ TopologyDescriptionBuilder& TopologyDescriptionBuilder::withServers(
 
 TopologyDescriptionBuilder& TopologyDescriptionBuilder::withMaxElectionID(
     const OID& maxElectionId) {
-    _instance->_maxElectionId = maxElectionId;
+    _instance->_maxElectionIdSetVersionPair.electionId = maxElectionId;
     return *this;
 }
 

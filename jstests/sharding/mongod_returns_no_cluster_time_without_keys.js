@@ -4,10 +4,13 @@
  * config server.
  *
  * This test restarts shard replica sets, so it requires a persistent storage engine.
- * @tags: [requires_persistence]
+ * @tags: [
+ *   requires_persistence,
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test uses authentication and runs commands without authenticating, which is not
 // compatible with implicit sessions.
@@ -56,7 +59,15 @@ adminDB.auth(adminUser.username, adminUser.password);
 assert(st.s.getDB("admin").system.keys.count() >= 2);
 
 let priRSConn = st.rs0.getPrimary().getDB("admin");
+if (TestData.configShard) {
+    // In config shard mode we've already used up the localhost exception on the first shard, so we
+    // have to auth to create the user below.
+    priRSConn.auth(adminUser.username, adminUser.password);
+}
 priRSConn.createUser({user: rUser.username, pwd: rUser.password, roles: ["root"]});
+if (TestData.configShard) {
+    priRSConn.logout();
+}
 priRSConn.auth(rUser.username, rUser.password);
 
 // use assert.soon since it's possible the shard primary may not have refreshed
@@ -99,4 +110,3 @@ assert.eq(resNoKeys.hasOwnProperty("$clusterTime"), false);
 assert.eq(resNoKeys.hasOwnProperty("operationTime"), false);
 
 st.stop();
-})();

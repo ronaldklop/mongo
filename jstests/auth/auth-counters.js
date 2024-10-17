@@ -1,8 +1,7 @@
 // Test for auth counters in serverStatus.
 // @tags: [requires_replication]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const keyfile = 'jstests/libs/key1';
 const badKeyfile = 'jstests/libs/key2';
@@ -25,8 +24,14 @@ test.createUser(
 // Count the number of authentications performed during setup
 const expected =
     assert.commandWorked(admin.runCommand({serverStatus: 1})).security.authentication.mechanisms;
+admin.logout();
 
 function assertStats() {
+    // Need to be authenticated to run serverStatus.
+    assert(admin.auth('admin', 'pwd'));
+    ++expected['SCRAM-SHA-256'].authenticate.successful;
+    ++expected['SCRAM-SHA-256'].authenticate.received;
+
     const mechStats = assert.commandWorked(admin.runCommand({serverStatus: 1}))
                           .security.authentication.mechanisms;
     Object.keys(expected).forEach(function(mech) {
@@ -45,13 +50,13 @@ function assertStats() {
             throw e;
         }
     });
+
+    admin.logout();
 }
 
 function assertSuccess(creds, mech, db = test) {
     assert.eq(db.auth(creds), true);
-    if (db !== admin) {
-        db.logout();
-    }
+    db.logout();
     ++expected[mech].authenticate.received;
     ++expected[mech].authenticate.successful;
     assertStats();
@@ -64,7 +69,7 @@ function assertFailure(creds, mech, db = test) {
 }
 
 function assertSuccessInternal() {
-    const mech = "SCRAM-SHA-1";
+    const mech = "SCRAM-SHA-256";
     // asCluster exiting cleanly indicates successful auth
     assert.eq(authutil.asCluster(replTest.nodes, keyfile, () => true), true);
     ++expected[mech].authenticate.received;
@@ -75,8 +80,11 @@ function assertSuccessInternal() {
     assertSuccess({user: 'admin', pwd: 'pwd'}, 'SCRAM-SHA-256', admin);
 }
 
+// Because authutil.asCluster utilizes SCRAM-SHA-256 as a default keyfile mechanism, we will attempt
+// to record this authentication with an invalid keyfile, and then verify that the # of
+// successful attempts made using the fallback (SCRAM-SHA-256) has NOT been incremented
 function assertFailureInternal() {
-    const mech = "SCRAM-SHA-1";
+    const mech = "SCRAM-SHA-256";
     // If asCluster fails, it explodes.
     assert.throws(authutil.asCluster, [replTest.nodes, badKeyfile, () => true]);
     ++expected[mech].authenticate.received;
@@ -125,4 +133,3 @@ const finalStats =
 replTest.stopSet();
 
 printjson(finalStats);
-})();

@@ -27,25 +27,45 @@
  *    it in the license file.
  */
 
-/**
- * pdfile unit tests
- */
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/json.h"
-#include "mongo/db/ops/insert.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/insert.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
+namespace mongo {
 namespace PdfileTests {
-
 namespace Insert {
+
 class Base {
 public:
-    Base() : _lk(&_opCtx), _context(&_opCtx, nss().ns()) {}
+    Base() : _lk(&_opCtx), _context(&_opCtx, nss()) {}
 
     virtual ~Base() {
         if (!collection())
@@ -57,10 +77,11 @@ public:
 
 protected:
     static NamespaceString nss() {
-        return NamespaceString("unittests.pdfiletests.Insert");
+        return NamespaceString::createNamespaceString_forTest("unittests.pdfiletests.Insert");
     }
     CollectionPtr collection() {
-        return CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        return CollectionPtr(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
     }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -75,20 +96,22 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
         BSONObj x = BSON("x" << 1);
         ASSERT(x["_id"].type() == 0);
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
-            coll = _context.db()->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(_context.db()->createCollection(&_opCtx, nss()));
         }
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT(!coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT_NOT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
 
         StatusWith<BSONObj> fixed = fixDocumentForInsert(&_opCtx, x);
         ASSERT(fixed.isOK());
         x = fixed.getValue();
         ASSERT(x["_id"].type() == jstOID);
-        ASSERT(coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
         wunit.commit();
     }
 };
@@ -156,11 +179,11 @@ public:
 };
 }  // namespace Insert
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("pdfile") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Insert::InsertNoId>();
         add<Insert::UpdateDate>();
         add<Insert::UpdateDate2>();
@@ -168,6 +191,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace PdfileTests
+}  // namespace mongo

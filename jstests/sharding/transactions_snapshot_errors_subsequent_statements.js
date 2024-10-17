@@ -6,11 +6,15 @@
 // sharded collection with one chunk on both shards.
 //
 // @tags: [requires_sharding, uses_transactions, uses_multi_shard_transaction]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    assertNoSuchTransactionOnAllShards,
+    disableStaleVersionAndSnapshotRetriesWithinTransactions,
+    enableStaleVersionAndSnapshotRetriesWithinTransactions,
+    kSnapshotErrors,
+    setFailCommandOnShards,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -48,6 +52,7 @@ function runTest(st, collName, errorCode, isSharded) {
     for (let commandTestCase of kCommandTestCases) {
         const commandName = commandTestCase.name;
         const commandBody = commandTestCase.command;
+        const failCommandOptions = {namespace: ns, errorCode, failCommands: [commandName]};
 
         if (isSharded && commandName === "distinct") {
             // Distinct isn't allowed on sharded collections in a multi-document transaction.
@@ -60,7 +65,7 @@ function runTest(st, collName, errorCode, isSharded) {
         assert.commandWorked(sessionDB.runCommand({find: collName, filter: {_id: 15}}));
 
         // Verify the command must fail on a snapshot error from a subsequent statement.
-        setFailCommandOnShards(st, {times: 1}, [commandName], errorCode, 1, ns);
+        setFailCommandOnShards(st, {times: 1}, failCommandOptions, 1);
         const res = assert.commandFailedWithCode(sessionDB.runCommand(commandBody), errorCode);
         assert.eq(res.errorLabels, ["TransientTransactionError"]);
 
@@ -71,23 +76,22 @@ function runTest(st, collName, errorCode, isSharded) {
     }
 }
 
-const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+const st = new ShardingTest({shards: 2, mongos: 1});
 
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 jsTestLog("Unsharded transaction");
 
 assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 5}, {writeConcern: {w: "majority"}}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 // Single shard case simulates the storage engine discarding an in-use snapshot.
 for (let errorCode of kSnapshotErrors) {
     runTest(st, collName, errorCode, false /* isSharded */);
 }
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
 // Set up 2 chunks, [minKey, 10), [10, maxKey), each with one document (includes the document
@@ -124,4 +128,3 @@ for (let errorCode of kSnapshotErrors) {
 disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 st.stop();
-})();

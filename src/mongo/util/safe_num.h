@@ -29,11 +29,16 @@
 
 #pragma once
 
+#include <cstdint>
 #include <iosfwd>
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo {
 
@@ -41,6 +46,7 @@ namespace mutablebson {
 class Element;
 class Document;
 }  // namespace mutablebson
+class Value;
 
 /**
  * SafeNum holds and does arithmetic on a number in a safe way, handling overflow
@@ -156,6 +162,7 @@ public:
 
     friend class mutablebson::Element;
     friend class mutablebson::Document;
+    friend class Value;
 
     /**
      * Appends contents to given BSONObjBuilder.

@@ -16,11 +16,9 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 3});
 replTest.startSet();
@@ -28,7 +26,10 @@ replTest.initiateWithHighElectionTimeout();
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
-
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 const dbName = "test";
 const collName = jsTestName();
 const testDB = primary.getDB(dbName);
@@ -96,7 +97,7 @@ jsTestLog("Checking that the first transaction is properly prepared");
 
 // Make sure that we can't read changes to the document from the first prepared transaction
 // after initial sync.
-assert.docEq(secondaryColl.findOne({_id: 1}), {_id: 1});
+assert.docEq({_id: 1}, secondaryColl.findOne({_id: 1}));
 
 jsTestLog("Committing the transaction");
 
@@ -105,7 +106,6 @@ replTest.awaitReplication();
 
 // Make sure that we can see the data from a committed transaction on the secondary if it was
 // applied during secondary oplog application.
-assert.docEq(secondaryColl.findOne({_id: 1}), {_id: 1, a: 1});
+assert.docEq({_id: 1, a: 1}, secondaryColl.findOne({_id: 1}));
 
 replTest.stopSet();
-})();

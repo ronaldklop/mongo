@@ -29,13 +29,14 @@
 
 #pragma once
 
-#include <memory>
-#include <vector>
-
 #include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 
@@ -74,6 +75,11 @@ public:
      * If a requested pin fails, a log will be issued, but the process will otherwise continue.
      */
     void reconcilePins(OperationContext* opCtx);
+
+    /**
+     * Removes all registered pins.
+     */
+    void clearPins(OperationContext* opCtx);
 
 private:
     std::vector<std::unique_ptr<DurableHistoryPin>> _pins;

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
@@ -54,10 +56,9 @@ MONGO_INITIALIZER(PdhInit)(InitializerContext* context) {
 
     hPdhLibrary = LoadLibraryW(L"pdh.dll");
     if (nullptr == hPdhLibrary) {
-        DWORD gle = GetLastError();
+        auto ec = lastSystemError();
         uasserted(ErrorCodes::WindowsPdhError,
-                  str::stream() << "LoadLibrary of pdh.dll failed with "
-                                << errnoWithDescription(gle));
+                  str::stream() << "LoadLibrary of pdh.dll failed with " << errorMessage(ec));
     }
 }
 
@@ -81,7 +82,7 @@ std::string errnoWithPdhDescription(PDH_STATUS status) {
         return str::stream() << "Format message failed with " << gle << " for status " << status;
     }
 
-    auto errorTextGuard = makeGuard([errorText] { LocalFree(errorText); });
+    ScopeGuard errorTextGuard([errorText] { LocalFree(errorText); });
     std::string utf8ErrorText = toUtf8String(errorText);
 
     auto size = utf8ErrorText.find_first_of("\r\n");

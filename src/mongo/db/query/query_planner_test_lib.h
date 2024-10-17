@@ -31,14 +31,20 @@
  * This file contains tests for mongo/db/query/query_planner.cpp
  */
 
+#include <ostream>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include <ostream>
 
 namespace mongo {
 
@@ -59,9 +65,9 @@ public:
      * Means that the index bounds on field 'a' consist of the two intervals
      * [1, 2) and (3, 4] and the index bounds on field 'b' are [-Infinity, Infinity].
      */
-    static bool boundsMatch(const BSONObj& testBounds,
-                            const IndexBounds trueBounds,
-                            bool relaxBoundsCheck);
+    static Status boundsMatch(const BSONObj& testBounds,
+                              IndexBounds trueBounds,
+                              bool relaxBoundsCheck);
 
     /**
      * @param testSoln -- a BSON representation of a query solution
@@ -69,16 +75,16 @@ public:
      * @param: relaxBoundsCheck -- If 'true', will perform a relaxed "subset" check on index bounds.
      *         Will perform a full check otherwise.
      *
-     * Returns true if the BSON representation matches the actual
-     * tree, otherwise returns false.
+     * Returns Status::OK() if the BSON representation matches the actual tree, otherwise returns
+     * a non-OK status indicating what did not match.
      */
-    static bool solutionMatches(const BSONObj& testSoln,
-                                const QuerySolutionNode* trueSoln,
-                                bool relaxBoundsCheck = false);
+    static Status solutionMatches(const BSONObj& testSoln,
+                                  const QuerySolutionNode* trueSoln,
+                                  bool relaxBoundsCheck = false);
 
-    static bool solutionMatches(const std::string& testSoln,
-                                const QuerySolutionNode* trueSoln,
-                                bool relaxBoundsCheck = false) {
+    static Status solutionMatches(const std::string& testSoln,
+                                  const QuerySolutionNode* trueSoln,
+                                  bool relaxBoundsCheck = false) {
         return solutionMatches(fromjson(testSoln), trueSoln, relaxBoundsCheck);
     }
 };

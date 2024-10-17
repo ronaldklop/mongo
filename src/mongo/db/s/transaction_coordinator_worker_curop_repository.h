@@ -28,7 +28,13 @@
  */
 #pragma once
 
+#include <memory>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
 
 namespace mongo {
 
@@ -43,6 +49,7 @@ public:
         kWritingDecision,
         kSendingCommit,
         kSendingAbort,
+        kWritingEndOfTransaction,
         kDeletingCoordinatorDoc
     };
 
@@ -54,8 +61,8 @@ public:
      */
     virtual void set(OperationContext* opCtx,
                      const LogicalSessionId& lsid,
-                     const TxnNumber txnNumber,
-                     const CoordinatorAction action) = 0;
+                     TxnNumberAndRetryCounter txnNumberAndRetryCounter,
+                     CoordinatorAction action) = 0;
 
     /**
      * Output the state into BSON previously associated with this OperationContext instance.

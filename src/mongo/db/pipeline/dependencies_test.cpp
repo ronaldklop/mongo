@@ -27,26 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <bitset>
+#include <compare>
 #include <set>
 #include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
-using std::set;
 using std::string;
 
 template <size_t ArrayLen>
-set<string> arrayToSet(const char* (&array)[ArrayLen]) {
-    set<string> out;
+OrderedPathSet arrayToSet(const char* (&array)[ArrayLen]) {
+    OrderedPathSet out;
     for (size_t i = 0; i < ArrayLen; i++)
         out.insert(array[i]);
     return out;
@@ -162,6 +164,13 @@ TEST(DependenciesToProjectionTest, ShouldIncludeFieldEvenIfSuffixOfAnotherFieldW
                       BSON("a" << 1 << "ab" << 1 << "_id" << 0));
 }
 
+TEST(DependenciesToProjectionTest, ExcludeIndirectDescendants) {
+    const char* array[] = {"a.b", "_id", "a.b.c.d.e"};
+    DepsTracker deps;
+    deps.fields = arrayToSet(array);
+    ASSERT_BSONOBJ_EQ(deps.toProjectionWithoutMetadata(), BSON("_id" << 1 << "a.b" << 1));
+}
+
 TEST(DependenciesToProjectionTest, ShouldIncludeIdIfNeeded) {
     const char* array[] = {"a", "_id"};
     DepsTracker deps;
@@ -197,6 +206,27 @@ TEST(DependenciesToProjectionTest, ShouldIncludeFieldPrefixedByIdWhenIdSubfieldI
     deps.fields = arrayToSet(array);
     ASSERT_BSONOBJ_EQ(deps.toProjectionWithoutMetadata(),
                       BSON("_id.a" << 1 << "_id_a" << 1 << "a" << 1));
+}
+
+// SERVER-66418
+TEST(DependenciesToProjectionTest, ChildCoveredByParentWithSpecialChars) {
+    // without "_id"
+    {
+        // This is an important test case because '-' is one of the few chars before '.' in utf-8.
+        const char* array[] = {"a", "a-b", "a.b"};
+        DepsTracker deps;
+        deps.fields = arrayToSet(array);
+        ASSERT_BSONOBJ_EQ(deps.toProjectionWithoutMetadata(),
+                          BSON("a" << 1 << "a-b" << 1 << "_id" << 0));
+    }
+    // with "_id"
+    {
+        const char* array[] = {"_id", "a", "a-b", "a.b"};
+        DepsTracker deps;
+        deps.fields = arrayToSet(array);
+        ASSERT_BSONOBJ_EQ(deps.toProjectionWithoutMetadata(),
+                          BSON("_id" << 1 << "a" << 1 << "a-b" << 1));
+    }
 }
 
 TEST(DependenciesToProjectionTest, ShouldOutputEmptyObjectIfEntireDocumentNeeded) {
@@ -257,6 +287,79 @@ TEST(DependenciesToProjectionTest,
     ASSERT_BSONOBJ_EQ(deps.toProjectionWithoutMetadata(), BSONObj());
     ASSERT_EQ(deps.metadataDeps().count(), 1u);
     ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+}
+
+TEST(DependenciesToProjectionTest, SortFieldPaths) {
+    const char* array[] = {"",
+                           "A",
+                           "_id",
+                           "a",
+                           "a.b",
+                           "a.b.c",
+                           "a.c",
+                           // '-' char in utf-8 comes before '.' but our special fieldpath sort
+                           // puts '.' first so that children directly follow their parents.
+                           "a-b",
+                           "a-b.ear",
+                           "a-bear",
+                           "a-bear.",
+                           "a🌲",
+                           "b",
+                           "b.a",
+                           "b.aa",
+                           "b.🌲d"};
+    auto fields = arrayToSet(array);
+    // our custom sort will restore the ordering above
+    auto itr = fields.begin();
+    for (unsigned long i = 0; i < fields.size(); i++) {
+        ASSERT_EQ(*itr, array[i]);
+        ++itr;
+    }
+}
+
+TEST(DependenciesToProjectionTest, PathLessThan) {
+    auto lessThan = PathComparator();
+
+    // Test std::string type comparison.
+    ASSERT_FALSE(lessThan(std::string("a"), std::string("a")));
+    ASSERT_TRUE(lessThan(std::string("a"), std::string("aa")));
+    ASSERT_TRUE(lessThan(std::string("a"), std::string("b")));
+    ASSERT_TRUE(lessThan(std::string(""), std::string("a")));
+    ASSERT_TRUE(lessThan(std::string("Aa"), std::string("aa")));
+    ASSERT_TRUE(lessThan(std::string("a.b"), std::string("ab")));
+    ASSERT_TRUE(lessThan(std::string("a.b"), std::string("a-b")));  // SERVER-66418
+    ASSERT_TRUE(lessThan(std::string("a.b"), std::string("a b")));  // SERVER-66418
+    // Verify the difference from the standard sort.
+    ASSERT_TRUE(std::string("a.b") > std::string("a-b"));
+    ASSERT_TRUE(std::string("a.b") > std::string("a b"));
+    // Test unicode behavior.
+    ASSERT_TRUE(lessThan(std::string("a.b"), std::string("a🌲")));
+    ASSERT_TRUE(lessThan(std::string("a.b"), std::string("a🌲b")));
+    ASSERT_TRUE(lessThan(std::string("🌲"), std::string("🌳")));  // U+1F332 < U+1F333
+    ASSERT_TRUE(lessThan(std::string("🌲"), std::string("🌲.b")));
+    ASSERT_FALSE(lessThan(std::string("🌲.b"), std::string("🌲")));
+
+    // Test StringData type comparison.
+    ASSERT_FALSE(lessThan(StringData("a"), StringData("a")));
+    ASSERT_TRUE(lessThan(StringData("a"), StringData("aa")));
+    ASSERT_TRUE(lessThan(StringData("a"), StringData("b")));
+    ASSERT_TRUE(lessThan(StringData(""), StringData("a")));
+    ASSERT_TRUE(lessThan(StringData("Aa"), StringData("aa")));
+    ASSERT_TRUE(lessThan(StringData("a.b"), StringData("ab")));
+
+    ASSERT_TRUE(lessThan(StringData("a.b"), StringData("a-b")));  // SERVER-66418
+    ASSERT_TRUE(lessThan(StringData("a.b"), StringData("a b")));  // SERVER-66418
+
+    // Verify the difference from the standard sort.
+    ASSERT_TRUE(StringData("a.b") > StringData("a-b"));
+    ASSERT_TRUE(StringData("a.b") > StringData("a b"));
+
+    // Test unicode behavior.
+    ASSERT_TRUE(lessThan(StringData("a.b"), StringData("a🌲")));
+    ASSERT_TRUE(lessThan(StringData("a.b"), StringData("a🌲b")));
+    ASSERT_TRUE(lessThan(StringData("🌲"), StringData("🌳")));  // U+1F332 < U+1F333
+    ASSERT_TRUE(lessThan(StringData("🌲"), StringData("🌲.b")));
+    ASSERT_FALSE(lessThan(StringData("🌲.b"), StringData("🌲")));
 }
 
 }  // namespace

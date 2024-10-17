@@ -75,10 +75,10 @@ from packing import pack, unpack
 	$1 = &temp;
 }
 %typemap(in, numinputs=0) WT_FILE_HANDLE ** (WT_FILE_HANDLE *temp = NULL) {
-	$1 = &temp;
+    $1 = &temp;
  }
-%typemap(in, numinputs=0) WT_LOCATION_HANDLE ** (WT_LOCATION_HANDLE *temp = NULL) {
-	$1 = &temp;
+%typemap(in, numinputs=0) WT_FILE_SYSTEM ** (WT_FILE_SYSTEM *temp = NULL) {
+    $1 = &temp;
  }
 %typemap(in, numinputs=0) WT_STORAGE_SOURCE ** (WT_STORAGE_SOURCE *temp = NULL) {
 	$1 = &temp;
@@ -119,15 +119,18 @@ from packing import pack, unpack
 	    SWIGTYPE_p___wt_cursor, 0);
 	if (*$1 != NULL) {
 		PY_CALLBACK *pcb;
-		uint32_t json;
+		uint64_t json, version_cursor;
 
 		json = (*$1)->flags & WT_CURSTD_DUMP_JSON;
+		version_cursor = (*$1)->flags & WT_CURSTD_VERSION_CURSOR;
 		if (!json)
 			(*$1)->flags |= WT_CURSTD_RAW;
 		PyObject_SetAttrString($result, "is_json",
 		    PyBool_FromLong(json != 0));
 		PyObject_SetAttrString($result, "is_column",
 		    PyBool_FromLong(strcmp((*$1)->key_format, "r") == 0));
+		PyObject_SetAttrString($result, "is_version_cursor",
+		    PyBool_FromLong(version_cursor != 0));
 		PyObject_SetAttrString($result, "key_format",
 		    PyString_InternFromString((*$1)->key_format));
 		PyObject_SetAttrString($result, "value_format",
@@ -190,12 +193,12 @@ from packing import pack, unpack
 	$1 = &val;
 }
 
-%typemap(in,numinputs=0) (char ***object_list, int *countp) (char **list, uint32_t nentries) {
+%typemap(in,numinputs=0) (char ***dirlist, int *countp) (char **list, uint32_t nentries) {
 	$1 = &list;
 	$2 = &nentries;
 }
 
-%typemap(argout) (char ***object_list, int *countp) {
+%typemap(argout) (char ***dirlist, int *countp) {
 	int i;
 	char **list;
 
@@ -203,8 +206,8 @@ from packing import pack, unpack
 	list = (*$1);
 	/*
 	 * When we're done with the individual C strings, free them.
-	 * In theory, we should call the ss_location_list_free() method,
-	 * but that's awkward, since we don't have the storage_source and session.
+	 * In theory, we should call the fs_directory_list_free() method,
+	 * but that's awkward, since we don't have the file system and session.
 	 */
 	for (i = 0; i < *$2; i++) {
 		PyObject *o = PyString_InternFromString(list[i]);
@@ -219,8 +222,8 @@ from packing import pack, unpack
 	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_file_handle, 0);
 }
 
-%typemap(argout) WT_LOCATION_HANDLE ** {
-	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_location_handle, 0);
+%typemap(argout) WT_FILE_SYSTEM ** {
+	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1), SWIGTYPE_p___wt_file_system, 0);
 }
 
 %typemap(argout) WT_STORAGE_SOURCE ** {
@@ -340,8 +343,8 @@ DESTRUCTOR(__wt_connection, close)
 DESTRUCTOR(__wt_cursor, close)
 DESTRUCTOR(__wt_file_handle, close)
 DESTRUCTOR(__wt_session, close)
-DESTRUCTOR(__wt_storage_source, close)
-DESTRUCTOR(__wt_location_handle, close)
+DESTRUCTOR(__wt_storage_source, ss_terminate)
+DESTRUCTOR(__wt_file_system, fs_terminate)
 
 /*
  * OVERRIDE_METHOD must be used when overriding or extending an existing
@@ -406,6 +409,7 @@ typedef struct {
 } PY_CALLBACK;
 
 static PyObject *wtError;
+static PyObject *wtRollbackError;
 
 static int sessionFreeHandler(WT_SESSION *session_arg);
 static int cursorFreeHandler(WT_CURSOR *cursor_arg);
@@ -421,19 +425,22 @@ static int unpackBytesOrString(PyObject *obj, void **data, size_t *size);
 
 %init %{
 	/*
-	 * Create an exception type and put it into the _wiredtiger module.
-	 * First increment the reference count because PyModule_AddObject
-	 * decrements it.  Then note that "m" is the local variable for the
-	 * module in the SWIG generated code.  If there is a SWIG variable for
-	 * this, I haven't found it.
+	 * Create exception types and put them into the _wiredtiger module.
+	 * For each, first increment the reference count because PyModule_AddObject
+	 * decrements it, and we don't want to look it up later.
 	 */
 	wtError = PyErr_NewException("_wiredtiger.WiredTigerError", NULL, NULL);
 	Py_INCREF(wtError);
 	PyModule_AddObject(m, "WiredTigerError", wtError);
+
+	wtRollbackError = PyErr_NewException("_wiredtiger.WiredTigerRollbackError", wtError, NULL);
+	Py_INCREF(wtRollbackError);
+	PyModule_AddObject(m, "WiredTigerRollbackError", wtRollbackError);
 %}
 
 %pythoncode %{
 WiredTigerError = _wiredtiger.WiredTigerError
+WiredTigerRollbackError = _wiredtiger.WiredTigerRollbackError
 
 # Python3 has no explicit long type, recnos work as ints
 import sys
@@ -518,7 +525,7 @@ SELFHELPER(struct __wt_connection, connection)
 SELFHELPER(struct __wt_session, session)
 SELFHELPER(struct __wt_cursor, cursor)
 SELFHELPER(struct __wt_file_handle, file_handle)
-SELFHELPER(struct __wt_location_handle, location_handle)
+SELFHELPER(struct __wt_file_system, file_system)
 SELFHELPER(struct __wt_storage_source, storage_source)
 
  /*
@@ -529,7 +536,10 @@ SELFHELPER(struct __wt_storage_source, storage_source)
 do {
 	if (PyErr_Occurred() == NULL) {
 		/* We could use PyErr_SetObject for more complex reporting. */
-		SWIG_SetErrorMsg(wtError, wiredtiger_strerror(result));
+                if (PyErr_Occurred() == NULL && (intptr_t)result == WT_ROLLBACK)
+			SWIG_SetErrorMsg(wtRollbackError, wiredtiger_strerror(result));
+                else
+			SWIG_SetErrorMsg(wtError, wiredtiger_strerror(result));
 	}
 	SWIG_fail;
 } while(0)
@@ -582,6 +592,7 @@ NOTFOUND_OK(__wt_cursor::remove)
 NOTFOUND_OK(__wt_cursor::search)
 NOTFOUND_OK(__wt_cursor::update)
 NOTFOUND_OK(__wt_cursor::_modify)
+NOTFOUND_OK(__wt_cursor::largest_key)
 ANY_OK(__wt_modify::__wt_modify)
 ANY_OK(__wt_modify::~__wt_modify)
 
@@ -593,6 +604,8 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception __wt_connection::get_home;
 %exception __wt_connection::is_new;
 %exception __wt_connection::search_near;
+%exception __wt_session::get_rollback_reason;
+%exception __wt_session::strerror;
 %exception __wt_cursor::_set_key;
 %exception __wt_cursor::_set_key_str;
 %exception __wt_cursor::_set_value;
@@ -600,6 +613,7 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception wiredtiger_strerror;
 %exception wiredtiger_version;
 %exception diagnostic_build;
+%exception standalone_build;
 
 /* WT_CURSOR customization. */
 /* First, replace the varargs get / set methods with Python equivalents. */
@@ -612,6 +626,9 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %ignore __wt_modify::data;
 %ignore __wt_modify::offset;
 %ignore __wt_modify::size;
+
+/* Replace get_raw_key_value method with a Python equivalent */
+%ignore __wt_cursor::get_raw_key_value;
 
 /* Next, override methods that return integers via arguments. */
 %ignore __wt_cursor::compare(WT_CURSOR *, WT_CURSOR *, int *);
@@ -628,7 +645,11 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 /* Handle binary data returns from get_key/value -- avoid cstring.i: it creates a list of returns. */
 %typemap(in,numinputs=0) (char **datap, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
 %typemap(in,numinputs=0) (char **charp, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
+%typemap(in,numinputs=0) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) (char *metadata, int metadatasize, char *data, int datasize) { $1 = &metadata; $2 = &metadatasize; $3 = &data; $4 = &datasize; }
+%typemap(in,numinputs=0) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (char *key_data, int key_size, char *value_data, int value_size) { $1 = &key_data; $2 = &key_size; $3 = &value_data; $4 = &value_size; }
 %typemap(frearg) (char **datap, int *sizep) "";
+%typemap(frearg) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) "";
+%typemap(frearg) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) "";
 %typemap(argout) (char **charp, int *sizep) {
 	if (*$1)
 		$result = PyUnicode_FromStringAndSize(*$1, *$2);
@@ -637,7 +658,31 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 %typemap(argout) (char **datap, int *sizep) {
 	if (*$1)
 		$result = PyBytes_FromStringAndSize(*$1, *$2);
- }
+}
+
+%typemap(argout)(char **metadatap, int *metadatasizep, char **datap, int *datasizep) (
+    PyObject *metadata, PyObject *data) {
+	if (*$1 && *$3) {
+		metadata = PyBytes_FromStringAndSize(*$1, *$2);
+		$result = metadata;
+		data = PyBytes_FromStringAndSize(*$3, *$4);
+		$result = SWIG_Python_AppendOutput($result, data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
+	}
+}
+
+%typemap(argout)(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (
+    PyObject *key_data, PyObject *value_data) {
+	if (*$1 && *$3) {
+		key_data = PyBytes_FromStringAndSize(*$1, *$2);
+		$result = key_data;
+		value_data = PyBytes_FromStringAndSize(*$3, *$4);
+		$result = SWIG_Python_AppendOutput($result, value_data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
+	}
+}
 
 /* Handle binary data input from FILE_HANDLE->fh_write. */
 %typemap(in,numinputs=1) (size_t length, const void *buf) (Py_ssize_t length, const void *buf = NULL) {
@@ -748,6 +793,18 @@ typedef int int_void;
 		return (ret);
 	}
 
+	int_void _get_raw_key_value(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) {
+		WT_ITEM k, v;
+		int ret = $self->get_raw_key_value($self, &k, &v);
+		if (ret == 0) {
+			*key_datap = (char *)k.data;
+			*key_sizep = (int)k.size;
+			*value_datap = (char *)v.data;
+			*value_sizep = (int)v.size;
+		}
+		return (ret);
+	}
+
 	int_void _get_value(char **datap, int *sizep) {
 		WT_ITEM v;
 		int ret = $self->get_value($self, &v);
@@ -764,6 +821,19 @@ typedef int int_void;
 		if (ret == 0) {
 			*charp = (char *)k;
 			*sizep = strlen(k);
+		}
+		return (ret);
+	}
+
+	int_void _get_version_cursor_value(char **metadatap, int *metadatasizep, char **datap, int *datasizep) {
+		WT_ITEM metadata;
+		WT_ITEM v;
+		int ret = $self->get_value($self, &metadata, &v);
+		if (ret == 0) {
+			*metadatap = (char *)metadata.data;
+			*metadatasizep = (int)metadata.size;
+			*datap = (char *)v.data;
+			*datasizep = (int)v.size;
 		}
 		return (ret);
 	}
@@ -873,8 +943,24 @@ typedef int int_void;
 		@copydoc WT_CURSOR::get_value'''
 		if self.is_json:
 			return [self._get_json_value()]
+		elif self.is_version_cursor:
+			result = self._get_version_cursor_value()
+			metadata = unpack("QQQQQQBBBB", result[0])
+			data = unpack(self.value_format[10:], result[1])
+			return metadata + data
 		else:
 			return unpack(self.value_format, self._get_value())
+
+	def get_raw_key_value(self):
+		'''get_raw_key_value(self) -> object
+
+		@copydoc WT_CURSOR::get_raw_key_value
+		Returns a tuple containing both the key and the value.'''
+
+		result = self._get_raw_key_value()
+		keys = unpack(self.key_format, result[0])
+		values = unpack(self.value_format, result[1])
+		return (keys[0], values[0])
 
 	def set_key(self, *args):
 		'''set_key(self) -> None
@@ -985,40 +1071,47 @@ typedef int int_void;
 };
 %enddef
 
-SIDESTEP_METHOD(__wt_storage_source, ss_location_handle,
-  (WT_SESSION *session, const char *config, WT_LOCATION_HANDLE **handle),
-  (self, session, config, handle))
+SIDESTEP_METHOD(__wt_storage_source, ss_customize_file_system,
+  (WT_SESSION *session, const char *bucket_name,
+    const char *auth_token, const char *config, WT_FILE_SYSTEM **file_systemp),
+  (self, session, bucket_name, auth_token, config, file_systemp))
 
-SIDESTEP_METHOD(__wt_location_handle, close,
+SIDESTEP_METHOD(__wt_storage_source, ss_flush,
+  (WT_SESSION *session, WT_FILE_SYSTEM *file_system,
+    const char *source, const char *object, const char *config),
+  (self, session, file_system, source, object, config))
+
+SIDESTEP_METHOD(__wt_storage_source, ss_flush_finish,
+  (WT_SESSION *session, WT_FILE_SYSTEM *file_system,
+    const char *source, const char *object, const char *config),
+  (self, session, file_system, source, object, config))
+
+SIDESTEP_METHOD(__wt_storage_source, terminate,
   (WT_SESSION *session),
   (self, session))
 
-SIDESTEP_METHOD(__wt_storage_source, ss_exist,
-  (WT_SESSION *session, WT_LOCATION_HANDLE *location_handle,
-    const char *name, bool *existp),
-  (self, session, location_handle, name, existp))
+SIDESTEP_METHOD(__wt_file_system, fs_exist,
+  (WT_SESSION *session, const char *name, bool *existp),
+  (self, session, name, existp))
 
-SIDESTEP_METHOD(__wt_storage_source, ss_flush,
-  (WT_SESSION *session, WT_LOCATION_HANDLE *location_handle,
-    const char *name, const char *config),
-  (self, session, location_handle, name, config))
+SIDESTEP_METHOD(__wt_file_system, fs_open_file,
+  (WT_SESSION *session, const char *name, WT_FS_OPEN_FILE_TYPE file_type,
+    uint32_t flags, WT_FILE_HANDLE **file_handlep),
+  (self, session, name, file_type, flags, file_handlep))
 
-SIDESTEP_METHOD(__wt_storage_source, ss_open_object,
-  (WT_SESSION *session, WT_LOCATION_HANDLE *location_handle,
-    const char *name, uint32_t flags, WT_FILE_HANDLE **file_handlep),
-  (self, session, location_handle, name, flags, file_handlep))
+SIDESTEP_METHOD(__wt_file_system, fs_remove,
+  (WT_SESSION *session, const char *name, uint32_t flags),
+  (self, session, name, flags))
 
-SIDESTEP_METHOD(__wt_storage_source, ss_remove,
-  (WT_SESSION *session, WT_LOCATION_HANDLE *location_handle,
-    const char *name, uint32_t flags),
-  (self, session, location_handle, name, flags))
+SIDESTEP_METHOD(__wt_file_system, fs_rename,
+  (WT_SESSION *session, const char *from, const char *to, uint32_t flags),
+  (self, session, from, to, flags))
 
-SIDESTEP_METHOD(__wt_storage_source, ss_size,
-  (WT_SESSION *session, WT_LOCATION_HANDLE *location_handle,
-    const char *name, wt_off_t *sizep),
-  (self, session, location_handle, name, sizep))
+SIDESTEP_METHOD(__wt_file_system, fs_size,
+  (WT_SESSION *session, const char *name, wt_off_t *sizep),
+  (self, session, name, sizep))
 
-SIDESTEP_METHOD(__wt_storage_source, terminate,
+SIDESTEP_METHOD(__wt_file_system, terminate,
   (WT_SESSION *session),
   (self, session))
 
@@ -1092,20 +1185,26 @@ SIDESTEP_METHOD(__wt_file_handle, fh_write,
     }
 };
 
-%ignore __wt_storage_source::ss_location_list;
-%rename (ss_location_list) __wt_storage_source::_ss_location_list;
-%extend __wt_storage_source {
-    int _ss_location_list(WT_SESSION *session, WT_LOCATION_HANDLE *handle, const char *prefix,
-      uint32_t limit, char ***object_list, int *countp) {
-        return (self->ss_location_list(self, session, handle, prefix, limit, object_list, countp));
+%ignore __wt_file_system::fs_directory_list;
+%ignore __wt_file_system::fs_directory_list_single;
+%rename (fs_directory_list) __wt_file_system::_fs_directory_list;
+%rename (fs_directory_list_single) __wt_file_system::_fs_directory_list_single;
+%extend __wt_file_system {
+    int _fs_directory_list(WT_SESSION *session, const char *directory, const char *prefix,
+      char ***dirlist, int *countp) {
+        return (self->fs_directory_list(self, session, directory, prefix, dirlist, countp));
+    }
+    int _fs_directory_list_single(WT_SESSION *session, const char *directory, const char *prefix,
+      char ***dirlist, int *countp) {
+        return (self->fs_directory_list_single(self, session, directory, prefix, dirlist, countp));
     }
 };
 
 /*
- * No need for a location_list_free method, as the list and its components
- * are freed immediately after the location_list call.
+ * No need for a directory_list_free method, as the list and its components
+ * are freed immediately after the directory_list call.
  */
-%ignore __wt_storage_source::ss_location_list_free;
+%ignore __wt_file_system::fs_directory_list_free;
 
 %{
 int diagnostic_build() {
@@ -1116,8 +1215,18 @@ int diagnostic_build() {
 #endif
 }
 %}
-
 int diagnostic_build();
+
+%{
+int standalone_build() {
+#ifdef WT_STANDALONE_BUILD
+	return 1;
+#else
+	return 0;
+#endif
+}
+%}
+int standalone_build();
 
 /* Remove / rename parts of the C API that we don't want in Python. */
 %immutable __wt_cursor::session;
@@ -1164,7 +1273,7 @@ OVERRIDE_METHOD(__wt_session, WT_SESSION, log_printf, (self, msg))
 %rename(Connection) __wt_connection;
 %rename(FileHandle) __wt_file_handle;
 %rename(StorageSource) __wt_storage_source;
-%rename(LocationHandle) __wt_location_handle;
+%rename(FileSystem) __wt_file_system;
 
 %include "wiredtiger.h"
 
@@ -1441,7 +1550,7 @@ def _rename_with_prefix(prefix, toclass):
 _rename_with_prefix('WT_STAT_CONN_', stat.conn)
 _rename_with_prefix('WT_STAT_DSRC_', stat.dsrc)
 _rename_with_prefix('WT_STAT_SESSION_', stat.session)
-_rename_with_prefix('WT_SS_', StorageSource)
+_rename_with_prefix('WT_FS_', FileSystem)
 _rename_with_prefix('WT_FILE_HANDLE_', FileHandle)
 del _rename_with_prefix
 %}

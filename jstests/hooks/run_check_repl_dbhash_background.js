@@ -15,11 +15,8 @@
  * fails with a non-transient error. The most common case of a transient error is attempting to read
  * from a collection after a catalog operation has been performed on the collection or database.
  */
-'use strict';
-
-(function() {
-load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
-load('jstests/libs/parallelTester.js');     // For Thread.
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
 if (typeof db === 'undefined') {
     throw new Error(
@@ -35,10 +32,14 @@ TestData.traceExceptions = false;
 // operations in this test that aren't resilient to interruptions.
 TestData.disableImplicitSessions = true;
 
+const buildInfo = assert.commandWorked(db.runCommand({"buildInfo": 1}));
 const conn = db.getMongo();
 const topology = DiscoverTopology.findConnectedNodes(conn);
 
-function checkReplDbhashBackgroundThread(hosts) {
+async function checkReplDbhashBackgroundThread(hosts) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
+    const {RetryableWritesUtil} = await import("jstests/libs/retryable_writes_util.js");
+
     let debugInfo = [];
 
     // Calls 'func' with the print() function overridden to be a no-op.
@@ -76,8 +77,7 @@ function checkReplDbhashBackgroundThread(hosts) {
     ].map(conn => conn.startSession({causalConsistency: false}));
 
     const resetFns = [];
-    const kForeverSeconds = 1e9;
-    const dbNames = new Set();
+    const dbs = new Map();
 
     // We enable the "WTPreserveSnapshotHistoryIndefinitely" failpoint to ensure that the same
     // snapshot will be available to read at on the primary and secondaries.
@@ -105,14 +105,21 @@ function checkReplDbhashBackgroundThread(hosts) {
         });
     }
 
+    const multitenancyRes =
+        rst.getPrimary().adminCommand({getParameter: 1, multitenancySupport: 1});
+    const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
+
     for (let session of sessions) {
         // Use the session's client directly so FSM workloads that kill random sessions won't
         // interrupt these operations.
         const dbNoSession = session.getClient().getDB('admin');
-        const res =
-            assert.commandWorked(dbNoSession.runCommand({listDatabases: 1, nameOnly: true}));
+
+        const cmdObj = multitenancy ? {listDatabasesForAllTenants: 1} : {listDatabases: 1};
+        const res = RetryableWritesUtil.runCommandWithRetries(dbNoSession, cmdObj);
         for (let dbInfo of res.databases) {
-            dbNames.add(dbInfo.name);
+            const key = `${dbInfo.tenantId}_${dbInfo.name}`;
+            const obj = {name: dbInfo.name, tenant: dbInfo.tenantId};
+            dbs.set(key, obj);
         }
         debugInfo.push({
             "node": dbNoSession.getMongo(),
@@ -123,9 +130,11 @@ function checkReplDbhashBackgroundThread(hosts) {
 
     // Transactions cannot be run on the following databases so we don't attempt to read at a
     // clusterTime on them either. (The "local" database is also not replicated.)
-    dbNames.delete('admin');
-    dbNames.delete('config');
-    dbNames.delete('local');
+    dbs.forEach((db, key) => {
+        if (["admin", "config", "local"].includes(db.name)) {
+            dbs.delete(key);
+        }
+    });
 
     const results = [];
 
@@ -143,49 +152,21 @@ function checkReplDbhashBackgroundThread(hosts) {
             session.advanceClusterTime(signedClusterTime);
 
             // We need to make sure the secondary has applied up to 'clusterTime' and advanced
-            // its majority commit point.
-
-            if (jsTest.options().enableMajorityReadConcern !== false) {
-                // If majority reads are supported, we can issue an afterClusterTime read on
-                // a nonexistent collection and wait on it. This has the advantage of being
-                // easier to debug in case of a timeout.
-                let res = assert.commandWorked(db.runCommand({
-                    find: 'run_check_repl_dbhash_background',
-                    readConcern: {level: 'majority', afterClusterTime: clusterTime},
-                    limit: 1,
-                    singleBatch: true,
-                }),
-                                               debugInfo);
-                debugInfo.push({
-                    "node": db.getMongo(),
-                    "session": session,
-                    "majorityReadOpTime": res['operationTime']
-                });
-            } else {
-                // If majority reads are not supported, then our only option is to poll for the
-                // appliedOpTime on the secondary to catch up.
-                assert.soon(
-                    function() {
-                        const rsStatus =
-                            assert.commandWorked(db.adminCommand({replSetGetStatus: 1}));
-
-                        // The 'atClusterTime' waits for the appliedOpTime to advance to
-                        // 'clusterTime'.
-                        const appliedOpTime = rsStatus.optimes.appliedOpTime;
-                        if (bsonWoCompare(appliedOpTime.ts, clusterTime) >= 0) {
-                            debugInfo.push({
-                                "node": db.getMongo(),
-                                "session": session,
-                                "appliedOpTime": appliedOpTime.ts
-                            });
-                        }
-
-                        return bsonWoCompare(appliedOpTime.ts, clusterTime) >= 0;
-                    },
-                    "The majority commit point on secondary " + i + " failed to reach " +
-                        tojson(clusterTime),
-                    10 * 60 * 1000);
-            }
+            // its majority commit point. Issue an afterClusterTime read on  a nonexistent
+            // collection and wait on it. This has the advantage of being easier to debug in case of
+            // a timeout.
+            let res = assert.commandWorked(db.runCommand({
+                find: 'run_check_repl_dbhash_background',
+                readConcern: {level: 'majority', afterClusterTime: clusterTime},
+                limit: 1,
+                singleBatch: true,
+            }),
+                                           debugInfo);
+            debugInfo.push({
+                "node": db.getMongo(),
+                "session": session,
+                "majorityReadOpTime": res['operationTime']
+            });
         }
     };
 
@@ -261,6 +242,19 @@ function checkReplDbhashBackgroundThread(hosts) {
         return result;
     };
 
+    // When token is not empty, set it on each connection before calling checkCollectionHashesForDB.
+    const checkCollectionHashesForDBWithToken = (dbName, clusterTime, token) => {
+        try {
+            jsTestLog(`About to run setSecurity token on ${rst}`);
+            rst.nodes.forEach(node => node._setSecurityToken(token));
+
+            jsTestLog(`Running checkcollection for ${dbName} with token ${token}`);
+            return checkCollectionHashesForDB(dbName, clusterTime);
+        } finally {
+            rst.nodes.forEach(node => node._setSecurityToken(undefined));
+        }
+    };
+
     // Outside of checkCollectionHashesForDB(), operations in this function are not resilient to
     // their session being killed by a concurrent FSM workload, so the driver sessions started above
     // have not been used and will have contain null logical time values. The process for selecting
@@ -268,12 +262,15 @@ function checkReplDbhashBackgroundThread(hosts) {
     // through each session to populate its logical times.
     sessions.forEach(session => session.getDatabase('admin').runCommand({ping: 1}));
 
-    for (let dbName of dbNames) {
+    for (const [key, db] of dbs) {
         let result;
         let clusterTime;
         let previousClusterTime;
         let hasTransientError;
         let performNoopWrite;
+
+        const dbName = db.name;
+        const token = db.tenant ? _createTenantToken({tenant: db.tenant}) : undefined;
 
         // The isTransientError() function is responsible for setting hasTransientError to true.
         const isTransientError = (e) => {
@@ -313,7 +310,7 @@ function checkReplDbhashBackgroundThread(hosts) {
             // engine cache is full. Since dbHash holds open a read snapshot for an extended period
             // of time and pulls all collection data into cache, the storage engine may abort the
             // operation if it needs to free up space. Try again after space has been freed.
-            if (e.code === ErrorCodes.WriteConflict && buildInfo().debug) {
+            if (e.code === ErrorCodes.WriteConflict && buildInfo.debug) {
                 hasTransientError = true;
             }
 
@@ -349,7 +346,7 @@ function checkReplDbhashBackgroundThread(hosts) {
                     });
                 }
 
-                result = checkCollectionHashesForDB(dbName, clusterTime);
+                result = checkCollectionHashesForDBWithToken(dbName, clusterTime, token);
             } catch (e) {
                 if (isTransientError(e)) {
                     if (performNoopWrite) {
@@ -451,7 +448,7 @@ function checkReplDbhashBackgroundThread(hosts) {
 }
 
 if (topology.type === Topology.kReplicaSet) {
-    let res = checkReplDbhashBackgroundThread(topology.nodes);
+    let res = await checkReplDbhashBackgroundThread(topology.nodes);
     assert.commandWorked(res, () => 'data consistency checks failed: ' + tojson(res));
 } else if (topology.type === Topology.kShardedCluster) {
     const threads = [];
@@ -501,6 +498,7 @@ if (topology.type === Topology.kReplicaSet) {
             }
         });
         if (exception) {
+            // eslint-disable-next-line
             throw exception;
         }
 
@@ -512,4 +510,3 @@ if (topology.type === Topology.kReplicaSet) {
 } else {
     throw new Error('Unsupported topology configuration: ' + tojson(topology));
 }
-})();

@@ -1,12 +1,9 @@
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/logv2_helpers.js");
+import {Thread} from "jstests/libs/parallelTester.js";
 
 /**
  * Implements a kill session test helper
  */
-var _kill_sessions_api_module = (function() {
-    "use strict";
-
+export var _kill_sessions_api_module = (function() {
     var KillSessionsTestHelper = {};
 
     function isdbgrid(client) {
@@ -249,21 +246,12 @@ var _kill_sessions_api_module = (function() {
     CursorHandle.prototype.assertCursorKillLogMessages = function(hostsToCheck) {
         for (let hostToCheck of hostsToCheck) {
             if (hostToCheck.host in this._cursors) {
-                if (isJsonLog(hostToCheck)) {
-                    assert(checkLog.checkContainsOnceJsonStringMatch(
-                               hostToCheck,
-                               20528,
-                               'cursorId',
-                               this._cursors[hostToCheck.host].exactValueString),
-                           "cursor kill was not logged by " + hostToCheck.host);
-                } else {
-                    assert(
-                        checkLog.checkContainsOnce(
-                            hostToCheck,
-                            'killing cursor: ' + this._cursors[hostToCheck.host].exactValueString +
-                                ' as part of killing session(s)'),
-                        "cursor kill was not logged by " + hostToCheck.host);
-                }
+                assert(checkLog.checkContainsOnceJsonStringMatch(
+                           hostToCheck,
+                           20528,
+                           'cursorId',
+                           this._cursors[hostToCheck.host].exactValueString),
+                       "cursor kill was not logged by " + hostToCheck.host);
             }
         }
     };
@@ -799,4 +787,4 @@ var _kill_sessions_api_module = (function() {
 })();
 
 // Globals
-KillSessionsTestHelper = _kill_sessions_api_module.KillSessionsTestHelper;
+export var KillSessionsTestHelper = _kill_sessions_api_module.KillSessionsTestHelper;

@@ -27,16 +27,60 @@
  *    it in the license file.
  */
 
-#include "lock_manager_defs.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/concurrency/resource_catalog.h"
 
 namespace mongo {
 
 // Hardcoded resource IDs.
-const ResourceId resourceIdLocalDB = ResourceId(RESOURCE_DATABASE, StringData("local"));
-const ResourceId resourceIdOplog = ResourceId(RESOURCE_COLLECTION, StringData("local.oplog.rs"));
-const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, StringData("admin"));
-const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL, 1ULL);
-const ResourceId resourceIdParallelBatchWriterMode = ResourceId(RESOURCE_PBWM, 1ULL);
-const ResourceId resourceIdReplicationStateTransitionLock = ResourceId(RESOURCE_RSTL, 1ULL);
+const ResourceId resourceIdLocalDB = ResourceId(RESOURCE_DATABASE, DatabaseName::kLocal);
+const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, DatabaseName::kAdmin);
+const ResourceId resourceIdGlobal =
+    ResourceId(RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kGlobal));
+const ResourceId resourceIdMultiDocumentTransactionsBarrier = ResourceId(
+    RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kMultiDocumentTransactionsBarrier));
+const ResourceId resourceIdReplicationStateTransitionLock = ResourceId(
+    RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kReplicationStateTransitionLock));
+
+std::string ResourceId::toString() const {
+    StringBuilder ss;
+    ss << "{" << _fullHash << ": " << resourceTypeName(getType()) << ", " << getHashId();
+    if (getType() == RESOURCE_DATABASE || getType() == RESOURCE_COLLECTION ||
+        getType() == RESOURCE_MUTEX || getType() == RESOURCE_DDL_DATABASE ||
+        getType() == RESOURCE_DDL_COLLECTION) {
+        if (auto resourceName = ResourceCatalog::get().name(*this)) {
+            ss << ", " << *resourceName;
+        }
+    }
+    ss << "}";
+
+    return ss.str();
+}
+
+void LockRequest::initNew(Locker* locker, LockGrantNotification* notify) {
+    this->locker = locker;
+    this->notify = notify;
+
+    enqueueAtFront = false;
+    compatibleFirst = false;
+    partitioned = false;
+
+    status = STATUS_NEW;
+    mode = MODE_NONE;
+
+    unlockPending = 0;
+    recursiveCount = 1;
+
+    lock = nullptr;
+    partitionedLock = nullptr;
+
+    prev = nullptr;
+    next = nullptr;
+}
 
 }  // namespace mongo

@@ -27,38 +27,58 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/util/stacktrace.h"
 
 #if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
 
-#include <array>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
 #include <atomic>
-#include <boost/filesystem.hpp>
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/fstream.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <cerrno>
+#include <csignal>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <dirent.h>
-#include <fcntl.h>
+#include <cstring>
+#include <ctime>
 #include <fmt/format.h>
-#include <signal.h>
+#include <map>
+#include <memory>
+#include <set>
 #include <string>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
+#include <utility>
 #include <vector>
+// IWYU pragma: no_include <syscall.h>
+// IWYU pragma: no_include "bits/types/siginfo_t.h"
 
 #include "mongo/base/parse_number.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
-#include "mongo/config.h"
+#include "mongo/bson/oid.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/stdx/thread.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/future.h"
 #include "mongo/util/stacktrace_somap.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace stack_trace_detail {
@@ -141,7 +161,6 @@ public:
 
     ~CachedMetaGenerator() {
         LOGV2(23393,
-              "CachedMetaGenerator: {hits}/{hitsAndMisses}",
               "CachedMetaGenerator",
               "hits"_attr = _hits,
               "hitsAndMisses"_attr = (_hits + _misses));
@@ -325,6 +344,14 @@ public:
     void printStacks(StackTraceSink& sink);
     void printStacks();
 
+    /*
+     * This function is currently prone to deadlocks and should not be used.
+     * For more information, refer to SERVER-90775.
+     * TODO (SERVER-90775): Verify that this function is no longer deadlock prone and remove the
+     * usage warnings.
+     */
+    void printAllThreadStacksBlocking_UNSAFE();
+
     /**
      * We need signals for two purpposes in the stack tracing system.
      *
@@ -382,6 +409,7 @@ private:
     int _signal = 0;
     std::atomic<int> _processingTid = -1;                               // NOLINT
     std::atomic<StackCollectionOperation*> _stackCollection = nullptr;  // NOLINT
+    PrintAllStacksSession _printAllStacksSession;
 
     MONGO_STATIC_ASSERT(decltype(_processingTid)::is_always_lock_free);
     MONGO_STATIC_ASSERT(decltype(_stackCollection)::is_always_lock_free);
@@ -406,10 +434,7 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
                           std::vector<int>& missedTids) {
     std::set<int> pendingTids;
     iterateTids([&](int tid) { pendingTids.insert(tid); });
-    LOGV2(23394,
-          "Preparing to dump up to {numThreads} thread stacks",
-          "Preparing to dump thread stacks",
-          "numThreads"_attr = pendingTids.size());
+    LOGV2(23394, "Preparing to dump thread stacks", "numThreads"_attr = pendingTids.size());
 
     messageStorage.resize(pendingTids.size());
     received.reserve(pendingTids.size());
@@ -426,7 +451,6 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
         if (int r = tgkill(getpid(), *iter, _signal); r < 0) {
             int errsv = errno;
             LOGV2(23395,
-                  "Failed to signal thread ({tid}): {error}",
                   "Failed to signal thread",
                   "tid"_attr = *iter,
                   "error"_attr = strerror(errsv));
@@ -436,10 +460,7 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
             ++iter;
         }
     }
-    LOGV2(23396,
-          "Signalled {numThreads} threads",
-          "Signalled threads",
-          "numThreads"_attr = pendingTids.size());
+    LOGV2(23396, "Signalled threads", "numThreads"_attr = pendingTids.size());
 
     size_t napMicros = 0;
     while (!pendingTids.empty()) {
@@ -506,15 +527,11 @@ void State::printStacks() {
             LOGV2(31423, "===== multithread stacktrace session begin =====");
         }
         void prologue(const BSONObj& obj) override {
-            LOGV2(31424,
-                  "Stacktrace Prologue: {prologue}",
-                  "Stacktrace Prologue",
-                  "prologue"_attr = obj);
+            LOGV2(31424, "Stacktrace Prologue", "prologue"_attr = obj);
         }
         void threadRecordsOpen() override {}
         void threadRecord(const BSONObj& obj) override {
             LOGV2(31425,  //
-                  "Stacktrace Record: {record}",
                   "Stacktrace Record",
                   "record"_attr = obj);
         }
@@ -523,10 +540,16 @@ void State::printStacks() {
             LOGV2(31426, "===== multithread stacktrace session end =====");
         }
     };
+
     LogEmitter emitter;
+    auto notifier = _printAllStacksSession.notifier();
     printToEmitter(emitter);
 }
 
+void State::printAllThreadStacksBlocking_UNSAFE() {
+    auto waiter = _printAllStacksSession.waiter();
+    kill(getpid(), _signal);  // The SignalHandler thread calls printAllThreadStacks.
+}
 
 void State::printToEmitter(AbstractEmitter& emitter) {
     std::vector<ThreadBacktrace> messageStorage;
@@ -615,7 +638,7 @@ void State::printToEmitter(AbstractEmitter& emitter) {
 }
 
 void State::action(siginfo_t* si) {
-    const auto errnoGuard = makeGuard([e = errno] { errno = e; });
+    const ScopeGuard errnoGuard([e = errno] { errno = e; });
     switch (si->si_code) {
         case SI_USER:
         case SI_QUEUE:
@@ -658,7 +681,6 @@ void initialize(int signal) {
     if (sigaction(signal, &sa, nullptr) != 0) {
         int savedErr = errno;
         LOGV2_FATAL(31376,
-                    "Failed to install sigaction for signal {signal}: {error}",
                     "Failed to install sigaction for signal",
                     "signal"_attr = signal,
                     "error"_attr = strerror(savedErr));
@@ -666,15 +688,33 @@ void initialize(int signal) {
 }
 
 }  // namespace
+
 }  // namespace stack_trace_detail
 
 
+/*
+ * This function should not be called from outside the SignalHandler thread.
+ */
 void printAllThreadStacks(StackTraceSink& sink) {
     stack_trace_detail::stateSingleton->printStacks(sink);
 }
 
+/*
+ * This function should not be called from outside the SignalHandler thread.
+ */
 void printAllThreadStacks() {
     stack_trace_detail::stateSingleton->printStacks();
+}
+
+/*
+ * This function is intended for usage of printing stacktraces when the caller is not the
+ * SignalHandler. This function is currently prone to deadlocks and should not be used. For more
+ * information, refer to SERVER-90775.
+ * TODO (SERVER-90775): Verify that this function is no longer deadlock prone and remove the
+ * usage warnings.
+ */
+void printAllThreadStacksBlocking_UNSAFE() {
+    stack_trace_detail::stateSingleton->printAllThreadStacksBlocking_UNSAFE();
 }
 
 void setupStackTraceSignalAction(int signal) {

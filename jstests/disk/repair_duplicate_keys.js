@@ -2,13 +2,17 @@
  * Tests that --repair deletes documents containing duplicate unique keys and inserts them into a
  * local lost and found collection.
  *
- * @tags: [requires_wiredtiger]
+ * @tags: [
+ *   requires_wiredtiger,
+ * ]
  */
 
-(function() {
-
-load('jstests/disk/libs/wt_file_helper.js');
-load("jstests/libs/uuid_util.js");
+import {
+    assertQueryUsesIndex,
+    assertRepairSucceeds,
+    startMongodOnExistingPath
+} from "jstests/disk/libs/wt_file_helper.js";
+import {extractUUIDFromObject, getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
 
 const baseName = "repair_duplicate_keys";
 const localBaseName = "local";
@@ -255,5 +259,4 @@ runRepairAndVerifyCollectionDocs();
 
     MongoRunner.stopMongod(mongod);
     jsTestLog("Exiting checkLostAndFoundCollForDoubleDup.");
-})();
 })();

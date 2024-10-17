@@ -25,7 +25,6 @@ import sys
 
 
 def jsToHeader(target, source):
-
     outFile = target
 
     h = [

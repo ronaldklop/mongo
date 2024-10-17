@@ -1,12 +1,5 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [assumes_unsharded_collection]
-
 // In MongoDB 3.4, $graphLookup was introduced. In this file, we test basic behavior and correctness
 // of the stage.
-
-(function() {
-"use strict";
 
 var local = db.local;
 var foreign = db.foreign;
@@ -184,4 +177,3 @@ assert.eq(res.integers.length, 100);
 res.integers.forEach(function(n) {
     assert.eq(n.distance, Math.abs(50 - n._id));
 });
-}());

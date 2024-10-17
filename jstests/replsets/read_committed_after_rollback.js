@@ -3,13 +3,11 @@
  * snapshots be dropped during rollback, therefore committed reads will block until a new committed
  * snapshot is available.
  *
- * @tags: [requires_majority_read_concern]
+ * @tags: [requires_majority_read_concern, requires_fcv_53]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 function doCommittedRead(coll) {
     var res = coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 10000});
@@ -25,9 +23,8 @@ function doDirtyRead(coll) {
 
 // Set up a set and grab things for later.
 var name = "read_committed_after_rollback";
-var replTest = new ReplSetTest(
-    {name: name, nodes: 5, useBridge: true, nodeOptions: {enableMajorityReadConcern: ''}});
-replTest.startSet();
+var replTest = new ReplSetTest({name: name, nodes: 5, useBridge: true});
+replTest.startSet({setParameter: {allowMultipleArbiters: true}});
 
 var nodes = replTest.nodeList();
 var config = {
@@ -50,6 +47,10 @@ replTest.initiate(config);
 var oldPrimary = replTest.getPrimary();
 var [newPrimary, pureSecondary, ...arbiters] = replTest.getSecondaries();
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(oldPrimary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 // This is the collection that all of the tests will use.
 var collName = name + '.collection';
 var oldPrimaryColl = oldPrimary.getCollection(collName);
@@ -58,6 +59,7 @@ var newPrimaryColl = newPrimary.getCollection(collName);
 // Set up initial state.
 assert.commandWorked(oldPrimaryColl.insert({_id: 1, state: 'old'},
                                            {writeConcern: {w: 'majority', wtimeout: 30000}}));
+replTest.awaitReplication();
 assert.eq(doDirtyRead(oldPrimaryColl), 'old');
 assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 assert.eq(doDirtyRead(newPrimaryColl), 'old');
@@ -133,4 +135,3 @@ assert.eq(doCommittedRead(oldPrimaryColl), 'new');
 replTest.checkReplicatedDataHashes();
 replTest.checkOplogs();
 replTest.stopSet();
-}());

@@ -27,34 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/shard_id.h"
 
-#include "mongo/unittest/unittest.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss("test.foo");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 const ShardId kShardOne("shardOne");
 const ShardId kShardTwo("shardTwo");
 const KeyPattern kShardKeyPattern(BSON("a" << 1));
 
 TEST(ChunkTest, HasMovedSincePinnedTimestamp) {
     const OID epoch = OID::gen();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    const UUID uuid = UUID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
 
-    ChunkType chunkType(kNss,
+    ChunkType chunkType(uuid,
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(101, 0), kShardOne), ChunkHistory(Timestamp(100, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(101, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(100, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -63,13 +72,15 @@ TEST(ChunkTest, HasMovedSincePinnedTimestamp) {
 
 TEST(ChunkTest, HasMovedAndReturnedSincePinnedTimestamp) {
     const OID epoch = OID::gen();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    const UUID uuid = UUID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
 
-    ChunkType chunkType(kNss,
+    ChunkType chunkType(uuid,
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory({ChunkHistory(Timestamp(102, 0), kShardOne),
+    chunkType.setOnCurrentShardSince(Timestamp(102, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
                           ChunkHistory(Timestamp(101, 0), kShardTwo),
                           ChunkHistory(Timestamp(100, 0), kShardOne)});
 
@@ -80,14 +91,16 @@ TEST(ChunkTest, HasMovedAndReturnedSincePinnedTimestamp) {
 
 TEST(ChunkTest, HasNotMovedSincePinnedTimestamp) {
     const OID epoch = OID::gen();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    const UUID uuid = UUID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
 
-    ChunkType chunkType(kNss,
+    ChunkType chunkType(uuid,
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(100, 0), kShardOne), ChunkHistory(Timestamp(99, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(100, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(99, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -97,13 +110,15 @@ TEST(ChunkTest, HasNotMovedSincePinnedTimestamp) {
 
 TEST(ChunkTest, HasNoHistoryValidForPinnedTimestamp_OneEntry) {
     const OID epoch = OID::gen();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    const UUID uuid = UUID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
 
-    ChunkType chunkType(kNss,
+    ChunkType chunkType(uuid,
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory({ChunkHistory(Timestamp(101, 0), kShardOne)});
+    chunkType.setOnCurrentShardSince(Timestamp(101, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -112,14 +127,16 @@ TEST(ChunkTest, HasNoHistoryValidForPinnedTimestamp_OneEntry) {
 
 TEST(ChunkTest, HasNoHistoryValidForPinnedTimestamp_MoreThanOneEntry) {
     const OID epoch = OID::gen();
-    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
+    const UUID uuid = UUID::gen();
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
 
-    ChunkType chunkType(kNss,
+    ChunkType chunkType(uuid,
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(102, 0), kShardOne), ChunkHistory(Timestamp(101, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(102, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(101, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));

@@ -29,15 +29,39 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/resource_yielder.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -170,7 +194,7 @@ private:
     std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
 
     // Synchronization.
-    Mutex _mutex = MONGO_MAKE_LATCH("Exchange::_mutex");
+    stdx::mutex _mutex;
     stdx::condition_variable _haveBufferSpace;
 
     // A thread that is currently loading the exchange buffers.
@@ -200,7 +224,7 @@ public:
      * while waiting.
      */
     DocumentSourceExchange(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                           const boost::intrusive_ptr<Exchange> exchange,
+                           boost::intrusive_ptr<Exchange> exchange,
                            size_t consumerId,
                            std::unique_ptr<ResourceYielder> yielder);
 
@@ -221,7 +245,11 @@ public:
 
     const char* getSourceName() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kExchange;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * DocumentSourceExchange does not have a direct source (it is reading through the shared
@@ -245,6 +273,11 @@ public:
 
     auto getConsumerId() const {
         return _consumerId;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // Any correlation analysis should have happened before this stage was created.
+        MONGO_UNREACHABLE;
     }
 
 private:

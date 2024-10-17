@@ -1,13 +1,11 @@
 /**
  * Tests for the create_sharded_collection_util.js module.
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {CreateShardedCollectionUtil} from "jstests/sharding/libs/create_sharded_collection_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
-load("jstests/sharding/libs/create_sharded_collection_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
-
-const st = new ShardingTest({mongos: 1, config: 1, shards: 3, rs: {nodes: 1}});
+const st = new ShardingTest({mongos: 1, shards: 3, rs: {nodes: 1}});
 const collection = st.s.getCollection("test.create_sharded_collection_util");
 
 function assertCreatedWithChunks(shardKey, chunks) {
@@ -102,4 +100,3 @@ assertFailToCreateWithChunks({a: 1},
                              /found gap/);
 
 st.stop();
-})();

@@ -34,7 +34,7 @@ global:
 imports:
     - "mongo/db/auth/access_checks.idl"
     - "mongo/db/auth/action_type.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ListCollectionsReplyInfo:
@@ -44,10 +44,12 @@ structs:
                 type: bool
                 description: "If true, the data store is read only."
                 optional: true
+                stability: stable
             uuid:
                 type: uuid
                 description: "Unique, immutable collection ID."
                 optional: true
+                stability: stable
 
     ListCollectionsReplyItem:
         description: "Individual result"
@@ -55,33 +57,47 @@ structs:
             name:
                 type: string
                 description: "Name of the collection."
+                stability: stable
             type:
                 type: string
                 description: "Type of data store."
+                stability: stable
             options:
                 type: object_owned
                 description: "Collection options."
                 optional: true
+                stability: stable
             info:
                 type: ListCollectionsReplyInfo
                 description: "Information about the collection."
                 optional: true
+                stability: stable
             idIndex:
                 type: object_owned
                 description: "Provides information on the _id index for the collection."
                 optional: true
+                stability: stable
 
     ListCollectionsReplyCursor:
         description: "Cursor object"
         fields:
-            id: long
-            ns: namespacestring
-            firstBatch: array<ListCollectionsReplyItem>
+            id: 
+                type: long
+                stability: stable
+            ns: 
+                type: namespacestring
+                stability: stable
+            firstBatch: 
+                type: array<ListCollectionsReplyItem>
+                stability: stable
 
     ListCollectionsReply:
         description: "The listCollection command's reply."
+        is_command_reply: true
         fields:
-            cursor: ListCollectionsReplyCursor
+            cursor:
+                type: ListCollectionsReplyCursor
+                stability: stable
 
 commands:
     listCollections:
@@ -104,17 +120,21 @@ commands:
             cursor:
                 type: SimpleCursorOptions
                 optional: true
+                stability: stable
             filter:
                 type: object
                 optional: true
+                stability: stable
             nameOnly:
                 type: bool
                 default: false
+                stability: stable
             authorizedCollections:
                 type: bool
                 default: false
+                stability: stable
             includePendingDrops:
                 type: safeBool
-                unstable: true
+                stability: unstable
                 optional: true
         reply_type: ListCollectionsReply

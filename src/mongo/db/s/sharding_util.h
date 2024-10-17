@@ -29,12 +29,19 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace sharding_util {
@@ -49,22 +56,91 @@ void tellShardsToRefreshCollection(OperationContext* opCtx,
                                    const std::shared_ptr<executor::TaskExecutor>& executor);
 
 /**
- * Sends _flushDatabaseCacheUpdatesWithWriteConcern to a list of shards. Throws if one of the
- * shards fails to refresh.
+ * Sends _flushRoutingTableCacheUpdatesWithWriteConcern to a list of shards. Does not wait for or
+ * check the responses from the shards.
  */
-void tellShardsToRefreshDatabase(OperationContext* opCtx,
-                                 const std::vector<ShardId>& shardIds,
-                                 const std::string& dbName,
-                                 const std::shared_ptr<executor::TaskExecutor>& executor);
+void triggerFireAndForgetShardRefreshes(OperationContext* opCtx,
+                                        const std::vector<ShardId>& shardIds,
+                                        const NamespaceString& nss);
 
 /**
- * Generic utility to send a command to a list of shards. Throws if one of the commands fails.
+ * Process the responses received from a set of requests sent to the shards. If `throwOnError=true`,
+ * throws in case one of the commands fails.
  */
-void sendCommandToShards(OperationContext* opCtx,
-                         StringData dbName,
-                         const BSONObj& command,
-                         const std::vector<ShardId>& shardIds,
-                         const std::shared_ptr<executor::TaskExecutor>& executor);
+std::vector<AsyncRequestsSender::Response> processShardResponses(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const BSONObj& command,
+    const std::vector<AsyncRequestsSender::Request>& requests,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    bool throwOnError);
 
+/**
+ * Generic utility to send a command to a list of shards. If `throwOnError=true`, throws in case one
+ * of the commands fails.
+ */
+std::vector<AsyncRequestsSender::Response> sendCommandToShards(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const BSONObj& command,
+    const std::vector<ShardId>& shardIds,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    bool throwOnError = true);
+
+/**
+ * Generic utility to send a command to a list of shards attaching the shard version to the request.
+ * If `throwOnError=true`, throws in case one of the commands fails.
+ */
+std::vector<AsyncRequestsSender::Response> sendCommandToShardsWithVersion(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const BSONObj& command,
+    const std::vector<ShardId>& shardIds,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const CollectionRoutingInfo& cri,
+    bool throwOnError = true);
+
+/**
+ * Creates the necessary indexes for the sharding index catalog collections.
+ */
+Status createShardingIndexCatalogIndexes(OperationContext* opCtx,
+                                         const NamespaceString& indexCatalogNamespace);
+
+/**
+ * Creates the necessary indexes for the collections collection.
+ */
+Status createShardCollectionCatalogIndexes(OperationContext* opCtx);
+
+/**
+ * Helper function to create an index on a collection locally.
+ */
+Status createIndexOnCollection(OperationContext* opCtx,
+                               const NamespaceString& ns,
+                               const BSONObj& keys,
+                               bool unique);
+/**
+ * Helper function to send a command to one shard
+ */
+void invokeCommandOnShardWithIdempotentRetryPolicy(OperationContext* opCtx,
+                                                   const ShardId& recipientId,
+                                                   const DatabaseName& dbName,
+                                                   const BSONObj& cmd);
+
+/**
+ * Runs doWork until it doesn't throw an error, the node is shutting down, the node has stepped
+ * down, or the node has stepped down and up.
+ *
+ * Note that it is not guaranteed that 'doWork' will not be executed while the node is secondary
+ * or after the node has stepped down and up, only that 'doWork' will eventually stop being retried
+ * if one of those events has happened.
+ *
+ * Requirements:
+ * - doWork must be idempotent.
+ */
+void retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
+    OperationContext* opCtx,
+    StringData taskDescription,
+    std::function<void(OperationContext*)> doWork,
+    boost::optional<Backoff> backoff = boost::none);
 }  // namespace sharding_util
 }  // namespace mongo

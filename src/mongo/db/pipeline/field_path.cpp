@@ -27,12 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
 
-#include "mongo/db/pipeline/field_path.h"
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
@@ -52,7 +52,12 @@ const StringDataSet kAllowedDollarPrefixedFields = {
     "$sortKey",
 
     // This is necessary for the "showRecordId" feature.
-    "$recordId"};
+    "$recordId",
+
+    // This is necessary for $search queries with a specified sort.
+    "$searchSortValues"_sd,
+    "$searchScore"_sd,
+};
 
 }  // namespace
 
@@ -67,7 +72,7 @@ string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
     return str::stream() << prefix << "." << suffix;
 }
 
-FieldPath::FieldPath(std::string inputPath)
+FieldPath::FieldPath(std::string inputPath, bool precomputeHashes, bool validateFieldNames)
     : _fieldPath(std::move(inputPath)), _fieldPathDotPosition{string::npos} {
     uassert(40352, "FieldPath cannot be constructed with empty string", !_fieldPath.empty());
     uassert(40353, "FieldPath must not end with a '.'.", _fieldPath[_fieldPath.size() - 1] != '.');
@@ -82,33 +87,46 @@ FieldPath::FieldPath(std::string inputPath)
 
     _fieldPathDotPosition.push_back(_fieldPath.size());
 
-    // Validate the path length and the fields.
+    // Validate the path length and the fields, and precompute their hashes if requested.
     const auto pathLength = getPathLength();
     uassert(ErrorCodes::Overflow,
             "FieldPath is too long",
             pathLength <= BSONDepth::getMaxAllowableDepth());
+    _fieldHash.reserve(pathLength);
     for (size_t i = 0; i < pathLength; ++i) {
-        uassertValidFieldName(getFieldName(i));
+        const auto& fieldName = getFieldName(i);
+        if (validateFieldNames) {
+            uassertValidFieldName(fieldName);
+        }
+        _fieldHash.push_back(precomputeHashes ? FieldNameHasher()(fieldName) : kHashUninitialized);
     }
 }
 
 void FieldPath::uassertValidFieldName(StringData fieldName) {
     uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
 
+    const auto dotsAndDollarsHint = " Consider using $getField or $setField.";
     if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
-        uasserted(16410, "FieldPath field names may not start with '$'.");
+        uasserted(16410,
+                  str::stream() << "FieldPath field names may not start with '$'."
+                                << dotsAndDollarsHint);
     }
 
     uassert(
         16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
-    uassert(
-        16412, "FieldPath field names may not contain '.'.", fieldName.find('.') == string::npos);
+
+    uassert(16412,
+            str::stream() << "FieldPath field names may not contain '.'." << dotsAndDollarsHint,
+            fieldName.find('.') == string::npos);
 }
 
 FieldPath FieldPath::concat(const FieldPath& tail) const {
     const FieldPath& head = *this;
 
     std::string concat;
+    uassert(ErrorCodes::Overflow,
+            "FieldPath concat would be too long",
+            getPathLength() + tail.getPathLength() <= BSONDepth::getMaxAllowableDepth());
     const auto expectedStringSize = _fieldPath.size() + 1 + tail._fieldPath.size();
     concat.reserve(expectedStringSize);
     concat.insert(concat.begin(), head._fieldPath.begin(), head._fieldPath.end());
@@ -123,19 +141,26 @@ FieldPath FieldPath::concat(const FieldPath& tail) const {
         head._fieldPathDotPosition.size() + tail._fieldPathDotPosition.size() - 2 + 1;
     newDots.reserve(expectedDotSize);
 
+    std::vector<size_t> newHashes;
+    // We don't need the extra entry in hashes.
+    newHashes.reserve(expectedDotSize - 1);
+
     // The first one in head._fieldPathDotPosition is npos. The last one, is, conveniently, the
     // size of head fieldPath, which also happens to be the index at which we added a new dot.
     newDots.insert(
         newDots.begin(), head._fieldPathDotPosition.begin(), head._fieldPathDotPosition.end());
+    newHashes.insert(newHashes.begin(), head._fieldHash.begin(), head._fieldHash.end());
 
     invariant(tail._fieldPathDotPosition.size() >= 2);
     for (size_t i = 1; i < tail._fieldPathDotPosition.size(); ++i) {
         // Move each index back by size of the first field path, plus one, for the newly added dot.
         newDots.push_back(tail._fieldPathDotPosition[i] + head._fieldPath.size() + 1);
+        newHashes.push_back(tail._fieldHash[i - 1]);
     }
     invariant(newDots.back() == concat.size());
     invariant(newDots.size() == expectedDotSize);
+    invariant(newHashes.size() == expectedDotSize - 1);
 
-    return FieldPath(std::move(concat), std::move(newDots));
+    return FieldPath(std::move(concat), std::move(newDots), std::move(newHashes));
 }
 }  // namespace mongo

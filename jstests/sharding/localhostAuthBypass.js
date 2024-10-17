@@ -3,21 +3,25 @@
 // This test is to ensure that localhost authentication works correctly against a sharded
 // cluster whether they are hosted with "localhost" or a hostname.
 
-// Checking UUID and index consistency, which occurs on ShardingTest.stop, involves using a
-// mongos to read data on the config server, but this test uses a special shutdown function
-// which stops the mongoses before calling ShardingTest.stop.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks, which occurs on ShardingTest.stop, involve using a mongos to read data on
+// the config server, but this test uses a special shutdown function which stops the mongoses before
+// calling ShardingTest.stop.
+// @tags : [requires_scripting]
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var replSetName = "replsets_server-6591";
 var keyfile = "jstests/libs/key1";
 var numShards = 2;
 var username = "foo";
 var password = "bar";
+var adhocShard = 0;
 
 var createUser = function(mongo) {
     print("============ adding a user.");
@@ -25,7 +29,9 @@ var createUser = function(mongo) {
 };
 
 var addUsersToEachShard = function(st) {
-    for (var i = 0; i < numShards; i++) {
+    // In config shard mode skip the first shard because it is also the config server and will
+    // already have a user made on it through mongos.
+    for (var i = TestData.configShard ? 1 : 0; i < numShards; i++) {
         print("============ adding a user to shard " + i);
         var d = st["shard" + i];
         d.getDB("admin").createUser({user: username, pwd: password, roles: jsTest.adminUserRoles});
@@ -33,14 +39,19 @@ var addUsersToEachShard = function(st) {
 };
 
 var addShard = function(st, shouldPass) {
-    var m = MongoRunner.runMongod({auth: "", keyFile: keyfile, useHostname: false, 'shardsvr': ''});
-    var res = st.getDB("admin").runCommand({addShard: m.host});
+    adhocShard++;
+    const rs =
+        new ReplSetTest({nodes: 1, host: 'localhost', name: 'localhostAuthShard-' + adhocShard});
+    rs.startSet({shardsvr: "", keyFile: keyfile, auth: ""});
+    rs.initiate();
+
+    var res = st.getDB("admin").runCommand({addShard: rs.getURL()});
     if (shouldPass) {
         assert.commandWorked(res, "Add shard");
     } else {
         assert.commandFailed(res, "Add shard");
     }
-    return m;
+    return rs;
 };
 
 var findEmptyShard = function(st, ns) {
@@ -169,8 +180,7 @@ var setupSharding = function(shardingTest) {
     var mongo = shardingTest.s;
 
     print("============ enabling sharding on test.foo.");
-    mongo.getDB("admin").runCommand({enableSharding: "test"});
-    shardingTest.ensurePrimaryShard('test', st.shard1.shardName);
+    mongo.getDB("admin").runCommand({enableSharding: "test", primaryShard: st.shard1.shardName});
     mongo.getDB("admin").runCommand({shardCollection: "test.foo", key: {_id: 1}});
 
     var test = mongo.getDB("test");
@@ -190,35 +200,6 @@ var start = function() {
                 false,  // Must use localhost to take advantage of the localhost auth bypass
         }
     });
-};
-
-var shutdown = function(st) {
-    print("============ shutting down.");
-
-    // SERVER-8445
-    // Unlike MongoRunner.stopMongod and ReplSetTest.stopSet,
-    // ShardingTest.stop does not have a way to provide auth
-    // information.  Therefore, we'll do this manually for now.
-
-    for (var i = 0; i < st._mongos.length; i++) {
-        var conn = st["s" + i];
-        MongoRunner.stopMongos(conn,
-                               /*signal*/ false,
-                               {auth: {user: username, pwd: password}});
-    }
-
-    for (var i = 0; i < st._connections.length; i++) {
-        st["rs" + i].stopSet(/*signal*/ false, {auth: {user: username, pwd: password}});
-    }
-
-    for (var i = 0; i < st._configServers.length; i++) {
-        var conn = st["config" + i];
-        MongoRunner.stopMongod(conn,
-                               /*signal*/ false,
-                               {auth: {user: username, pwd: password}});
-    }
-
-    st.stop();
 };
 
 print("=====================");
@@ -259,8 +240,7 @@ assertCanRunCommands(mongo, st);
 extraShards.push(addShard(mongo, 1));
 st.printShardingStatus();
 
-shutdown(st);
-extraShards.forEach(function(sh) {
-    MongoRunner.stopMongod(sh);
+extraShards.forEach(function(rs) {
+    rs.stopSet();
 });
-})();
+st.stop();

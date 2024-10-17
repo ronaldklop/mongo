@@ -32,10 +32,10 @@
 #include "mongo/util/text.h"
 
 #include <boost/integer_traits.hpp>
-#include <errno.h>
+#include <cerrno>
 #include <iostream>
 #include <memory>
-#include <sstream>
+#include <sstream>  // IWYU pragma: keep
 
 #ifdef _WIN32
 #include <io.h>
@@ -168,7 +168,7 @@ std::string toUtf8String(const std::wstring& wide) {
                                     nullptr,
                                     nullptr);
         if (len > 0) {
-            verify(len == static_cast<int>(buffer.size()));
+            MONGO_verify(len == static_cast<int>(buffer.size()));
             return std::string(&buffer[0], buffer.size());
         }
     }

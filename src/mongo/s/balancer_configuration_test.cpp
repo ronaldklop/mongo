@@ -27,25 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/date_time/gregorian/gregorian_types.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
-#include <boost/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <boost/date_time/gregorian/greg_date.hpp>
+#include <boost/date_time/posix_time/posix_time_duration.hpp>
+#include <boost/date_time/posix_time/ptime.hpp>
+#include <boost/date_time/time_duration.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <memory>
+#include <system_error>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/executor/network_test_env.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -60,14 +74,6 @@ boost::gregorian::date currentDate() {
     return now.date();
 }
 
-
-BSONObj getReplSecondaryOkMetadata() {
-    BSONObjBuilder o;
-    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
-    o.append(rpc::kReplSetMetadataFieldName, 1);
-    return o.obj();
-}
-
 class BalancerConfigurationTestFixture : public ShardingTestFixture {
 protected:
     /**
@@ -76,16 +82,16 @@ protected:
      */
     void expectSettingsQuery(StringData key, StatusWith<boost::optional<BSONObj>> result) {
         onFindCommand([&](const RemoteCommandRequest& request) {
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto opMsg = static_cast<OpMsgRequest>(request);
             auto findCommand = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-            ASSERT_EQ(findCommand->getNamespaceOrUUID().nss()->ns(), "config.settings");
+            ASSERT_EQ(findCommand->getNamespaceOrUUID().nss(),
+                      NamespaceString::kConfigSettingsNamespace);
             ASSERT_BSONOBJ_EQ(findCommand->getFilter(), BSON("_id" << key));
 
-            checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
+            checkReadConcern(request.cmdObj,
+                             VectorClock::kInitialComponentTime.asTimestamp(),
+                             repl::OpTime::kUninitializedTerm);
 
             if (!result.isOK()) {
                 return StatusWith<vector<BSONObj>>(result.getStatus());
@@ -109,16 +115,14 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
 
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
-    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
     ASSERT(config.shouldBalance());
-    ASSERT(config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
-    ASSERT(config.getShouldAutoSplit());
+    ASSERT_EQ(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes, config.getMaxChunkSizeBytes());
 }
 
 TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
@@ -130,16 +134,14 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
 
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>(BSON("value" << 3)));
-    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
     ASSERT(config.shouldBalance());
-    ASSERT(config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
     ASSERT_EQ(3 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
-    ASSERT(config.getShouldAutoSplit());
 }
 
 TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
@@ -152,61 +154,14 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     expectSettingsQuery(BalancerSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("stopped" << true)));
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
-    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
     ASSERT(!config.shouldBalance());
-    ASSERT(!config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
-    ASSERT(config.getShouldAutoSplit());
-}
-
-TEST_F(BalancerConfigurationTestFixture, AutoSplitSettingsDocumentOnly) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    BalancerConfiguration config;
-
-    auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
-
-    expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
-    expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
-    expectSettingsQuery(AutoSplitSettingsType::kKey,
-                        boost::optional<BSONObj>(BSON("enabled" << false)));
-
-    future.default_timed_get();
-
-    ASSERT(config.shouldBalance());
-    ASSERT(config.shouldBalanceForAutoSplit());
-    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
-              config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
-    ASSERT(!config.getShouldAutoSplit());
-}
-
-TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentBalanceForAutoSplitOnly) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    BalancerConfiguration config;
-
-    auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
-
-    expectSettingsQuery(BalancerSettingsType::kKey,
-                        boost::optional<BSONObj>(BSON("mode"
-                                                      << "autoSplitOnly")));
-    expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
-    expectSettingsQuery(AutoSplitSettingsType::kKey,
-                        boost::optional<BSONObj>(BSON("enabled" << true)));
-
-    future.default_timed_get();
-
-    ASSERT(!config.shouldBalance());
-    ASSERT(config.shouldBalanceForAutoSplit());
-    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
-              config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT_EQ(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes, config.getMaxChunkSizeBytes());
 }
 
 TEST(BalancerSettingsType, Defaults) {
@@ -228,10 +183,6 @@ TEST(BalancerSettingsType, AllValidBalancerModeOptions) {
               assertGet(BalancerSettingsType::fromBSON(BSON("mode"
                                                             << "full")))
                   .getMode());
-    ASSERT_EQ(BalancerSettingsType::kAutoSplitOnly,
-              assertGet(BalancerSettingsType::fromBSON(BSON("mode"
-                                                            << "autoSplitOnly")))
-                  .getMode());
     ASSERT_EQ(BalancerSettingsType::kOff,
               assertGet(BalancerSettingsType::fromBSON(BSON("mode"
                                                             << "off")))
@@ -239,11 +190,15 @@ TEST(BalancerSettingsType, AllValidBalancerModeOptions) {
 }
 
 TEST(BalancerSettingsType, InvalidBalancerModeOption) {
-    ASSERT_EQ(ErrorCodes::BadValue,
-              BalancerSettingsType::fromBSON(BSON("mode"
-                                                  << "BAD"))
-                  .getStatus()
-                  .code());
+    startCapturingLogMessages();
+    ASSERT_EQ(BalancerSettingsType::kOff,
+              assertGet(BalancerSettingsType::fromBSON(BSON("mode"
+                                                            << "BAD")))
+                  .getMode());
+    stopCapturingLogMessages();
+    ASSERT_EQ(1,
+              countTextFormatLogLinesContaining(
+                  "Balancer turned off because currently set balancing mode is not valid"));
 }
 
 TEST(BalancerSettingsType, BalancingWindowStartLessThanStop) {

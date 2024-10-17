@@ -29,25 +29,42 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/update/modifier_table.h"
 #include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/pipeline_executor.h"
+#include "mongo/db/update/update_executor.h"
+#include "mongo/db/update/update_node.h"
 #include "mongo/db/update/update_node_visitor.h"
 #include "mongo/db/update/update_object_node.h"
 #include "mongo/db/update/update_tree_executor.h"
 #include "mongo/db/update_index_data.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -56,7 +73,7 @@ class OperationContext;
 
 class UpdateDriver {
 public:
-    enum class UpdateType { kOperator, kReplacement, kPipeline, kDelta };
+    enum class UpdateType { kOperator, kReplacement, kPipeline, kDelta, kTransform };
 
     UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
@@ -67,7 +84,7 @@ public:
     void parse(const write_ops::UpdateModification& updateExpr,
                const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
                boost::optional<BSONObj> constants = boost::none,
-               const bool multi = false);
+               bool multi = false);
 
     /**
      * Fills in document with any fields in the query which are valid.
@@ -88,7 +105,7 @@ public:
                                            const FieldRefSet& immutablePaths,
                                            mutablebson::Document& doc) const;
 
-    Status populateDocumentWithQueryFields(const CanonicalQuery& query,
+    Status populateDocumentWithQueryFields(const MatchExpression& query,
                                            const FieldRefSet& immutablePaths,
                                            mutablebson::Document& doc) const;
 
@@ -151,15 +168,6 @@ public:
         return _updateType;
     }
 
-    static bool isDocReplacement(const write_ops::UpdateModification& updateMod);
-
-    bool modsAffectIndices() const {
-        return _affectIndices;
-    }
-    void refreshIndexKeys(const UpdateIndexData* indexedFields) {
-        _indexedFields = indexedFields;
-    }
-
     bool logOp() const {
         return _logOp;
     }
@@ -174,6 +182,10 @@ public:
         _fromOplogApplication = fromOplogApplication;
     }
 
+    void setSkipDotsDollarsCheck(bool skipDotsDollarsCheck) {
+        _skipDotsDollarsCheck = skipDotsDollarsCheck;
+    }
+
     mutablebson::Document& getDocument() {
         return _objDoc;
     }
@@ -184,6 +196,21 @@ public:
 
     bool needMatchDetails() const {
         return _positional;
+    }
+
+    bool containsDotsAndDollarsField() const {
+        return _containsDotsAndDollarsField;
+    }
+
+    void setContainsDotsAndDollarsField(const bool containsDotsAndDollarsField) {
+        _containsDotsAndDollarsField = containsDotsAndDollarsField;
+    }
+
+    bool bypassEmptyTsReplacement() const {
+        return _bypassEmptyTsReplacement;
+    }
+    void setBypassEmptyTsReplacement(bool bypassEmptyTsReplacement) {
+        _bypassEmptyTsReplacement = bypassEmptyTsReplacement;
     }
 
     /**
@@ -203,7 +230,7 @@ public:
 
 private:
     /** Create the modifier and add it to the back of the modifiers vector */
-    inline Status addAndParse(const modifiertable::ModifierType type, const BSONElement& elem);
+    inline Status addAndParse(modifiertable::ModifierType type, const BSONElement& elem);
 
     //
     // immutable properties after parsing
@@ -212,12 +239,6 @@ private:
     UpdateType _updateType = UpdateType::kOperator;
 
     std::unique_ptr<UpdateExecutor> _updateExecutor;
-
-    // What are the list of fields in the collection over which the update is going to be
-    // applied that participate in indices?
-    //
-    // NOTE: Owned by the collection's info cache!.
-    const UpdateIndexData* _indexedFields = nullptr;
 
     //
     // mutable properties after parsing
@@ -229,14 +250,19 @@ private:
     // True if this update comes from an oplog application.
     bool _fromOplogApplication = false;
 
-    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    bool _bypassEmptyTsReplacement = false;
 
-    // Are any of the fields mentioned in the mods participating in any index? Is set anew
-    // at each call to update.
-    bool _affectIndices = false;
+    // True if this update is guaranteed not to contain dots or dollars fields and should skip the
+    // check.
+    bool _skipDotsDollarsCheck = false;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;
+
+    // True if the updated document contains any '.'/'$' field name.
+    bool _containsDotsAndDollarsField = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;

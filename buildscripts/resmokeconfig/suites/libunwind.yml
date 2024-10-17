@@ -2,12 +2,10 @@ test_kind: js_test
 
 selector:
   roots:
-  - jstests/libunwind/*.js
+    - jstests/libunwind/*.js
 
 executor:
-  config:
-    shell_options:
-      readMode: commands
+  config: {}
   fixture:
     class: MongoDFixture
     mongod_options:

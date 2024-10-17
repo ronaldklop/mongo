@@ -24,6 +24,18 @@ GIGBYTES = 1024 * 1024 * 1024
 CacheItem = collections.namedtuple("CacheContents", ["path", "time", "size"])
 
 
+def get_cachefile_size(file_path, is_cksum):
+    """Get the size of the cachefile."""
+    if is_cksum:
+        size = 0
+        for cksum_path in os.listdir(file_path):
+            cksum_path = os.path.join(file_path, cksum_path)
+            size += os.stat(cksum_path).st_size
+    else:
+        size = os.stat(file_path).st_size
+    return size
+
+
 def collect_cache_contents(cache_path):
     """Collect the cache contents."""
     # map folder names to timestamps
@@ -37,15 +49,33 @@ def collect_cache_contents(cache_path):
         if os.path.isdir(path):
             for file_name in os.listdir(path):
                 file_path = os.path.join(path, file_name)
+                # Cache prune script is allowing only directories with this extension
+                # which comes from the validate_cache_dir.py tool in SCons, it must match
+                # the extension set in that file.
+                cksum_type = False
                 if os.path.isdir(file_path):
-                    LOGGER.warning(
-                        "cache item %s is a directory and not a file. "
-                        "The cache may be corrupt.", file_path)
-                    continue
+                    hash_length = -32
+                    tmp_length = -len(".cksum.tmp") + hash_length
+                    cksum_type = (
+                        file_path.lower().endswith(".cksum")
+                        or file_path.lower().endswith(".del")
+                        or file_path.lower()[tmp_length:hash_length] == ".cksum.tmp"
+                    )
+
+                    if not cksum_type:
+                        LOGGER.warning(
+                            "cache item %s is a directory and not a file. "
+                            "The cache may be corrupt.",
+                            file_path,
+                        )
+                        continue
 
                 try:
-                    item = CacheItem(path=file_path, time=os.stat(file_path).st_atime,
-                                     size=os.stat(file_path).st_size)
+                    item = CacheItem(
+                        path=file_path,
+                        time=os.stat(file_path).st_atime,
+                        size=get_cachefile_size(file_path, cksum_type),
+                    )
 
                     total += item.size
 
@@ -77,11 +107,22 @@ def prune_cache(cache_path, cache_size_gb, clean_ratio):
         # just delete things until the total_size falls below the target cache size ratio.
         while total_size >= cache_size * clean_ratio:
             if not contents:
-                LOGGER.error("cache size is over quota, and there are no files in "
-                             "the queue to delete.")
+                LOGGER.error(
+                    "cache size is over quota, and there are no files in " "the queue to delete."
+                )
                 return False
 
             cache_item = contents.pop()
+
+            # check the atime again just to make sure something wasn't accessed while
+            # we pruning other files.
+            try:
+                if cache_item.time < os.stat(cache_item.path).st_atime:
+                    continue
+            except FileNotFoundError as err:
+                LOGGER.warning("Unable to find file %s : %s", cache_item, err)
+                continue
+
             to_remove = cache_item.path + ".del"
             try:
                 os.rename(cache_item.path, to_remove)
@@ -90,12 +131,19 @@ def prune_cache(cache_path, cache_size_gb, clean_ratio):
                 LOGGER.warning("Unable to rename %s : %s", cache_item, err)
             else:
                 try:
-                    os.remove(to_remove)
+                    if os.path.isdir(to_remove):
+                        shutil.rmtree(to_remove)
+                    else:
+                        os.remove(to_remove)
                     total_size -= cache_item.size
                 except Exception as err:  # pylint: disable=broad-except
                     # this should not happen, but who knows?
-                    LOGGER.error("error [%s, %s] removing file '%s', "
-                                 "please report this error", err, type(err), to_remove)
+                    LOGGER.error(
+                        "error [%s, %s] removing file '%s', " "please report this error",
+                        err,
+                        type(err),
+                        to_remove,
+                    )
 
         LOGGER.info("total cache size at the end of pruning: %d", total_size)
         return True
@@ -111,12 +159,18 @@ def main():
     parser = argparse.ArgumentParser(description="SCons cache pruning tool")
 
     parser.add_argument("--cache-dir", "-d", default=None, help="path to the cache directory.")
-    parser.add_argument("--cache-size", "-s", default=200, type=int,
-                        help="maximum size of cache in GB.")
     parser.add_argument(
-        "--prune-ratio", "-p", default=0.8, type=float,
-        help=("ratio (as 1.0 > x > 0) of total cache size to prune "
-              "to when cache exceeds quota."))
+        "--cache-size", "-s", default=200, type=int, help="maximum size of cache in GB."
+    )
+    parser.add_argument(
+        "--prune-ratio",
+        "-p",
+        default=0.8,
+        type=float,
+        help=(
+            "ratio (as 1.0 > x > 0) of total cache size to prune " "to when cache exceeds quota."
+        ),
+    )
     parser.add_argument("--print-cache-dir", default=False, action="store_true")
 
     args = parser.parse_args()
@@ -125,8 +179,9 @@ def main():
         LOGGER.error("must specify a valid cache path, [%s]", args.cache_dir)
         exit(1)
 
-    ok = prune_cache(cache_path=args.cache_dir, cache_size_gb=args.cache_size,
-                     clean_ratio=args.prune_ratio)
+    ok = prune_cache(
+        cache_path=args.cache_dir, cache_size_gb=args.cache_size, clean_ratio=args.prune_ratio
+    )
 
     if not ok:
         LOGGER.error("encountered error cleaning the cache. exiting.")

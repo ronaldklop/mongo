@@ -1,12 +1,17 @@
 // Test the catch-up behavior of new primaries.
 
-(function() {
-"use strict";
-
-load("jstests/libs/logv2_helpers.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/election_metrics.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication} from "jstests/libs/write_concern_util.js";
+import {
+    verifyCatchUpConclusionReason,
+    verifyServerStatusChange
+} from "jstests/replsets/libs/election_metrics.js";
+import {
+    getLatestOp,
+    reconfig,
+    reconnect,
+    stopReplicationAndEnforceNewPrimaryToCatchUp,
+} from "jstests/replsets/rslib.js";
 
 var name = "catch_up";
 var rst = new ReplSetTest({name: name, nodes: 3, useBridge: true, waitForKeys: true});
@@ -24,6 +29,10 @@ rst.awaitSecondaryNodes();
 
 var primary = rst.getPrimary();
 var primaryColl = primary.getDB("test").coll;
+
+// The default WC is majority and this test can't test catchup properly if it used majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Set verbosity for replication on all nodes.
 var verbosity = {
@@ -115,11 +124,7 @@ restartServerReplication(stepUpResults.oldSecondaries);
 assert.eq(stepUpResults.newPrimary, rst.getPrimary());
 
 // Wait until the new primary completes the transition to primary and writes a no-op.
-if (isJsonLog(stepUpResults.newPrimary)) {
-    checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
-} else {
-    checkLog.contains(stepUpResults.newPrimary, "transition to primary complete");
-}
+checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
 // Check that the new primary's term has been updated because of the no-op.
 assert.eq(getLatestOp(stepUpResults.newPrimary).t, stepUpResults.latestOpOnNewPrimary.t + 1);
 
@@ -160,7 +165,7 @@ rst.awaitReplication();
 
 jsTest.log("Case 3: The primary needs to catch up, but has to change sync source to catch up.");
 // Reconfig the election timeout to be longer than 1 minute so that the third node will no
-// longer be blacklisted by the new primary if it happened to be at the beginning of the test.
+// longer be denylisted by the new primary if it happened to be at the beginning of the test.
 reconfigElectionAndCatchUpTimeout(3 * 60 * 1000, conf.settings.catchUpTimeoutMillis);
 
 stepUpResults = stopReplicationAndEnforceNewPrimaryToCatchUp(rst, rst.getSecondaries()[0]);
@@ -280,4 +285,3 @@ rst.awaitReplication();
 checkOpInOplog(steppedDownPrimary, stepUpResults.latestOpOnOldPrimary, 1);
 
 rst.stopSet();
-})();

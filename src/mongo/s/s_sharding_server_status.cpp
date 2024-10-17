@@ -27,11 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/executor/hedging_metrics.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/idl/cluster_server_parameter_server_status.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
@@ -43,7 +50,7 @@ namespace {
 
 class ShardingServerStatus final : public ServerStatusSection {
 public:
-    ShardingServerStatus() : ServerStatusSection("sharding") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -56,23 +63,44 @@ public:
 
         BSONObjBuilder result;
 
+        result.append("routerServiceEnabled",
+                      serverGlobalParams.clusterRole.has(ClusterRole::RouterServer));
+
         result.append("configsvrConnectionString",
                       shardRegistry->getConfigServerConnectionString().toString());
 
-        grid->configOpTime().append(&result, "lastSeenConfigServerOpTime");
+        const auto vcTime = VectorClock::get(opCtx)->getTime();
+
+        const auto configOpTime = [&]() {
+            const auto vcConfigTimeTs = vcTime.configTime().asTimestamp();
+            return mongo::repl::OpTime(vcConfigTimeTs, mongo::repl::OpTime::kUninitializedTerm);
+        }();
+        configOpTime.append("lastSeenConfigServerOpTime", &result);
+
+        const auto topologyOpTime = [&]() {
+            const auto vcTopologyTimeTs = vcTime.topologyTime().asTimestamp();
+            return mongo::repl::OpTime(vcTopologyTimeTs, mongo::repl::OpTime::kUninitializedTerm);
+        }();
+        topologyOpTime.append("lastSeenTopologyOpTime", &result);
 
         const long long maxChunkSizeInBytes =
             grid->getBalancerConfiguration()->getMaxChunkSizeBytes();
         result.append("maxChunkSizeInBytes", maxChunkSizeInBytes);
 
+        _clusterParameterStatus.report(opCtx, &result);
+
         return result.obj();
     }
 
-} shardingServerStatus;
+private:
+    ClusterServerParameterServerStatus _clusterParameterStatus;
+};
+auto& shardingServerStatus =
+    *ServerStatusSectionBuilder<ShardingServerStatus>("sharding").forRouter();
 
 class ShardingStatisticsServerStatus final : public ServerStatusSection {
 public:
-    ShardingStatisticsServerStatus() : ServerStatusSection("shardingStatistics") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -88,27 +116,17 @@ public:
 
         numHostsTargetedMetrics.appendSection(&result);
         catalogCache->report(&result);
+
+        if (grid->isInitialized()) {
+            auto configServerInShardCache = grid->shardRegistry()->cachedClusterHasConfigShard();
+            result.appendBool("configServerInShardCache", configServerInShardCache.value_or(false));
+        }
+
         return result.obj();
     }
-
-} shardingStatisticsServerStatus;
-
-class HedgingMetricsServerStatus : public ServerStatusSection {
-public:
-    HedgingMetricsServerStatus() : ServerStatusSection("hedgingMetrics") {}
-
-    ~HedgingMetricsServerStatus() override = default;
-
-    bool includeByDefault() const override {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx,
-                            const BSONElement& configElement) const override {
-        return HedgingMetrics::get(opCtx)->toBSON();
-    }
-
-} hedgingMetricsServerStatus;
+};
+auto& shardingStatisitcsServerStatus =
+    *ServerStatusSectionBuilder<ShardingStatisticsServerStatus>("shardingStatistics").forRouter();
 
 }  // namespace
 }  // namespace mongo

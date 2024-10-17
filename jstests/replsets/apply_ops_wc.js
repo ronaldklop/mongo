@@ -9,10 +9,12 @@
  * It finally stops replication at another secondary and confirms that applyOps commands fail.
  */
 
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopServerReplication
+} from "jstests/libs/write_concern_util.js";
 
-(function() {
-"use strict";
 var nodeCount = 3;
 var replTest = new ReplSetTest({name: 'applyOpsWCSet', nodes: nodeCount});
 replTest.startSet();
@@ -25,6 +27,12 @@ var testDB = "applyOps-wc-test";
 
 // Get test collection.
 var primary = replTest.getPrimary();
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
+
 var db = primary.getDB(testDB);
 var coll = db.apply_ops_wc;
 
@@ -133,4 +141,3 @@ majorityWriteConcerns.forEach(testMajorityWriteConcerns);
 restartReplicationOnSecondaries(replTest);
 
 replTest.stopSet();
-})();

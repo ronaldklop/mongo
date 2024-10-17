@@ -2,10 +2,8 @@
  * Tests that query options are not dropped by mongos when a query against a view is rewritten as an
  * aggregation against the underlying collection.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/profiler.js");  // For profilerHasSingleMatchingEntryOrThrow.
+import {profilerHasSingleMatchingEntryOrThrow} from "jstests/libs/profiler.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({
     name: "view_rewrite",
@@ -28,24 +26,19 @@ const config = mongos.getDB("config");
 const mongosDB = mongos.getDB("view_rewrite");
 const coll = mongosDB.getCollection("coll");
 
-assert.commandWorked(config.adminCommand({enableSharding: mongosDB.getName()}));
-st.ensurePrimaryShard(mongosDB.getName(), "view_rewrite-rs0");
-
-const rs0Secondary = st.rs0.getSecondary();
-const rs1Primary = st.rs1.getPrimary();
-const rs1Secondary = st.rs1.getSecondary();
+assert.commandWorked(
+    config.adminCommand({enableSharding: mongosDB.getName(), primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(config.adminCommand({shardCollection: coll.getFullName(), key: {a: 1}}));
 assert.commandWorked(mongos.adminCommand({split: coll.getFullName(), middle: {a: 5}}));
 assert.commandWorked(
-    mongosDB.adminCommand({moveChunk: coll.getFullName(), find: {a: 5}, to: "view_rewrite-rs1"}));
+    mongosDB.adminCommand({moveChunk: coll.getFullName(), find: {a: 5}, to: st.shard1.shardName}));
 
 for (let i = 0; i < 10; ++i) {
     assert.commandWorked(coll.insert({a: i}));
 }
 
 assert.commandWorked(mongosDB.createView("view", coll.getName(), []));
-const view = mongosDB.getCollection("view");
 
 //
 // Confirms that queries run against views on mongos result in execution of a rewritten
@@ -154,7 +147,10 @@ function confirmReadPreference(shardSecondary) {
 
     // Aggregation
     assert.commandWorked(mongosDB.runCommand({
-        query: {aggregate: "view", pipeline: [], comment: "agg_readPref", cursor: {}},
+        aggregate: "view",
+        pipeline: [],
+        comment: "agg_readPref",
+        cursor: {},
         $readPreference: {mode: "nearest", tags: [{tag: "secondary"}]},
         readConcern: {level: "local"}
     }));
@@ -172,7 +168,9 @@ function confirmReadPreference(shardSecondary) {
 
     // Find
     assert.commandWorked(mongosDB.runCommand({
-        query: {find: "view", comment: "find_readPref", maxTimeMS: 5 * 60 * 1000},
+        find: "view",
+        comment: "find_readPref",
+        maxTimeMS: 5 * 60 * 1000,
         $readPreference: {mode: "nearest", tags: [{tag: "secondary"}]},
         readConcern: {level: "local"}
     }));
@@ -190,7 +188,8 @@ function confirmReadPreference(shardSecondary) {
 
     // Count
     assert.commandWorked(mongosDB.runCommand({
-        query: {count: "view", comment: "count_readPref"},
+        count: "view",
+        comment: "count_readPref",
         $readPreference: {mode: "nearest", tags: [{tag: "secondary"}]},
         readConcern: {level: "local"}
     }));
@@ -208,7 +207,9 @@ function confirmReadPreference(shardSecondary) {
 
     // Distinct
     assert.commandWorked(mongosDB.runCommand({
-        query: {distinct: "view", key: "a", comment: "distinct_readPref"},
+        distinct: "view",
+        key: "a",
+        comment: "distinct_readPref",
         $readPreference: {mode: "nearest", tags: [{tag: "secondary"}]},
         readConcern: {level: "local"}
     }));
@@ -233,4 +234,3 @@ confirmReadPreference(st.rs0.getSecondary().getDB(mongosDB.getName()));
 confirmReadPreference(st.rs1.getSecondary().getDB(mongosDB.getName()));
 
 st.stop();
-})();

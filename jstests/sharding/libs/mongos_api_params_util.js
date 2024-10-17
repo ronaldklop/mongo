@@ -3,13 +3,29 @@
  * servers and shards.
  */
 
-let MongosAPIParametersUtil = (function() {
-    'use strict';
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardTransitionUtil} from "jstests/libs/shard_transition_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
+import {
+    commandsAddedToMongosSinceLastLTS,
+    commandsRemovedFromMongosSinceLastLTS
+} from "jstests/sharding/libs/last_lts_mongos_commands.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-    load('jstests/replsets/rslib.js');
-    load('jstests/sharding/libs/last_lts_mongos_commands.js');
-    load('jstests/sharding/libs/sharded_transactions_helpers.js');
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
+
+export let MongosAPIParametersUtil = (function() {
     function validateTestCase(testCase) {
         assert(testCase.skip || testCase.run,
                "must specify exactly one of 'skip' or 'run' for test case " + tojson(testCase));
@@ -46,7 +62,8 @@ let MongosAPIParametersUtil = (function() {
                                                     ["permittedInTxn", true],
                                                     ["permittedOnShardedCollection", true],
                                                     ["requiresShardedCollection", false],
-                                                    ["requiresCommittedReads", false]]) {
+                                                    ["requiresCommittedReads", false],
+                                                    ["requiresCatalogShardEnabled", false]]) {
             if (testCase.hasOwnProperty(propertyName)) {
                 assert(typeof testCase[propertyName] === "boolean",
                        `${propertyName} must be a boolean: ${tojson(testCase)}`);
@@ -56,6 +73,7 @@ let MongosAPIParametersUtil = (function() {
         }
 
         assert(testCase.shardCommandName ? typeof (testCase.shardCommandName) === "string" : true);
+        assert(testCase.shardPrimary ? typeof (testCase.shardPrimary) === "function" : true);
         assert(testCase.configServerCommandName
                    ? typeof (testCase.configServerCommandName) === "string"
                    : true);
@@ -69,16 +87,15 @@ let MongosAPIParametersUtil = (function() {
 
     function awaitRemoveShard(shardName) {
         assert.commandWorked(st.startBalancer());
-        st.waitForBalancer(true, 60000);
-        assert.soon(() => {
-            const res = st.s.adminCommand({removeShard: shardName});
-            jsTestLog(`removeShard result: ${tojson(res)}`);
-            if (!res.ok && res.code === ErrorCodes.ShardNotFound) {
-                return true;
-            }
+        st.awaitBalancerRound();
+        removeShard(st, shardName);
+        assert.commandWorked(st.stopBalancer());
+    }
 
-            return 'completed' === res.state;
-        }, "removeShard never completed for shard " + shardName, 10 * 60 * 1000, 1000);
+    function awaitTransitionToDedicatedConfigServer() {
+        assert.commandWorked(st.startBalancer());
+        st.awaitBalancerRound();
+        ShardTransitionUtil.transitionToDedicatedConfigServer(st);
         assert.commandWorked(st.stopBalancer());
     }
 
@@ -97,7 +114,44 @@ let MongosAPIParametersUtil = (function() {
             skip: "executes locally on mongos (not sent to any remote node)"
         },
         {commandName: "_mergeAuthzCollections", skip: "internal API"},
-        {commandName: "abortTransaction", skip: "prohibits API parameters"},
+        {
+            commandName: "abortTransaction",
+            run: {
+                inAPIVersion1: true,
+                runsAgainstAdminDb: true,
+                shardCommandName: "abortTransaction",
+                permittedInTxn: false,  // We handle the transaction manually in this test.
+                setUp: (context) => {
+                    // Start a session and transaction.
+                    const session = st.s0.startSession();
+                    const txnOptions = {autocommit: false};
+
+                    withRetryOnTransientTxnError(
+                        () => {
+                            session.startTransaction(txnOptions);
+
+                            const cmd = {
+                                insert: "collection",
+                                // A doc on each shard in the 2-shard configuration.
+                                documents: [{_id: 1}, {_id: 21}],
+                            };
+                            assert.commandWorked(session.getDatabase("db").runCommand(
+                                Object.assign(cmd, context.apiParameters)));
+                        },
+                        () => {
+                            session.abortTransaction();
+                        });
+
+                    context.session = session;
+                },
+                command: (context) => ({
+                    abortTransaction: 1,
+                    lsid: context.session.getSessionId(),
+                    txnNumber: context.session.getTxnNumber_forTesting(),
+                    autocommit: false
+                })
+            }
+        },
         {
             commandName: "addShard",
             run: {
@@ -105,13 +159,32 @@ let MongosAPIParametersUtil = (function() {
                 runsAgainstAdminDb: true,
                 configServerCommandName: "_configsvrAddShard",
                 shardCommandName: "_addShard",
+                shardPrimary: () => {
+                    return st.rs1.getPrimary();
+                },
                 permittedInTxn: false,
                 setUp: () => {
                     // Remove shard0 so we can add it back.
                     assert.commandWorked(st.s0.getDB("db").dropDatabase());
-                    awaitRemoveShard(st.shard0.shardName);
+                    awaitRemoveShard(st.shard1.shardName);
                 },
-                command: () => ({addShard: st.rs0.getURL()})
+                command: () => ({addShard: st.rs1.getURL()})
+            }
+        },
+        {
+            commandName: "transitionFromDedicatedConfigServer",
+            run: {
+                inAPIVersion1: false,
+                runsAgainstAdminDb: true,
+                configServerCommandName: "_configsvrTransitionFromDedicatedConfigServer",
+                permittedInTxn: false,
+                requiresCatalogShardEnabled: true,
+                setUp: () => {
+                    // Remove shard0 so we can add it back.
+                    assert.commandWorked(st.s0.getDB("db").dropDatabase());
+                    awaitTransitionToDedicatedConfigServer();
+                },
+                command: () => ({transitionFromDedicatedConfigServer: 1})
             }
         },
         {
@@ -145,10 +218,6 @@ let MongosAPIParametersUtil = (function() {
             skip: "executes locally on mongos (not sent to any remote node)"
         },
         {
-            commandName: "availableQueryOptions",
-            skip: "executes locally on mongos (not sent to any remote node)"
-        },
-        {
             commandName: "balancerCollectionStatus",
             skip: "executes locally on mongos (not sent to any remote node)"
         },
@@ -177,7 +246,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "collMod",
             run: {
                 inAPIVersion1: true,
-                shardCommandName: "collMod",
+                shardCommandName: "_shardsvrCollMod",
                 permittedInTxn: false,
                 command: () => ({collMod: "collection"}),
             }
@@ -191,7 +260,41 @@ let MongosAPIParametersUtil = (function() {
                 command: () => ({collStats: "collection"}),
             }
         },
-        {commandName: "commitTransaction", skip: "prohibits API parameters"},
+        {
+            commandName: "commitTransaction",
+            run: {
+                inAPIVersion1: true,
+                runsAgainstAdminDb: true,
+                shardCommandName: "commitTransaction",
+                permittedInTxn: false,  // We handle the transaction manually in this test.
+                setUp: (context) => {
+                    // Start a session and transaction.
+                    const session = st.s0.startSession();
+                    const txnOptions = {autocommit: false};
+
+                    withRetryOnTransientTxnError(() => {
+                        session.startTransaction(txnOptions);
+
+                        const cmd = {
+                            insert: "collection",
+                            // A doc on each shard in the 2-shard configuration.
+                            documents: [{_id: 1}, {_id: 21}],
+                        };
+
+                        assert.commandWorked(session.getDatabase("db").runCommand(
+                            Object.assign(cmd, context.apiParameters)));
+                    });
+
+                    context.session = session;
+                },
+                command: (context) => ({
+                    commitTransaction: 1,
+                    lsid: context.session.getSessionId(),
+                    txnNumber: context.session.getTxnNumber_forTesting(),
+                    autocommit: false
+                })
+            }
+        },
         {commandName: "compact", skip: "not allowed through mongos"},
         {
             commandName: "configureFailPoint",
@@ -213,7 +316,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "convertToCapped",
             run: {
                 inAPIVersion1: false,
-                shardCommandName: "convertToCapped",
+                shardCommandName: "_shardsvrConvertToCapped",
                 permittedOnShardedCollection: false,
                 permittedInTxn: false,
                 command: () => ({convertToCapped: "collection", size: 8192}),
@@ -223,13 +326,13 @@ let MongosAPIParametersUtil = (function() {
         {
             commandName: "count",
             run: {
-                inAPIVersion1: false,
+                inAPIVersion1: true,
                 shardCommandName: "count",
                 permittedInTxn: false,
                 command: () => ({count: "collection"})
             },
             explain: {
-                inAPIVersion1: false,
+                inAPIVersion1: true,
                 shardCommandName: "explain",
                 permittedInTxn: false,
                 command: () => ({explain: {count: "collection"}})
@@ -238,13 +341,13 @@ let MongosAPIParametersUtil = (function() {
         {
             commandName: "count",
             run: {
-                inAPIVersion1: false,
+                inAPIVersion1: true,
                 shardCommandName: "count",
                 permittedInTxn: false,
                 command: () => ({count: "collection", query: {x: 1}})
             },
             explain: {
-                inAPIVersion1: false,
+                inAPIVersion1: true,
                 shardCommandName: "explain",
                 permittedInTxn: false,
                 command: () => ({explain: {count: "collection", query: {x: 1}}})
@@ -254,7 +357,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "create",
             run: {
                 inAPIVersion1: true,
-                shardCommandName: "create",
+                shardCommandName: "_shardsvrCreateCollection",
                 command: () => ({create: "collection2"})
             }
         },
@@ -394,7 +497,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "dropIndexes",
             run: {
                 inAPIVersion1: true,
-                shardCommandName: "dropIndexes",
+                shardCommandName: "_shardsvrDropIndexes",
                 permittedInTxn: false,
                 command: () => ({dropIndexes: "collection", index: "*"}),
             }
@@ -456,6 +559,30 @@ let MongosAPIParametersUtil = (function() {
             }
         },
         {
+            commandName: "find",
+            run: {
+                inAPIVersion1: true,
+                shardCommandName: "find",
+                setUp: function() {
+                    st.s.getDB("db")["view"].drop();
+                    assert.commandWorked(st.s.getDB("db").runCommand(
+                        {create: "view", viewOn: "collection", pipeline: []}));
+                },
+                command: () => ({find: "view", filter: {x: 1}})
+            },
+            explain: {
+                inAPIVersion1: true,
+                shardCommandName: "explain",
+                permittedInTxn: false,
+                setUp: function() {
+                    st.s.getDB("db")["view"].drop();
+                    assert.commandWorked(st.s.getDB("db").runCommand(
+                        {create: "view", viewOn: "collection", pipeline: []}));
+                },
+                command: () => ({explain: {find: "view", filter: {x: 1}}})
+            }
+        },
+        {
             commandName: "findAndModify",
             run: {
                 inAPIVersion1: true,
@@ -502,12 +629,29 @@ let MongosAPIParametersUtil = (function() {
             commandName: "getDiagnosticData",
             skip: "executes locally on mongos (not sent to any remote node)"
         },
-        {
-            commandName: "getLastError",
-            skip: "executes locally on mongos (not sent to any remote node)"
-        },
         {commandName: "getLog", skip: "executes locally on mongos (not sent to any remote node)"},
-        {commandName: "getMore", skip: "prohibits API parameters"},
+        {
+            commandName: "getMore",
+            run: {
+                inAPIVersion1: true,
+                shardCommandName: "getMore",
+                permittedInTxn: true,
+                setUp: (context) => {
+                    // Global setup puts one doc on each shard, we need several on each.
+                    assert.commandWorked(st.s0.getDB("db").runCommand({
+                        insert: "collection",
+                        documents: [{_id: 1}, {_id: 2}, {_id: 3}, {_id: 11}, {_id: 12}, {_id: 13}]
+                    }));
+                    const findCmd =
+                        Object.assign({find: "collection", batchSize: 1}, context.apiParameters);
+                    const res = assert.commandWorked(context.db.runCommand(findCmd));
+                    context.cursorId = res.cursor.id;
+                },
+                command: (context) => {
+                    return {getMore: context.cursorId, collection: "collection"};
+                }
+            }
+        },
         {
             commandName: "getParameter",
             skip: "executes locally on mongos (not sent to any remote node)"
@@ -520,7 +664,6 @@ let MongosAPIParametersUtil = (function() {
             commandName: "getShardVersion",
             skip: "executes locally on mongos (not sent to any remote node)"
         },
-        {commandName: "getnonce", skip: "executes locally on mongos (not sent to any remote node)"},
         {
             commandName: "grantPrivilegesToRole",
             run: {
@@ -667,10 +810,14 @@ let MongosAPIParametersUtil = (function() {
                     context.thread.start();
                     const adminDb = st.s0.getDB("admin");
 
-                    jsTestLog(`Waiting for "find" on "${st.rs0.name}" ` +
+                    jsTestLog(`Waiting for "find" on "${st.shard0.shardName}" ` +
                               `with comment ${uuidStr} in currentOp`);
                     assert.soon(() => {
-                        const filter = {"command.comment": uuidStr, shard: st.rs0.name};
+                        const filter = {
+                            "command.find": "collection",
+                            "command.comment": uuidStr,
+                            shard: st.shard0.shardName
+                        };
                         const inprog = adminDb.currentOp(filter).inprog;
                         if (inprog.length === 1) {
                             jsTestLog(`Found it! findOpId ${inprog[0].opid}`);
@@ -789,14 +936,15 @@ let MongosAPIParametersUtil = (function() {
             run: {
                 inAPIVersion1: false,
                 shardCommandName: "mergeChunks",
-                configServerCommandName: "_configsvrCommitChunkMerge",
+                configServerCommandName: "_configsvrCommitChunksMerge",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
                 requiresShardedCollection: true,
                 setUp: () => {
-                    // Collection is already split into chunks [MinKey, 10], (10, MaxKey].
                     assert.commandWorked(
                         st.s.adminCommand({split: "db.collection", middle: {_id: -5}}));
+                    assert.commandWorked(
+                        st.s.adminCommand({split: "db.collection", middle: {_id: 10}}));
                     // Now the chunks are: [MinKey, -5], (-5, 10], (10, MaxKey].
                 },
                 command: () => ({mergeChunks: "db.collection", bounds: [{_id: MinKey}, {_id: 10}]})
@@ -806,8 +954,8 @@ let MongosAPIParametersUtil = (function() {
             commandName: "moveChunk",
             run: {
                 inAPIVersion1: false,
-                shardCommandName: "moveChunk",
-                configServerCommandName: "_configsvrMoveChunk",
+                shardCommandName: "_shardsvrMoveRange",
+                configServerCommandName: "_configsvrMoveRange",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
                 requiresShardedCollection: true,
@@ -907,12 +1055,29 @@ let MongosAPIParametersUtil = (function() {
                 runsAgainstAdminDb: true,
                 configServerCommandName: "_configsvrRemoveShard",
                 permittedInTxn: false,
-                command: () => ({removeShard: st.shard0.shardName}),
+                command: () => ({removeShard: st.shard1.shardName}),
                 cleanUp: () => {
                     // Wait for the shard to be removed completely before re-adding it.
-                    awaitRemoveShard(st.shard0.shardName);
+                    awaitRemoveShard(st.shard1.shardName);
                     assert.commandWorked(st.s0.getDB("admin").runCommand(
-                        {addShard: st.rs0.getURL(), name: st.shard0.shardName}));
+                        {addShard: st.rs1.getURL(), name: st.shard1.shardName}));
+                }
+            }
+        },
+        {
+            commandName: "transitionToDedicatedConfigServer",
+            run: {
+                inAPIVersion1: false,
+                runsAgainstAdminDb: true,
+                configServerCommandName: "_configsvrTransitionToDedicatedConfigServer",
+                permittedInTxn: false,
+                requiresCatalogShardEnabled: true,
+                command: () => ({transitionToDedicatedConfigServer: 1}),
+                cleanUp: () => {
+                    // Wait for the shard to be removed completely before re-adding it.
+                    awaitTransitionToDedicatedConfigServer(st.shard0.shardName);
+                    assert.commandWorked(
+                        st.s0.getDB("admin").runCommand({transitionFromDedicatedConfigServer: 1}));
                 }
             }
         },
@@ -1032,6 +1197,10 @@ let MongosAPIParametersUtil = (function() {
             skip: "executes locally on mongos (not sent to any remote node)"
         },
         {
+            commandName: "rotateFTDC",
+            skip: "executes locally on mongos (not sent to any remote node)"
+        },
+        {
             commandName: "saslContinue",
             skip: "executes locally on mongos (not sent to any remote node)"
         },
@@ -1042,6 +1211,23 @@ let MongosAPIParametersUtil = (function() {
         {
             commandName: "serverStatus",
             skip: "executes locally on mongos (not sent to any remote node)"
+        },
+        {
+            commandName: "setAllowMigrations",
+            run: {
+                inAPIVersion1: false,
+                shardCommandName: "_shardsvrSetAllowMigrations",
+                runsAgainstAdminDb: true,
+                permittedInTxn: false,
+                requiresShardedCollection: true,
+                setUp: () => {
+                    assert.commandWorked(st.s.adminCommand(
+                        {enableSharding: "db", primaryShard: st.shard0.shardName}));
+                    assert.commandWorked(
+                        st.s.adminCommand({shardCollection: "db.collection", key: {_id: 1}}));
+                },
+                command: () => ({setAllowMigrations: "db.collection", allowMigrations: true})
+            }
         },
         {
             commandName: "setDefaultRWConcern",
@@ -1059,6 +1245,8 @@ let MongosAPIParametersUtil = (function() {
                 inAPIVersion1: false,
                 shardCommandName: "setIndexCommitQuorum",
                 permittedInTxn: false,
+                // The command should fail if there is no active index build on the collection.
+                expectedFailureCode: ErrorCodes.IndexNotFound,
                 command: () => ({
                     setIndexCommitQuorum: "collection",
                     indexNames: ["index"],
@@ -1073,13 +1261,12 @@ let MongosAPIParametersUtil = (function() {
                 configServerCommandName: "setFeatureCompatibilityVersion",
                 permittedInTxn: false,
                 runsAgainstAdminDb: true,
-                command: () => ({setFeatureCompatibilityVersion: latestFCV})
+                command: () => ({setFeatureCompatibilityVersion: latestFCV, confirm: true})
             }
         },
         {
-            commandName: "setFreeMonitoring",
-            skip: "explicitly fails for mongos, primary mongod only",
-            conditional: true
+            commandName: "setProfilingFilterGlobally",
+            skip: "executes locally on mongos (not sent to any remote node)",
         },
         {
             commandName: "setParameter",
@@ -1094,8 +1281,8 @@ let MongosAPIParametersUtil = (function() {
                 permittedInTxn: false,
                 permittedOnShardedCollection: false,
                 setUp: () => {
-                    assert.commandWorked(st.s.adminCommand({enableSharding: "db"}));
-                    st.ensurePrimaryShard("db", st.shard0.shardName);
+                    assert.commandWorked(st.s.adminCommand(
+                        {enableSharding: "db", primaryShard: st.shard0.shardName}));
                 },
                 command: () => ({shardCollection: "db.collection", key: {_id: 1}})
             }
@@ -1125,7 +1312,7 @@ let MongosAPIParametersUtil = (function() {
                     keyPattern: {_id: 1},
                     min: {_id: 0},
                     max: {_id: MaxKey},
-                    maxChunkSizeBytes: 1024
+                    maxChunkSizeBytes: 1024 * 1024
                 })
             }
         },
@@ -1271,13 +1458,15 @@ let MongosAPIParametersUtil = (function() {
         };
     });
 
-    const st = new ShardingTest({mongos: 1, shards: 2, rs: {nodes: 1}});
+    const st = new ShardingTest({mongos: 1, shards: 2, config: 1, rs: {nodes: 1}});
     const listCommandsRes = st.s0.adminCommand({listCommands: 1});
     assert.commandWorked(listCommandsRes);
 
     const supportsCommittedReads =
         assert.commandWorked(st.rs0.getPrimary().adminCommand({serverStatus: 1}))
             .storageEngine.supportsCommittedReads;
+
+    const isConfigShardEnabled = ShardTransitionUtil.isConfigServerTransitionEnabledIgnoringFCV(st);
 
     (() => {
         // Validate test cases for all commands. Ensure there is at least one test case for every
@@ -1311,7 +1500,7 @@ let MongosAPIParametersUtil = (function() {
         }
     })();
 
-    function checkPrimaryLog(conn, commandName, apiVersion, apiStrict, apiDeprecationErrors) {
+    function checkPrimaryLog(conn, commandName, apiParameters) {
         let msg;
         assert.soon(
             () => {
@@ -1329,8 +1518,9 @@ let MongosAPIParametersUtil = (function() {
                         continue;
 
                     lastCommandInvocation = args;
-                    if (args.apiVersion !== apiVersion || args.apiStrict !== apiStrict ||
-                        args.apiDeprecationErrors !== apiDeprecationErrors)
+                    if (args.apiVersion !== apiParameters.apiVersion ||
+                        args.apiStrict !== apiParameters.apiStrict ||
+                        args.apiDeprecationErrors !== apiParameters.apiDeprecationErrors)
                         continue;
 
                     // Found a match.
@@ -1338,14 +1528,13 @@ let MongosAPIParametersUtil = (function() {
                 }
 
                 if (lastCommandInvocation === undefined) {
-                    msg = `Primary didn't log ${commandName}`;
+                    msg = `Primary didn't log ${commandName} with API parameters ` +
+                        `${tojson(apiParameters)}.`;
                     return false;
                 }
 
-                msg = `Primary didn't log ${commandName} with apiVersion ${apiVersion},` +
-                    ` apiStrict ${apiStrict},` +
-                    ` apiDeprecationErrors ${apiDeprecationErrors}.` +
-                    ` Last invocation of ${commandName} was` +
+                msg = `Primary didn't log ${commandName} with API parameters ` +
+                    `${tojson(apiParameters)}. Last invocation of ${commandName} was` +
                     ` ${tojson(lastCommandInvocation)}`;
                 return false;
             },
@@ -1361,17 +1550,17 @@ let MongosAPIParametersUtil = (function() {
         // progress.
         let testInstances = [];
 
-        for (const [apiVersion, apiStrict, apiDeprecationErrors] of [
-                 [undefined, undefined, undefined],
-                 ["1", undefined, undefined],
-                 ["1", undefined, false],
-                 ["1", undefined, true],
-                 ["1", false, undefined],
-                 ["1", false, false],
-                 ["1", false, true],
-                 ["1", true, undefined],
-                 ["1", true, false],
-                 ["1", true, true],
+        for (const apiParameters
+                 of [{},
+                     {apiVersion: "1"},
+                     {apiVersion: "1", apiDeprecationErrors: false},
+                     {apiVersion: "1", apiDeprecationErrors: true},
+                     {apiVersion: "1", apiStrict: false},
+                     {apiVersion: "1", apiStrict: false, apiDeprecationErrors: false},
+                     {apiVersion: "1", apiStrict: false, apiDeprecationErrors: true},
+                     {apiVersion: "1", apiStrict: true},
+                     {apiVersion: "1", apiStrict: true, apiDeprecationErrors: false},
+                     {apiVersion: "1", apiStrict: true, apiDeprecationErrors: true},
         ]) {
             for (const testCase of testCases) {
                 if (testCase.skip)
@@ -1393,13 +1582,14 @@ let MongosAPIParametersUtil = (function() {
                     if (!supportsCommittedReads && runOrExplain.requiresCommittedReads)
                         continue;
 
-                    if (apiStrict && !runOrExplain.inAPIVersion1)
+                    if (!isConfigShardEnabled && runOrExplain.requiresCatalogShardEnabled)
+                        continue;
+
+                    if (apiParameters.apiStrict && !runOrExplain.inAPIVersion1)
                         continue;
 
                     testInstances.push({
-                        apiVersion: apiVersion,
-                        apiStrict: apiStrict,
-                        apiDeprecationErrors: apiDeprecationErrors,
+                        apiParameters: apiParameters,
                         commandName: testCase.commandName,
                         runOrExplain: runOrExplain
                     });
@@ -1408,114 +1598,110 @@ let MongosAPIParametersUtil = (function() {
         }
 
         for (let i = 0; i < testInstances.length; ++i) {
-            const {apiVersion, apiStrict, apiDeprecationErrors, commandName, runOrExplain} =
-                testInstances[i];
+            const {apiParameters, commandName, runOrExplain} = testInstances[i];
+
+            assert.commandWorked(
+                st.s.adminCommand({enableSharding: "db", primaryShard: st.shard0.shardName}));
 
             if (shardedCollection) {
-                jsTestLog("Sharded setup");
-                assert.commandWorked(st.s.getDB("db")["collection"].insert(
-                    {_id: 0}, {writeConcern: {w: "majority"}}));
-                assert.commandWorked(st.s.getDB("db")["collection"].insert(
-                    {_id: 20}, {writeConcern: {w: "majority"}}));
-
-                assert.commandWorked(st.s.adminCommand({enableSharding: "db"}));
-                st.ensurePrimaryShard("db", st.shard0.shardName);
                 assert.commandWorked(
                     st.s.adminCommand({shardCollection: "db.collection", key: {_id: 1}}));
-
-                // The chunk with _id 0 is on shard 0.
-                assert.commandWorked(
-                    st.s.adminCommand({split: "db.collection", middle: {_id: 10}}));
-                assert.commandWorked(st.s.adminCommand({
-                    moveChunk: "db.collection",
-                    find: {_id: 20},
-                    to: st.shard1.shardName,
-                    _waitForDelete: true
-                }));
-            } else {
-                jsTestLog("Unsharded setup");
-                assert.commandWorked(st.s.getDB("db")["collection"].insert(
-                    {_id: 0}, {writeConcern: {w: "majority"}}));
-                st.ensurePrimaryShard("db", st.shard0.shardName);
             }
+
+            assert.commandWorked(
+                st.s.getDB("db")["collection"].insert({_id: 0}, {writeConcern: {w: "majority"}}));
 
             const configPrimary = st.configRS.getPrimary();
-            const shardZeroPrimary = st.rs0.getPrimary();
-            const context = {};
+            const shardPrimary =
+                runOrExplain.shardPrimary ? runOrExplain.shardPrimary() : st.rs0.getPrimary();
+            const context = {apiParameters: apiParameters};
 
-            if (runOrExplain.setUp) {
-                jsTestLog(`setUp function for ${commandName}`);
-                runOrExplain.setUp(context);
-                jsTestLog(`setUp function for ${commandName} completed`);
-            }
+            withRetryOnTransientTxnError(
+                () => {
+                    const commandDbName = runOrExplain.runsAgainstAdminDb ? "admin" : "db";
+                    if (inTransaction) {
+                        context.session = st.s0.startSession();
+                        context.session.startTransaction();
+                        context.db = context.session.getDatabase(commandDbName);
+                    } else {
+                        context.db = st.s0.getDB(commandDbName);
+                    }
 
-            // Make a copy of the test's command body, and set its API parameters.
-            const commandDbName = runOrExplain.runsAgainstAdminDb ? "admin" : "db";
-            const commandBody = runOrExplain.command(context);
-            const commandWithAPIParams = Object.assign({}, commandBody);
-            if (apiVersion !== undefined) {
-                commandWithAPIParams.apiVersion = apiVersion;
-            }
+                    if (runOrExplain.setUp) {
+                        jsTestLog(`setUp function for ${commandName}`);
+                        runOrExplain.setUp(context);
+                        jsTestLog(`setUp function for ${commandName} completed`);
+                    }
 
-            if (apiStrict !== undefined) {
-                commandWithAPIParams.apiStrict = apiStrict;
-            }
+                    // Make a copy of the test's command body, and set its API parameters.
+                    const commandBody = runOrExplain.command(context);
+                    const commandWithAPIParams =
+                        Object.assign(Object.assign({}, commandBody), apiParameters);
 
-            if (apiDeprecationErrors !== undefined) {
-                commandWithAPIParams.apiDeprecationErrors = apiDeprecationErrors;
-            }
+                    assert.commandWorked(configPrimary.adminCommand({clearLog: "global"}));
+                    assert.commandWorked(shardPrimary.adminCommand({clearLog: "global"}));
+                    const message = `[${i + 1} of ${testInstances.length}]: command ${
+                                        tojson(commandWithAPIParams)}` +
+                        ` ${shardedCollection ? "sharded" : "unsharded"},` +
+                        ` ${inTransaction ? "in" : "outside"} transaction` +
+                        ` on "${commandDbName}" database`;
 
-            assert.commandWorked(configPrimary.adminCommand({clearLog: "global"}));
-            assert.commandWorked(shardZeroPrimary.adminCommand({clearLog: "global"}));
-            const message =
-                `[${i + 1} of ${testInstances.length}]: command ${tojson(commandWithAPIParams)}` +
-                ` ${shardedCollection ? "sharded" : "unsharded"},` +
-                ` ${inTransaction ? "in" : "outside"} transaction` +
-                ` on "${commandDbName}" database`;
+                    flushRoutersAndRefreshShardMetadata(st, {ns: "db.collection"});
 
-            flushRoutersAndRefreshShardMetadata(st, {ns: "db.collection"});
+                    jsTestLog(`Running ${message}`);
+                    setLogVerbosity([configPrimary, st.rs0.getPrimary(), st.rs1.getPrimary()],
+                                    {"command": {"verbosity": 2}});
 
-            jsTestLog(`Running ${message}`);
-            setLogVerbosity([configPrimary, shardZeroPrimary, st.rs1.getPrimary()],
-                            {"command": {"verbosity": 2}});
+                    const res = context.db.runCommand(commandWithAPIParams);
+                    jsTestLog(`Command result: ${tojson(res)}`);
+                    if (runOrExplain.expectedFailureCode) {
+                        assert.commandFailedWithCode(res, runOrExplain.expectedFailureCode);
+                    } else {
+                        assert.commandWorked(res);
+                    }
 
-            if (inTransaction) {
-                const session = st.s0.startSession();
-                const sessionDb = session.getDatabase(commandDbName);
-                session.startTransaction();
-                const res = sessionDb.runCommand(commandWithAPIParams);
-                jsTestLog(`Command result: ${tojson(res)}`);
-                assert.commandWorked(res);
-                assert.commandWorked(session.commitTransaction_forTesting());
-            } else {
-                const db = st.s0.getDB(commandDbName);
-                const res = db.runCommand(commandWithAPIParams);
-                jsTestLog(`Command result: ${tojson(res)}`);
-                assert.commandWorked(res);
-            }
+                    if (inTransaction) {
+                        const commitCmd = {
+                            commitTransaction: 1,
+                            txnNumber: context.session.getTxnNumber_forTesting(),
+                            autocommit: false
+                        };
+
+                        assert.commandWorked(context.session.getDatabase("admin").runCommand(
+                            Object.assign(commitCmd, apiParameters)));
+                    }
+                },
+                () => {
+                    if (inTransaction) {
+                        jsTestLog(`handling transactional retry for ${commandName}`);
+                        context.session.abortTransaction();
+
+                        setLogVerbosity([configPrimary, st.rs0.getPrimary(), st.rs1.getPrimary()],
+                                        {"command": {"verbosity": 0}});
+
+                        st.s0.getDB("db").runCommand({dropDatabase: 1});
+                        if (runOrExplain.cleanUp) {
+                            jsTestLog(`cleanUp function for ${commandName}`);
+                            runOrExplain.cleanUp(context);
+                            jsTestLog(`cleanUp function for ${commandName} completed`);
+                        }
+                    }
+                });
 
             const configServerCommandName = runOrExplain.configServerCommandName;
             const shardCommandName = runOrExplain.shardCommandName;
 
             if (configServerCommandName) {
                 jsTestLog(`Check for ${configServerCommandName} in config server's log`);
-                checkPrimaryLog(configPrimary,
-                                configServerCommandName,
-                                apiVersion,
-                                apiStrict,
-                                apiDeprecationErrors);
+                checkPrimaryLog(configPrimary, configServerCommandName, apiParameters);
             }
 
             if (shardCommandName) {
                 jsTestLog(`Check for ${shardCommandName} in shard server's log`);
-                checkPrimaryLog(shardZeroPrimary,
-                                shardCommandName,
-                                apiVersion,
-                                apiStrict,
-                                apiDeprecationErrors);
+                checkPrimaryLog(shardPrimary, shardCommandName, apiParameters);
             }
 
-            setLogVerbosity([configPrimary, shardZeroPrimary, st.rs1.getPrimary()],
+            setLogVerbosity([configPrimary, st.rs0.getPrimary(), st.rs1.getPrimary()],
                             {"command": {"verbosity": 0}});
 
             st.s0.getDB("db").runCommand({dropDatabase: 1});

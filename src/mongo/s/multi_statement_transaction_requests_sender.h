@@ -30,10 +30,28 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
+#include "mongo/client/read_preference.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/async_requests_sender.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
+
+namespace transaction_request_sender_details {
+std::vector<AsyncRequestsSender::Request> attachTxnDetails(
+    OperationContext* opCtx, const std::vector<AsyncRequestsSender::Request>& requests);
+
+void processReplyMetadata(OperationContext* opCtx,
+                          const AsyncRequestsSender::Response& response,
+                          bool forAsyncGetMore = false);
+void processReplyMetadataForAsyncGetMore(OperationContext* opCtx,
+                                         const ShardId& shardId,
+                                         const BSONObj& responseBson);
+}  // namespace transaction_request_sender_details
 
 /**
  * Wrapper for AsyncRequestSender that attaches multi-statement transaction related fields to
@@ -44,22 +62,22 @@ class MultiStatementTransactionRequestsSender {
 public:
     /**
      * Constructs a new MultiStatementTransactionRequestsSender. The OperationContext* and
-     * TaskExecutor* must
-     * remain valid for the lifetime of the ARS.
+     * TaskExecutor* must remain valid for the lifetime of the ARS.
      */
     MultiStatementTransactionRequestsSender(
         OperationContext* opCtx,
         std::shared_ptr<executor::TaskExecutor> executor,
-        StringData dbName,
+        const DatabaseName& dbName,
         const std::vector<AsyncRequestsSender::Request>& requests,
         const ReadPreferenceSetting& readPreference,
-        Shard::RetryPolicy retryPolicy);
+        Shard::RetryPolicy retryPolicy,
+        AsyncRequestsSender::ShardHostMap designatedHostsMap = {});
 
     ~MultiStatementTransactionRequestsSender();
 
     bool done();
 
-    AsyncRequestsSender::Response next();
+    AsyncRequestsSender::Response next(bool forMergeCursors = false);
 
     void stopRetrying();
 

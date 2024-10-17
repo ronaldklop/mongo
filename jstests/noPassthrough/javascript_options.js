@@ -1,7 +1,12 @@
-(function() {
-"use strict";
-
-load('jstests/libs/command_line/test_parsed_options.js');
+/*
+ * @tags: [
+ *   requires_scripting,
+ * ]
+ */
+import {
+    testGetCmdLineOptsMongod,
+    testGetCmdLineOptsMongos
+} from "jstests/libs/command_line/test_parsed_options.js";
 
 let expectedResult = {"parsed": {"security": {"javascriptEnabled": false}}};
 testGetCmdLineOptsMongod({noscripting: ""}, expectedResult);
@@ -28,4 +33,3 @@ testGetCmdLineOptsMongod({config: "jstests/libs/config_files/enable_scripting.js
                          expectedResult);
 testGetCmdLineOptsMongos({config: "jstests/libs/config_files/enable_scripting.json"},
                          expectedResult);
-}());

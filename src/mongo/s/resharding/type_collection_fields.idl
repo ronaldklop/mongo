@@ -57,14 +57,19 @@ structs:
         description: "Resharding-related fields specific to recipient shards."
         inline_chained_structs: true
         chained_structs:
-            FetchTimestamp: FetchTimestampStruct
+            ReshardingApproxCopySize: ReshardingApproxCopySizeStruct
         # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
         # required for resharding because durable state from all resharding operations is cleaned up
         # before the upgrade or downgrade can complete.
         strict: false
         fields:
-            donorShardIds:
-                type: array<shard_id>
+            cloneTimestamp:
+                type: timestamp
+                optional: true
+                description: "The timestamp for the snapshot read while cloning from the donors."
+            donorShards:
+                type: array<DonorShardFetchTimestamp>
+                description: "The list of donors to clone from."
             sourceUUID:
                 cpp_name: sourceUUID
                 type: uuid
@@ -75,13 +80,22 @@ structs:
                 description: "The namespace of the collection being resharded."
             minimumOperationDurationMillis:
                 type: long
+            oplogBatchTaskCount:
+                type: long
+                description: >-
+                    "The number of subtasks to divide a single oplog batch into,
+                    so that it may be applied concurrently by multiple threads."
+                optional: true
+            relaxed:
+                type: optionalBool
+                description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    uuid to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
 
     TypeCollectionReshardingFields:
         description: "Resharding-related fields meant to be stored in a config.collections
                       document."
-        inline_chained_structs: true
-        chained_structs:
-            AbortReason: AbortReasonStruct
         # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
         # required for resharding because durable state from all resharding operations is cleaned up
         # before the upgrade or downgrade can complete.
@@ -94,9 +108,27 @@ structs:
             state:
                 type: CoordinatorState
                 default: kUnused
+            userCanceled:
+                type: bool
+                optional: true
+                description: >-
+                    If emplaced, indicates whether an abort originated from a user cancellation.
             donorFields:
                 type: TypeCollectionDonorFields
                 optional: true
             recipientFields:
                 type: TypeCollectionRecipientFields
                 optional: true
+            startTime:
+                type: date
+                description: "Start time of the operation."
+                optional: true
+            provenance:
+                type: Provenance
+                description: "The source operation that called this resharding operation."
+                optional: true
+            implicitlyCreateIndex:
+                type: bool
+                description: "Whether to create an index on the shard key pattern if the shard key
+                              does not already have a support index."
+                default: true

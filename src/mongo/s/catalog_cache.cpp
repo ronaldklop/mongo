@@ -27,150 +27,387 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#define LOGV2_FOR_CATALOG_REFRESH(ID, DLEVEL, MESSAGE, ...) \
-    LOGV2_DEBUG_OPTIONS(                                    \
-        ID, DLEVEL, {logv2::LogComponent::kShardingCatalogRefresh}, MESSAGE, ##__VA_ARGS__)
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/catalog_cache.h"
 
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <fmt/format.h>
+#include <list>
+#include <memory>
+#include <set>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/repl/optime_with.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_database.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/is_mongos.h"
+#include "mongo/s/index_version.h"
 #include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/util/concurrency/with_lock.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/invalidating_lru_cache.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(blockCollectionCacheLookup);
+MONGO_FAIL_POINT_DEFINE(blockDatabaseCacheLookup);
 
-// How many times to try refreshing the routing info if the set of chunks loaded from the config
-// server is found to be inconsistent.
-const int kMaxInconsistentRoutingInfoRefreshAttempts = 3;
+// How many times to try refreshing the routing info or the index info of a collection if the
+// information loaded from the config server is found to be inconsistent.
+const int kMaxInconsistentCollectionRefreshAttempts = 3;
 
 const int kDatabaseCacheSize = 10000;
 const int kCollectionCacheSize = 10000;
+const int kIndexCacheSize = 10000;
 
-const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh =
-    OperationContext::declareDecoration<bool>();
+std::shared_ptr<RoutingTableHistory> createUpdatedRoutingTableHistory(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    bool isIncremental,
+    const RoutingTableHistoryValueHandle& existingHistory,
+    const CatalogCacheLoader::CollectionAndChangedChunks& collectionAndChunks) {
+    // If a refresh doesn't find new information -> re-use the existing RoutingTableHistory
+    if (isIncremental && collectionAndChunks.changedChunks.size() == 1 &&
+        collectionAndChunks.changedChunks[0].getVersion() == existingHistory->optRt->getVersion()) {
 
-const OperationContext::Decoration<bool> operationBlockedBehindCatalogCacheRefresh =
-    OperationContext::declareDecoration<bool>();
+        tassert(7032310,
+                fmt::format("allowMigrations field of collection '{}' changed without changing the "
+                            "collection placement version {}. Old value: {}, new value: {}",
+                            nss.toStringForErrorMsg(),
+                            existingHistory->optRt->getVersion().toString(),
+                            existingHistory->optRt->allowMigrations(),
+                            collectionAndChunks.allowMigrations),
+                collectionAndChunks.allowMigrations == existingHistory->optRt->allowMigrations());
+
+        const auto& oldReshardingFields = existingHistory->optRt->getReshardingFields();
+        const auto& newReshardingFields = collectionAndChunks.reshardingFields;
+        tassert(7032311,
+                fmt::format("reshardingFields field of collection '{}' changed without changing "
+                            "the collection placement version {}. Old value: {}, new value: {}",
+                            nss.toStringForErrorMsg(),
+                            existingHistory->optRt->getVersion().toString(),
+                            oldReshardingFields->toBSON().toString(),
+                            newReshardingFields->toBSON().toString()),
+                [&] {
+                    if (oldReshardingFields && newReshardingFields)
+                        return oldReshardingFields->toBSON().woCompare(
+                                   newReshardingFields->toBSON()) == 0;
+                    else
+                        return !oldReshardingFields && !newReshardingFields;
+                }());
+
+        return existingHistory->optRt;
+    }
+
+    auto newRoutingHistory = [&] {
+        // If we have routing info already and it's for the same collection, we're updating.
+        // Otherwise, we are making a whole new routing table.
+        if (isIncremental &&
+            existingHistory->optRt->getVersion().isSameCollection(
+                {collectionAndChunks.epoch, collectionAndChunks.timestamp})) {
+            return existingHistory->optRt->makeUpdated(collectionAndChunks.timeseriesFields,
+                                                       collectionAndChunks.reshardingFields,
+                                                       collectionAndChunks.allowMigrations,
+                                                       collectionAndChunks.unsplittable,
+                                                       collectionAndChunks.changedChunks);
+        }
+
+        auto defaultCollator = [&]() -> std::unique_ptr<CollatorInterface> {
+            if (!collectionAndChunks.defaultCollation.isEmpty()) {
+                // The collation should have been validated upon collection creation
+                return uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                           ->makeFromBSON(collectionAndChunks.defaultCollation));
+            }
+            return nullptr;
+        }();
+
+        return RoutingTableHistory::makeNew(nss,
+                                            *collectionAndChunks.uuid,
+                                            KeyPattern(collectionAndChunks.shardKeyPattern),
+                                            collectionAndChunks.unsplittable,
+                                            std::move(defaultCollator),
+                                            collectionAndChunks.shardKeyIsUnique,
+                                            collectionAndChunks.epoch,
+                                            collectionAndChunks.timestamp,
+                                            collectionAndChunks.timeseriesFields,
+                                            std::move(collectionAndChunks.reshardingFields),
+                                            collectionAndChunks.allowMigrations,
+                                            collectionAndChunks.changedChunks);
+    }();
+
+    return std::make_shared<RoutingTableHistory>(std::move(newRoutingHistory));
+}
 
 }  // namespace
 
-CachedDatabaseInfo::CachedDatabaseInfo(DatabaseTypeValueHandle&& dbt) : _dbt(std::move(dbt)){};
-
-DatabaseType CachedDatabaseInfo::getDatabaseType() const {
-    return *_dbt;
+ShardVersion CollectionRoutingInfo::getCollectionVersion() const {
+    return ShardVersionFactory::make(
+        cm, sii ? boost::make_optional(sii->getCollectionIndexes()) : boost::none);
 }
 
-const ShardId& CachedDatabaseInfo::primaryId() const {
-    return _dbt->getPrimary();
+ShardVersion CollectionRoutingInfo::getShardVersion(const ShardId& shardId) const {
+    return ShardVersionFactory::make(
+        cm, shardId, sii ? boost::make_optional(sii->getCollectionIndexes()) : boost::none);
 }
 
-bool CachedDatabaseInfo::shardingEnabled() const {
-    return _dbt->getSharded();
+AtomicWord<uint64_t> ComparableDatabaseVersion::_disambiguatingSequenceNumSource{1ULL};
+AtomicWord<uint64_t> ComparableDatabaseVersion::_forcedRefreshSequenceNumSource{1ULL};
+
+ComparableDatabaseVersion ComparableDatabaseVersion::makeComparableDatabaseVersion(
+    const boost::optional<DatabaseVersion>& version) {
+    return ComparableDatabaseVersion(version,
+                                     _disambiguatingSequenceNumSource.fetchAndAdd(1),
+                                     _forcedRefreshSequenceNumSource.load());
 }
 
-DatabaseVersion CachedDatabaseInfo::databaseVersion() const {
-    return _dbt->getVersion();
+ComparableDatabaseVersion
+ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh() {
+    return ComparableDatabaseVersion(boost::none /* version */,
+                                     _disambiguatingSequenceNumSource.fetchAndAdd(1),
+                                     _forcedRefreshSequenceNumSource.addAndFetch(2) - 1);
 }
 
-CatalogCache::CatalogCache(ServiceContext* const service, CatalogCacheLoader& cacheLoader)
-    : _cacheLoader(cacheLoader),
-      _executor(std::make_shared<ThreadPool>([] {
+void ComparableDatabaseVersion::setDatabaseVersion(const DatabaseVersion& version) {
+    _dbVersion = version;
+}
+
+std::string ComparableDatabaseVersion::toString() const {
+    BSONObjBuilder builder;
+    if (_dbVersion)
+        builder.append("dbVersion"_sd, _dbVersion->toBSON());
+    else
+        builder.append("dbVersion"_sd, "None");
+
+    builder.append("disambiguatingSequenceNum"_sd,
+                   static_cast<int64_t>(_disambiguatingSequenceNum));
+
+    builder.append("forcedRefreshSequenceNum"_sd, static_cast<int64_t>(_forcedRefreshSequenceNum));
+
+    return builder.obj().toString();
+}
+
+bool ComparableDatabaseVersion::operator==(const ComparableDatabaseVersion& other) const {
+    if (_forcedRefreshSequenceNum != other._forcedRefreshSequenceNum)
+        return false;  // Values created on two sides of a forced refresh sequence number are always
+                       // considered different
+    if (_forcedRefreshSequenceNum == 0)
+        return true;  // Only default constructed values have _forcedRefreshSequenceNum == 0 and
+                      // they are always equal
+
+    // Relying on the boost::optional<DatabaseVersion>::operator== comparison
+    return _dbVersion == other._dbVersion;
+}
+
+bool ComparableDatabaseVersion::operator<(const ComparableDatabaseVersion& other) const {
+    if (_forcedRefreshSequenceNum < other._forcedRefreshSequenceNum)
+        return true;  // Values created on two sides of a forced refresh sequence number are always
+                      // considered different
+    if (_forcedRefreshSequenceNum > other._forcedRefreshSequenceNum)
+        return false;  // Values created on two sides of a forced refresh sequence number are always
+                       // considered different
+    if (_forcedRefreshSequenceNum == 0)
+        return false;  // Only default constructed values have _forcedRefreshSequenceNum == 0 and
+                       // they are always equal
+
+    // If both versions are valid we rely on the underlying DatabaseVersion comparison
+    if (_dbVersion && other._dbVersion)
+        return _dbVersion < other._dbVersion;
+
+    // Finally, we do a disambiguating sequence number comparison
+    return _disambiguatingSequenceNum < other._disambiguatingSequenceNum;
+}
+
+CatalogCache::CatalogCache(ServiceContext* const service,
+                           std::shared_ptr<CatalogCacheLoader> cacheLoader,
+                           StringData kind)
+    : _kind(kind),
+      _cacheLoader(cacheLoader),
+      _executor([this] {
           ThreadPool::Options options;
-          options.poolName = "CatalogCache";
+          options.poolName = "CatalogCache" + (_kind.empty() ? "" : "::" + _kind);
           options.minThreads = 0;
           options.maxThreads = 6;
           return options;
-      }())),
-      _databaseCache(service, *_executor, _cacheLoader),
-      _collectionCache(service, *_executor, _cacheLoader) {
-    _executor->startup();
+      }()),
+      _databaseCache(service, _executor, _cacheLoader),
+      _collectionCache(service, _executor, _cacheLoader),
+      _indexCache(service, _executor) {
+    _executor.startup();
 }
 
 CatalogCache::~CatalogCache() {
-    // The executor is used by the Database and Collection caches,
-    // so it must be joined, before these caches are destroyed,
-    // per the contract of ReadThroughCache.
-    _executor->shutdown();
-    _executor->join();
+    // The executor is used by all the caches that correspond to the router role, so it must be
+    // joined before these caches are destroyed, per the contract of ReadThroughCache.
+    shutDownAndJoin();
+}
+
+void CatalogCache::shutDownAndJoin() {
+    // The CatalogCache must be shuted down before shutting down the CatalogCacheLoader as the
+    // CatalogCache may try to schedule work on CatalogCacheLoader and fail.
+    _executor.shutdown();
+    _executor.join();
+
+    _cacheLoader->shutDown();
 }
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx,
-                                                         StringData dbName,
-                                                         bool allowLocks) {
-    if (!allowLocks) {
-        invariant(
-            !opCtx->lockState() || !opCtx->lockState()->isLocked(),
+                                                         const DatabaseName& dbName) {
+    return _getDatabase(opCtx, dbName);
+}
+
+StatusWith<CachedDatabaseInfo> CatalogCache::_getDatabase(OperationContext* opCtx,
+                                                          const DatabaseName& dbName,
+                                                          bool allowLocks) {
+    tassert(7032313,
             "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
             "hold the lock during a network call, and can lead to a deadlock as described in "
-            "SERVER-37398.");
+            "SERVER-37398.",
+            allowLocks || !shard_role_details::getLocker(opCtx) ||
+                !shard_role_details::getLocker(opCtx)->isLocked());
+
+    if (dbName.isAdminDB() || dbName.isConfigDB()) {
+        // The 'admin' and 'config' databases are known to always be in the config server, there is
+        // no need to make a request to the DatabaseCache. This prevents a potential deadlock on
+        // config shard nodes issuing aggregations on 'config' to themselves during a refresh, and
+        // finding the CatalogCache thread pool is full when the aggregation itself needs to refresh
+        // the cache (i.e. $unionWith).
+        return CachedDatabaseInfo{
+            DatabaseType(dbName, ShardId::kConfigServerId, DatabaseVersion::makeFixed())};
     }
 
+    Timer t{};
+    ScopeGuard finishTiming([&] {
+        CurOp::get(opCtx)->debug().catalogCacheDatabaseLookupMillis += Milliseconds(t.millis());
+    });
+
     try {
-        auto dbEntry = _databaseCache.acquire(opCtx, dbName, CacheCausalConsistency::kLatestKnown);
+        auto dbEntryFuture =
+            _databaseCache.acquireAsync(dbName, CacheCausalConsistency::kLatestKnown);
+
+        if (allowLocks) {
+            // When allowLocks is true we may be holding a lock, so we don't want to block the
+            // current thread: if the future is ready let's use it, otherwise return an error.
+            if (dbEntryFuture.isReady()) {
+                return dbEntryFuture.get(opCtx);
+            } else {
+                // This error only contains the database name and must be handled by any callers of
+                // _getDatabase with the potential for allowLocks to be true. The caller should
+                // convert this to ErrorCodes::ShardCannotRefreshDueToLocksHeld with the full
+                // namespace.
+                return Status{ShardCannotRefreshDueToLocksHeldInfo(NamespaceString(dbName)),
+                              "Database info refresh did not complete"};
+            }
+        }
+
+        // From this point we can guarantee that allowLocks is false.
+        auto dbEntry = dbEntryFuture.get(opCtx);
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "database " << dbName << " not found",
+                str::stream() << "database " << dbName.toStringForErrorMsg() << " not found",
                 dbEntry);
 
-        return {CachedDatabaseInfo(std::move(dbEntry))};
+        return dbEntry;
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
 }
 
-StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
+StatusWith<ChunkManager> CatalogCache::_getCollectionPlacementInfoAt(
     OperationContext* opCtx,
     const NamespaceString& nss,
     boost::optional<Timestamp> atClusterTime,
     bool allowLocks) {
-    if (!allowLocks) {
-        invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
-                  "Do not hold a lock while refreshing the catalog cache. Doing so would "
-                  "potentially hold "
-                  "the lock during a network call, and can lead to a deadlock as described in "
-                  "SERVER-37398.");
-    }
+    tassert(7032314,
+            "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+            "hold the lock during a network call, and can lead to a deadlock as described in "
+            "SERVER-37398.",
+            allowLocks || !shard_role_details::getLocker(opCtx)->isLocked());
 
     try {
-        const auto swDbInfo = getDatabase(opCtx, nss.db(), allowLocks);
+        const auto swDbInfo = _getDatabase(opCtx, nss.dbName(), allowLocks);
         if (!swDbInfo.isOK()) {
-            if (swDbInfo == ErrorCodes::NamespaceNotFound) {
+            if (swDbInfo == ErrorCodes::ShardCannotRefreshDueToLocksHeld) {
+                // Since collection refreshes always imply database refreshes, it is ok to transform
+                // this error into a collection error rather than a database error.
+                auto dbRefreshInfo =
+                    swDbInfo.getStatus().extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+                LOGV2_DEBUG(7850500,
+                            2,
+                            "Adding collection name to ShardCannotRefreshDueToLocksHeld error",
+                            "dbName"_attr = dbRefreshInfo->getNss().dbName(),
+                            "nss"_attr = nss);
+                return Status{ShardCannotRefreshDueToLocksHeldInfo(nss),
+                              "Routing info refresh did not complete"};
+            } else if (swDbInfo == ErrorCodes::NamespaceNotFound) {
                 LOGV2_FOR_CATALOG_REFRESH(
                     4947103,
                     2,
                     "Invalidating cached collection entry because its database has been dropped",
-                    "namespace"_attr = nss);
+                    logAttrs(nss));
                 invalidateCollectionEntry_LINEARIZABLE(nss);
             }
             return swDbInfo.getStatus();
         }
 
+        Timer curOpTimer{};
+        ScopeGuard finishTiming([&] {
+            CurOp::get(opCtx)->debug().catalogCacheCollectionLookupMillis +=
+                Milliseconds(curOpTimer.millis());
+        });
+
         const auto dbInfo = std::move(swDbInfo.getValue());
 
-        const auto cacheConsistency = gEnableFinerGrainedCatalogCacheRefresh &&
-                !operationShouldBlockBehindCatalogCacheRefresh(opCtx)
-            ? CacheCausalConsistency::kLatestCached
-            : CacheCausalConsistency::kLatestKnown;
+        if (nss.isNamespaceAlwaysUntracked()) {
+            // If the collection is known to always be untracked, there is no need to request it to
+            // the CollectionCache.
+            return ChunkManager(dbInfo->getPrimary(),
+                                dbInfo->getVersion(),
+                                OptionalRoutingTableHistory(),
+                                atClusterTime);
+        }
 
-        auto collEntryFuture = _collectionCache.acquireAsync(nss, cacheConsistency);
+        auto collEntryFuture =
+            _collectionCache.acquireAsync(nss, CacheCausalConsistency::kLatestKnown);
 
         if (allowLocks) {
             // When allowLocks is true we may be holding a lock, so we don't
@@ -178,21 +415,17 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
             // use it, otherwise return an error
 
             if (collEntryFuture.isReady()) {
-                setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, false);
-                return ChunkManager(dbInfo.primaryId(),
-                                    dbInfo.databaseVersion(),
+                return ChunkManager(dbInfo->getPrimary(),
+                                    dbInfo->getVersion(),
                                     collEntryFuture.get(opCtx),
                                     atClusterTime);
             } else {
-                return Status{ErrorCodes::StaleShardVersion,
+                return Status{ShardCannotRefreshDueToLocksHeldInfo(nss),
                               "Routing info refresh did not complete"};
             }
         }
 
         // From this point we can guarantee that allowLocks is false
-
-        operationBlockedBehindCatalogCacheRefresh(opCtx) = true;
-
         size_t acquireTries = 0;
         Timer t;
 
@@ -201,51 +434,32 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
                 auto collEntry = collEntryFuture.get(opCtx);
                 _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros());
 
-                setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, false);
-
-                return ChunkManager(dbInfo.primaryId(),
-                                    dbInfo.databaseVersion(),
+                return ChunkManager(dbInfo->getPrimary(),
+                                    dbInfo->getVersion(),
                                     std::move(collEntry),
                                     atClusterTime);
-            } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>& ex) {
-                LOGV2_FOR_CATALOG_REFRESH(5310501,
-                                          0,
-                                          "Collection refresh failed",
-                                          "namespace"_attr = nss,
-                                          "exception"_attr = redact(ex));
+            } catch (const DBException& ex) {
                 _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros());
-                acquireTries++;
-                if (acquireTries == kMaxInconsistentRoutingInfoRefreshAttempts) {
+                bool isCatalogCacheRetriableError = ex.isA<ErrorCategory::SnapshotError>() ||
+                    ex.code() == ErrorCodes::ConflictingOperationInProgress ||
+                    ex.code() == ErrorCodes::QueryPlanKilled;
+                if (!isCatalogCacheRetriableError) {
                     return ex.toStatus();
                 }
-            } catch (ExceptionFor<ErrorCodes::QueryPlanKilled>& ex) {
-                // TODO SERVER-53283: Remove once 5.0 has branched out.
-                // This would happen when the query to config.chunks is killed because the index it
-                // relied on has been dropped while the query was ongoing.
-                LOGV2_FOR_CATALOG_REFRESH(5310503,
+
+                LOGV2_FOR_CATALOG_REFRESH(4086500,
                                           0,
                                           "Collection refresh failed",
-                                          "namespace"_attr = nss,
+                                          logAttrs(nss),
                                           "exception"_attr = redact(ex));
-                _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros());
                 acquireTries++;
-                if (acquireTries == kMaxInconsistentRoutingInfoRefreshAttempts) {
-                    return ex.toStatus();
-                }
-            } catch (ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
-                LOGV2_FOR_CATALOG_REFRESH(5487402,
-                                          0,
-                                          "Collection refresh failed",
-                                          "namespace"_attr = nss,
-                                          "exception"_attr = redact(ex));
-                _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros());
-                acquireTries++;
-                if (acquireTries == kMaxInconsistentRoutingInfoRefreshAttempts) {
+                if (acquireTries == kMaxInconsistentCollectionRefreshAttempts) {
                     return ex.toStatus();
                 }
             }
 
-            collEntryFuture = _collectionCache.acquireAsync(nss, cacheConsistency);
+            collEntryFuture =
+                _collectionCache.acquireAsync(nss, CacheCausalConsistency::kLatestKnown);
             t.reset();
         }
     } catch (const DBException& ex) {
@@ -253,126 +467,285 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
     }
 }
 
-StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfo(OperationContext* opCtx,
-                                                                const NamespaceString& nss,
-                                                                bool allowLocks) {
-    return _getCollectionRoutingInfoAt(opCtx, nss, boost::none, allowLocks);
+StatusWith<CollectionRoutingInfo> CatalogCache::_getCollectionRoutingInfoAt(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    boost::optional<Timestamp> optAtClusterTime,
+    bool allowLocks) {
+    try {
+        auto cm = uassertStatusOK(
+            _getCollectionPlacementInfoAt(opCtx, nss, optAtClusterTime, allowLocks));
+        if (!cm.isSharded()) {
+            // If the collection is unsharded, it cannot have global indexes so there is no need to
+            // fetch the index information.
+            return CollectionRoutingInfo{std::move(cm), boost::none};
+        }
+        auto sii = _getCollectionIndexInfo(opCtx, nss, allowLocks);
+        return _retryUntilConsistentRoutingInfo(opCtx, nss, std::move(cm), std::move(sii));
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
 }
 
-StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoAt(OperationContext* opCtx,
-                                                                  const NamespaceString& nss,
-                                                                  Timestamp atClusterTime) {
-    return _getCollectionRoutingInfoAt(opCtx, nss, atClusterTime, false);
+StatusWith<CollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoAt(
+    OperationContext* opCtx, const NamespaceString& nss, Timestamp atClusterTime, bool allowLocks) {
+    return _getCollectionRoutingInfoAt(opCtx, nss, atClusterTime, allowLocks);
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getCollectionRoutingInfo(OperationContext* opCtx,
+                                                                         const NamespaceString& nss,
+                                                                         bool allowLocks) {
+    return _getCollectionRoutingInfoAt(opCtx, nss, boost::none /* atClusterTime */, allowLocks);
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoWithRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    _triggerPlacementVersionRefresh(nss);
+    _triggerIndexVersionRefresh(nss);
+    return _getCollectionRoutingInfoAt(opCtx, nss, boost::none /* atClusterTime */);
+}
+
+
+boost::optional<ShardingIndexesCatalogCache> CatalogCache::_getCollectionIndexInfo(
+    OperationContext* opCtx, const NamespaceString& nss, bool allowLocks) {
+
+    // (Ignore FCV check): It is okay to ignore FCV in mongos. This is a temporary solution to solve
+    // performance issue when fetching index information in mongos.
+    if (!feature_flags::gGlobalIndexesShardingCatalog.isEnabledAndIgnoreFCVUnsafe()) {
+        return boost::none;
+    }
+
+    if (!allowLocks) {
+        invariant(!shard_role_details::getLocker(opCtx)->isLocked(),
+                  "Do not hold a lock while refreshing the catalog cache. Doing so would "
+                  "potentially hold "
+                  "the lock during a network call, and can lead to a deadlock as described in "
+                  "SERVER-37398.");
+    }
+
+    Timer curOpTimer{};
+    ScopeGuard finishTiming([&] {
+        CurOp::get(opCtx)->debug().catalogCacheIndexLookupMillis +=
+            Milliseconds(curOpTimer.millis());
+    });
+
+    auto indexEntryFuture = _indexCache.acquireAsync(nss, CacheCausalConsistency::kLatestKnown);
+
+    if (allowLocks) {
+        // When allowLocks is true we may be holding a lock, so we don't
+        // want to block the current thread: if the future is ready let's
+        // use it, otherwise return an error
+        uassert(ShardCannotRefreshDueToLocksHeldInfo(nss),
+                "Index info refresh did not complete",
+                indexEntryFuture.isReady());
+        return indexEntryFuture.get(opCtx)->optSii;
+    }
+
+    // From this point we can guarantee that allowLocks is false
+    size_t acquireTries = 0;
+
+    while (true) {
+        try {
+            auto indexEntry = indexEntryFuture.get(opCtx);
+
+            return indexEntry->optSii;
+        } catch (const DBException& ex) {
+            bool isCatalogCacheRetriableError = ex.isA<ErrorCategory::SnapshotError>() ||
+                ex.code() == ErrorCodes::ConflictingOperationInProgress ||
+                ex.code() == ErrorCodes::QueryPlanKilled;
+            if (!isCatalogCacheRetriableError) {
+                throw;
+            }
+
+            LOGV2_FOR_CATALOG_REFRESH(
+                6686301, 0, "Index refresh failed", logAttrs(nss), "exception"_attr = redact(ex));
+
+            acquireTries++;
+            if (acquireTries == kMaxInconsistentCollectionRefreshAttempts) {
+                throw;
+            }
+        }
+
+        indexEntryFuture = _indexCache.acquireAsync(nss, CacheCausalConsistency::kLatestKnown);
+    }
 }
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabaseWithRefresh(OperationContext* opCtx,
-                                                                    StringData dbName) {
-    _databaseCache.invalidate(dbName);
+                                                                    const DatabaseName& dbName) {
+    _databaseCache.advanceTimeInStore(
+        dbName, ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh());
     return getDatabase(opCtx, dbName);
 }
 
-StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoWithRefresh(
-    OperationContext* opCtx, const NamespaceString& nss) {
-    _collectionCache.invalidate(nss);
-    setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
-    return getCollectionRoutingInfo(opCtx, nss);
+void CatalogCache::_triggerPlacementVersionRefresh(const NamespaceString& nss) {
+    _collectionCache.advanceTimeInStore(
+        nss, ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh());
 }
 
-ChunkManager CatalogCache::getShardedCollectionRoutingInfo(OperationContext* opCtx,
-                                                           const NamespaceString& nss) {
-    auto cm = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
-
-    uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Expected collection " << nss << " to be sharded",
-            cm.isSharded());
-
-    return cm;
+void CatalogCache::_triggerIndexVersionRefresh(const NamespaceString& nss) {
+    _indexCache.advanceTimeInStore(
+        nss, ComparableIndexVersion::makeComparableIndexVersionForForcedRefresh());
 }
 
-StatusWith<ChunkManager> CatalogCache::getShardedCollectionRoutingInfoWithRefresh(
-    OperationContext* opCtx, const NamespaceString& nss) {
-    auto routingInfoStatus = getCollectionRoutingInfoWithRefresh(opCtx, nss);
-    if (routingInfoStatus.isOK() && !routingInfoStatus.getValue().isSharded()) {
-        return {ErrorCodes::NamespaceNotSharded,
-                str::stream() << "Collection " << nss.ns() << " is not sharded."};
+StatusWith<CollectionRoutingInfo> CatalogCache::_retryUntilConsistentRoutingInfo(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    ChunkManager&& cm,
+    boost::optional<ShardingIndexesCatalogCache>&& sii) {
+    try {
+        // A non-empty ShardingIndexesCatalogCache implies that the collection is sharded since
+        // global indexes cannot be created on unsharded collections.
+        while (sii && (!cm.isSharded() || !cm.uuidMatches(sii->getCollectionIndexes().uuid()))) {
+            auto nextSii = uassertStatusOK(getCollectionIndexInfoWithRefresh(opCtx, nss));
+            if (sii.is_initialized() && nextSii.is_initialized() &&
+                sii->getCollectionIndexes() == nextSii->getCollectionIndexes()) {
+                cm = uassertStatusOK(getCollectionPlacementInfoWithRefresh(opCtx, nss));
+            }
+            sii = std::move(nextSii);
+        }
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
-    return routingInfoStatus;
+    return CollectionRoutingInfo{std::move(cm), std::move(sii)};
 }
 
-void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
+StatusWith<ChunkManager> CatalogCache::getCollectionPlacementInfoWithRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    try {
+        _triggerPlacementVersionRefresh(nss);
+        return _getCollectionPlacementInfoAt(opCtx, nss, boost::none /* atClusterTime */);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+StatusWith<boost::optional<ShardingIndexesCatalogCache>>
+CatalogCache::getCollectionIndexInfoWithRefresh(OperationContext* opCtx,
+                                                const NamespaceString& nss) {
+    try {
+        _triggerIndexVersionRefresh(nss);
+        return _getCollectionIndexInfo(opCtx, nss);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+CollectionRoutingInfo CatalogCache::getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                                    const NamespaceString& nss) {
+    auto cri = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                          << " to be sharded",
+            cri.cm.isSharded());
+    return cri;
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getShardedCollectionRoutingInfoWithRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    try {
+        auto cri = uassertStatusOK(getCollectionRoutingInfoWithRefresh(opCtx, nss));
+        uassert(ErrorCodes::NamespaceNotSharded,
+                str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                              << " to be sharded",
+                cri.cm.isSharded());
+        return cri;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getShardedCollectionRoutingInfoWithPlacementRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    try {
+        _triggerPlacementVersionRefresh(nss);
+        auto cri = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
+        uassert(ErrorCodes::NamespaceNotSharded,
+                str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                              << " to be sharded",
+                cri.cm.isSharded());
+        return cri;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+CollectionRoutingInfo CatalogCache::getTrackedCollectionRoutingInfo(OperationContext* opCtx,
+                                                                    const NamespaceString& nss) {
+    auto cri = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                          << " to be tracked",
+            cri.cm.hasRoutingTable());
+    return cri;
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getTrackedCollectionRoutingInfoWithRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    try {
+        auto cri = uassertStatusOK(getCollectionRoutingInfoWithRefresh(opCtx, nss));
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                              << " to be tracked",
+                cri.cm.hasRoutingTable());
+        return cri;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+StatusWith<CollectionRoutingInfo> CatalogCache::getTrackedCollectionRoutingInfoWithPlacementRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    try {
+        _triggerPlacementVersionRefresh(nss);
+        auto cri = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                              << " to be tracked",
+                cri.cm.hasRoutingTable());
+        return cri;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+void CatalogCache::onStaleDatabaseVersion(const DatabaseName& dbName,
                                           const boost::optional<DatabaseVersion>& databaseVersion) {
     if (databaseVersion) {
         const auto version =
-            ComparableDatabaseVersion::makeComparableDatabaseVersion(databaseVersion.get());
+            ComparableDatabaseVersion::makeComparableDatabaseVersion(databaseVersion.value());
         LOGV2_FOR_CATALOG_REFRESH(4899101,
                                   2,
                                   "Registering new database version",
                                   "db"_attr = dbName,
-                                  "version"_attr = version.toBSONForLogging());
+                                  "version"_attr = version);
         _databaseCache.advanceTimeInStore(dbName, version);
     } else {
-        _databaseCache.invalidate(dbName);
+        _databaseCache.invalidateKey(dbName);
     }
 }
 
-void CatalogCache::setOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx,
-                                                                    bool shouldBlock) {
-    if (gEnableFinerGrainedCatalogCacheRefresh) {
-        operationShouldBlockBehindCatalogCacheRefresh(opCtx) = shouldBlock;
-    }
-}
-
-void CatalogCache::invalidateShardOrEntireCollectionEntryForShardedCollection(
-    const NamespaceString& nss,
-    const boost::optional<ChunkVersion>& wantedVersion,
-    const ShardId& shardId) {
+void CatalogCache::onStaleCollectionVersion(const NamespaceString& nss,
+                                            const boost::optional<ShardVersion>& wantedVersion) {
     _stats.countStaleConfigErrors.addAndFetch(1);
 
-    auto collectionEntry = _collectionCache.peekLatestCached(nss);
-
     const auto newChunkVersion = wantedVersion
-        ? ComparableChunkVersion::makeComparableChunkVersion(*wantedVersion)
+        ? ComparableChunkVersion::makeComparableChunkVersion(wantedVersion->placementVersion())
         : ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh();
+    _collectionCache.advanceTimeInStore(nss, newChunkVersion);
 
-    const bool timeAdvanced = _collectionCache.advanceTimeInStore(nss, newChunkVersion);
-
-    if (timeAdvanced && collectionEntry && collectionEntry->optRt) {
-        // Shards marked stale will be reset on the next refresh.
-        // We can mark the shard stale only if the time advanced, otherwise no refresh would happen
-        // and the shard will remain marked stale.
-        // Even if a concurrent refresh is happening this is still the old collectionEntry,
-        // so it is safe to call setShardStale.
-        collectionEntry->optRt->setShardStale(shardId);
-    }
+    const auto newIndexVersion = wantedVersion
+        ? ComparableIndexVersion::makeComparableIndexVersion(wantedVersion->indexVersion())
+        : ComparableIndexVersion::makeComparableIndexVersionForForcedRefresh();
+    _indexCache.advanceTimeInStore(nss, newIndexVersion);
 }
 
-void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
-                                     const ChunkVersion& targetCollectionVersion,
-                                     const ShardId& shardId) {
-    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none, shardId),
-            str::stream() << "could not act as router for " << nss.ns()
-                          << ", no entry for database " << nss.db(),
-            _databaseCache.peekLatestCached(nss.db()));
-
-    auto collectionValueHandle = _collectionCache.peekLatestCached(nss);
-    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none, shardId),
-            str::stream() << "could not act as router for " << nss.ns()
-                          << ", no entry for collection.",
-            collectionValueHandle);
-
-    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none, shardId),
-            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
-                          << targetCollectionVersion.toString()
-                          << ", but found the collection was unsharded",
-            collectionValueHandle->optRt);
-
-    auto foundVersion = collectionValueHandle->optRt->getVersion();
-    uassert(StaleConfigInfo(nss, targetCollectionVersion, foundVersion, shardId),
-            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
-                          << targetCollectionVersion.toString() << ", but found "
-                          << foundVersion.toString(),
-            foundVersion.epoch() == targetCollectionVersion.epoch());
+void CatalogCache::advanceCollectionTimeInStore(const NamespaceString& nss,
+                                                const ChunkVersion& newVersionInStore) {
+    const auto newChunkVersion =
+        ComparableChunkVersion::makeComparableChunkVersion(newVersionInStore);
+    _collectionCache.advanceTimeInStore(nss, newChunkVersion);
 }
+
 
 void CatalogCache::invalidateEntriesThatReferenceShard(const ShardId& shardId) {
     LOGV2_DEBUG(4997600,
@@ -380,169 +753,139 @@ void CatalogCache::invalidateEntriesThatReferenceShard(const ShardId& shardId) {
                 "Invalidating databases and collections referencing a specific shard",
                 "shardId"_attr = shardId);
 
-    _databaseCache.invalidateCachedValueIf(
-        [&](const DatabaseType& dbt) { return dbt.getPrimary() == shardId; });
+    _databaseCache.invalidateLatestCachedValueIf_IgnoreInProgress(
+        [&](const DatabaseName&, const DatabaseType& dbt) { return dbt.getPrimary() == shardId; });
 
     // Invalidate collections which contain data on this shard.
-    _collectionCache.invalidateCachedValueIf([&](const OptionalRoutingTableHistory& ort) {
-        if (!ort.optRt)
-            return false;
-        const auto& rt = *ort.optRt;
+    _collectionCache.invalidateLatestCachedValueIf_IgnoreInProgress(
+        [&](const NamespaceString&, const OptionalRoutingTableHistory& ort) {
+            if (!ort.optRt)
+                return false;
+            const auto& rt = *ort.optRt;
 
-        std::set<ShardId> shardIds;
-        rt.getAllShardIds(&shardIds);
+            std::set<ShardId> shardIds;
+            rt.getAllShardIds(&shardIds);
 
-        LOGV2_DEBUG(22647,
-                    3,
-                    "Invalidating cached collection {namespace} that has data "
-                    "on shard {shardId}",
-                    "Invalidating cached collection",
-                    "namespace"_attr = rt.nss(),
-                    "shardId"_attr = shardId);
-        return shardIds.find(shardId) != shardIds.end();
-    });
+            LOGV2_DEBUG(22647,
+                        3,
+                        "Invalidating cached collection",
+                        logAttrs(rt.nss()),
+                        "shardId"_attr = shardId);
+            return shardIds.find(shardId) != shardIds.end();
+        });
 
     LOGV2(22648,
-          "Finished invalidating databases and collections with data on shard: {shardId}",
           "Finished invalidating databases and collections that reference specific shard",
           "shardId"_attr = shardId);
 }
 
-void CatalogCache::purgeDatabase(StringData dbName) {
-    _databaseCache.invalidate(dbName);
+void CatalogCache::purgeDatabase(const DatabaseName& dbName) {
+    _databaseCache.invalidateKey(dbName);
     _collectionCache.invalidateKeyIf(
-        [&](const NamespaceString& nss) { return nss.db() == dbName; });
+        [&](const NamespaceString& nss) { return nss.dbName() == dbName; });
+    _indexCache.invalidateKeyIf([&](const NamespaceString& nss) { return nss.dbName() == dbName; });
 }
 
 void CatalogCache::purgeAllDatabases() {
     _databaseCache.invalidateAll();
     _collectionCache.invalidateAll();
+    _indexCache.invalidateAll();
 }
 
 void CatalogCache::report(BSONObjBuilder* builder) const {
-    BSONObjBuilder cacheStatsBuilder(builder->subobjStart("catalogCache"));
+    BSONObjBuilder cacheStatsBuilder(
+        builder->subobjStart("catalogCache" + (_kind.empty() ? "" : "::" + _kind)));
 
     const size_t numDatabaseEntries = _databaseCache.getCacheInfo().size();
     const size_t numCollectionEntries = _collectionCache.getCacheInfo().size();
+    const size_t numIndexEntries = _indexCache.getCacheInfo().size();
 
     cacheStatsBuilder.append("numDatabaseEntries", static_cast<long long>(numDatabaseEntries));
     cacheStatsBuilder.append("numCollectionEntries", static_cast<long long>(numCollectionEntries));
+    cacheStatsBuilder.append("numIndexEntries", static_cast<long long>(numIndexEntries));
 
     _stats.report(&cacheStatsBuilder);
     _collectionCache.reportStats(&cacheStatsBuilder);
 }
 
-void CatalogCache::checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx,
-                                                           mongo::LogicalOp opType) {
-    if (!isMongos() || !operationBlockedBehindCatalogCacheRefresh(opCtx)) {
-        return;
-    }
-
-    auto& opsBlockedByRefresh = _stats.operationsBlockedByRefresh;
-
-    opsBlockedByRefresh.countAllOperations.fetchAndAddRelaxed(1);
-
-    switch (opType) {
-        case LogicalOp::opInsert:
-            opsBlockedByRefresh.countInserts.fetchAndAddRelaxed(1);
-            break;
-        case LogicalOp::opQuery:
-            opsBlockedByRefresh.countQueries.fetchAndAddRelaxed(1);
-            break;
-        case LogicalOp::opUpdate:
-            opsBlockedByRefresh.countUpdates.fetchAndAddRelaxed(1);
-            break;
-        case LogicalOp::opDelete:
-            opsBlockedByRefresh.countDeletes.fetchAndAddRelaxed(1);
-            break;
-        case LogicalOp::opCommand:
-            opsBlockedByRefresh.countCommands.fetchAndAddRelaxed(1);
-            break;
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-void CatalogCache::invalidateDatabaseEntry_LINEARIZABLE(const StringData& dbName) {
-    _databaseCache.invalidate(dbName);
+void CatalogCache::invalidateDatabaseEntry_LINEARIZABLE(const DatabaseName& dbName) {
+    _databaseCache.invalidateKey(dbName);
 }
 
 void CatalogCache::invalidateCollectionEntry_LINEARIZABLE(const NamespaceString& nss) {
-    _collectionCache.invalidate(nss);
+    _collectionCache.invalidateKey(nss);
+}
+
+void CatalogCache::invalidateIndexEntry_LINEARIZABLE(const NamespaceString& nss) {
+    // (Ignore FCV check): It is okay to ignore FCV in mongos.
+    if (!feature_flags::gGlobalIndexesShardingCatalog.isEnabledAndIgnoreFCVUnsafe()) {
+        _indexCache.invalidateKey(nss);
+    }
+}
+
+boost::optional<ChunkVersion> CatalogCache::peekCollectionCacheVersion(const NamespaceString& nss) {
+    auto valueHandle = _collectionCache.peekLatestCached(nss);
+    if (valueHandle && valueHandle->optRt) {
+        return valueHandle->optRt->getVersion();
+    } else {
+        return boost::none;
+    }
 }
 
 void CatalogCache::Stats::report(BSONObjBuilder* builder) const {
     builder->append("countStaleConfigErrors", countStaleConfigErrors.load());
 
     builder->append("totalRefreshWaitTimeMicros", totalRefreshWaitTimeMicros.load());
-
-    if (isMongos()) {
-        BSONObjBuilder operationsBlockedByRefreshBuilder(
-            builder->subobjStart("operationsBlockedByRefresh"));
-
-        operationsBlockedByRefreshBuilder.append(
-            "countAllOperations", operationsBlockedByRefresh.countAllOperations.load());
-        operationsBlockedByRefreshBuilder.append("countInserts",
-                                                 operationsBlockedByRefresh.countInserts.load());
-        operationsBlockedByRefreshBuilder.append("countQueries",
-                                                 operationsBlockedByRefresh.countQueries.load());
-        operationsBlockedByRefreshBuilder.append("countUpdates",
-                                                 operationsBlockedByRefresh.countUpdates.load());
-        operationsBlockedByRefreshBuilder.append("countDeletes",
-                                                 operationsBlockedByRefresh.countDeletes.load());
-        operationsBlockedByRefreshBuilder.append("countCommands",
-                                                 operationsBlockedByRefresh.countCommands.load());
-
-        operationsBlockedByRefreshBuilder.done();
-    }
 }
 
 CatalogCache::DatabaseCache::DatabaseCache(ServiceContext* service,
                                            ThreadPoolInterface& threadPool,
-                                           CatalogCacheLoader& catalogCacheLoader)
-    : ReadThroughCache(_mutex,
-                       service,
-                       threadPool,
-                       [this](OperationContext* opCtx,
-                              const std::string& dbName,
-                              const ValueHandle& db,
-                              const ComparableDatabaseVersion& previousDbVersion) {
-                           return _lookupDatabase(opCtx, dbName, db, previousDbVersion);
-                       },
-                       kDatabaseCacheSize),
+                                           std::shared_ptr<CatalogCacheLoader> catalogCacheLoader)
+    : ReadThroughCache(
+          _mutex,
+          service->getService(),
+          threadPool,
+          [this](OperationContext* opCtx,
+                 const DatabaseName& dbName,
+                 const ValueHandle& db,
+                 const ComparableDatabaseVersion& previousDbVersion) {
+              return _lookupDatabase(opCtx, dbName, db, previousDbVersion);
+          },
+          kDatabaseCacheSize),
       _catalogCacheLoader(catalogCacheLoader) {}
 
 CatalogCache::DatabaseCache::LookupResult CatalogCache::DatabaseCache::_lookupDatabase(
     OperationContext* opCtx,
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const DatabaseTypeValueHandle& previousDbType,
     const ComparableDatabaseVersion& previousDbVersion) {
+    if (MONGO_unlikely(blockDatabaseCacheLookup.shouldFail())) {
+        LOGV2(8023400, "Hanging before refreshing cached database entry");
+        blockDatabaseCacheLookup.pauseWhileSet();
+    }
     // TODO (SERVER-34164): Track and increment stats for database refreshes
 
     LOGV2_FOR_CATALOG_REFRESH(24102, 2, "Refreshing cached database entry", "db"_attr = dbName);
 
+    // This object will define the new time of the database info obtained by this refresh
+    auto newDbVersion = ComparableDatabaseVersion::makeComparableDatabaseVersion(boost::none);
+
     Timer t{};
     try {
-        auto newDb = _catalogCacheLoader.getDatabase(dbName).get();
+        auto newDb = _catalogCacheLoader->getDatabase(dbName).get();
         uassertStatusOKWithContext(
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, newDb.getPrimary()),
-            str::stream() << "The primary shard for database " << dbName << " does not exist");
+            str::stream() << "The primary shard for database " << dbName.toStringForErrorMsg()
+                          << " does not exist");
 
-        const bool mustReplaceEntryDueToUpgradeOrDowngrade = previousDbType &&
-            (previousDbType->getVersion().getTimestamp().is_initialized() !=
-             newDb.getVersion().getTimestamp().is_initialized());
-
-        auto newDbVersion = mustReplaceEntryDueToUpgradeOrDowngrade
-            ? ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh(
-                  newDb.getVersion())
-            : ComparableDatabaseVersion::makeComparableDatabaseVersion(newDb.getVersion());
+        newDbVersion.setDatabaseVersion(newDb.getVersion());
 
         LOGV2_FOR_CATALOG_REFRESH(24101,
                                   1,
                                   "Refreshed cached database entry",
                                   "db"_attr = dbName,
-                                  "newDbVersion"_attr = newDbVersion.toBSONForLogging(),
-                                  "oldDbVersion"_attr = previousDbVersion.toBSONForLogging(),
+                                  "newDbVersion"_attr = newDbVersion,
+                                  "oldDbVersion"_attr = previousDbVersion,
                                   "duration"_attr = Milliseconds(t.millis()));
         return CatalogCache::DatabaseCache::LookupResult(std::move(newDb), std::move(newDbVersion));
     } catch (const DBException& ex) {
@@ -553,26 +896,27 @@ CatalogCache::DatabaseCache::LookupResult CatalogCache::DatabaseCache::_lookupDa
                                   "duration"_attr = Milliseconds(t.millis()),
                                   "error"_attr = redact(ex));
         if (ex.code() == ErrorCodes::NamespaceNotFound) {
-            return CatalogCache::DatabaseCache::LookupResult(boost::none, previousDbVersion);
+            return CatalogCache::DatabaseCache::LookupResult(boost::none, std::move(newDbVersion));
         }
         throw;
     }
 }
 
-CatalogCache::CollectionCache::CollectionCache(ServiceContext* service,
-                                               ThreadPoolInterface& threadPool,
-                                               CatalogCacheLoader& catalogCacheLoader)
-    : ReadThroughCache(_mutex,
-                       service,
-                       threadPool,
-                       [this](OperationContext* opCtx,
-                              const NamespaceString& nss,
-                              const ValueHandle& collectionHistory,
-                              const ComparableChunkVersion& previousChunkVersion) {
-                           return _lookupCollection(
-                               opCtx, nss, collectionHistory, previousChunkVersion);
-                       },
-                       kCollectionCacheSize),
+CatalogCache::CollectionCache::CollectionCache(
+    ServiceContext* service,
+    ThreadPoolInterface& threadPool,
+    std::shared_ptr<CatalogCacheLoader> catalogCacheLoader)
+    : ReadThroughCache(
+          _mutex,
+          service->getService(),
+          threadPool,
+          [this](OperationContext* opCtx,
+                 const NamespaceString& nss,
+                 const ValueHandle& collectionHistory,
+                 const ComparableChunkVersion& previousChunkVersion) {
+              return _lookupCollection(opCtx, nss, collectionHistory, previousChunkVersion);
+          },
+          kCollectionCacheSize),
       _catalogCacheLoader(catalogCacheLoader) {}
 
 void CatalogCache::CollectionCache::reportStats(BSONObjBuilder* builder) const {
@@ -612,10 +956,26 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
     OperationContext* opCtx,
     const NamespaceString& nss,
     const RoutingTableHistoryValueHandle& existingHistory,
-    const ComparableChunkVersion& previousVersion) {
+    const ComparableChunkVersion& timeInStore) {
     const bool isIncremental(existingHistory && existingHistory->optRt);
     _updateRefreshesStats(isIncremental, true);
-    blockCollectionCacheLookup.pauseWhileSet(opCtx);
+
+    blockCollectionCacheLookup.executeIf(
+        [&](const BSONObj& data) {
+            LOGV2(9131800, "Hanging before refreshing cached collection entry", "nss"_attr = nss);
+            blockCollectionCacheLookup.pauseWhileSet();
+        },
+        [&](const BSONObj& data) {
+            if (data.isEmpty())
+                return true;  // If there is no data, always hang.
+
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss");
+            return fpNss == nss || (fpNss.isDbOnly() && fpNss.isEqualDb(nss));
+        });
+
+    // This object will define the new time of the routing info obtained by this refresh
+    auto newComparableVersion =
+        ComparableChunkVersion::makeComparableChunkVersion(ChunkVersion::UNSHARDED());
 
     Timer t{};
     try {
@@ -625,98 +985,39 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
         LOGV2_FOR_CATALOG_REFRESH(4619900,
                                   1,
                                   "Refreshing cached collection",
-                                  "namespace"_attr = nss,
+                                  logAttrs(nss),
                                   "lookupSinceVersion"_attr = lookupVersion,
-                                  "timeInStore"_attr = previousVersion.toBSONForLogging());
+                                  "timeInStore"_attr = timeInStore);
 
-        auto collectionAndChunks = _catalogCacheLoader.getChunksSince(nss, lookupVersion).get();
+        auto collectionAndChunks = _catalogCacheLoader->getChunksSince(nss, lookupVersion).get();
 
-        bool mustReplaceEntryDueToUpgradeOrDowngrade = false;
-        auto newRoutingHistory = [&] {
-            // If we have routing info already and it's for the same collection epoch, we're
-            // updating. Otherwise, we're making a whole new routing table.
-            if (isIncremental &&
-                existingHistory->optRt->getVersion().epoch() == collectionAndChunks.epoch) {
-                if (existingHistory->optRt->getVersion().getTimestamp().is_initialized() !=
-                    collectionAndChunks.creationTime.is_initialized()) {
-                    mustReplaceEntryDueToUpgradeOrDowngrade = true;
-                    return existingHistory->optRt
-                        ->makeUpdatedReplacingTimestamp(collectionAndChunks.creationTime)
-                        .makeUpdated(collectionAndChunks.reshardingFields,
-                                     collectionAndChunks.allowMigrations,
-                                     collectionAndChunks.changedChunks);
-                } else {
-                    return existingHistory->optRt->makeUpdated(collectionAndChunks.reshardingFields,
-                                                               collectionAndChunks.allowMigrations,
-                                                               collectionAndChunks.changedChunks);
-                }
-            }
-
-            auto defaultCollator = [&]() -> std::unique_ptr<CollatorInterface> {
-                if (!collectionAndChunks.defaultCollation.isEmpty()) {
-                    // The collation should have been validated upon collection creation
-                    return uassertStatusOK(
-                        CollatorFactoryInterface::get(opCtx->getServiceContext())
-                            ->makeFromBSON(collectionAndChunks.defaultCollation));
-                }
-                return nullptr;
-            }();
-
-            return RoutingTableHistory::makeNew(nss,
-                                                collectionAndChunks.uuid,
-                                                KeyPattern(collectionAndChunks.shardKeyPattern),
-                                                std::move(defaultCollator),
-                                                collectionAndChunks.shardKeyIsUnique,
-                                                collectionAndChunks.epoch,
-                                                collectionAndChunks.creationTime,
-                                                std::move(collectionAndChunks.reshardingFields),
-                                                collectionAndChunks.allowMigrations,
-                                                collectionAndChunks.changedChunks);
-        }();
-
-        newRoutingHistory.setAllShardsRefreshed();
+        std::shared_ptr<RoutingTableHistory> newRoutingHistory = createUpdatedRoutingTableHistory(
+            opCtx, nss, isIncremental, existingHistory, collectionAndChunks);
+        invariant(newRoutingHistory);
 
         // Check that the shards all match with what is on the config server
         std::set<ShardId> shardIds;
-        newRoutingHistory.getAllShardIds(&shardIds);
+        newRoutingHistory->getAllShardIds(&shardIds);
         for (const auto& shardId : shardIds) {
             uassertStatusOKWithContext(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId),
-                                       str::stream() << "Collection " << nss
+                                       str::stream() << "Collection " << nss.toStringForErrorMsg()
                                                      << " references shard which does not exist");
         }
 
-        const ChunkVersion newVersion = newRoutingHistory.getVersion();
+        const ChunkVersion newVersion = newRoutingHistory->getVersion();
+        newComparableVersion.setChunkVersion(newVersion);
 
-        // This object will define the new time in store
-        auto newComparableVersion = (mustReplaceEntryDueToUpgradeOrDowngrade)
-            ? ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(newVersion)
-            : ComparableChunkVersion::makeComparableChunkVersion(newVersion);
-
-        if (isIncremental && existingHistory->optRt->getVersion() == newVersion) {
-            invariant(newRoutingHistory.sameAllowMigrations(*existingHistory->optRt),
-                      str::stream() << "allowMigrations field of " << nss
-                                    << "collection changed without changing the collection version "
-                                    << newVersion.toString()
-                                    << ". Old value: " << existingHistory->optRt->allowMigrations()
-                                    << ", new value: " << newRoutingHistory.allowMigrations());
-
-            invariant(newRoutingHistory.sameReshardingFields(*existingHistory->optRt),
-                      str::stream()
-                          << "reshardingFields field of " << nss
-                          << "collection changed without changing the collection version "
-                          << newVersion.toString() << ". Old value: "
-                          << existingHistory->optRt->getReshardingFields()->toBSON()
-                          << ", new value: " << newRoutingHistory.getReshardingFields()->toBSON());
-        }
-
-        LOGV2_FOR_CATALOG_REFRESH(4619901,
-                                  isIncremental || newComparableVersion != previousVersion ? 0 : 1,
-                                  "Refreshed cached collection",
-                                  "namespace"_attr = nss,
-                                  "lookupSinceVersion"_attr = lookupVersion,
-                                  "newVersion"_attr = newComparableVersion.toBSONForLogging(),
-                                  "timeInStore"_attr = previousVersion.toBSONForLogging(),
-                                  "duration"_attr = Milliseconds(t.millis()));
+        // The log below is logged at debug(0) (equivalent to info level) only if the new placement
+        // version is different than the one we already had (if any).
+        LOGV2_FOR_CATALOG_REFRESH(
+            4619901,
+            (!isIncremental || newVersion != existingHistory->optRt->getVersion()) ? 0 : 1,
+            "Refreshed cached collection",
+            logAttrs(nss),
+            "lookupSinceVersion"_attr = lookupVersion,
+            "newVersion"_attr = newComparableVersion,
+            "timeInStore"_attr = timeInStore,
+            "duration"_attr = Milliseconds(t.millis()));
         _updateRefreshesStats(isIncremental, false);
 
         return LookupResult(OptionalRoutingTableHistory(std::move(newRoutingHistory)),
@@ -729,18 +1030,16 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
             LOGV2_FOR_CATALOG_REFRESH(4619902,
                                       0,
                                       "Collection has found to be unsharded after refresh",
-                                      "namespace"_attr = nss,
+                                      logAttrs(nss),
                                       "duration"_attr = Milliseconds(t.millis()));
 
-            return LookupResult(
-                OptionalRoutingTableHistory(),
-                ComparableChunkVersion::makeComparableChunkVersion(ChunkVersion::UNSHARDED()));
+            return LookupResult(OptionalRoutingTableHistory(), std::move(newComparableVersion));
         }
 
         LOGV2_FOR_CATALOG_REFRESH(4619903,
                                   0,
                                   "Error refreshing cached collection",
-                                  "namespace"_attr = nss,
+                                  logAttrs(nss),
                                   "duration"_attr = Milliseconds(t.millis()),
                                   "error"_attr = redact(ex));
 
@@ -748,4 +1047,81 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
     }
 }
 
+CatalogCache::IndexCache::IndexCache(ServiceContext* service, ThreadPoolInterface& threadPool)
+    : ReadThroughCache(
+          _mutex,
+          service->getService(),
+          threadPool,
+          [this](OperationContext* opCtx,
+                 const NamespaceString& nss,
+                 const ValueHandle& indexes,
+                 const ComparableIndexVersion& previousIndexVersion) {
+              return _lookupIndexes(opCtx, nss, indexes, previousIndexVersion);
+          },
+          kIndexCacheSize) {}
+
+CatalogCache::IndexCache::LookupResult CatalogCache::IndexCache::_lookupIndexes(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ValueHandle& indexes,
+    const ComparableIndexVersion& previousVersion) {
+
+    // This object will define the new time of the index info obtained by this refresh
+    ComparableIndexVersion newComparableVersion =
+        ComparableIndexVersion::makeComparableIndexVersion(boost::none);
+
+    try {
+        LOGV2_FOR_CATALOG_REFRESH(6686302,
+                                  1,
+                                  "Refreshing cached indexes",
+                                  logAttrs(nss),
+                                  "timeInStore"_attr = previousVersion);
+
+        const auto readConcern = [&]() -> repl::ReadConcernArgs {
+            const auto vcTime = VectorClock::get(opCtx)->getTime();
+            return {vcTime.configTime(), repl::ReadConcernLevel::kSnapshotReadConcern};
+        }();
+        auto collAndIndexes =
+            Grid::get(opCtx)->catalogClient()->getCollectionAndShardingIndexCatalogEntries(
+                opCtx, nss, readConcern);
+        const auto& coll = collAndIndexes.first;
+        const auto& indexVersion = coll.getIndexVersion();
+        newComparableVersion.setCollectionIndexes(
+            indexVersion ? boost::make_optional(indexVersion->indexVersion()) : boost::none);
+
+        LOGV2_FOR_CATALOG_REFRESH(6686303,
+                                  newComparableVersion != previousVersion ? 0 : 1,
+                                  "Refreshed cached indexes",
+                                  logAttrs(nss),
+                                  "newVersion"_attr = newComparableVersion,
+                                  "timeInStore"_attr = previousVersion);
+
+        if (!indexVersion) {
+            return LookupResult(OptionalShardingIndexCatalogInfo(),
+                                std::move(newComparableVersion));
+        }
+
+        IndexCatalogTypeMap newIndexesMap;
+        for (const auto& index : collAndIndexes.second) {
+            newIndexesMap[index.getName()] = index;
+        }
+
+        return LookupResult(OptionalShardingIndexCatalogInfo(ShardingIndexesCatalogCache(
+                                *indexVersion, std::move(newIndexesMap))),
+                            std::move(newComparableVersion));
+    } catch (const DBException& ex) {
+        if (ex.code() == ErrorCodes::NamespaceNotFound) {
+            LOGV2_FOR_CATALOG_REFRESH(
+                7038200, 0, "Collection has found to be unsharded after refresh", logAttrs(nss));
+            return LookupResult(OptionalShardingIndexCatalogInfo(),
+                                std::move(newComparableVersion));
+        }
+        LOGV2_FOR_CATALOG_REFRESH(6686304,
+                                  0,
+                                  "Error refreshing cached indexes",
+                                  logAttrs(nss),
+                                  "error"_attr = redact(ex));
+        throw;
+    }
+}
 }  // namespace mongo

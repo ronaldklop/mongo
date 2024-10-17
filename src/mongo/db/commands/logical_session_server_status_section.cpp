@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <memory>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_stats_gen.h"
+#include "mongo/db/session/session_catalog.h"
 
 namespace mongo {
 namespace {
 
 class LogicalSessionServerStatusSection : public ServerStatusSection {
 public:
-    LogicalSessionServerStatusSection() : ServerStatusSection("logicalSessionRecordCache") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -57,8 +61,10 @@ public:
 
         return statsBuilder.obj();
     }
+};
 
-} logicalSessionsServerStatusSection;
+auto& logicalSessionServerStatusSection =
+    *ServerStatusSectionBuilder<LogicalSessionServerStatusSection>("logicalSessionRecordCache");
 
 }  // namespace
 }  // namespace mongo

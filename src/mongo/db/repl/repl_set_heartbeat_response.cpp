@@ -27,22 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/repl_set_heartbeat_response.h"
 
 #include <string>
 
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -54,10 +56,12 @@ const std::string kConfigTermFieldName = "configTerm";
 const std::string kElectionTimeFieldName = "electionTime";
 const std::string kMemberStateFieldName = "state";
 const std::string kOkFieldName = "ok";
-const std::string kDurableOpTimeFieldName = "durableOpTime";
-const std::string kDurableWallTimeFieldName = "durableWallTime";
 const std::string kAppliedOpTimeFieldName = "opTime";
 const std::string kAppliedWallTimeFieldName = "wallTime";
+const std::string kWrittenOpTimeFieldName = "writtenOpTime";
+const std::string kWrittenWallTimeFieldName = "writtenWallTime";
+const std::string kDurableOpTimeFieldName = "durableOpTime";
+const std::string kDurableWallTimeFieldName = "durableWallTime";
 const std::string kPrimaryIdFieldName = "primaryId";
 const std::string kReplSetFieldName = "set";
 const std::string kSyncSourceFieldName = "syncingTo";
@@ -95,13 +99,17 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder) const {
     if (_primaryIdSet) {
         builder->append(kPrimaryIdFieldName, _primaryId);
     }
-    if (_durableOpTimeSet) {
-        _durableOpTime.append(builder, kDurableOpTimeFieldName);
-        builder->appendDate(kDurableWallTimeFieldName, _durableWallTime);
-    }
     if (_appliedOpTimeSet) {
-        _appliedOpTime.append(builder, kAppliedOpTimeFieldName);
+        _appliedOpTime.append(kAppliedOpTimeFieldName, builder);
         builder->appendDate(kAppliedWallTimeFieldName, _appliedWallTime);
+    }
+    if (_writtenOpTimeSet) {
+        _writtenOpTime.append(kWrittenOpTimeFieldName, builder);
+        builder->appendDate(kWrittenWallTimeFieldName, _writtenWallTime);
+    }
+    if (_durableOpTimeSet) {
+        _durableOpTime.append(kDurableOpTimeFieldName, builder);
+        builder->appendDate(kDurableWallTimeFieldName, _durableWallTime);
     }
     if (_electableSet) {
         *builder << kIsElectableFieldName << _electable;
@@ -167,6 +175,12 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
     _durableWallTime = durableWallTimeElement.Date();
     _durableOpTimeSet = true;
 
+    status = bsonExtractBooleanField(doc, kIsElectableFieldName, &_electable);
+    if (!status.isOK()) {
+        _electableSet = false;
+    } else {
+        _electableSet = true;
+    }
 
     // In V1, heartbeats OpTime is type Object and we construct an OpTime out of its nested fields.
     status = bsonExtractOpTimeField(doc, kAppliedOpTimeFieldName, &_appliedOpTime);
@@ -184,12 +198,29 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
     _appliedWallTime = appliedWallTimeElement.Date();
     _appliedOpTimeSet = true;
 
-    status = bsonExtractBooleanField(doc, kIsElectableFieldName, &_electable);
+    status = bsonExtractOpTimeField(doc, kWrittenOpTimeFieldName, &_writtenOpTime);
     if (!status.isOK()) {
-        _electableSet = false;
-    } else {
-        _electableSet = true;
+        if (status.code() == ErrorCodes::NoSuchKey) {
+            _writtenOpTime = _appliedOpTime;
+        } else {
+            return status;
+        }
     }
+
+    BSONElement writtenWallTimeElement;
+    _writtenWallTime = Date_t();
+    status = bsonExtractTypedField(
+        doc, kWrittenWallTimeFieldName, BSONType::Date, &writtenWallTimeElement);
+    if (!status.isOK()) {
+        if (status.code() == ErrorCodes::NoSuchKey) {
+            _writtenWallTime = _appliedWallTime;
+        } else {
+            return status;
+        }
+    } else {
+        _writtenWallTime = writtenWallTimeElement.Date();
+    }
+    _writtenOpTimeSet = true;
 
     const BSONElement memberStateElement = doc[kMemberStateFieldName];
     if (memberStateElement.eoo()) {
@@ -299,6 +330,16 @@ OpTime ReplSetHeartbeatResponse::getAppliedOpTime() const {
 OpTimeAndWallTime ReplSetHeartbeatResponse::getAppliedOpTimeAndWallTime() const {
     invariant(_appliedOpTimeSet);
     return {_appliedOpTime, _appliedWallTime};
+}
+
+OpTime ReplSetHeartbeatResponse::getWrittenOpTime() const {
+    invariant(_writtenOpTimeSet);
+    return _writtenOpTime;
+}
+
+OpTimeAndWallTime ReplSetHeartbeatResponse::getWrittenOpTimeAndWallTime() const {
+    invariant(_writtenOpTimeSet);
+    return {_writtenOpTime, _writtenWallTime};
 }
 
 OpTime ReplSetHeartbeatResponse::getDurableOpTime() const {

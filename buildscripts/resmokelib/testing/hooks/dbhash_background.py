@@ -8,18 +8,24 @@ import os.path
 
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.hooks import jsfile
-from buildscripts.resmokelib.testing.hooks.background_job import _BackgroundJob, _ContinuousDynamicJSTestCase
+from buildscripts.resmokelib.testing.hooks.background_job import (
+    _BackgroundJob,
+    _ContinuousDynamicJSTestCase,
+)
 
 
 class CheckReplDBHashInBackground(jsfile.JSHook):
     """A hook for comparing the dbhashes of all replica set members while a test is running."""
 
+    IS_BACKGROUND = True
+
     def __init__(self, hook_logger, fixture, shell_options=None):
         """Initialize CheckReplDBHashInBackground."""
         description = "Check dbhashes of all replica set members while a test is running"
         js_filename = os.path.join("jstests", "hooks", "run_check_repl_dbhash_background.js")
-        jsfile.JSHook.__init__(self, hook_logger, fixture, js_filename, description,
-                               shell_options=shell_options)
+        jsfile.JSHook.__init__(
+            self, hook_logger, fixture, js_filename, description, shell_options=shell_options
+        )
 
         self._background_job = None
 
@@ -35,14 +41,15 @@ class CheckReplDBHashInBackground(jsfile.JSHook):
                 self.logger.info(
                     "Not enabling the background check repl dbhash thread because '%s' storage"
                     " engine doesn't support snapshot reads.",
-                    server_status["storageEngine"]["name"])
+                    server_status["storageEngine"]["name"],
+                )
                 return
 
         self._background_job = _BackgroundJob("CheckReplDBHashInBackground")
         self.logger.info("Starting the background check repl dbhash thread.")
         self._background_job.start()
 
-    def after_suite(self, test_report):
+    def after_suite(self, test_report, teardown_flag=None):
         """Signal the background thread to exit, and wait until it does."""
         if self._background_job is None:
             return
@@ -56,7 +63,8 @@ class CheckReplDBHashInBackground(jsfile.JSHook):
             return
 
         hook_test_case = _ContinuousDynamicJSTestCase.create_before_test(
-            test.logger, test, self, self._js_filename, self._shell_options)
+            test.logger, test, self, self._js_filename, self._shell_options
+        )
         hook_test_case.configure(self.fixture)
 
         self.logger.info("Resuming the background check repl dbhash thread.")
@@ -81,5 +89,6 @@ class CheckReplDBHashInBackground(jsfile.JSHook):
             else:
                 self.logger.error(
                     "Encountered an error inside the background check repl dbhash thread.",
-                    exc_info=self._background_job.exc_info)
+                    exc_info=self._background_job.exc_info,
+                )
                 raise self._background_job.exc_info[1]

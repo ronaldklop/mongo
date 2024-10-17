@@ -1,20 +1,16 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [
-//   assumes_unsharded_collection,
-// ]
-
 // In MongoDB 3.4, $graphLookup was introduced. In this file, we test the error cases.
-load("jstests/aggregation/extras/utils.js");        // For "assertErrorCode".
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
+
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 var local = db.local;
+var foreign = db.foreign;
 
 local.drop();
 assert.commandWorked(local.insert({b: 0}));
+
+foreign.drop();
 
 var pipeline = {$graphLookup: 4};
 assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "$graphLookup spec must be an object");
@@ -292,7 +288,7 @@ pipeline = {
 assert.throws(
     () => local.aggregate(pipeline), [], "cannot use $near inside $graphLookup at any depth");
 
-let foreign = db.foreign;
+// let foreign = db.foreign;
 foreign.drop();
 assert.commandWorked(foreign.insert({a: 0, x: 0}));
 
@@ -353,9 +349,9 @@ assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
 // usage over 100MB.
 foreign.drop();
 
-var bulk = foreign.initializeUnorderedBulkOp();
-for (var i = 0; i < 14; i++) {
-    var obj = {from: 0, to: 1};
+bulk = foreign.initializeUnorderedBulkOp();
+for (let i = 0; i < 14; i++) {
+    let obj = {from: 0, to: 1};
     obj['s'] = new Array(7 * 1024 * 1024).join(' ');
     bulk.insert(obj);
 }
@@ -370,32 +366,30 @@ pipeline = {
             as: "out"
         }
     };
-
 assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
 
 // Here, we test that the cache keeps memory usage under 100MB, and does not cause an error.
 foreign.drop();
 
-var bulk = foreign.initializeUnorderedBulkOp();
-for (var i = 0; i < 13; i++) {
-    var obj = {from: 0, to: 1};
+bulk = foreign.initializeUnorderedBulkOp();
+for (let i = 0; i < 13; i++) {
+    let obj = {from: 0, to: 1};
     obj['s'] = new Array(7 * 1024 * 1024).join(' ');
     bulk.insert(obj);
 }
 assert.commandWorked(bulk.execute());
 
 var res = local
-                  .aggregate({
-                      $graphLookup: {
-                          from: "foreign",
-                          startWith: {$literal: 0},
-                          connectToField: "from",
-                          connectFromField: "to",
-                          as: "out"
-                      }
-                  },
-                             {$unwind: {path: "$out"}})
-                  .toArray();
+                .aggregate({
+                    $graphLookup: {
+                        from: "foreign",
+                        startWith: {$literal: 0},
+                        connectToField: "from",
+                        connectFromField: "to",
+                        as: "out"
+                    }
+                },
+                            {$unwind: {path: "$out"}})
+                .toArray();
 
 assert.eq(res.length, 13);
-}());

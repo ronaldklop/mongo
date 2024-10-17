@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/repl/tenant_migration_decoration.h"
 
 namespace mongo {
 namespace repl {
-const OperationContext::Decoration<boost::optional<TenantMigrationRecipientInfo>>
-    tenantMigrationRecipientInfo =
-        OperationContext::declareDecoration<boost::optional<TenantMigrationRecipientInfo>>();
+const OperationContext::Decoration<boost::optional<TenantMigrationInfo>> tenantMigrationInfo =
+    OperationContext::declareDecoration<boost::optional<TenantMigrationInfo>>();
 }  // namespace repl
 }  // namespace mongo

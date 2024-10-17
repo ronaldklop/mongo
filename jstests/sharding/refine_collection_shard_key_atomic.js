@@ -3,10 +3,12 @@
 // config.chunks, and config.tags.
 //
 
-(function() {
-'use strict';
-load('jstests/libs/fail_point_util.js');
-load("jstests/sharding/libs/find_chunks_util.js");
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
+
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1});
 const mongos = st.s0;
@@ -87,13 +89,30 @@ let awaitShellToRefineCollectionShardKey = startParallelShell(() => {
 }, mongos.port);
 hangBeforeCommitFailPoint.wait();
 
-// Verify that 'config.collections' has not been updated since we haven't committed the transaction.
+// Verify that 'config.collections' has not been updated since we haven't committed the transaction,
+// except for the 'allowMigrations' property which is updated by the
+// RefineCollectionShardKeyCoordinator before the commit phase.
 let newCollArr = mongos.getCollection(kConfigCollections).find({_id: kNsName}).toArray();
+newCollArr.forEach(element => {
+    delete element['allowMigrations'];
+});
 assert.sameMembers(oldCollArr, newCollArr);
 
-// Verify that 'config.chunks' has not been updated since we haven't committed the transaction.
+// Verify that 'config.chunks' has not been updated since we haven't committed the transaction,
+// except for the chunk version which has been bumped by the setAllowMigrations command prior to the
+// refineCollectionShardKey commit.
 let newChunkArr =
     findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
+
+newChunkArr.forEach(element => {
+    delete element['lastmod'];
+});
+
+let oldChunkArrWithoutLastmod = oldChunkArr;
+oldChunkArrWithoutLastmod.forEach(element => {
+    delete element['lastmod'];
+});
+
 assert.sameMembers(oldChunkArr, newChunkArr);
 
 // Verify that 'config.tags' has not been updated since we haven't committed the transaction.
@@ -183,4 +202,3 @@ newTagsArr = mongos.getCollection(kConfigTags).find({ns: kNsName}).sort({min: 1}
 assert.eq([], newTagsArr);
 
 st.stop();
-})();

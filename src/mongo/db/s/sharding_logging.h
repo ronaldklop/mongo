@@ -29,8 +29,18 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
 
@@ -38,11 +48,7 @@ namespace mongo {
  * Diagnostic logging of sharding metadata events (changelog and actionlog).
  */
 class ShardingLogging {
-
 public:
-    ShardingLogging();
-    ~ShardingLogging();
-
     /**
      * Retrieves the ShardingLogging instance associated with the current service/operation context.
      */
@@ -50,26 +56,34 @@ public:
     static ShardingLogging* get(OperationContext* operationContext);
 
     Status logAction(OperationContext* opCtx,
-                     const StringData what,
-                     const StringData ns,
-                     const BSONObj& detail);
+                     StringData what,
+                     const NamespaceString& ns,
+                     const BSONObj& detail,
+                     std::shared_ptr<Shard> configShard = nullptr,
+                     ShardingCatalogClient* catalogClient = nullptr);
 
     Status logChangeChecked(
         OperationContext* opCtx,
-        const StringData what,
-        const StringData ns,
+        StringData what,
+        const NamespaceString& ns,
         const BSONObj& detail = BSONObj(),
-        const WriteConcernOptions& writeConcern = ShardingCatalogClient::kMajorityWriteConcern);
+        const WriteConcernOptions& writeConcern = ShardingCatalogClient::kMajorityWriteConcern,
+        std::shared_ptr<Shard> configShard = nullptr,
+        ShardingCatalogClient* catalogClient = nullptr);
 
     void logChange(
         OperationContext* const opCtx,
         const StringData what,
-        const StringData ns,
+        const NamespaceString& ns,
         const BSONObj& detail = BSONObj(),
-        const WriteConcernOptions& writeConcern = ShardingCatalogClient::kMajorityWriteConcern) {
+        const WriteConcernOptions& writeConcern = ShardingCatalogClient::kMajorityWriteConcern,
+        std::shared_ptr<Shard> configShard = nullptr,
+        ShardingCatalogClient* catalogClient = nullptr) {
         // It is safe to ignore the results of `logChangeChecked` in many cases, as the
         // failure to log a change is often of no consequence.
-        logChangeChecked(opCtx, what, ns, detail, writeConcern).ignore();
+        logChangeChecked(
+            opCtx, what, ns, detail, writeConcern, std::move(configShard), catalogClient)
+            .ignore();
     }
 
 private:
@@ -79,7 +93,8 @@ private:
     Status _createCappedConfigCollection(OperationContext* opCtx,
                                          StringData collName,
                                          int cappedSize,
-                                         const WriteConcernOptions& writeConcern);
+                                         const WriteConcernOptions& writeConcern,
+                                         std::shared_ptr<Shard> configShard);
 
     /**
      * Best effort method, which logs diagnostic events on the config server. If the config server
@@ -94,11 +109,12 @@ private:
      * @param writeConcern Write concern options to use for logging
      */
     Status _log(OperationContext* opCtx,
-                const StringData logCollName,
-                const StringData what,
-                const StringData operationNSS,
+                StringData logCollName,
+                StringData what,
+                const NamespaceString& operationNSS,
                 const BSONObj& detail,
-                const WriteConcernOptions& writeConcern);
+                const WriteConcernOptions& writeConcern,
+                ShardingCatalogClient* catalogClient);
 
     // Member variable properties:
     // (S) Self-synchronizing; access in any way from any context.

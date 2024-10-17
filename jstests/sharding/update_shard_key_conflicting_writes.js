@@ -2,22 +2,18 @@
  * Test the write conflict behavior between updates to a document's shard key and other
  * updates/deletes.
  *
- * Use the 'requires_find_command' tag to skip this test in sharding_op_query suite. Otherwise,
- * sessionDB.coll.find() will throw "Cannot run a legacy query on a session".
- *
  * @tags: [
- *  requires_find_command,
- *  uses_multi_shard_transaction,
- *  uses_transactions,
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
  * ]
  */
 
-(function() {
-
-"use strict";
-
-load('jstests/libs/parallelTester.js');  // for Thread.
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision,
+    waitForFailpoint,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 let st = new ShardingTest({mongos: 1, shards: 2});
 let kDbName = 'db';
@@ -26,8 +22,8 @@ let ns = kDbName + '.foo';
 let db = mongos.getDB(kDbName);
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, st.shard0.shardName);
+assert.commandWorked(
+    mongos.adminCommand({enableSharding: kDbName, primaryShard: st.shard0.shardName}));
 
 // Shards the collection "db.foo" on shard key {"x" : 1} such that negative "x" values are on
 // shard0 and positive on shard1
@@ -101,7 +97,9 @@ function setFailPointAndSendUpdateToShardKeyInParallelShell(
     let thread = new Thread(
         conflictingUpdate, st.s.host, kDbName, {"x": originalShardKeyValue}, {$inc: {"a": 1}});
     thread.start();
-    assert.soon(() => opStarted("update"));
+    // We check both update and bulkWrite since this test is run in bulk_write_targeted_override
+    // which rewrites the updates as bulkWrites.
+    assert.soon(() => opStarted("update") || opStarted("bulkWrite"));
     // Once we commit the transaction, the non-transaction update should finish, but it should
     // not actually modify any documents since the transaction commited first.
     assert.commandWorked(session.commitTransaction_forTesting());
@@ -271,7 +269,9 @@ function setFailPointAndSendUpdateToShardKeyInParallelShell(
     let awaitShell = setFailPointAndSendUpdateToShardKeyInParallelShell(
         "hangBeforeInsertOnUpdateShardKey", "alwaysOn", st.s, codeToRunInParallelShell);
     let awaitShell2 = startParallelShell(codeToRunInParallelShell2, st.s.port);
-    assert.soon(() => opStarted("update"));
+    // We check both update and bulkWrite since this test is run in bulk_write_targeted_override
+    // which rewrites the updates as bulkWrites.
+    assert.soon(() => opStarted("update") || opStarted("bulkWrite"));
     assert.commandWorked(st.s.adminCommand({
         configureFailPoint: "hangBeforeInsertOnUpdateShardKey",
         mode: "off",
@@ -310,7 +310,9 @@ function setFailPointAndSendUpdateToShardKeyInParallelShell(
     let awaitShell = setFailPointAndSendUpdateToShardKeyInParallelShell(
         "hangBeforeInsertOnUpdateShardKey", "alwaysOn", st.s, codeToRunInParallelShell);
     let awaitShell2 = startParallelShell(codeToRunInParallelShell2, st.s.port);
-    assert.soon(() => opStarted("remove"));
+    // We check both remove and bulkWrite since this test is run in bulk_write_targeted_override
+    // which rewrites the removes as bulkWrites.
+    assert.soon(() => opStarted("remove") || opStarted("bulkWrite"));
     assert.commandWorked(st.s.adminCommand({
         configureFailPoint: "hangBeforeInsertOnUpdateShardKey",
         mode: "off",
@@ -451,4 +453,3 @@ function setFailPointAndSendUpdateToShardKeyInParallelShell(
 })();
 
 st.stop();
-}());

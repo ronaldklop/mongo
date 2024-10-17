@@ -27,15 +27,26 @@
  *    it in the license file.
  */
 #pragma once
+#include <algorithm>
+#include <boost/optional.hpp>
 #include <functional>
+#include <memory>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/sdam/sdam_configuration.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/client/sdam/topology_description.h"
 #include "mongo/platform/random.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo::sdam {
 /**
@@ -57,7 +68,7 @@ public:
      * ServerDescription(s). The server is selected randomly from those that match the criteria.
      */
     virtual boost::optional<ServerDescriptionPtr> selectServer(
-        const TopologyDescriptionPtr topologyDescription,
+        TopologyDescriptionPtr topologyDescription,
         const ReadPreferenceSetting& criteria,
         const std::vector<HostAndPort>& excludedHosts = std::vector<HostAndPort>()) = 0;
 
@@ -70,12 +81,12 @@ public:
     explicit SdamServerSelector(const SdamConfiguration& config);
 
     boost::optional<std::vector<ServerDescriptionPtr>> selectServers(
-        const TopologyDescriptionPtr topologyDescription,
+        TopologyDescriptionPtr topologyDescription,
         const ReadPreferenceSetting& criteria,
         const std::vector<HostAndPort>& excludedHosts = std::vector<HostAndPort>()) override;
 
     boost::optional<ServerDescriptionPtr> selectServer(
-        const TopologyDescriptionPtr topologyDescription,
+        TopologyDescriptionPtr topologyDescription,
         const ReadPreferenceSetting& criteria,
         const std::vector<HostAndPort>& excludedHosts = std::vector<HostAndPort>()) override;
 
@@ -84,8 +95,8 @@ public:
 
 private:
     void _getCandidateServers(std::vector<ServerDescriptionPtr>* result,
-                              const TopologyDescriptionPtr topologyDescription,
-                              const ReadPreferenceSetting& criteria,
+                              TopologyDescriptionPtr topologyDescription,
+                              ReadPreferenceSetting effectiveCriteria,
                               const std::vector<HostAndPort>& excludedHosts);
 
     bool _containsAllTags(ServerDescriptionPtr server, const BSONObj& tags);
@@ -197,11 +208,13 @@ private:
 
     const SelectionFilter shardedFilter = [this](const ReadPreferenceSetting& readPref,
                                                  const std::vector<HostAndPort>& excludedHosts) {
-        return [&](const ServerDescriptionPtr& s) { return s->getType() == ServerType::kMongos; };
+        return [&](const ServerDescriptionPtr& s) {
+            return s->getType() == ServerType::kMongos;
+        };
     };
 
     SdamConfiguration _config;
-    mutable PseudoRandom _random;
+    static thread_local PseudoRandom _random;
 };
 
 // This is used to filter out servers based on their current latency measurements.

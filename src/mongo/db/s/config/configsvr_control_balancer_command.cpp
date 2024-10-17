@@ -27,18 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,6 +63,11 @@ namespace {
 class ConfigSvrBalancerControlCommand : public BasicCommand {
 public:
     ConfigSvrBalancerControlCommand(StringData name) : BasicCommand(name) {}
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command, which is exported by the sharding config server. Do not call "
@@ -65,18 +86,20 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         uassert(ErrorCodes::InternalError,
@@ -86,7 +109,7 @@ public:
 
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << getName() << " can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
         _run(opCtx, &result);
 
@@ -105,9 +128,17 @@ private:
     void _run(OperationContext* opCtx, BSONObjBuilder* result) override {
         auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
         uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kFull));
-        uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, true));
-        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
-        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.start", "", BSONObj()).ignore();
+        uassertStatusOK(balancerConfig->changeAutoMergeSettings(opCtx, true));
+        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged(opCtx);
+        auto catalogManager = ShardingCatalogManager::get(opCtx);
+        ShardingLogging::get(opCtx)
+            ->logAction(opCtx,
+                        "balancer.start",
+                        NamespaceString::kEmpty,
+                        BSONObj(),
+                        catalogManager->localConfigShard(),
+                        catalogManager->localCatalogClient())
+            .ignore();
     }
 };
 
@@ -124,12 +155,20 @@ private:
 
         auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
         uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kOff));
-        uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, false));
+        uassertStatusOK(balancerConfig->changeAutoMergeSettings(opCtx, false));
 
-        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
+        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged(opCtx);
         Balancer::get(opCtx)->joinCurrentRound(opCtx);
 
-        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.stop", "", BSONObj()).ignore();
+        auto catalogManager = ShardingCatalogManager::get(opCtx);
+        ShardingLogging::get(opCtx)
+            ->logAction(opCtx,
+                        "balancer.stop",
+                        NamespaceString::kEmpty,
+                        BSONObj(),
+                        catalogManager->localConfigShard(),
+                        catalogManager->localCatalogClient())
+            .ignore();
     }
 };
 
@@ -144,11 +183,9 @@ private:
     }
 };
 
-MONGO_INITIALIZER(ClusterBalancerControlCommands)(InitializerContext* context) {
-    new ConfigSvrBalancerStartCommand();
-    new ConfigSvrBalancerStopCommand();
-    new ConfigSvrBalancerStatusCommand();
-}
+MONGO_REGISTER_COMMAND(ConfigSvrBalancerStartCommand).forShard();
+MONGO_REGISTER_COMMAND(ConfigSvrBalancerStopCommand).forShard();
+MONGO_REGISTER_COMMAND(ConfigSvrBalancerStatusCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -27,11 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/query/index_bounds_builder_test.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/index_bounds_builder_test.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/interval_evaluation_tree.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -107,15 +119,6 @@ TEST_F(IndexBoundsBuilderTest, RootedLiteral) {
     std::string prefix = IndexBoundsBuilder::simpleRegex("^\\Qasdf\\E", "", testIndex, &tightness);
     ASSERT_EQUALS(prefix, "asdf");
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
-}
-
-TEST_F(IndexBoundsBuilderTest, RootedLiteralWithExtra) {
-    auto testIndex = buildSimpleIndexEntry();
-    IndexBoundsBuilder::BoundsTightness tightness;
-    std::string prefix =
-        IndexBoundsBuilder::simpleRegex("^\\Qasdf\\E.*", "", testIndex, &tightness);
-    ASSERT_EQUALS(prefix, "asdf");
-    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
 }
 
 TEST_F(IndexBoundsBuilderTest, RootedLiteralNoEnd) {
@@ -264,11 +267,12 @@ TEST_F(IndexBoundsBuilderTest, RootedRegexCantBeIndexedTightlyIfIndexHasCollatio
 TEST_F(IndexBoundsBuilderTest, SimpleNonPrefixRegex) {
     auto testIndex = buildSimpleIndexEntry();
     BSONObj obj = fromjson("{a: /foo/}");
-    auto expr = parseMatchExpression(obj);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
     BSONElement elt = obj.firstElement();
     OrderedIntervalList oil;
     IndexBoundsBuilder::BoundsTightness tightness;
-    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness, &ietBuilder);
     ASSERT_EQUALS(oil.intervals.size(), 2U);
     ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                   oil.intervals[0].compare(Interval(fromjson("{'': '', '': {}}"), true, false)));
@@ -276,16 +280,18 @@ TEST_F(IndexBoundsBuilderTest, SimpleNonPrefixRegex) {
         Interval::INTERVAL_EQUALS,
         oil.intervals[1].compare(Interval(fromjson("{'': /foo/, '': /foo/}"), true, true)));
     ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
+    assertIET(inputParamIdMap, ietBuilder, elt, testIndex, oil);
 }
 
 TEST_F(IndexBoundsBuilderTest, NonSimpleRegexWithPipe) {
     auto testIndex = buildSimpleIndexEntry();
     BSONObj obj = fromjson("{a: /^foo.*|bar/}");
-    auto expr = parseMatchExpression(obj);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
     BSONElement elt = obj.firstElement();
     OrderedIntervalList oil;
     IndexBoundsBuilder::BoundsTightness tightness;
-    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness, &ietBuilder);
     ASSERT_EQUALS(oil.intervals.size(), 2U);
     ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                   oil.intervals[0].compare(Interval(fromjson("{'': '', '': {}}"), true, false)));
@@ -293,16 +299,18 @@ TEST_F(IndexBoundsBuilderTest, NonSimpleRegexWithPipe) {
                   oil.intervals[1].compare(
                       Interval(fromjson("{'': /^foo.*|bar/, '': /^foo.*|bar/}"), true, true)));
     ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
+    assertIET(inputParamIdMap, ietBuilder, elt, testIndex, oil);
 }
 
 TEST_F(IndexBoundsBuilderTest, SimpleRegexSingleLineMode) {
     auto testIndex = buildSimpleIndexEntry();
     BSONObj obj = fromjson("{a: /^foo/s}");
-    auto expr = parseMatchExpression(obj);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
     BSONElement elt = obj.firstElement();
     OrderedIntervalList oil;
     IndexBoundsBuilder::BoundsTightness tightness;
-    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness, &ietBuilder);
     ASSERT_EQUALS(oil.intervals.size(), 2U);
     ASSERT_EQUALS(
         Interval::INTERVAL_EQUALS,
@@ -311,16 +319,18 @@ TEST_F(IndexBoundsBuilderTest, SimpleRegexSingleLineMode) {
         Interval::INTERVAL_EQUALS,
         oil.intervals[1].compare(Interval(fromjson("{'': /^foo/s, '': /^foo/s}"), true, true)));
     ASSERT(tightness == IndexBoundsBuilder::EXACT);
+    assertIET(inputParamIdMap, ietBuilder, elt, testIndex, oil);
 }
 
 TEST_F(IndexBoundsBuilderTest, SimplePrefixRegex) {
     auto testIndex = buildSimpleIndexEntry();
     BSONObj obj = fromjson("{a: /^foo/}");
-    auto expr = parseMatchExpression(obj);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
     BSONElement elt = obj.firstElement();
     OrderedIntervalList oil;
     IndexBoundsBuilder::BoundsTightness tightness;
-    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness, &ietBuilder);
     ASSERT_EQUALS(oil.intervals.size(), 2U);
     ASSERT_EQUALS(
         Interval::INTERVAL_EQUALS,
@@ -329,6 +339,33 @@ TEST_F(IndexBoundsBuilderTest, SimplePrefixRegex) {
         Interval::INTERVAL_EQUALS,
         oil.intervals[1].compare(Interval(fromjson("{'': /^foo/, '': /^foo/}"), true, true)));
     ASSERT(tightness == IndexBoundsBuilder::EXACT);
+    assertIET(inputParamIdMap, ietBuilder, elt, testIndex, oil);
+}
+
+// Using exact index bounds for prefix regex in the form ^[].*
+TEST_F(IndexBoundsBuilderTest, RootedLiteralWithExtra) {
+    auto testIndex = buildSimpleIndexEntry();
+    IndexBoundsBuilder::BoundsTightness tightness;
+    std::string prefix =
+        IndexBoundsBuilder::simpleRegex("^\\Qasdf\\E.*", "", testIndex, &tightness);
+    ASSERT_EQUALS(prefix, "asdf");
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+}
+
+TEST_F(IndexBoundsBuilderTest, PrefixRegex) {
+    auto testIndex = buildSimpleIndexEntry();
+    IndexBoundsBuilder::BoundsTightness tightness;
+    std::string prefix = IndexBoundsBuilder::simpleRegex("^abc.*", "", testIndex, &tightness);
+    ASSERT_EQUALS(prefix, "abc");
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+}
+
+TEST_F(IndexBoundsBuilderTest, RegexWithCharactersFollowingPrefix) {
+    auto testIndex = buildSimpleIndexEntry();
+    IndexBoundsBuilder::BoundsTightness tightness;
+    std::string prefix = IndexBoundsBuilder::simpleRegex("^abc.*f", "", testIndex, &tightness);
+    ASSERT_EQUALS(prefix, "abc");
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
 }
 
 }  // namespace

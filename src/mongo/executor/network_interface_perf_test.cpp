@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -51,6 +50,9 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace mongo {
 namespace executor {
 namespace {
@@ -60,13 +62,13 @@ const std::size_t numOperations = 16384;
 
 int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
     net->startup();
-    auto guard = makeGuard([&] { net->shutdown(); });
+    ScopeGuard guard([&] { net->shutdown(); });
 
     auto fixture = unittest::getFixtureConnectionString();
     auto server = fixture.getServers()[0];
 
     std::atomic<int> remainingOps(operations);  // NOLINT
-    auto mtx = MONGO_MAKE_LATCH();
+    stdx::mutex mtx;
     stdx::condition_variable cv;
     Timer t;
 
@@ -81,19 +83,19 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
         if (--remainingOps) {
             return func();
         }
-        stdx::unique_lock<Latch> lk(mtx);
+        stdx::unique_lock<stdx::mutex> lk(mtx);
         cv.notify_one();
     };
 
     func = [&]() {
         RemoteCommandRequest request{
-            server, "admin", bsonObjPing, BSONObj(), nullptr, Milliseconds(-1)};
+            server, DatabaseName::kAdmin, bsonObjPing, BSONObj(), nullptr, Milliseconds(-1)};
         net->startCommand(makeCallbackHandle(), request, callback).transitional_ignore();
     };
 
     func();
 
-    stdx::unique_lock<Latch> lk(mtx);
+    stdx::unique_lock<stdx::mutex> lk(mtx);
     cv.wait(lk, [&] { return remainingOps.load() == 0; });
 
     return t.millis();
@@ -107,10 +109,7 @@ TEST(NetworkInterfaceASIO, SerialPerf) {
 
     int duration = timeNetworkTestMillis(numOperations, &netAsio);
     int result = numOperations * 1000 / duration;
-    LOGV2(22591,
-          "THROUGHPUT asio ping ops/s: {throughput}",
-          "THROUGHPUT asio ping ops/s",
-          "throughput"_attr = result);
+    LOGV2(22591, "THROUGHPUT asio ping ops/s", "throughput"_attr = result);
 }
 
 }  // namespace

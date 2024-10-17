@@ -5,21 +5,9 @@
  * - Which window functions accept bounds?
  * - When something is not allowed, what error message do we expect?
  */
-(function() {
-"use strict";
 
-const getParam = db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1});
-jsTestLog(getParam);
-const featureEnabled = assert.commandWorked(getParam).featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
-
-const coll = db[jsTestName()];
+const coll = db.setWindowFields_parse;
 coll.drop();
-
-assert.commandWorked(coll.insert({}));
 
 function run(stage, extraCommandArgs = {}) {
     return coll.runCommand(
@@ -44,7 +32,8 @@ assert.commandWorked(
     run({$setWindowFields: {partitionBy: "$$myobj.a", output: {}}}, {let : {myobj: {a: 456}}}));
 
 // Test that parsing fails for unrecognized parameters.
-assert.commandFailedWithCode(run({$setWindowFields: {what_is_this: 1}}), 40415);
+assert.commandFailedWithCode(run({$setWindowFields: {what_is_this: 1}}),
+                             ErrorCodes.IDLUnknownField);
 
 // Test for a successful parse, ignoring the response documents.
 assert.commandWorked(run({
@@ -79,28 +68,23 @@ assert.commandWorked(runWindowFunction({"$sum": "$a", window: {documents: ['unbo
 assert.commandWorked(runWindowFunction({"$max": "$a", window: {documents: [-3, 'unbounded']}}));
 
 // Range-based bounds:
-assert.commandFailedWithCode(
-    runWindowFunction({"$sum": "$a", window: {range: ['unbounded', 'unbounded']}}), 5397901);
-assert.commandFailedWithCode(runWindowFunction({"$sum": "$a", window: {range: [-2, +4]}}), 5397901);
-assert.commandFailedWithCode(runWindowFunction({"$sum": "$a", window: {range: [-3, 'unbounded']}}),
-                             5397901);
-assert.commandFailedWithCode(runWindowFunction({"$sum": "$a", window: {range: ['unbounded', +5]}}),
-                             5397901);
-assert.commandFailedWithCode(
-    runWindowFunction({"$sum": "$a", window: {range: [NumberDecimal('1.42'), NumberLong(5)]}}),
-    5397901);
+assert.commandWorked(runWindowFunction({$sum: "$a", window: {range: ['unbounded', 'unbounded']}}));
+assert.commandWorked(runWindowFunction({$sum: "$a", window: {range: [-2, +4]}}));
+assert.commandWorked(runWindowFunction({$sum: "$a", window: {range: [-3, 'unbounded']}}));
+assert.commandWorked(runWindowFunction({$sum: "$a", window: {range: ['unbounded', +5]}}));
+assert.commandWorked(
+    runWindowFunction({$sum: "$a", window: {range: [NumberDecimal('1.42'), NumberLong(5)]}}));
 
 // Time-based bounds:
-assert.commandFailedWithCode(
-    runWindowFunction({"$sum": "$a", window: {range: [-3, 'unbounded'], unit: 'hour'}}), 5397902);
+assert.commandWorked(
+    runWindowFunction({"$sum": "$a", window: {range: [-3, 'unbounded'], unit: 'hour'}}));
 
 // Numeric bounds can be a constant expression:
 let expr = {$add: [2, 2]};
 assert.commandWorked(runWindowFunction({"$sum": "$a", window: {documents: [expr, expr]}}));
-assert.commandFailedWithCode(runWindowFunction({"$sum": "$a", window: {range: [expr, expr]}}),
-                             5397901);
-assert.commandFailedWithCode(
-    runWindowFunction({"$sum": "$a", window: {range: [expr, expr], unit: 'hour'}}), 5397902);
+assert.commandWorked(runWindowFunction({"$sum": "$a", window: {range: [expr, expr]}}));
+assert.commandWorked(
+    runWindowFunction({"$sum": "$a", window: {range: [expr, expr], unit: 'hour'}}));
 // But 'current' and 'unbounded' are not expressions: they're more like keywords.
 assert.commandFailedWithCode(
     runWindowFunction({"$sum": "$a", window: {documents: [{$const: 'current'}, 3]}}),
@@ -146,7 +130,8 @@ assert.commandFailedWithCode(
     run({
         $setWindowFields: {output: {v: {$sum: "$a", window: {range: ['unbounded', 'unbounded']}}}}
     }),
-    5397901);
+    5339902,
+    'Range-based bounds require sortBy a single field');
 assert.commandFailedWithCode(
     run({
         $setWindowFields: {
@@ -154,11 +139,13 @@ assert.commandFailedWithCode(
             output: {v: {$sum: "$a", window: {range: ['unbounded', 'unbounded']}}}
         }
     }),
-    5397901);
+    5339902,
+    'Range-based bounds require sortBy a single field');
+
 assert.commandFailedWithCode(
     run({$setWindowFields: {output: {v: {$sum: "$a", window: {range: ['unbounded', 'current']}}}}}),
     5339902,
-    'Range-based bounds require a sortBy a single field');
+    'Range-based bounds require sortBy a single field');
 assert.commandFailedWithCode(
     run({
         $setWindowFields: {
@@ -174,7 +161,8 @@ assert.commandFailedWithCode(
         $setWindowFields:
             {output: {v: {$sum: "$a", window: {range: ['unbounded', 'unbounded'], unit: 'second'}}}}
     }),
-    5397902);
+    5339902);
+
 assert.commandFailedWithCode(
     run({
         $setWindowFields: {
@@ -182,7 +170,7 @@ assert.commandFailedWithCode(
             output: {v: {$sum: "$a", window: {range: ['unbounded', 'unbounded'], unit: 'second'}}}
         }
     }),
-    5397902);
+    5339902);
 assert.commandFailedWithCode(
     run({
         $setWindowFields:
@@ -223,10 +211,48 @@ assert.commandWorked(run({
 }));
 
 // Not every accumulator is automatically a window function.
-assert.commandFailedWithCode(run({$setWindowFields: {output: {v: {$mergeObjects: "$a"}}}}),
-                             ErrorCodes.FailedToParse,
-                             'No such window function: $mergeObjects');
-assert.commandFailedWithCode(run({$setWindowFields: {output: {v: {$accumulator: "$a"}}}}),
-                             ErrorCodes.FailedToParse,
-                             'No such window function: $accumulator');
-})();
+let err = assert.commandFailedWithCode(run({$setWindowFields: {output: {a: {b: {$sum: "$a"}}}}}),
+                                       ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Expected a $-prefixed window function, b');
+
+err = assert.commandFailedWithCode(
+    run({$setWindowFields: {output: {total: {sum: "$x", window: {documents: [-1, 1]}}}}}),
+    ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Expected a $-prefixed window function, sum');
+
+err = assert.commandFailedWithCode(run({$setWindowFields: {output: {total: {}}}}),
+                                   ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Expected a $-prefixed window function');
+
+err = assert.commandFailedWithCode(run({$setWindowFields: {output: {v: {$mergeObjects: "$a"}}}}),
+                                   ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Unrecognized window function, $mergeObjects');
+
+err = assert.commandFailedWithCode(run({$setWindowFields: {output: {v: {$accumulator: "$a"}}}}),
+                                   ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Unrecognized window function, $accumulator');
+
+err = assert.commandFailedWithCode(
+    run({
+        $setWindowFields:
+            {output: {total: {$summ: "$x", window: {documents: ['unbounded', 'current']}}}}
+    }),
+    ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Unrecognized window function, $summ');
+
+err = assert.commandFailedWithCode(
+    run({
+        $setWindowFields:
+            {output: {total: {$summ: "$x", windoww: {documents: ['unbounded', 'current']}}}}
+    }),
+    ErrorCodes.FailedToParse);
+assert.includes(err.errmsg, 'Unrecognized window function, $summ');
+
+// Test that an empty object is a valid projected field.
+assert.commandWorked(coll.insert({}));
+assert.commandWorked(run({$setWindowFields: {output: {v: {$max: {mergeObjects: {}}}}}}));
+
+// However conflicting field paths is always an error.
+err = assert.commandFailedWithCode(
+    run({$setWindowFields: {output: {a: {$sum: 1}, 'a.b': {$sum: 1}}}}), 6307900);
+assert.includes(err.errmsg, 'specification contains two conflicting paths');

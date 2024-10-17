@@ -50,12 +50,6 @@ public:
     virtual ~ReplicaSetMonitorInterface() = default;
 
     /**
-     * The default timeout, which will be used for finding a replica set host if the caller does
-     * not explicitly specify it.
-     */
-    static constexpr Seconds kDefaultFindHostTimeout{15};
-
-    /**
      * Schedules the initial refresh task into task executor.
      */
     virtual void init() = 0;
@@ -69,12 +63,6 @@ public:
      * Returns a host matching the given read preference or an error, if no host matches.
      *
      * @param readPref Read preference to match against
-     * @param maxWait If no host is readily available that matches the specified read preference,
-     *   wait for one to become available for up to the specified time and periodically refresh
-     *   the view of the set. The call may return with an error earlier than the specified value,
-     *   if none of the known hosts for the set are reachable within some number of attempts.
-     *   Note that if a maxWait of 0ms is specified, this method may still attempt to contact
-     *   every host in the replica set up to one time.
      * @param excludedHosts List of hosts that are not eligible to be chosen.
      *
      * Known errors are:
@@ -185,6 +173,11 @@ public:
      * continuing.
      */
     virtual void runScanForMockReplicaSet() = 0;
+
+    /**
+     * Returns the ping time of `server` if available.
+     */
+    virtual boost::optional<Microseconds> pingTime(const HostAndPort& server) const = 0;
 };
 
 }  // namespace mongo

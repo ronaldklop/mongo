@@ -29,7 +29,9 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -39,6 +41,11 @@ namespace repl {
 
 class ReplicationCoordinatorExternalState;
 class ReplSetConfig;
+
+/**
+ * Checks if the member given by the config index is electable in the new config.
+ */
+Status checkElectable(const ReplSetConfig& newConfig, int configIndex);
 
 /**
  * Checks if two configs are the same in content, ignoring 'version' and 'term' fields.
@@ -64,6 +71,12 @@ StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalSt
 StatusWith<int> findSelfInConfigIfElectable(ReplicationCoordinatorExternalState* externalState,
                                             const ReplSetConfig& newConfig,
                                             ServiceContext* ctx);
+
+/**
+ * Does a quick pass to see whether a host exists in the new config. Not as precise as
+ * findSelfInConfig.
+ */
+int findOwnHostInConfigQuick(const ReplSetConfig& newConfig, HostAndPort host);
 
 /**
  * Validates that "newConfig" is a legal configuration that the current
@@ -104,16 +117,18 @@ Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
                                  bool allowSplitHorizonIP);
 
 /**
- * Validates that "newConfig" is an acceptable configuration when received in a heartbeat
- * reasponse.
+ * Validates that "newConfig" is an acceptable configuration when
+ * received in a heartbeat reasponse.
  *
- * If the new configuration omits the current node, but is otherwise valid, returns
- * ErrorCodes::NodeNotFound.  If the configuration is wholly valid, returns Status::OK().
- * Otherwise, returns some other error status.
+ * If the new configuration omits the current node, but is
+ * otherwise valid, returns ErrorCodes::NodeNotFound.  If the
+ * configuration is wholly valid, returns Status::OK(). Otherwise,
+ * returns some other error status.
  */
 StatusWith<int> validateConfigForHeartbeatReconfig(
     ReplicationCoordinatorExternalState* externalState,
     const ReplSetConfig& newConfig,
+    HostAndPort ownHost,
     ServiceContext* ctx);
 }  // namespace repl
 }  // namespace mongo

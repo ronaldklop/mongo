@@ -27,27 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <mutex>
 
-#include "mongo/client/sasl_aws_client_protocol.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <kms_message/kms_caller_identity_request.h>
+#include <kms_message/kms_message_defines.h>
+#include <kms_message/kms_request.h>
 
-#include <iostream>
-
-#include "mongo/base/data_range_cursor.h"
-#include "mongo/base/data_type_validated.h"
+#include "mongo/base/data_range.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/client/sasl_aws_client_protocol.h"
 #include "mongo/client/sasl_aws_client_protocol_gen.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/client/sasl_aws_protocol_common_gen.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/platform/random.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/kms_message_support.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace awsIam {
 namespace {
 // Secure Random for AWS SASL Nonce generation
-Mutex saslAWSClientMutex = MONGO_MAKE_LATCH("IAMAWSClientMutex");
+stdx::mutex saslAWSClientMutex;
 SecureRandom saslAWSClientGen;
 
 std::vector<char> generateClientNonce() {
@@ -56,7 +67,7 @@ std::vector<char> generateClientNonce() {
     ret.resize(kClientFirstNonceLength);
 
     {
-        stdx::lock_guard<Latch> lk(saslAWSClientMutex);
+        stdx::lock_guard<stdx::mutex> lk(saslAWSClientMutex);
         saslAWSClientGen.fill(ret.data(), ret.size());
     }
 
@@ -99,7 +110,7 @@ template <typename T>
 AWSCredentials parseCredentials(StringData data) {
     BSONObj obj = fromjson(data.toString());
 
-    auto creds = T::parse(IDLParserErrorContext("security-credentials"), obj);
+    auto creds = T::parse(IDLParserContext("security-credentials"), obj);
 
     return AWSCredentials(creds.getAccessKeyId().toString(),
                           creds.getSecretAccessKey().toString(),
@@ -182,9 +193,9 @@ std::string generateClientSecond(StringData serverFirstBase64,
     if (credentials.sessionToken) {
         // TODO: move this into kms-message
         uassertKmsRequest(kms_request_add_header_field(
-            request.get(), "X-Amz-Security-Token", credentials.sessionToken.get().c_str()));
+            request.get(), "X-Amz-Security-Token", credentials.sessionToken.value().c_str()));
 
-        second.setXAmzSecurityToken(boost::optional<StringData>(credentials.sessionToken.get()));
+        second.setXAmzSecurityToken(boost::optional<StringData>(credentials.sessionToken.value()));
     }
 
     UniqueKmsCharBuffer kmsSignature(kms_request_get_signature(request.get()));
@@ -230,6 +241,10 @@ AWSCredentials parseCredentialsFromEC2IamSecurityCredentials(StringData data) {
 
 AWSCredentials parseCredentialsFromECSTaskIamCredentials(StringData data) {
     return parseCredentials<EcsTaskSecurityCredentials>(data);
+}
+
+MONGO_INITIALIZER(SASLRegisterKMS)(::mongo::InitializerContext*) {
+    kms_message_init();
 }
 
 }  // namespace awsIam

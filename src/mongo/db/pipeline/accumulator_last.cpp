@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -40,14 +41,10 @@ using boost::intrusive_ptr;
 
 REGISTER_ACCUMULATOR(last, genericParseSingleExpressionAccumulator<AccumulatorLast>);
 
-const char* AccumulatorLast::getOpName() const {
-    return "$last";
-}
-
 void AccumulatorLast::processInternal(const Value& input, bool merging) {
     /* always remember the last value seen */
     _last = input;
-    _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
+    _memUsageTracker.set(sizeof(*this) + _last.getApproximateSize() - sizeof(Value));
 }
 
 Value AccumulatorLast::getValue(bool toBeMerged) {
@@ -55,11 +52,11 @@ Value AccumulatorLast::getValue(bool toBeMerged) {
 }
 
 AccumulatorLast::AccumulatorLast(ExpressionContext* const expCtx) : AccumulatorState(expCtx) {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorLast::reset() {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _last = Value();
 }
 

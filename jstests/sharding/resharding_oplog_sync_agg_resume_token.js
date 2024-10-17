@@ -2,10 +2,10 @@
  * Test that the postBatchResumeToken field is only included for the oplog namespace when
  * $_requestReshardingResumeToken is specified for an aggregate command.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Returns true if timestamp 'ts1' value is greater than timestamp 'ts2' value.
 function timestampGreaterThan(ts1, ts2) {
@@ -202,4 +202,3 @@ result = localDb.runCommand({
 assert.commandWorked(result);
 assert(!result.cursor.hasOwnProperty("postBatchResumeToken"), result);
 rst.stopSet();
-})();

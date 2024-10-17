@@ -33,18 +33,41 @@
  * Connect to a Replica Set, from C++.
  */
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <map>
+#include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/config.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/unique_message.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
 class ReplicaSetMonitor;
 class TagSet;
 struct ReadPreferenceSetting;
+
 typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 
 /** Use this class to connect to a replica set of servers.  The class will manage
@@ -57,9 +80,7 @@ typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 */
 class DBClientReplicaSet : public DBClientBase {
 public:
-    using DBClientBase::query;
-    using DBClientBase::remove;
-    using DBClientBase::update;
+    using DBClientBase::find;
 
     /** Call connect() after constructing. autoReconnect is always on for DBClientReplicaSet
      * connections. */
@@ -77,7 +98,7 @@ public:
      */
     Status connect();
 
-    Status authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) override;
+    void authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) override;
 
     /**
      * Logs out the connection for the given database.
@@ -86,49 +107,29 @@ public:
      * @param info the result object for the logout command (provided for backwards
      *     compatibility with mongo shell)
      */
-    void logout(const std::string& dbname, BSONObj& info) override;
+    void logout(const DatabaseName& dbname, BSONObj& info) override;
 
     // ----------- simple functions --------------
 
-    /** throws userassertion "no primary found" */
-    std::unique_ptr<DBClientCursor> query(
-        const NamespaceStringOrUUID& nsOrUuid,
-        Query query,
-        int nToReturn = 0,
-        int nToSkip = 0,
-        const BSONObj* fieldsToReturn = nullptr,
-        int queryOptions = 0,
-        int batchSize = 0,
-        boost::optional<BSONObj> readConcernObj = boost::none) override;
+    std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
+                                         const ReadPreferenceSetting& readPref,
+                                         ExhaustMode exhaustMode) override;
 
-    /** throws userassertion "no primary found" */
-    BSONObj findOne(const std::string& ns,
-                    const Query& query,
-                    const BSONObj* fieldsToReturn = nullptr,
-                    int queryOptions = 0,
-                    boost::optional<BSONObj> readConcernObj = boost::none) override;
-
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 BSONObj obj,
-                int flags = 0,
+                bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     /** insert multiple objects.  Note that single object insert is asynchronous, so this version
         is only nominally faster and not worth a special effort to try to use.  */
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 const std::vector<BSONObj>& v,
-                int flags = 0,
+                bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void remove(const std::string& ns,
-                Query obj,
-                int flags,
-                boost::optional<BSONObj> writeConcernObj = boost::none) override;
-
-    void update(const std::string& ns,
-                Query query,
-                BSONObj obj,
-                int flags,
+    void remove(const NamespaceString& nss,
+                const BSONObj& filter,
+                bool removeMany = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     void killCursor(const NamespaceString& ns, long long cursorID) override;
@@ -155,11 +156,7 @@ public:
     // ---- callback pieces -------
 
     void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
-    Status recv(Message& toRecv, int lastRequestId) override;
-    void checkResponse(const std::vector<BSONObj>& batch,
-                       bool networkError,
-                       bool* retry = nullptr,
-                       std::string* targetHost = nullptr) override;
+    Message recv(int lastRequestId) override;
 
     /* this is the callback from our underlying connections to notify us that we got a "not primary"
      * error.
@@ -205,9 +202,6 @@ public:
     ConnectionString::ConnectionType type() const override {
         return ConnectionString::ConnectionType::kReplicaSet;
     }
-    bool lazySupported() const override {
-        return true;
-    }
 
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) final;
@@ -222,23 +216,6 @@ public:
     int getMinWireVersion() final;
     int getMaxWireVersion() final;
     // ---- low level ------
-
-    bool call(Message& toSend,
-              Message& response,
-              bool assertOk,
-              std::string* actualServer) override;
-
-    /**
-     * Returns whether a query or command can be sent to secondaries based on the query object
-     * and options.
-     *
-     * @param ns the namespace of the query.
-     * @param queryObj the query object to check.
-     * @param queryOptions the query options
-     *
-     * @return true if the query/cmd could potentially be sent to a secondary, false otherwise
-     */
-    static bool isSecondaryQuery(const std::string& ns, const BSONObj& queryObj, int queryOptions);
 
     /**
      * Performs a "soft reset" by clearing all states relating to secondary nodes and
@@ -262,6 +239,8 @@ public:
 
 #ifdef MONGO_CONFIG_SSL
     const SSLConfiguration* getSSLConfiguration() override;
+
+    bool isTLS() override;
 #endif
 
 protected:
@@ -282,8 +261,10 @@ private:
 
     DBClientConnection* checkPrimary();
 
+    Message _call(Message& toSend, std::string* actualServer) override;
+
     template <typename Authenticate>
-    Status _runAuthLoop(Authenticate authCb);
+    void _runAuthLoop(Authenticate authCb);
 
     /**
      * Helper method for selecting a node based on the read preference. Will advance
@@ -358,22 +339,11 @@ private:
     // this could be a security issue, as the password is stored in memory
     // not sure if/how we should handle
     bool _internalAuthRequested = false;
-    std::map<std::string, BSONObj> _auths;  // dbName -> auth parameters
+    absl::flat_hash_map<DatabaseName, BSONObj> _auths;  // dbName -> auth parameters
 
     MongoURI _uri;
 
 protected:
-    /**
-     * for storing (non-threadsafe) information between lazy calls
-     */
-    class LazyState {
-    public:
-        LazyState() : _lastClient(nullptr), _lastOp(-1), _secondaryQueryOk(false), _retries(0) {}
-        DBClientConnection* _lastClient;
-        int _lastOp;
-        bool _secondaryQueryOk;
-        int _retries;
-
-    } _lazyState;
+    DBClientConnection* _lastClient = nullptr;
 };
 }  // namespace mongo

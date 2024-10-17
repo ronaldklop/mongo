@@ -33,7 +33,8 @@ global:
         - "mongo/db/matcher/schema/encrypt_schema_types.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/crypto/encryption_fields.idl"
 
 types:
     encryptSchemaKeyId:
@@ -42,6 +43,8 @@ types:
         cpp_type: "mongo::EncryptSchemaKeyId"
         serializer: mongo::EncryptSchemaKeyId::serializeToBSON
         deserializer: mongo::EncryptSchemaKeyId::parseFromBSON
+        # EncryptSchemaKeyId has only non view members.
+        is_view: false
 
     bsonTypeSet:
         bson_serialization_type: any
@@ -49,6 +52,8 @@ types:
         cpp_type: "mongo::BSONTypeSet"
         serializer: mongo::BSONTypeSet::serializeToBSON
         deserializer: mongo::BSONTypeSet::parseFromBSON
+        # BSONTypeSet initialized with non view objects.
+        is_view: false
 
 enums:
     FleAlgorithm:
@@ -57,13 +62,7 @@ enums:
         values:
             kDeterministic: "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
             kRandom: "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
-    FleAlgorithmInt:
-        description: "The algorithm used to encrypt fields for field level encryption represented
-            as an unsigned integer."
-        type: int
-        values:
-            kDeterministic: 1
-            kRandom: 2
+    
 
 structs:
     # Maps to the encrypt keyword in JSON Schema.
@@ -101,27 +100,5 @@ structs:
             type: encryptSchemaKeyId
             optional: true
 
-    EncryptionPlaceholder:
-        description: "Implements Encryption BinData (subtype 6) sub-subtype 0, the intent-to-encrypt
-            mapping. Contains a value to encrypt and a description of how it should be encrypted."
-        strict: true
-        fields:
-          a:
-            description: "The encryption algorithm to be used."
-            type: FleAlgorithmInt
-            cpp_name: algorithm
-          ki:
-            description: "Used to query the key vault by _id. If omitted, ka must be specified."
-            type: uuid
-            cpp_name: keyId
-            optional: true
-          ka:
-            description: "Used to query the key vault by keyAltName. If omitted,
-                ki must be specified."
-            type: string
-            cpp_name: keyAltName
-            optional: true
-          v:
-            description: "value to encrypt"
-            type: IDLAnyType
-            cpp_name: value
+
+

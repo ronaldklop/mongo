@@ -27,24 +27,45 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/catalog/database.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/delete.h"
-#include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_request.h"
+#include "mongo/db/query/write_ops/delete.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_recipient_entry_helpers.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
-#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/repl/tenant_migration_util.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 
 namespace mongo {
@@ -54,7 +75,13 @@ namespace tenantMigrationRecipientEntryHelpers {
 
 Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDocument& stateDoc) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
     // Sanity check
     uassert(ErrorCodes::PrimarySteppedDown,
@@ -63,7 +90,7 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
             repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
     return writeConflictRetry(
-        opCtx, "insertTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> Status {
+        opCtx, "insertTenantMigrationRecipientStateDoc", nss, [&]() -> Status {
             // Insert the 'stateDoc' if no active tenant migration found for the 'tenantId' provided
             // in the 'stateDoc'. Tenant Migration is considered as active for a tenantId if a state
             // document exists on the disk for that 'tenantId' and not marked to be garbage
@@ -74,7 +101,7 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
                                      << BSON("$exists" << false));
             const auto updateMod = BSON("$setOnInsert" << stateDoc.toBSON());
             auto updateResult =
-                Helpers::upsert(opCtx, nss.ns(), filter, updateMod, /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, collection, filter, updateMod, /*fromMigrate=*/false);
 
             // '$setOnInsert' update operator can no way modify the existing on-disk state doc.
             invariant(!updateResult.numDocsModified);
@@ -91,17 +118,23 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
 
 Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDocument& stateDoc) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
 
     return writeConflictRetry(
-        opCtx, "updateTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> Status {
+        opCtx, "updateTenantMigrationRecipientStateDoc", nss, [&]() -> Status {
             auto updateResult =
-                Helpers::upsert(opCtx, nss.ns(), stateDoc.toBSON(), /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, collection, stateDoc.toBSON(), /*fromMigrate=*/false);
             if (updateResult.numMatched == 0) {
                 return {ErrorCodes::NoSuchKey,
                         str::stream()
@@ -115,43 +148,50 @@ Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
 StatusWith<bool> deleteStateDocIfMarkedAsGarbageCollectable(OperationContext* opCtx,
                                                             StringData tenantId) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    const auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
 
     auto query = BSON(TenantMigrationRecipientDocument::kTenantIdFieldName
                       << tenantId << TenantMigrationRecipientDocument::kExpireAtFieldName
                       << BSON("$exists" << 1));
-    return writeConflictRetry(
-        opCtx, "deleteTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> bool {
-            auto nDeleted =
-                deleteObjects(opCtx, collection.getCollection(), nss, query, true /* justOne */);
-            return nDeleted > 0;
-        });
+    return writeConflictRetry(opCtx, "deleteTenantMigrationRecipientStateDoc", nss, [&]() -> bool {
+        auto nDeleted = deleteObjects(opCtx, collection, query, true /* justOne */);
+        return nDeleted > 0;
+    });
 }
 
 StatusWith<TenantMigrationRecipientDocument> getStateDoc(OperationContext* opCtx,
                                                          const UUID& migrationUUID) {
     // Read the most up to date data.
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+    // ReadConcern must also be fixed for the new scope. It will get restored when exiting this.
+    auto originalReadConcern =
+        std::exchange(repl::ReadConcernArgs::get(opCtx), repl::ReadConcernArgs());
+    ON_BLOCK_EXIT([&] { repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern); });
+
     AutoGetCollectionForRead collection(opCtx,
                                         NamespaceString::kTenantMigrationRecipientsNamespace);
 
     if (!collection) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "Collection not found: "
-                                    << NamespaceString::kTenantMigrationRecipientsNamespace.ns());
+                                    << NamespaceString::kTenantMigrationRecipientsNamespace
+                                           .toStringForErrorMsg());
     }
 
     BSONObj result;
-    auto foundDoc = Helpers::findOne(opCtx,
-                                     collection.getCollection(),
-                                     BSON("_id" << migrationUUID),
-                                     result,
-                                     /*requireIndex=*/true);
+    auto foundDoc =
+        Helpers::findOne(opCtx, collection.getCollection(), BSON("_id" << migrationUUID), result);
     if (!foundDoc) {
         return Status(ErrorCodes::NoMatchingDocument,
                       str::stream() << "No matching state doc found with tenant migration UUID: "
@@ -159,7 +199,7 @@ StatusWith<TenantMigrationRecipientDocument> getStateDoc(OperationContext* opCtx
     }
 
     try {
-        return TenantMigrationRecipientDocument::parse(IDLParserErrorContext("recipientStateDoc"),
+        return TenantMigrationRecipientDocument::parse(IDLParserContext("recipientStateDoc"),
                                                        result);
     } catch (DBException& ex) {
         return ex.toStatus(

@@ -27,14 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/meta/type_traits.h>
 
-#include "mongo/s/catalog_cache_loader_mock.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/stdx/thread.h"
+#include "mongo/s/catalog_cache_loader_mock.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -48,33 +54,7 @@ const Status CatalogCacheLoaderMock::kChunksInternalErrorStatus = {
 const Status CatalogCacheLoaderMock::kDatabaseInternalErrorStatus = {
     ErrorCodes::InternalError, "Mocked catalog cache loader received unexpected database request"};
 
-
-void CatalogCacheLoaderMock::initializeReplicaSetRole(bool isPrimary) {
-    MONGO_UNREACHABLE;
-}
-
-void CatalogCacheLoaderMock::onStepDown() {
-    MONGO_UNREACHABLE;
-}
-
-void CatalogCacheLoaderMock::onStepUp() {
-    MONGO_UNREACHABLE;
-}
-
 void CatalogCacheLoaderMock::shutDown() {}
-
-void CatalogCacheLoaderMock::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
-    MONGO_UNREACHABLE;
-}
-
-void CatalogCacheLoaderMock::waitForCollectionFlush(OperationContext* opCtx,
-                                                    const NamespaceString& nss) {
-    MONGO_UNREACHABLE;
-}
-
-void CatalogCacheLoaderMock::waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) {
-    MONGO_UNREACHABLE;
-}
 
 CollectionAndChangedChunks getCollectionRefresh(
     const StatusWith<CollectionType>& swCollectionReturnValue,
@@ -92,9 +72,11 @@ CollectionAndChangedChunks getCollectionRefresh(
     return CollectionAndChangedChunks{swCollectionReturnValue.getValue().getEpoch(),
                                       swCollectionReturnValue.getValue().getTimestamp(),
                                       swCollectionReturnValue.getValue().getUuid(),
+                                      swCollectionReturnValue.getValue().getUnsplittable(),
                                       swCollectionReturnValue.getValue().getKeyPattern().toBSON(),
                                       swCollectionReturnValue.getValue().getDefaultCollation(),
                                       swCollectionReturnValue.getValue().getUnique(),
+                                      swCollectionReturnValue.getValue().getTimeseriesFields(),
                                       reshardingFields,
                                       swCollectionReturnValue.getValue().getAllowMigrations(),
                                       std::move(chunks)};
@@ -117,15 +99,8 @@ SemiFuture<CollectionAndChangedChunks> CatalogCacheLoaderMock::getChunksSince(
         .semi();
 }
 
-SemiFuture<DatabaseType> CatalogCacheLoaderMock::getDatabase(StringData dbName) {
-    return makeReadyFutureWith([this] {
-               uassertStatusOK(_swDatabaseReturnValue);
-               return DatabaseType(_swDatabaseReturnValue.getValue().getName(),
-                                   _swDatabaseReturnValue.getValue().getPrimary(),
-                                   _swDatabaseReturnValue.getValue().getSharded(),
-                                   _swDatabaseReturnValue.getValue().getVersion());
-           })
-        .semi();
+SemiFuture<DatabaseType> CatalogCacheLoaderMock::getDatabase(const DatabaseName& dbName) {
+    return makeReadyFutureWith([this] { return _swDatabaseReturnValue; }).semi();
 }
 
 void CatalogCacheLoaderMock::setCollectionRefreshReturnValue(

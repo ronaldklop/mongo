@@ -1,8 +1,5 @@
 // Test that the ssl=true/false option is honored in shell URIs.
 
-(function() {
-"use strict";
-
 var shouldSucceed = function(uri) {
     var conn = new Mongo(uri);
     var res = conn.getDB('admin').runCommand({"hello": 1});
@@ -11,31 +8,31 @@ var shouldSucceed = function(uri) {
 
 var shouldFail = function(uri) {
     assert.throws(function(uri) {
-        var conn = new Mongo(uri);
+        new Mongo(uri);
     }, [uri], "network error while attempting to run command");
 };
 
 // Start up a mongod with ssl required.
-var sslMongo = MongoRunner.runMongod({
-    sslMode: "requireSSL",
-    sslPEMKeyFile: "jstests/libs/server.pem",
-    sslCAFile: "jstests/libs/ca.pem",
+var tlsMongo = MongoRunner.runMongod({
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: "jstests/libs/server.pem",
+    tlsCAFile: "jstests/libs/ca.pem",
 });
 
-var sslURI = "mongodb://localhost:" + sslMongo.port + "/admin";
+var tlsURI = "mongodb://localhost:" + tlsMongo.port + "/admin";
 
 // When talking to a server with SSL, connecting with ssl=false fails.
-shouldSucceed(sslURI);
-shouldSucceed(sslURI + "?ssl=true");
-shouldFail(sslURI + "?ssl=false");
+shouldSucceed(tlsURI);
+shouldSucceed(tlsURI + "?ssl=true");
+shouldFail(tlsURI + "?ssl=false");
 
 var connectWithURI = function(uri) {
     return runMongoProgram('mongo',
-                           '--ssl',
-                           '--sslAllowInvalidCertificates',
-                           '--sslCAFile',
+                           '--tls',
+                           '--tlsAllowInvalidCertificates',
+                           '--tlsCAFile',
                            'jstests/libs/ca.pem',
-                           '--sslPEMKeyFile',
+                           '--tlsCertificateKeyFile',
                            'jstests/libs/client.pem',
                            uri,
                            '--eval',
@@ -51,14 +48,13 @@ var shouldNotConnect = function(uri) {
 };
 
 // When talking to a server with SSL, connecting with ssl=false on the command line fails.
-shouldConnect(sslURI);
-shouldNotConnect(sslURI + "?ssl=false");
-shouldConnect(sslURI + "?ssl=true");
+shouldConnect(tlsURI);
+shouldNotConnect(tlsURI + "?ssl=false");
+shouldConnect(tlsURI + "?ssl=true");
 
-// Connecting with ssl=true without --ssl will not work
-var res = runMongoProgram('mongo', sslURI + "?ssl=true", '--eval', 'db.runCommand({hello: 1})');
-assert.eq(res, 1, "should not have been able to connect without --ssl");
+// Connecting with ssl=true without --tls will not work
+var res = runMongoProgram('mongo', tlsURI + "?ssl=true", '--eval', 'db.runCommand({hello: 1})');
+assert.eq(res, 1, "should not have been able to connect without --tls");
 
 // Clean up
-MongoRunner.stopMongod(sslMongo);
-}());
+MongoRunner.stopMongod(tlsMongo);

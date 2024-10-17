@@ -27,43 +27,59 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
 #include <deque>
+#include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_source_streaming_group.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
-
 namespace {
-using boost::intrusive_ptr;
-using std::deque;
-using std::map;
-using std::string;
-using std::vector;
 
 static const char* const ns = "unittests.document_source_group_tests";
 
@@ -72,9 +88,9 @@ using DocumentSourceGroupTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoading) {
     auto expCtx = getExpCtx();
-    expCtx->inMongos = true;  // Disallow external sort.
+    expCtx->inRouter = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
-    auto&& parser = AccumulationStatement::getParser("$sum", boost::none);
+    auto&& [parser, _1, _2, _3] = AccumulationStatement::getParser("$sum");
     auto accumulatorArg = BSON("" << 1);
     auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
     AccumulationStatement countStatement{"count", accExpr};
@@ -106,12 +122,12 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
     auto expCtx = getExpCtx();
 
     // Allow the $group stage to spill to disk.
-    TempDir tempDir("DocumentSourceGroupTest");
+    unittest::TempDir tempDir("DocumentSourceGroupTest");
     expCtx->tempDir = tempDir.path();
     expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto&& [parser, _1, _2, _3] = AccumulationStatement::getParser("$push");
     auto accumulatorArg = BSON(""
                                << "$largeStr");
     auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
@@ -121,7 +137,7 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
-    string largeStr(maxMemoryUsageBytes, 'x');
+    std::string largeStr(maxMemoryUsageBytes, 'x');
     auto mock =
         DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
@@ -151,10 +167,10 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
 TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSetIsTooLarge) {
     auto expCtx = getExpCtx();
     const size_t maxMemoryUsageBytes = 1000;
-    expCtx->inMongos = true;  // Disallow external sort.
+    expCtx->inRouter = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
-    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto&& [parser, _1, _2, _3] = AccumulationStatement::getParser("$push");
     auto accumulatorArg = BSON(""
                                << "$largeStr");
     auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
@@ -164,7 +180,7 @@ TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSet
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
-    string largeStr(maxMemoryUsageBytes, 'x');
+    std::string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                                    Document{{"_id", 1}, {"largeStr", largeStr}}},
                                                   expCtx);
@@ -177,10 +193,10 @@ TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSet
 TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
     const size_t maxMemoryUsageBytes = 1000;
-    expCtx->inMongos = true;  // Disallow external sort.
+    expCtx->inRouter = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
-    auto&& parser = AccumulationStatement::getParser("$push", boost::none);
+    auto&& [parser, _1, _2, _3] = AccumulationStatement::getParser("$push");
     auto accumulatorArg = BSON(""
                                << "$largeStr");
     auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
@@ -190,7 +206,7 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, maxMemoryUsageBytes);
 
-    string largeStr(maxMemoryUsageBytes / 2, 'x');
+    std::string largeStr(maxMemoryUsageBytes / 2, 'x');
     auto mock =
         DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
@@ -245,74 +261,283 @@ TEST_F(DocumentSourceGroupTest, ShouldNotReportDottedGroupKeyAsARename) {
     ASSERT_EQ(modifiedPathsRet.renames.size(), 0UL);
 }
 
-BSONObj toBson(const intrusive_ptr<DocumentSource>& source) {
-    vector<Value> arr;
+TEST_F(DocumentSourceGroupTest, GroupRedactsCorrectWithIdNull) {
+    auto spec = fromjson(R"({
+        $group: {
+            _id: null,
+            foo: { $count: {} }
+        }
+    })");
+    auto docSource = DocumentSourceGroup::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$group":{"_id":"?null","HASH<foo>":{"$sum":"?number"}}})",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceGroupTest, GroupRedactsCorrectWithIdSingleField) {
+    auto spec = fromjson(R"({
+        $group: {
+            _id: '$foo'
+        }
+    })");
+    auto docSource = DocumentSourceGroup::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$group": {
+                "_id": "$HASH<foo>"
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceGroupTest, GroupRedactsCorrectWithIdDocument) {
+    auto spec = fromjson(R"({
+        $group: {
+            _id: {
+                x: '$x',
+                y: '$z'
+            },
+            foo: {
+                $sum: {
+                    $multiply: ['$a.b', '$c', '$d']
+                }
+            },
+            bar: {
+                $first: '$baz'
+            }
+        }
+    })");
+    auto docSource = DocumentSourceGroup::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$group": {
+                "_id": {
+                    "HASH<x>": "$HASH<x>",
+                    "HASH<y>": "$HASH<z>"
+                },
+                "HASH<foo>": {
+                    "$sum": {
+                        "$multiply": ["$HASH<a>.HASH<b>", "$HASH<c>", "$HASH<d>"]
+                    }
+                },
+                "HASH<bar>": {
+                    "$first": "$HASH<baz>"
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceGroupTest, StreamingGroupRedactsCorrectly) {
+    auto spec = fromjson(R"({
+        $_internalStreamingGroup: {
+            _id: {
+                a: "$a",
+                b: "$b"
+            },
+            a: {
+                $first: '$b'
+            },
+            $monotonicIdFields: [ "a", "b" ]
+        }
+    })");
+    auto docSource = DocumentSourceStreamingGroup::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalStreamingGroup": {
+                "_id": {
+                    "HASH<a>": "$HASH<a>",
+                    "HASH<b>": "$HASH<b>"
+                },
+                "HASH<a>": {
+                    "$first": "$HASH<b>"
+                },
+                "$monotonicIdFields": [ "HASH<a>", "HASH<b>" ]
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceGroupTest, CanHandleEmptyExpressionObject) {
+    // Test the case where the _id expression is an empty object. This is handled as a special case,
+    // but is not directly reachable from the parser, so we will manually instantiate an
+    // ExpressionObject here.
+    auto idExpression = ExpressionObject::create(getExpCtx().get(), {});
+    std::vector<AccumulationStatement> accumulationStatements;
+    auto group = DocumentSourceGroup::create(getExpCtx(), idExpression, accumulationStatements);
+    auto mock = DocumentSourceMock::createForTest({Document{{"_id"_sd, 0}}}, getExpCtx());
+    group->setSource(mock.get());
+    auto next = group->getNext();
+    ASSERT(next.isAdvanced());
+    // The constant _id value from the $group spec is passed through.
+    ASSERT_DOCUMENT_EQ((Document{{"_id", Document{}}}), next.getDocument());
+}
+
+TEST_F(DocumentSourceGroupTest, CanOutputExectionStatsExplainWithoutProcessingDocuments) {
+    auto expCtx = getExpCtx();
+    expCtx->explain = ExplainOptions::Verbosity::kExecStats;
+
+    auto&& [parser, _1, _2, _3] = AccumulationStatement::getParser("$sum");
+    auto accumulatorArg = BSON("" << 1);
+    auto accExpr = parser(expCtx.get(), accumulatorArg.firstElement(), expCtx->variablesParseState);
+    AccumulationStatement countStatement{"count", accExpr};
+
+    auto group = DocumentSourceGroup::create(
+        expCtx, ExpressionConstant::create(expCtx.get(), Value(BSONNULL)), {countStatement});
+    group->dispose();
+
+    SerializationOptions explainOpts;
+    explainOpts.verbosity = expCtx->explain;
+    ASSERT_DOCUMENT_EQ(Document(fromjson(
+                           R"({
+                            $group: {
+                                _id: {$const: null},
+                                count: {$sum: {$const: 1}}},
+                                maxAccumulatorMemoryUsageBytes: {count: 0},
+                                totalOutputDataSizeBytes: 0,
+                                usedDisk: false,
+                                spills: 0,
+                                spilledDataStorageSize: 0,
+                                numBytesSpilledEstimate: 0,
+                                spilledRecords: 0
+                            })")),
+                       group->serialize(explainOpts).getDocument());
+}
+
+TEST_F(DocumentSourceGroupTest, CorrectlyReportsTriviallyReferencedExprsFromID) {
+    // Verify that DocumentSourceGroupBase::getTriviallyReferencedPaths identifies paths which are
+    // used directly, without further computation - "trivially" referenced.
+    const auto getTriviallyReferenced = [&](StringData idJsonStr) {
+        auto idExpr = fromjson(idJsonStr);
+        auto spec = BSON("$group" << BSON("_id" << idExpr));
+        auto group = boost::dynamic_pointer_cast<DocumentSourceGroup>(
+            DocumentSourceGroup::createFromBson(spec.firstElement(), getExpCtx()));
+        return group->getTriviallyReferencedPaths();
+    };
+    const auto expect = [&](StringData idJsonStr, OrderedPathSet expected) {
+        auto actual = getTriviallyReferenced(idJsonStr);
+        ASSERT_EQ(actual, expected) << fmt::format(
+            "_id:{}, [{}] != [{}]", idJsonStr, fmt::join(actual, ", "), fmt::join(expected, ", "));
+    };
+    expect(R"(["$a"])", {"a"});
+    expect(R"(["$a", "$a"])", {"a"});
+    expect(R"({"foo":"$a"})", {"a"});
+    expect(R"({"foo":"$a", "bar":"$a"})", {"a"});
+
+    expect(R"(["$a", "$b"])", {"a", "b"});
+    expect(R"({"foo":"$a", "bar":"$b"})", {"a", "b"});
+
+    expect(R"({"foo":["$a", "$b"]})", {"a", "b"});
+    expect(R"([{"foo":["$a", "$b"]}])", {"a", "b"});
+}
+
+
+BSONObj toBson(const boost::intrusive_ptr<DocumentSource>& source) {
+    std::vector<Value> arr;
     source->serializeToArray(arr);
     ASSERT_EQUALS(arr.size(), 1UL);
     return arr[0].getDocument().toBson();
 }
 
+enum class GroupStageType { Default, Streaming };
+
 class Base : public ServiceContextTest {
 public:
-    Base()
+    Base(GroupStageType groupStageType = GroupStageType::Default)
         : _opCtx(makeOperationContext()),
-          _ctx(new ExpressionContextForTest(_opCtx.get(),
-                                            AggregateCommandRequest(NamespaceString(ns), {}))),
-          _tempDir("DocumentSourceGroupTest") {}
+          _ctx(new ExpressionContextForTest(
+              _opCtx.get(),
+              AggregateCommandRequest(NamespaceString::createNamespaceString_forTest(ns),
+                                      std::vector<mongo::BSONObj>()))),
+          _tempDir("DocumentSourceGroupTest"),
+          _groupStageType(groupStageType) {}
 
 protected:
-    void createGroup(const BSONObj& spec, bool inShard = false, bool inMongos = false) {
-        BSONObj namedSpec = BSON("$group" << spec);
+    StringData getStageName() const {
+        switch (_groupStageType) {
+            case GroupStageType::Default:
+                return DocumentSourceGroup::kStageName;
+            case GroupStageType::Streaming:
+                return DocumentSourceStreamingGroup::kStageName;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    virtual boost::optional<int64_t> getMaxMemoryUsageBytes() {
+        return boost::none;
+    }
+
+    boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement specElement, boost::intrusive_ptr<ExpressionContext> expressionContext) {
+        switch (_groupStageType) {
+            case GroupStageType::Default:
+                return DocumentSourceGroup::createFromBsonWithMaxMemoryUsage(
+                    std::move(specElement), expressionContext, getMaxMemoryUsageBytes());
+            case GroupStageType::Streaming:
+                return DocumentSourceStreamingGroup::createFromBsonWithMaxMemoryUsage(
+                    std::move(specElement), expressionContext, getMaxMemoryUsageBytes());
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    void createGroup(const BSONObj& spec, bool inShard = false, bool inRouter = false) {
+        BSONObj namedSpec = BSON(getStageName() << spec);
         BSONElement specElement = namedSpec.firstElement();
 
-        intrusive_ptr<ExpressionContextForTest> expressionContext = new ExpressionContextForTest(
-            _opCtx.get(), AggregateCommandRequest(NamespaceString(ns), {}));
-        // For $group, 'inShard' implies 'fromMongos' and 'needsMerge'.
-        expressionContext->fromMongos = expressionContext->needsMerge = inShard;
-        expressionContext->inMongos = inMongos;
+        boost::intrusive_ptr<ExpressionContextForTest> expressionContext =
+            new ExpressionContextForTest(
+                _opCtx.get(),
+                AggregateCommandRequest(NamespaceString::createNamespaceString_forTest(ns),
+                                        std::vector<mongo::BSONObj>()));
+        expressionContext->allowDiskUse = true;
+        // For $group, 'inShard' implies 'fromRouter' and 'needsMerge'.
+        expressionContext->fromRouter = expressionContext->needsMerge = inShard;
+        expressionContext->inRouter = inRouter;
         // Won't spill to disk properly if it needs to.
         expressionContext->tempDir = _tempDir.path();
 
-        _group = DocumentSourceGroup::createFromBson(specElement, expressionContext);
+        _group = createFromBson(specElement, expressionContext);
         assertRoundTrips(_group, expressionContext);
     }
-    DocumentSourceGroup* group() {
-        return static_cast<DocumentSourceGroup*>(_group.get());
+    DocumentSourceGroupBase* group() {
+        return static_cast<DocumentSourceGroupBase*>(_group.get());
     }
     /** Assert that iterator state accessors consistently report the source is exhausted. */
-    void assertEOF(const intrusive_ptr<DocumentSource>& source) const {
+    void assertEOF(const boost::intrusive_ptr<DocumentSource>& source) const {
         // It should be safe to check doneness multiple times
         ASSERT(source->getNext().isEOF());
         ASSERT(source->getNext().isEOF());
         ASSERT(source->getNext().isEOF());
     }
 
-    intrusive_ptr<ExpressionContextForTest> ctx() const {
+    boost::intrusive_ptr<ExpressionContextForTest> ctx() const {
         return _ctx;
     }
 
 private:
     /** Check that the group's spec round trips. */
-    void assertRoundTrips(const intrusive_ptr<DocumentSource>& group,
+    void assertRoundTrips(const boost::intrusive_ptr<DocumentSource>& group,
                           const boost::intrusive_ptr<ExpressionContext>& expCtx) {
         // We don't check against the spec that generated 'group' originally, because
         // $const operators may be introduced in the first serialization.
         BSONObj spec = toBson(group);
         BSONElement specElement = spec.firstElement();
-        intrusive_ptr<DocumentSource> generated =
-            DocumentSourceGroup::createFromBson(specElement, expCtx);
+        boost::intrusive_ptr<DocumentSource> generated = createFromBson(specElement, expCtx);
         ASSERT_BSONOBJ_EQ(spec, toBson(generated));
     }
     std::unique_ptr<QueryTestServiceContext> _queryServiceContext;
     ServiceContext::UniqueOperationContext _opCtx;
-    intrusive_ptr<ExpressionContextForTest> _ctx;
-    intrusive_ptr<DocumentSource> _group;
-    TempDir _tempDir;
+    boost::intrusive_ptr<ExpressionContextForTest> _ctx;
+    boost::intrusive_ptr<DocumentSource> _group;
+    unittest::TempDir _tempDir;
+    GroupStageType _groupStageType;
 };
 
 class ParseErrorBase : public Base {
 public:
-    virtual ~ParseErrorBase() {}
+    ~ParseErrorBase() override {}
     void _doTest() final {
         ASSERT_THROWS(createGroup(spec()), AssertionException);
     }
@@ -323,7 +548,7 @@ protected:
 
 class ExpressionBase : public Base {
 public:
-    virtual ~ExpressionBase() {}
+    ~ExpressionBase() override {}
     void _doTest() final {
         createGroup(spec());
         auto source = DocumentSourceMock::createForTest(Document(doc()), ctx());
@@ -342,10 +567,10 @@ protected:
 };
 
 class IdConstantBase : public ExpressionBase {
-    virtual BSONObj doc() {
+    BSONObj doc() override {
         return BSONObj();
     }
-    virtual BSONObj expected() {
+    BSONObj expected() override {
         // Since spec() specifies a constant _id, its value will be passed through.
         return spec();
     }
@@ -355,66 +580,85 @@ class IdConstantBase : public ExpressionBase {
 class NonObject : public Base {
 public:
     void _doTest() final {
-        BSONObj spec = BSON("$group"
-                            << "foo");
+        BSONObj spec = BSON(getStageName() << "foo");
         BSONElement specElement = spec.firstElement();
-        ASSERT_THROWS(DocumentSourceGroup::createFromBson(specElement, ctx()), AssertionException);
+        ASSERT_THROWS(createFromBson(specElement, ctx()), AssertionException);
     }
 };
 
 /** $group spec is an empty object. */
 class EmptySpec : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSONObj();
     }
 };
 
 /** $group _id is an empty object. */
 class IdEmptyObject : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
+        return BSON("_id" << BSONObj());
+    }
+};
+
+/** $group _id is an empty object surrounded by a no-op $expr */
+class IdEmptyObjectWithExpr : public IdConstantBase {
+    BSONObj spec() override {
+        return BSON("_id" << BSON("$expr" << BSONObj()));
+    }
+    BSONObj expected() override {
+        return BSON("_id" << BSONObj());
+    }
+};
+
+/** $group _id is an empty object surrounded by multiple no-op $exprs */
+class IdEmptyObjectWithManyExpr : public IdConstantBase {
+    BSONObj spec() override {
+        return BSON("_id" << BSON("$expr" << BSON("$expr" << BSON("$expr" << BSONObj()))));
+    }
+    BSONObj expected() override {
         return BSON("_id" << BSONObj());
     }
 };
 
 /** $group _id is computed from an object expression. */
 class IdObjectExpression : public ExpressionBase {
-    BSONObj doc() {
+    BSONObj doc() override {
         return BSON("a" << 6);
     }
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << BSON("z"
                                   << "$a"));
     }
-    BSONObj expected() {
+    BSONObj expected() override {
         return BSON("_id" << BSON("z" << 6));
     }
 };
 
 /** $group _id is specified as an invalid object expression. */
 class IdInvalidObjectExpression : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << BSON("$add" << 1 << "$and" << 1));
     }
 };
 
 /** $group with two _id specs. */
 class TwoIdSpecs : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "_id" << 2);
     }
 };
 
 /** $group _id is the empty string. */
 class IdEmptyString : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id"
                     << "");
     }
 };
 
-/** $group _id is a string constant. */
+/** $group _id is a std::string constant. */
 class IdStringConstant : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id"
                     << "abc");
     }
@@ -422,21 +666,21 @@ class IdStringConstant : public IdConstantBase {
 
 /** $group _id is a field path expression. */
 class IdFieldPath : public ExpressionBase {
-    BSONObj doc() {
+    BSONObj doc() override {
         return BSON("a" << 5);
     }
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id"
                     << "$a");
     }
-    BSONObj expected() {
+    BSONObj expected() override {
         return BSON("_id" << 5);
     }
 };
 
 /** $group with _id set to an invalid field path. */
 class IdInvalidFieldPath : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id"
                     << "$a..");
     }
@@ -444,106 +688,106 @@ class IdInvalidFieldPath : public ParseErrorBase {
 
 /** $group _id is a numeric constant. */
 class IdNumericConstant : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 2);
     }
 };
 
 /** $group _id is an array constant. */
 class IdArrayConstant : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << BSON_ARRAY(1 << 2));
     }
 };
 
 /** $group _id is a regular expression (not supported). */
 class IdRegularExpression : public IdConstantBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return fromjson("{_id:/a/}");
     }
 };
 
 /** The name of an aggregate field is specified with a $ prefix. */
 class DollarAggregateFieldName : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "$foo" << BSON("$sum" << 1));
     }
 };
 
 /** An aggregate field spec that is not an object. */
 class NonObjectAggregateSpec : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "a" << 1);
     }
 };
 
 /** An aggregate field spec that is not an object. */
 class EmptyObjectAggregateSpec : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "a" << BSONObj());
     }
 };
 
 /** An aggregate field spec with an invalid accumulator operator. */
 class BadAccumulator : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "a" << BSON("$bad" << 1));
     }
 };
 
 /** An aggregate field spec with an array argument. */
 class SumArray : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "a" << BSON("$sum" << BSONArray()));
     }
 };
 
 /** Multiple accumulator operators for a field. */
 class MultipleAccumulatorsForAField : public ParseErrorBase {
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 1 << "a" << BSON("$sum" << 1 << "$push" << 1));
     }
 };
 
 /** Aggregation using duplicate field names is allowed currently. */
 class DuplicateAggregateFieldNames : public ExpressionBase {
-    BSONObj doc() {
+    BSONObj doc() override {
         return BSONObj();
     }
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 0 << "z" << BSON("$sum" << 1) << "z" << BSON("$push" << 1));
     }
-    BSONObj expected() {
+    BSONObj expected() override {
         return BSON("_id" << 0 << "z" << 1 << "z" << BSON_ARRAY(1));
     }
 };
 
 /** Aggregate the value of an object expression. */
 class AggregateObjectExpression : public ExpressionBase {
-    BSONObj doc() {
+    BSONObj doc() override {
         return BSON("a" << 6);
     }
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 0 << "z"
                           << BSON("$first" << BSON("x"
                                                    << "$a")));
     }
-    BSONObj expected() {
+    BSONObj expected() override {
         return BSON("_id" << 0 << "z" << BSON("x" << 6));
     }
 };
 
 /** Aggregate the value of an operator expression. */
 class AggregateOperatorExpression : public ExpressionBase {
-    BSONObj doc() {
+    BSONObj doc() override {
         return BSON("a" << 6);
     }
-    BSONObj spec() {
+    BSONObj spec() override {
         return BSON("_id" << 0 << "z"
                           << BSON("$first"
                                   << "$a"));
     }
-    BSONObj expected() {
+    BSONObj expected() override {
         return BSON("_id" << 0 << "z" << 6);
     }
 };
@@ -553,12 +797,14 @@ struct ValueCmp {
         return ValueComparator().evaluate(a < b);
     }
 };
-typedef map<Value, Document, ValueCmp> IdMap;
+typedef std::map<Value, Document, ValueCmp> IdMap;
 
 class CheckResultsBase : public Base {
 public:
-    virtual ~CheckResultsBase() {}
-    void _doTest() {
+    CheckResultsBase(GroupStageType groupStageType = GroupStageType::Default)
+        : Base(groupStageType) {}
+    ~CheckResultsBase() override {}
+    void _doTest() override {
         runSharded(false);
         runSharded(true);
     }
@@ -567,11 +813,11 @@ public:
         auto source = DocumentSourceMock::createForTest(inputData(), ctx());
         group()->setSource(source.get());
 
-        intrusive_ptr<DocumentSource> sink = group();
+        boost::intrusive_ptr<DocumentSource> sink = group();
         if (sharded) {
             sink = createMerger();
             // Serialize and re-parse the shard stage.
-            createGroup(toBson(group())["$group"].Obj(), true);
+            createGroup(toBson(group())[group()->getSourceName()].Obj(), true);
             group()->setSource(source.get());
             sink->setSource(group());
         }
@@ -580,7 +826,7 @@ public:
     }
 
 protected:
-    virtual deque<DocumentSource::GetNextResult> inputData() {
+    virtual std::deque<DocumentSource::GetNextResult> inputData() {
         return {};
     }
     virtual BSONObj groupSpec() {
@@ -590,24 +836,26 @@ protected:
     virtual BSONObj expectedResultSet() {
         BSONObj wrappedResult =
             // fromjson cannot parse an array, so place the array within an object.
-            fromjson(string("{'':") + expectedResultSetString() + "}");
+            fromjson(std::string("{'':") + expectedResultSetString() + "}");
         return wrappedResult[""].embeddedObject().getOwned();
     }
     /** Expected results.  Must be sorted by _id to ensure consistent ordering. */
-    virtual string expectedResultSetString() {
+    virtual std::string expectedResultSetString() {
         return "[]";
     }
-    intrusive_ptr<DocumentSource> createMerger() {
+    boost::intrusive_ptr<DocumentSource> createMerger() {
         // Set up a group merger to simulate merging results in the router.  In this
         // case only one shard is in use.
         auto distributedPlanLogic = group()->distributedPlanLogic();
         ASSERT(distributedPlanLogic);
-        ASSERT(distributedPlanLogic->mergingStage);
-        ASSERT_NOT_EQUALS(group(), distributedPlanLogic->mergingStage);
-        ASSERT_FALSE(static_cast<bool>(distributedPlanLogic->inputSortPattern));
-        return distributedPlanLogic->mergingStage;
+        ASSERT_EQ(distributedPlanLogic->mergingStages.size(), 1)
+            << distributedPlanLogic->mergingStages.size();
+        auto mergingStage = *distributedPlanLogic->mergingStages.begin();
+        ASSERT_NOT_EQUALS(group(), mergingStage);
+        ASSERT_FALSE(static_cast<bool>(distributedPlanLogic->mergeSortPattern));
+        return mergingStage;
     }
-    void checkResultSet(const intrusive_ptr<DocumentSource>& sink) {
+    void checkResultSet(const boost::intrusive_ptr<DocumentSource>& sink) {
         // Load the results from the DocumentSourceGroup and sort them by _id.
         IdMap resultSet;
         for (auto output = sink->getNext(); output.isAdvanced(); output = sink->getNext()) {
@@ -634,80 +882,80 @@ class EmptyCollection : public CheckResultsBase {};
 
 /** A $group performed on a single document. */
 class SingleDocument : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("a" << 1)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id" << 0 << "a"
                           << BSON("$sum"
                                   << "$a"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,a:1}]";
     }
 };
 
 /** A $group performed on two values for a single key. */
 class TwoValuesSingleKey : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("a" << 1), DOC("a" << 2)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id" << 0 << "a"
                           << BSON("$push"
                                   << "$a"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,a:[1,2]}]";
     }
 };
 
 /** A $group performed on two values with one key each. */
 class TwoValuesTwoKeys : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("_id" << 0 << "a" << 1), DOC("_id" << 1 << "a" << 2)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id"
                     << "$_id"
                     << "a"
                     << BSON("$push"
                             << "$a"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,a:[1]},{_id:1,a:[2]}]";
     }
 };
 
 /** A $group performed on two values with two keys each. */
 class FourValuesTwoKeys : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("id" << 0 << "a" << 1),
                 DOC("id" << 1 << "a" << 2),
                 DOC("id" << 0 << "a" << 3),
                 DOC("id" << 1 << "a" << 4)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id"
                     << "$id"
                     << "a"
                     << BSON("$push"
                             << "$a"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,a:[1,3]},{_id:1,a:[2,4]}]";
     }
 };
 
 /** A $group performed on two values with two keys each and two accumulator operations. */
 class FourValuesTwoKeysTwoAccumulators : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("id" << 0 << "a" << 1),
                 DOC("id" << 1 << "a" << 2),
                 DOC("id" << 0 << "a" << 3),
                 DOC("id" << 1 << "a" << 4)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id"
                     << "$id"
                     << "list"
@@ -715,31 +963,31 @@ class FourValuesTwoKeysTwoAccumulators : public CheckResultsBase {
                             << "$a")
                     << "sum" << BSON("$sum" << BSON("$divide" << BSON_ARRAY("$a" << 2))));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,list:[1,3],sum:2},{_id:1,list:[2,4],sum:3}]";
     }
 };
 
 /** Null and undefined _id values are grouped together. */
 class GroupNullUndefinedIds : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("a" << BSONNULL << "b" << 100), DOC("b" << 10)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id"
                     << "$a"
                     << "sum"
                     << BSON("$sum"
                             << "$b"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:null,sum:110}]";
     }
 };
 
 /** A complex _id expression. */
 class ComplexId : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("a"
                     << "de"_sd
                     << "b"
@@ -757,28 +1005,28 @@ class ComplexId : public CheckResultsBase {
                     << "d"
                     << "ef"_sd)};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id" << BSON("$concat" << BSON_ARRAY("$a"
                                                           << "$b"
                                                           << "$c"
                                                           << "$d")));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:'deadbeef'}]";
     }
 };
 
 /** An undefined accumulator value is dropped. */
 class UndefinedAccumulatorValue : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {Document()};
     }
-    virtual BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return BSON("_id" << 0 << "first"
                           << BSON("$first"
                                   << "$missing"));
     }
-    virtual string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0, first:null}]";
     }
 };
@@ -800,7 +1048,7 @@ public:
                          << BSON("$push"
                                  << "$y")));
         // Create a merger version of the source.
-        intrusive_ptr<DocumentSource> group = createMerger();
+        boost::intrusive_ptr<DocumentSource> group = createMerger();
         // Attach the merger to the synthetic shard results.
         group->setSource(source.get());
         // Check the merger's output.
@@ -808,7 +1056,7 @@ public:
     }
 
 private:
-    string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:0,list:[1,2,10,20]},{_id:1,list:[3,4,30,40]}]";
     }
 };
@@ -833,17 +1081,17 @@ public:
 };
 
 /**
- * A string constant (not a field path) as an _id expression and passed to an accumulator.
+ * A std::string constant (not a field path) as an _id expression and passed to an accumulator.
  * SERVER-6766
  */
 class StringConstantIdAndAccumulatorExpressions : public CheckResultsBase {
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {Document()};
     }
-    BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         return fromjson("{_id:{$const:'$_id...'},a:{$push:{$const:'$a...'}}}");
     }
-    string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:'$_id...',a:['$a...']}]";
     }
 };
@@ -857,26 +1105,305 @@ public:
         // Run standard base tests.
         CheckResultsBase::_doTest();
     }
-    deque<DocumentSource::GetNextResult> inputData() {
+    std::deque<DocumentSource::GetNextResult> inputData() override {
         return {Document()};
     }
-    BSONObj groupSpec() {
+    BSONObj groupSpec() override {
         // An array can be specified using $const.
         return fromjson("{_id:[1,2,3],a:{$push:{$const:[4,5,6]}}}");
     }
-    string expectedResultSetString() {
+    std::string expectedResultSetString() override {
         return "[{_id:[1,2,3],a:[[4,5,6]]}]";
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class StreamingSimple final : public CheckResultsBase {
+public:
+    StreamingSimple() : CheckResultsBase(GroupStageType::Streaming) {}
+
+private:
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        return {Document(BSON("a" << 1 << "b" << 1)),
+                Document(BSON("a" << 1 << "b" << 2)),
+                Document(BSON("a" << 2 << "b" << 3)),
+                Document(BSON("a" << 2 << "b" << 1))};
+    }
+    BSONObj groupSpec() final {
+        return BSON("_id"
+                    << "$a"
+                    << "sum"
+                    << BSON("$sum"
+                            << "$b")
+                    << "$monotonicIdFields" << BSON_ARRAY("_id"));
+    }
+    std::string expectedResultSetString() final {
+        return "[{_id:1,sum:3},{_id:2,sum:4}]";
+    }
+};
+
+constexpr size_t kBigStringSize = 1024;
+const std::string kBigString(kBigStringSize, 'a');
+
+class CheckResultsAndSpills : public CheckResultsBase {
+public:
+    CheckResultsAndSpills(GroupStageType groupStageType, uint64_t expectedSpills)
+        : CheckResultsBase(groupStageType), _expectedSpills(expectedSpills) {}
+
+    void _doTest() final {
+        for (int sharded = 0; sharded < 2; ++sharded) {
+            runSharded(sharded);
+            const auto* groupStats = static_cast<const GroupStats*>(group()->getSpecificStats());
+            ASSERT_EQ(groupStats->spills, _expectedSpills);
+        }
+    }
+
+private:
+    uint64_t _expectedSpills;
+};
+
+template <GroupStageType groupStageType, uint64_t expectedSpills>
+class StreamingSpillTest : public CheckResultsAndSpills {
+public:
+    StreamingSpillTest() : CheckResultsAndSpills(groupStageType, expectedSpills) {}
+
+private:
+    static constexpr int kCount = 11;
+
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        std::deque<DocumentSource::GetNextResult> queue;
+        for (int i = 0; i < kCount; ++i) {
+            queue.emplace_back(Document(BSON("a" << i << "b" << kBigString)));
+        }
+        return queue;
+    }
+
+    BSONObj groupSpec() final {
+        if constexpr (groupStageType == GroupStageType::Streaming) {
+            return fromjson("{_id: '$a', big_array: {$push: '$b'}, $monotonicIdFields: ['_id']}");
+        } else {
+            return fromjson("{_id: '$a', big_array: {$push: '$b'}}");
+        }
+    }
+
+    boost::optional<int64_t> getMaxMemoryUsageBytes() final {
+        return 10 * kBigStringSize;
+    }
+
+    BSONObj expectedResultSet() final {
+        BSONArrayBuilder result;
+        for (int i = 0; i < kCount; ++i) {
+            result << BSON("_id" << i << "big_array" << BSON_ARRAY(kBigString));
+        }
+        return result.arr();
+    }
+};
+
+class WithoutStreamingSpills final
+    : public StreamingSpillTest<GroupStageType::Default, 2 /*expectedSpills*/> {};
+class StreamingDoesNotSpill final
+    : public StreamingSpillTest<GroupStageType::Streaming, 0 /*expectedSpills*/> {};
+
+class StreamingCanSpill final : public CheckResultsAndSpills {
+public:
+    StreamingCanSpill() : CheckResultsAndSpills(GroupStageType::Streaming, 2 /*expectedSpills*/) {}
+
+private:
+    static constexpr int kCount = 11;
+
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        std::deque<DocumentSource::GetNextResult> queue;
+        for (int i = 0; i < kCount; ++i) {
+            queue.emplace_back(Document(BSON("x" << 0 << "y" << i << "b" << kBigString)));
+        }
+        return queue;
+    }
+
+    BSONObj groupSpec() final {
+        auto id = BSON("x"
+                       << "$x"
+                       << "y"
+                       << "$y");
+        return BSON("_id" << id << "big_array"
+                          << BSON("$push"
+                                  << "$b")
+                          << "$monotonicIdFields" << BSON_ARRAY("x"));
+    }
+
+    boost::optional<int64_t> getMaxMemoryUsageBytes() final {
+        return 10 * kBigStringSize;
+    }
+
+    BSONObj expectedResultSet() final {
+        BSONArrayBuilder result;
+        for (int i = 0; i < kCount; ++i) {
+            auto id = BSON("x" << 0 << "y" << i);
+            result << BSON("_id" << id << "big_array" << BSON_ARRAY(kBigString));
+        }
+        return result.arr();
+    }
+};
+
+class StreamingAlternatingSpillAndNoSpillBatches : public CheckResultsAndSpills {
+public:
+    StreamingAlternatingSpillAndNoSpillBatches()
+        : CheckResultsAndSpills(GroupStageType::Streaming, expectedSpills()) {}
+
+private:
+    static constexpr int kCount = 12;
+
+    int expectedSpills() const {
+        // 'DocumentSourceGroup' has the knob called 'internalQueryEnableAggressiveSpillsInGroup'
+        // used to spill more aggressively when turned on.
+        return internalQueryEnableAggressiveSpillsInGroup ? kCount : 4;
+    }
+
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        std::deque<DocumentSource::GetNextResult> queue;
+        for (int i = 0; i < kCount; ++i) {
+            // For groups with i % 3 == 0 and i % 3 == 1 there should be no spilling, but groups
+            // with i % 3 == 2 should spill.
+            for (int j = 0; j < (i % 3) + 1; ++j) {
+                queue.emplace_back(Document(BSON("a" << i << "b" << kBigString)));
+            }
+        }
+        return queue;
+    }
+
+    BSONObj groupSpec() final {
+        return BSON("_id"
+                    << "$a"
+                    << "big_array"
+                    << BSON("$push"
+                            << "$b")
+                    << "$monotonicIdFields" << BSON_ARRAY("_id"));
+    }
+
+    boost::optional<int64_t> getMaxMemoryUsageBytes() final {
+        return (25 * kBigStringSize) / 10;
+    }
+
+    BSONObj expectedResultSet() final {
+        BSONArrayBuilder result;
+        for (int i = 0; i < kCount; ++i) {
+            BSONArrayBuilder bigArrayBuilder;
+            for (int j = 0; j < (i % 3) + 1; ++j) {
+                bigArrayBuilder << kBigString;
+            }
+            result << BSON("_id" << i << "big_array" << bigArrayBuilder.arr());
+        }
+        return result.arr();
+    }
+};
+
+class StreamingComplex final : public CheckResultsBase {
+public:
+    StreamingComplex() : CheckResultsBase(GroupStageType::Streaming) {}
+
+private:
+    static constexpr int kCount = 3;
+
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        std::deque<DocumentSource::GetNextResult> queue;
+        for (int i = 0; i < kCount; ++i) {
+            for (int j = 0; j < kCount; ++j) {
+                for (int k = 0; k < kCount; ++k) {
+                    queue.emplace_back(Document(BSON("x" << i << "y" << j << "z" << k)));
+                }
+            }
+        }
+        return queue;
+    }
+
+    BSONObj groupSpec() final {
+        BSONObj id = BSON("x"
+                          << "$x"
+                          << "y"
+                          << "$y");
+        return BSON("_id" << id << "sum"
+                          << BSON("$sum"
+                                  << "$z")
+                          << "$monotonicIdFields" << BSON_ARRAY("x"));
+    }
+
+    boost::optional<int64_t> getMaxMemoryUsageBytes() final {
+        return 10 * kBigStringSize;
+    }
+
+    BSONObj expectedResultSet() final {
+        BSONArrayBuilder result;
+        for (int i = 0; i < kCount; ++i) {
+            for (int j = 0; j < kCount; ++j) {
+                result << BSON("_id" << BSON("x" << i << "y" << j) << "sum"
+                                     << (kCount * (kCount - 1)) / 2);
+            }
+        }
+        return result.arr();
+    }
+};
+
+class StreamingMultipleMonotonicFields final : public CheckResultsBase {
+public:
+    StreamingMultipleMonotonicFields() : CheckResultsBase(GroupStageType::Streaming) {}
+
+private:
+    static constexpr int kCount = 6;
+    std::deque<DocumentSource::GetNextResult> inputData() final {
+        std::deque<DocumentSource::GetNextResult> queue;
+        generateInputOutput([&queue](int x, int y) {
+            for (int i = 0; i < kCount; ++i) {
+                queue.emplace_back(Document(BSON("x" << x << "y" << y << "z" << i)));
+            }
+        });
+        return queue;
+    }
+
+    BSONObj groupSpec() final {
+        return fromjson(
+            "{_id: {x: '$x', y: '$y'}, sum: {$sum: '$z'}, $monotonicIdFields: ['x', 'y']}");
+    }
+
+    boost::optional<int64_t> getMaxMemoryUsageBytes() final {
+        return 10 * kBigStringSize;
+    }
+
+    BSONObj expectedResultSet() final {
+        BSONArrayBuilder result;
+        const int sum = (kCount * (kCount - 1)) / 2;
+        generateInputOutput([&](int x, int y) {
+            result << BSON("_id" << BSON("x" << x << "y" << y) << "sum" << sum);
+        });
+        return result.arr();
+    }
+
+    template <typename Callback>
+    void generateInputOutput(const Callback& callback) {
+        int x = 0;
+        int y = 0;
+        for (int i = 0; i < kCount; ++i) {
+            callback(x, y);
+            int state = i % 3;
+            if (state == 0) {
+                x++;
+            } else if (state == 1) {
+                y++;
+            } else {
+                x++;
+                y++;
+            }
+        }
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("DocumentSourceGroupTests") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<NonObject>();
         add<EmptySpec>();
         add<IdEmptyObject>();
+        add<IdEmptyObjectWithExpr>();
+        add<IdEmptyObjectWithManyExpr>();
         add<IdObjectExpression>();
         add<IdInvalidObjectExpression>();
         add<TwoIdSpecs>();
@@ -909,8 +1436,16 @@ public:
         add<Dependencies>();
         add<StringConstantIdAndAccumulatorExpressions>();
         add<ArrayConstantAccumulatorExpression>();
+
+        add<StreamingSimple>();
+        add<WithoutStreamingSpills>();
+        add<StreamingDoesNotSpill>();
+        add<StreamingCanSpill>();
+        add<StreamingAlternatingSpillAndNoSpillBatches>();
+        add<StreamingComplex>();
+        add<StreamingMultipleMonotonicFields>();
 #if 0
-        // Disabled tests until SERVER-23318 is implemented.
+        // TODO (SERVER-23318): Enable tests
         add<StreamingOptimization>();
         add<StreamingWithMultipleIdFields>();
         add<NoOptimizationIfMissingDoubleSort>();
@@ -926,7 +1461,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

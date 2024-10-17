@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_ranker.h"
 
@@ -45,13 +47,137 @@ namespace mongo::plan_ranker {
 std::unique_ptr<PlanScorer<PlanStageStats>> makePlanScorer();
 
 /**
+ * Takes a vector of pairs holding (score, planIndex).
+ * Returns an iterator pointing to the first non-tying plan, or the end of the vector.
+ */
+inline std::vector<std::pair<double, size_t>>::iterator findTopTiedPlans(
+    std::vector<std::pair<double, size_t>>& plans) {
+    return std::find_if(plans.begin(), plans.end(), [&plans](const auto& plan) {
+        return plan.first != plans[0].first;
+    });
+}
+
+/**
+ * Holds information about tie breaking heuristic bonuses. It is used to update candidate plan score
+ * and log the bonuses.
+ */
+struct TieBreakingScores {
+    TieBreakingScores(bool isPlanTied, double score)
+        : isPlanTied(isPlanTied), score(score), docsExaminedBonus(0.0), indexPrefixBonus(0.0) {}
+
+    double getTotalBonus() const {
+        return docsExaminedBonus + indexPrefixBonus;
+    }
+
+    const bool isPlanTied;
+    const double score;
+    double docsExaminedBonus;
+    double indexPrefixBonus;
+};
+
+/**
+ * Apply docs examined tie breaking heuristic and return bonuses in 'scores' list. 'candidates' and
+ * 'scores' are synchronized, with the i-th score from 'scores' corresponding to the i-th
+ * 'candidate.'
+ */
+template <typename PlanStageType, typename ResultType, typename Data>
+void calcDocsExaminedHeuristicBonus(
+    const std::vector<std::pair<double, size_t>>& scoresAndCandidateIndices,
+    size_t numberOfTiedPlans,
+    const std::vector<BaseCandidatePlan<PlanStageType, ResultType, Data>>& candidates,
+    const std::vector<size_t>& documentsExamined,
+    std::vector<TieBreakingScores>& scores) {
+    // The vector tiedPlans holds the number of documents and the plan's index.
+    std::vector<std::pair<double, size_t>> tiedPlans{};
+    tiedPlans.reserve(numberOfTiedPlans);
+    for (size_t i = 0; i < numberOfTiedPlans; ++i) {
+        const size_t candidateIndex = scoresAndCandidateIndices[i].second;
+        tiedPlans.emplace_back(std::make_pair(documentsExamined[candidateIndex], candidateIndex));
+    }
+
+    // Sort top plans by least documents examined, and allocate a bonus to each of the top plans.
+    std::stable_sort(tiedPlans.begin(), tiedPlans.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+    auto stillTiedPlansEnd = findTopTiedPlans(tiedPlans);
+    for (auto topPlan = tiedPlans.begin(); topPlan < stillTiedPlansEnd; ++topPlan) {
+        scores[topPlan->second].docsExaminedBonus = kBonusEpsilon;
+    }
+}
+
+/**
+ * Apply best index prefix tie breaking heuristic and return bonuses in 'scores' list. 'candidates'
+ * and 'scores' are synchronized, with the i-th score from 'scores' corresponding to the i-th
+ * 'candidate.'
+ */
+template <typename PlanStageType, typename ResultType, typename Data>
+void calcIndexPrefixHeuristicBonus(
+    const std::vector<std::pair<double, size_t>>& scoresAndCandidateIndices,
+    size_t numberOfTiedPlans,
+    const std::vector<BaseCandidatePlan<PlanStageType, ResultType, Data>>& candidates,
+    std::vector<TieBreakingScores>& scores) {
+    std::vector<const QuerySolution*> solutions{};
+    solutions.reserve(numberOfTiedPlans);
+
+    for (size_t i = 0; i < numberOfTiedPlans; ++i) {
+        const size_t candidateIndex = scoresAndCandidateIndices[i].second;
+        solutions.emplace_back(candidates[candidateIndex].solution.get());
+    }
+
+    auto winIndices = applyIndexPrefixHeuristic(solutions);
+    for (auto winIndex : winIndices) {
+        const auto candidateIndex = scoresAndCandidateIndices[winIndex].second;
+        scores[candidateIndex].indexPrefixBonus += 2 * kBonusEpsilon;
+    }
+}
+
+/**
+ * Apply tie-breaking hearistics and update candidate plan scores.
+ */
+template <typename PlanStageType, typename ResultType, typename Data>
+void addTieBreakingHeuristicsBonuses(
+    std::vector<std::pair<double, size_t>>& scoresAndCandidateIndices,
+    const std::vector<BaseCandidatePlan<PlanStageType, ResultType, Data>>& candidates,
+    const std::vector<size_t>& documentsExamined) {
+    auto tiedPlansEnd = findTopTiedPlans(scoresAndCandidateIndices);
+    int numberOfTiedPlans = std::distance(scoresAndCandidateIndices.begin(), tiedPlansEnd);
+
+    if (numberOfTiedPlans > 1) {
+        // Initialize 'scores' list. 'candidates' and 'scores' are synchronized, with the i-th score
+        // from 'scores' corresponding to the i-th 'candidate.'
+        std::vector<TieBreakingScores> scores{};
+        scores.reserve(candidates.size());
+        for (size_t i = 0; i < scoresAndCandidateIndices.size(); ++i) {
+            scores.emplace_back(/* isPlanTied */ i < static_cast<size_t>(numberOfTiedPlans),
+                                /* score */ scoresAndCandidateIndices[i].first);
+        }
+
+        calcDocsExaminedHeuristicBonus(
+            scoresAndCandidateIndices, numberOfTiedPlans, candidates, documentsExamined, scores);
+
+        calcIndexPrefixHeuristicBonus(
+            scoresAndCandidateIndices, numberOfTiedPlans, candidates, scores);
+
+        // Log tie breaking bonuses.
+        for (const auto& score : scores) {
+            log_detail::logTieBreaking(
+                score.score, score.docsExaminedBonus, score.indexPrefixBonus, score.isPlanTied);
+        }
+
+        for (auto& scoreAndIndex : scoresAndCandidateIndices) {
+            scoreAndIndex.first += scores[scoreAndIndex.second].getTotalBonus();
+        }
+    }
+}
+
+/**
  * Returns a PlanRankingDecision which has the ranking and the information about the ranking
  * process with status OK if everything worked. 'candidateOrder' within the PlanRankingDecision
  * holds indices into candidates ordered by score (winner in first element).
  *
  * Returns an error if there was an issue with plan ranking (e.g. there was no viable plan).
  */
-template <typename PlanStageStatsType, typename PlanStageType, typename ResultType, typename Data>
+template <typename PlanStageType, typename ResultType, typename Data>
 StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
     const std::vector<BaseCandidatePlan<PlanStageType, ResultType, Data>>& candidates) {
     invariant(!candidates.empty());
@@ -62,32 +188,21 @@ StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
     double eofBonus = 1.0;
 
     // Get stat trees from each plan.
-    std::vector<std::unique_ptr<PlanStageStatsType>> statTrees;
+    std::vector<std::unique_ptr<PlanStageStats>> statTrees;
     for (size_t i = 0; i < candidates.size(); ++i) {
-        if constexpr (std::is_same_v<PlanStageStatsType, PlanStageStats>) {
-            statTrees.push_back(candidates[i].root->getStats());
-        } else {
-            statTrees.push_back(candidates[i].root->getStats(false /* includeDebugInfo */));
-        }
+        statTrees.push_back(candidates[i].root->getStats());
     }
 
     // Holds (score, candidateIndex).
     // Used to derive scores and candidate ordering.
     std::vector<std::pair<double, size_t>> scoresAndCandidateIndices;
     std::vector<size_t> failed;
+    std::vector<size_t> documentsExamined;
 
     // Compute score for each tree.  Record the best.
     for (size_t i = 0; i < statTrees.size(); ++i) {
-        auto explainer = [&]() {
-            if constexpr (std::is_same_v<PlanStageStatsType, PlanStageStats>) {
-                return plan_explainer_factory::make(candidates[i].root,
-                                                    candidates[i].solution->_enumeratorExplainInfo);
-            } else {
-                static_assert(std::is_same_v<PlanStageStatsType, mongo::sbe::PlanStageStats>);
-                return plan_explainer_factory::make(
-                    candidates[i].root.get(), &candidates[i].data, candidates[i].solution.get());
-            }
-        }();
+        auto explainer = plan_explainer_factory::make(
+            candidates[i].root, candidates[i].solution->_enumeratorExplainInfo);
 
         if (candidates[i].status.isOK()) {
             log_detail::logScoringPlan([&]() { return candidates[i].solution->toString(); },
@@ -99,23 +214,20 @@ StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
                                        [&]() { return explainer->getPlanSummary(); },
                                        i,
                                        statTrees[i]->common.isEOF);
-            auto scorer = [solution = candidates[i].solution.get()]()
-                -> std::unique_ptr<PlanScorer<PlanStageStatsType>> {
-                if constexpr (std::is_same_v<PlanStageStatsType, PlanStageStats>) {
-                    return makePlanScorer();
-                } else {
-                    static_assert(std::is_same_v<PlanStageStatsType, mongo::sbe::PlanStageStats>);
-                    return sbe::plan_ranker::makePlanScorer(solution);
-                }
-            }();
-            double score = scorer->calculateScore(statTrees[i].get());
+            double score = makePlanScorer()->calculateScore(statTrees[i].get());
             log_detail::logScore(score);
             if (statTrees[i]->common.isEOF) {
                 log_detail::logEOFBonus(eofBonus);
                 score += 1;
             }
 
+            candidates[i].solution->score = score;
             scoresAndCandidateIndices.push_back(std::make_pair(score, i));
+
+            // Collect some information about documents examined for tie breaking later.
+            PlanSummaryStats stats;
+            explainer->getSummaryStats(&stats);
+            documentsExamined.push_back(stats.totalDocsExamined);
         } else {
             failed.push_back(i);
             log_detail::logFailedPlan([&] { return explainer->getPlanSummary(); });
@@ -137,38 +249,32 @@ StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
                          return lhs.first > rhs.first;
                      });
 
-    auto why = std::make_unique<PlanRankingDecision>();
+    // Apply tie-breaking heuristics.
+    if (internalQueryPlanTieBreakingWithIndexHeuristics.load()) {
+        addTieBreakingHeuristicsBonuses(scoresAndCandidateIndices, candidates, documentsExamined);
 
-    if constexpr (std::is_same_v<PlanStageStatsType, mongo::sbe::PlanStageStats>) {
-        // For SBE, we need to store a serialized winning plan within the ranking decision to be
-        // able to included it into the explain output for a cached plan stats, since we cannot
-        // reconstruct it from a PlanStageStats tree.
-        auto explainer = plan_explainer_factory::make(
-            candidates[0].root.get(), &candidates[0].data, candidates[0].solution.get());
-        auto&& [stats, _] =
-            explainer->getWinningPlanStats(ExplainOptions::Verbosity::kQueryPlanner);
-        SBEStatsDetails details;
-        details.serializedWinningPlan = std::move(stats);
-        why->stats = std::move(details);
-    } else {
-        static_assert(std::is_same_v<PlanStageStatsType, PlanStageStats>);
-        why->stats = StatsDetails{};
+        // Re-sort the candidates.
+        std::stable_sort(scoresAndCandidateIndices.begin(),
+                         scoresAndCandidateIndices.end(),
+                         [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
     }
+
+    auto why = std::make_unique<PlanRankingDecision>();
+    why->stats = StatsDetails{};
 
     // Update results in 'why'
     // Stats and scores in 'why' are sorted in descending order by score.
-    auto&& stats = why->getStats<PlanStageStatsType>();
     why->failedCandidates = std::move(failed);
     for (size_t i = 0; i < scoresAndCandidateIndices.size(); ++i) {
         double score = scoresAndCandidateIndices[i].first;
         size_t candidateIndex = scoresAndCandidateIndices[i].second;
 
-        stats.candidatePlanStats.push_back(std::move(statTrees[candidateIndex]));
+        why->stats.candidatePlanStats.push_back(std::move(statTrees[candidateIndex]));
         why->scores.push_back(score);
         why->candidateOrder.push_back(candidateIndex);
     }
     for (auto& i : why->failedCandidates) {
-        stats.candidatePlanStats.push_back(std::move(statTrees[i]));
+        why->stats.candidatePlanStats.push_back(std::move(statTrees[i]));
     }
 
     return StatusWith<std::unique_ptr<PlanRankingDecision>>(std::move(why));

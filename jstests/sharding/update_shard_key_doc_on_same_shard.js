@@ -1,45 +1,45 @@
-/*
+/**
  * Tests that changing the shard key value of a document using update and findAndModify works
  * correctly when the new shard key value belongs to the same shard.
- * @tags: [requires_find_command, uses_transactions, uses_multi_shard_transaction]
+ * @tags: [
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {
+    assertCanDoReplacementUpdateWhereShardKeyMissingFields,
+    assertCannotUpdate_id,
+    assertCannotUpdate_idDottedPath,
+    assertCannotUpdateSKToArray,
+    assertCannotUpdateWithMultiTrue,
+    assertCanUnsetSKField,
+    assertCanUpdateDottedPath,
+    assertCanUpdateInBulkOpWhenDocsRemainOnSameShard,
+    assertCanUpdatePartialShardKey,
+    assertCanUpdatePrimitiveShardKey,
+    assertCanUpdatePrimitiveShardKeyHashedSameShards,
+    shardCollectionMoveChunks,
+} from "jstests/sharding/libs/update_shard_key_helpers.js";
 
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/update_shard_key_helpers.js");
-
-const st = new ShardingTest({mongos: 1, shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
+const st = new ShardingTest({
+    mongos: 1,
+    shards: {rs0: {nodes: 3}, rs1: {nodes: 3}},
+    rsOptions:
+        {setParameter: {maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS}}
+});
 const kDbName = 'db';
 const ns = kDbName + '.foo';
 const mongos = st.s0;
 const shard0 = st.shard0.shardName;
-const shard1 = st.shard1.shardName;
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, shard0);
-
-// -----------------------------------------
-// Updates to the shard key are not allowed if write is not retryable and not in a multi-stmt
-// txn
-// -----------------------------------------
-
-let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
-shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-
-assert.writeError(mongos.getDB(kDbName).foo.update({"x": 300}, {"x": 600}));
-assert.eq(1, mongos.getDB(kDbName).foo.find({"x": 300}).itcount());
-assert.eq(0, mongos.getDB(kDbName).foo.find({"x": 600}).itcount());
-
-assert.throws(function() {
-    mongos.getDB(kDbName).foo.findAndModify({query: {"x": 300}, update: {$set: {"x": 600}}});
-});
-assert.eq(1, mongos.getDB(kDbName).foo.find({"x": 300}).itcount());
-assert.eq(0, mongos.getDB(kDbName).foo.find({"x": 600}).itcount());
-
-mongos.getDB(kDbName).foo.drop();
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: shard0}));
 
 // ---------------------------------
 // Update shard key retryable write
@@ -786,7 +786,7 @@ assertCanUpdateInBulkOpWhenDocsRemainOnSameShard(st, kDbName, ns, session, sessi
 assertCanUpdateInBulkOpWhenDocsRemainOnSameShard(st, kDbName, ns, session, sessionDB, true, true);
 
 // Update two docs, updating one twice
-docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
+let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
 
 session.startTransaction();
@@ -854,4 +854,3 @@ assert.eq(id, sessionDB.foo.find({"x": 1}).toArray()[0]._id);
 mongos.getDB(kDbName).foo.drop();
 
 st.stop();
-})();

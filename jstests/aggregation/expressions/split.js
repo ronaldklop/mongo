@@ -1,11 +1,9 @@
 // In SERVER-6773, the $split expression was introduced. In this file, we test the functionality and
 // error cases of the expression.
 
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode and testExpression.
-load("jstests/libs/sbe_assert_error_override.js");
+import {assertErrorCode, testExpression} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.split;
 
@@ -42,6 +40,7 @@ testExpression(coll, {$split: [null, "abc"]}, null);
 // Ensure that $split produces null when given missing fields as input.
 testExpression(coll, {$split: ["$a", "a"]}, null);
 testExpression(coll, {$split: ["a", "$a"]}, null);
+testExpression(coll, {$split: ["$missing", {$toLower: "$missing"}]}, null);
 
 //
 // Error Code tests with constant-folding optimization.
@@ -77,4 +76,3 @@ pipeline = {
     $project: {split: {$split: ["abc", ""]}}
 };
 assertErrorCode(coll, pipeline, 40087);
-})();

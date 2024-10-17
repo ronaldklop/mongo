@@ -27,48 +27,87 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/migration_util.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
 #include <fmt/format.h>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/query.h"
-#include "mongo/db/catalog/collection_catalog_helper.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops.h"
-#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_coordinator.h"
+#include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/s/sharding_util.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
-#include "mongo/db/write_concern.h"
-#include "mongo/executor/task_executor_pool.h"
+#include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/ensure_chunk_version_is_greater_than_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
 
 namespace mongo {
 namespace migrationutil {
@@ -83,16 +122,7 @@ MONGO_FAIL_POINT_DEFINE(hangInRefreshFilteringMetadataUntilSuccessInterruptible)
 MONGO_FAIL_POINT_DEFINE(hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible);
 MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateCommitDecisionInterruptible);
 MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateAbortDecisionInterruptible);
 MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInDeleteRangeDeletionOnRecipientInterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInDeleteRangeDeletionOnRecipientThenSimulateErrorUninterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInDeleteRangeDeletionLocallyInterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInReadyRangeDeletionOnRecipientInterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInReadyRangeDeletionOnRecipientThenSimulateErrorUninterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInReadyRangeDeletionLocallyInterruptible);
-MONGO_FAIL_POINT_DEFINE(hangInReadyRangeDeletionLocallyThenSimulateErrorUninterruptible);
 MONGO_FAIL_POINT_DEFINE(hangInAdvanceTxnNumInterruptible);
 MONGO_FAIL_POINT_DEFINE(hangInAdvanceTxnNumThenSimulateErrorUninterruptible);
 
@@ -101,125 +131,191 @@ const char kDestinationShard[] = "destination";
 const char kIsDonorShard[] = "isDonorShard";
 const char kChunk[] = "chunk";
 const char kCollection[] = "collection";
-const auto kLogRetryAttemptThreshold = 20;
+const char kSessionOplogEntriesMigrated[] = "sessionOplogEntriesMigrated";
+const char ksessionOplogEntriesSkippedSoFarLowerBound[] =
+    "sessionOplogEntriesSkippedSoFarLowerBound";
+const char ksessionOplogEntriesToBeMigratedSoFar[] = "sessionOplogEntriesToBeMigratedSoFar";
+const Backoff kExponentialBackoff(Seconds(10), Milliseconds::max());
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kNoTimeout);
 
-template <typename Cmd>
-void sendToRecipient(OperationContext* opCtx,
-                     const ShardId& recipientId,
-                     const Cmd& cmd,
-                     const BSONObj& passthroughFields = {}) {
-    auto recipientShard =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, recipientId));
+class MigrationUtilExecutor {
+public:
+    MigrationUtilExecutor()
+        : _executor(executor::ThreadPoolTaskExecutor::create(
+              _makePool(), executor::makeNetworkInterface("MigrationUtil-TaskExecutor"))) {}
 
-    auto cmdBSON = cmd.toBSON(passthroughFields);
-    LOGV2_DEBUG(22023, 1, "Sending request to recipient", "commandToSend"_attr = redact(cmdBSON));
-
-    auto response = recipientShard->runCommandWithFixedRetryAttempts(
-        opCtx,
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        cmd.getDbName().toString(),
-        cmdBSON,
-        Shard::RetryPolicy::kIdempotent);
-
-    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(response));
-}
-
-/**
- * Runs doWork until it doesn't throw an error, the node is shutting down, the node has stepped
- * down, or the node has stepped down and up.
- *
- * Note that it is not guaranteed that 'doWork' will not be executed while the node is secondary
- * or after the node has stepped down and up, only that 'doWork' will eventually stop being retried
- * if one of those events has happened.
- *
- * Requirements:
- * - doWork must be idempotent.
- */
-void retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
-    OperationContext* opCtx,
-    StringData taskDescription,
-    std::function<void(OperationContext*)> doWork) {
-    const std::string newClientName = "{}-{}"_format(getThreadName(), taskDescription);
-    const auto initialTerm = repl::ReplicationCoordinator::get(opCtx)->getTerm();
-
-    for (int attempt = 1;; attempt++) {
-        // If the server is already doing a clean shutdown, join the shutdown.
-        if (globalInShutdownDeprecated()) {
-            shutdown(waitForShutdown());
-        }
-
-        // If the node is no longer primary, stop retrying.
-        uassert(ErrorCodes::InterruptedDueToReplStateChange,
-                "Stepped down while {}"_format(taskDescription),
-                repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
-                    repl::MemberState::RS_PRIMARY);
-
-        // If the term changed, that means that the step up recovery could have run or is running
-        // so stop retrying in order to avoid duplicate work.
-        uassert(ErrorCodes::InterruptedDueToReplStateChange,
-                "Term changed while {}"_format(taskDescription),
-                initialTerm == repl::ReplicationCoordinator::get(opCtx)->getTerm());
-
-        try {
-            auto newClient = opCtx->getServiceContext()->makeClient(newClientName);
-
-            {
-                stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillableByStepdown(lk);
-            }
-
-            auto newOpCtx = newClient->makeOperationContext();
-            AlternativeClientRegion altClient(newClient);
-
-            doWork(newOpCtx.get());
-            break;
-        } catch (DBException& ex) {
-            if (attempt % kLogRetryAttemptThreshold == 1) {
-                LOGV2_WARNING(23937,
-                              "Retrying task after failed attempt",
-                              "taskDescription"_attr = redact(taskDescription),
-                              "attempt"_attr = attempt,
-                              "error"_attr = redact(ex));
-            }
-        }
+    void shutDownAndJoin() {
+        _executor->shutdown();
+        _executor->join();
     }
-}
 
-}  // namespace
+    std::shared_ptr<executor::ThreadPoolTaskExecutor> getExecutor() {
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        if (!_started) {
+            _executor->startup();
+            _started = true;
+        }
+        return _executor;
+    }
 
-std::shared_ptr<ThreadPool> getMigrationUtilExecutor() {
-    static Mutex mutex = MONGO_MAKE_LATCH("MigrationUtilExecutor::_mutex");
-    static std::shared_ptr<ThreadPool> executor;
-
-    stdx::lock_guard<Latch> lg(mutex);
-    if (!executor) {
+private:
+    std::unique_ptr<ThreadPool> _makePool() {
         ThreadPool::Options options;
         options.poolName = "MoveChunk";
         options.minThreads = 0;
         options.maxThreads = 16;
-        executor = std::make_shared<ThreadPool>(std::move(options));
-        executor->startup();
+        return std::make_unique<ThreadPool>(std::move(options));
     }
 
-    return executor;
+    std::shared_ptr<executor::ThreadPoolTaskExecutor> _executor;
+
+    // TODO SERVER-57253: get rid of _mutex and _started fields
+    stdx::mutex _mutex;
+    bool _started = false;
+};
+
+const auto migrationUtilExecutorDecoration =
+    ServiceContext::declareDecoration<MigrationUtilExecutor>();
+const ServiceContext::ConstructorActionRegisterer migrationUtilExecutorRegisterer{
+    "MigrationUtilExecutor",
+    [](ServiceContext* service) {
+        // TODO SERVER-57253: start migration util executor at decoration construction time
+    },
+    [](ServiceContext* service) {
+        migrationUtilExecutorDecoration(service).shutDownAndJoin();
+    }};
+
+
+void refreshFilteringMetadataUntilSuccess(OperationContext* opCtx, const NamespaceString& nss) {
+    hangBeforeFilteringMetadataRefresh.pauseWhileSet();
+
+    sharding_util::retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
+        opCtx, "refreshFilteringMetadataUntilSuccess", [&nss](OperationContext* newOpCtx) {
+            hangInRefreshFilteringMetadataUntilSuccessInterruptible.pauseWhileSet(newOpCtx);
+
+            try {
+                FilteringMetadataCache::get(newOpCtx)->onCollectionPlacementVersionMismatch(
+                    newOpCtx, nss, boost::none);
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // Can throw NamespaceNotFound if the collection/database was dropped
+            }
+
+            if (hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
+                    .shouldFail()) {
+                hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
+                    .pauseWhileSet();
+                uasserted(ErrorCodes::InternalError,
+                          "simulate an error response for onCollectionPlacementVersionMismatch");
+            }
+        });
 }
 
-BSONObj makeMigrationStatusDocument(const NamespaceString& nss,
-                                    const ShardId& fromShard,
-                                    const ShardId& toShard,
-                                    const bool& isDonorShard,
-                                    const BSONObj& min,
-                                    const BSONObj& max) {
+void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     const UUID& collUUID,
+                                     const ChunkRange& range,
+                                     const ChunkVersion& preMigrationChunkVersion) {
+    ConfigsvrEnsureChunkVersionIsGreaterThan ensureChunkVersionIsGreaterThanRequest;
+    ensureChunkVersionIsGreaterThanRequest.setDbName(DatabaseName::kAdmin);
+    ensureChunkVersionIsGreaterThanRequest.setMinKey(range.getMin());
+    ensureChunkVersionIsGreaterThanRequest.setMaxKey(range.getMax());
+    ensureChunkVersionIsGreaterThanRequest.setVersion(preMigrationChunkVersion);
+    ensureChunkVersionIsGreaterThanRequest.setNss(nss);
+    ensureChunkVersionIsGreaterThanRequest.setCollectionUUID(collUUID);
+    generic_argument_util::setMajorityWriteConcern(ensureChunkVersionIsGreaterThanRequest);
+    const auto ensureChunkVersionIsGreaterThanRequestBSON =
+        ensureChunkVersionIsGreaterThanRequest.toBSON();
+
+    hangInEnsureChunkVersionIsGreaterThanInterruptible.pauseWhileSet(opCtx);
+
+    const auto ensureChunkVersionIsGreaterThanResponse =
+        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            DatabaseName::kAdmin,
+            ensureChunkVersionIsGreaterThanRequestBSON,
+            Shard::RetryPolicy::kIdempotent);
+    const auto ensureChunkVersionIsGreaterThanStatus =
+        Shard::CommandResponse::getEffectiveStatus(ensureChunkVersionIsGreaterThanResponse);
+
+    uassertStatusOK(ensureChunkVersionIsGreaterThanStatus);
+
+    if (hangInEnsureChunkVersionIsGreaterThanThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInEnsureChunkVersionIsGreaterThanThenSimulateErrorUninterruptible.pauseWhileSet();
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response for _configsvrEnsureChunkVersionIsGreaterThan");
+    }
+}
+
+BSONObj getQueryFilterForRangeDeletionTask(const UUID& collectionUuid, const ChunkRange& range) {
+    return BSON(RangeDeletionTask::kCollectionUuidFieldName
+                << collectionUuid << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMinKey
+                << range.getMin() << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMaxKey
+                << range.getMax());
+}
+
+
+}  // namespace
+
+std::shared_ptr<executor::ThreadPoolTaskExecutor> getMigrationUtilExecutor(
+    ServiceContext* serviceContext) {
+    return migrationUtilExecutorDecoration(serviceContext).getExecutor();
+}
+
+BSONObjBuilder _makeMigrationStatusDocumentCommon(const NamespaceString& nss,
+                                                  const ShardId& fromShard,
+                                                  const ShardId& toShard,
+                                                  const bool& isDonorShard,
+                                                  const BSONObj& min,
+                                                  const BSONObj& max) {
     BSONObjBuilder builder;
     builder.append(kSourceShard, fromShard.toString());
     builder.append(kDestinationShard, toShard.toString());
     builder.append(kIsDonorShard, isDonorShard);
     builder.append(kChunk, BSON(ChunkType::min(min) << ChunkType::max(max)));
-    builder.append(kCollection, nss.ns());
+    builder.append(kCollection,
+                   NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    return builder;
+}
+
+BSONObj makeMigrationStatusDocumentSource(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesToBeMigratedSoFar,
+    boost::optional<long long> sessionOplogEntriesSkippedSoFarLowerBound) {
+    BSONObjBuilder builder =
+        _makeMigrationStatusDocumentCommon(nss, fromShard, toShard, isDonorShard, min, max);
+    if (sessionOplogEntriesToBeMigratedSoFar) {
+        builder.append(ksessionOplogEntriesToBeMigratedSoFar,
+                       sessionOplogEntriesToBeMigratedSoFar.value());
+    }
+    if (sessionOplogEntriesSkippedSoFarLowerBound) {
+        builder.append(ksessionOplogEntriesSkippedSoFarLowerBound,
+                       sessionOplogEntriesSkippedSoFarLowerBound.value());
+    }
+    return builder.obj();
+}
+
+BSONObj makeMigrationStatusDocumentDestination(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesMigrated) {
+    BSONObjBuilder builder =
+        _makeMigrationStatusDocumentCommon(nss, fromShard, toShard, isDonorShard, min, max);
+    if (sessionOplogEntriesMigrated) {
+        builder.append(kSessionOplogEntriesMigrated, sessionOplogEntriesMigrated.value());
+    }
     return builder.obj();
 }
 
@@ -261,294 +357,12 @@ ChunkRange extendOrTruncateBoundsForMetadata(const CollectionMetadata& metadata,
     }
 }
 
-Query overlappingRangeQuery(const ChunkRange& range, const UUID& uuid) {
-    return QUERY(RangeDeletionTask::kCollectionUuidFieldName
-                 << uuid << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMinKey << LT
-                 << range.getMax() << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMaxKey
-                 << GT << range.getMin());
-}
-
-size_t checkForConflictingDeletions(OperationContext* opCtx,
-                                    const ChunkRange& range,
-                                    const UUID& uuid) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-
-    return store.count(opCtx, overlappingRangeQuery(range, uuid));
-}
-
-ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
-                                             const RangeDeletionTask& deletionTask) {
-    const auto serviceContext = opCtx->getServiceContext();
-    return ExecutorFuture<void>(getMigrationUtilExecutor())
-        .then([=] {
-            auto deletionTaskUuidMatchesFilteringMetadataUuid =
-                [](OperationContext* opCtx,
-                   CollectionShardingRuntime* csr,
-                   const RangeDeletionTask& deletionTask) {
-                    auto optCollDescr = csr->getCurrentMetadataIfKnown();
-                    return optCollDescr && optCollDescr->isSharded() &&
-                        optCollDescr->uuidMatches(deletionTask.getCollectionUuid());
-                };
-
-            ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-            auto uniqueOpCtx = tc->makeOperationContext();
-            auto opCtx = uniqueOpCtx.get();
-
-            uassert(
-                ErrorCodes::ResumableRangeDeleterDisabled,
-                str::stream()
-                    << "Not submitting range deletion task " << redact(deletionTask.toBSON())
-                    << " because the disableResumableRangeDeleter server parameter is set to true",
-                !disableResumableRangeDeleter.load());
-
-            // Make sure the collection metadata is up-to-date.
-            while (true) {
-                {
-                    AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
-                    auto csr = CollectionShardingRuntime::get(opCtx, deletionTask.getNss());
-
-                    if (deletionTaskUuidMatchesFilteringMetadataUuid(opCtx, csr, deletionTask)) {
-                        break;
-                    }
-
-                    // If the collection's filtering metadata is not known, is unsharded, or its
-                    // UUID does not match the UUID of the deletion task, force a filtering metadata
-                    // refresh, because this node may have just stepped up and therefore may have a
-                    // stale cache.
-                    auto optCollDescr = csr->getCurrentMetadataIfKnown();
-                    LOGV2(22024,
-                          "Filtering metadata for this range deletion task may be outdated; "
-                          "forcing refresh",
-                          "deletionTask"_attr = redact(deletionTask.toBSON()),
-                          "error"_attr =
-                              (optCollDescr ? (optCollDescr->isSharded()
-                                                   ? "Collection has UUID that does not match "
-                                                     "UUID of the deletion task"
-                                                   : "Collection is unsharded")
-                                            : "Collection's sharding state is not known"),
-                          "namespace"_attr = deletionTask.getNss(),
-                          "migrationId"_attr = deletionTask.getId());
-                }
-
-                try {
-                    onShardVersionMismatch(opCtx, deletionTask.getNss(), boost::none);
-                } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                    // If the database has been dropped, don't retry to get the shard version
-                    break;
-                }
-
-                AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
-                auto csr = CollectionShardingRuntime::get(opCtx, deletionTask.getNss());
-                if (csr->getCurrentMetadataIfKnown()) {
-                    break;
-                }
-            }
-
-            AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, deletionTask.getNss());
-            // Keep the collection metadata from changing for the rest of this scope.
-            auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-            auto optCollDescr = csr->getCurrentMetadataIfKnown();
-            uassert(ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
-                    str::stream()
-                        << "Even after forced refresh, filtering metadata for namespace in "
-                           "deletion task "
-                        << (optCollDescr
-                                ? (optCollDescr->isSharded()
-                                       ? " has UUID that does not match UUID of the deletion task"
-                                       : " is unsharded")
-                                : " is not known"),
-                    deletionTaskUuidMatchesFilteringMetadataUuid(opCtx, csr, deletionTask));
-
-            LOGV2(22026,
-                  "Submitting range deletion task",
-                  "deletionTask"_attr = redact(deletionTask.toBSON()),
-                  "migrationId"_attr = deletionTask.getId());
-
-            const auto whenToClean = deletionTask.getWhenToClean() == CleanWhenEnum::kNow
-                ? CollectionShardingRuntime::kNow
-                : CollectionShardingRuntime::kDelayed;
-
-            return csr->cleanUpRange(deletionTask.getRange(), deletionTask.getId(), whenToClean);
-        })
-        .onError([=](const Status status) {
-            ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-            auto uniqueOpCtx = tc->makeOperationContext();
-            auto opCtx = uniqueOpCtx.get();
-
-            LOGV2(22027,
-                  "Failed to submit range deletion task",
-                  "deletionTask"_attr = redact(deletionTask.toBSON()),
-                  "error"_attr = redact(status),
-                  "migrationId"_attr = deletionTask.getId());
-
-            if (status == ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist) {
-                deleteRangeDeletionTaskLocally(
-                    opCtx, deletionTask.getId(), ShardingCatalogClient::kLocalWriteConcern);
-            }
-
-            // Note, we use onError and make it return its input status, because ExecutorFuture does
-            // not support tapError.
-            return status;
-        });
-}
-
-void submitPendingDeletions(OperationContext* opCtx) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-
-    auto query = QUERY("pending" << BSON("$exists" << false));
-
-    store.forEach(opCtx, query, [&opCtx](const RangeDeletionTask& deletionTask) {
-        migrationutil::submitRangeDeletionTask(opCtx, deletionTask).getAsync([](auto) {});
-        return true;
-    });
-}
-
-void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
-    LOGV2(22028, "Starting pending deletion submission thread.");
-
-    ExecutorFuture<void>(getMigrationUtilExecutor())
-        .then([serviceContext] {
-            ThreadClient tc("ResubmitRangeDeletions", serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-
-            auto opCtx = tc->makeOperationContext();
-
-            submitPendingDeletions(opCtx.get());
-        })
-        .getAsync([](const Status& status) {
-            if (!status.isOK()) {
-                LOGV2(45739,
-                      "Error while submitting pending range deletions",
-                      "error"_attr = redact(status));
-            }
-        });
-}
-
-void dropRangeDeletionsCollection(OperationContext* opCtx) {
-    DBDirectClient client(opCtx);
-    client.dropCollection(NamespaceString::kRangeDeletionNamespace.toString(),
-                          WriteConcerns::kMajorityWriteConcern);
-}
-
-template <typename Callable>
-void forEachOrphanRange(OperationContext* opCtx, const NamespaceString& nss, Callable&& handler) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-
-    const auto csr = CollectionShardingRuntime::get(opCtx, nss);
-    const auto metadata = csr->getCurrentMetadataIfKnown();
-    const auto emptyChunkMap =
-        RangeMap{SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()};
-
-    if (!metadata) {
-        LOGV2(474680,
-              "Upgrade: Skipping orphaned range enumeration because the collection's sharding "
-              "state is not known",
-              "namespace"_attr = nss);
-        return;
-    }
-
-    if (!metadata->isSharded()) {
-        LOGV2(22029,
-              "Upgrade: Skipping orphaned range enumeration because the collection is not sharded",
-              "namespace"_attr = nss);
-        return;
-    }
-
-    auto startingKey = metadata->getMinKey();
-
-    while (true) {
-        auto range = metadata->getNextOrphanRange(emptyChunkMap, startingKey);
-        if (!range) {
-            LOGV2_DEBUG(22030,
-                        2,
-                        "Upgrade: Completed orphanged range enumeration; no orphaned ranges "
-                        "remain",
-                        "namespace"_attr = nss.toString(),
-                        "startingKey"_attr = redact(startingKey));
-
-            return;
-        }
-
-        handler(*range);
-
-        startingKey = range->getMax();
-    }
-}
-
-void submitOrphanRanges(OperationContext* opCtx, const NamespaceString& nss, const UUID& uuid) {
-    try {
-
-        onShardVersionMismatch(opCtx, nss, boost::none);
-
-        LOGV2_DEBUG(22031,
-                    2,
-                    "Upgrade: Cleaning up existing orphans",
-                    "namespace"_attr = nss,
-                    "uuid"_attr = uuid);
-
-        std::vector<RangeDeletionTask> deletions;
-        forEachOrphanRange(opCtx, nss, [&deletions, &opCtx, &nss, &uuid](const auto& range) {
-            // Since this is not part of an active migration, the migration UUID and the donor shard
-            // are set to unused values so that they don't conflict.
-            RangeDeletionTask task(
-                UUID::gen(), nss, uuid, ShardId("fromFCVUpgrade"), range, CleanWhenEnum::kDelayed);
-            deletions.emplace_back(task);
-        });
-
-        if (deletions.empty())
-            return;
-
-        PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-
-        for (const auto& task : deletions) {
-            LOGV2_DEBUG(22032,
-                        2,
-                        "Upgrade: Submitting chunk range for cleanup",
-                        "range"_attr = redact(task.getRange().toString()),
-                        "namespace"_attr = nss);
-            store.add(opCtx, task);
-        }
-    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& e) {
-        LOGV2(22033,
-              "Upgrade: Failed to clean up orphans because the namespace was not found; the "
-              "collection must have been dropped",
-              "namespace"_attr = nss,
-              "error"_attr = redact(e.what()));
-    }
-}
-
-void submitOrphanRangesForCleanup(OperationContext* opCtx) {
-    auto catalog = CollectionCatalog::get(opCtx);
-    const auto& dbs = catalog->getAllDbNames();
-
-    for (const auto& dbName : dbs) {
-        if (dbName == NamespaceString::kLocalDb)
-            continue;
-
-        for (auto collIt = catalog->begin(opCtx, dbName); collIt != catalog->end(opCtx); ++collIt) {
-            auto uuid = collIt.uuid().get();
-            auto nss = catalog->lookupNSSByUUID(opCtx, uuid).get();
-            LOGV2_DEBUG(22034,
-                        2,
-                        "Upgrade: Processing collection for orphaned range cleanup",
-                        "namespace"_attr = nss);
-            if (!nss.isNamespaceAlwaysUnsharded()) {
-                submitOrphanRanges(opCtx, nss, uuid);
-            }
-        }
-    }
+bool deletionTaskUuidMatchesFilteringMetadataUuid(
+    OperationContext* opCtx,
+    const boost::optional<mongo::CollectionMetadata>& optCollDescr,
+    const RangeDeletionTask& deletionTask) {
+    return optCollDescr && optCollDescr->isSharded() &&
+        optCollDescr->uuidMatches(deletionTask.getCollectionUuid());
 }
 
 void persistMigrationCoordinatorLocally(OperationContext* opCtx,
@@ -567,20 +381,75 @@ void persistMigrationCoordinatorLocally(OperationContext* opCtx,
     }
 }
 
-void persistRangeDeletionTaskLocally(OperationContext* opCtx,
-                                     const RangeDeletionTask& deletionTask,
-                                     const WriteConcernOptions& writeConcern) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    try {
-        store.add(opCtx, deletionTask, writeConcern);
-    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
-        // Convert a DuplicateKey error to an anonymous error.
-        uasserted(31375,
-                  str::stream() << "While attempting to write range deletion task for migration "
-                                << ", found document with the same migration id. Attempted range "
-                                   "deletion task: "
-                                << deletionTask.toBSON());
-    }
+void notifyChangeStreamsOnRecipientFirstChunk(OperationContext* opCtx,
+                                              const NamespaceString& collNss,
+                                              const ShardId& fromShardId,
+                                              const ShardId& toShardId,
+                                              boost::optional<UUID> collUUID) {
+
+    const std::string dbgMessage = str::stream()
+        << "Migrating chunk from shard " << fromShardId << " to shard " << toShardId
+        << " with no chunks for this collection";
+
+    // The message expected by change streams
+    const auto o2Message =
+        BSON("migrateChunkToNewShard"
+             << NamespaceStringUtil::serialize(collNss, SerializationContext::stateDefault())
+             << "fromShardId" << fromShardId << "toShardId" << toShardId);
+
+    auto const serviceContext = opCtx->getClient()->getServiceContext();
+
+    // TODO (SERVER-71444): Fix to be interruptible or document exception.
+    UninterruptibleLockGuard noInterrupt(opCtx);  // NOLINT.
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
+    writeConflictRetry(opCtx, "migrateChunkToNewShard", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork uow(opCtx);
+        serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
+                                                             collNss,
+                                                             *collUUID,
+                                                             BSON("msg" << dbgMessage),
+                                                             o2Message,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none);
+        uow.commit();
+    });
+}
+
+void notifyChangeStreamsOnDonorLastChunk(OperationContext* opCtx,
+                                         const NamespaceString& collNss,
+                                         const ShardId& donorShardId,
+                                         boost::optional<UUID> collUUID) {
+
+    const std::string oMessage = str::stream()
+        << "Migrate the last chunk for " << collNss.toStringForErrorMsg() << " off shard "
+        << donorShardId;
+
+    // The message expected by change streams
+    const auto o2Message =
+        BSON("migrateLastChunkFromShard"
+             << NamespaceStringUtil::serialize(collNss, SerializationContext::stateDefault())
+             << "shardId" << donorShardId);
+
+    auto const serviceContext = opCtx->getClient()->getServiceContext();
+
+    // TODO (SERVER-71444): Fix to be interruptible or document exception.
+    UninterruptibleLockGuard noInterrupt(opCtx);  // NOLINT.
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
+    writeConflictRetry(opCtx, "migrateLastChunkFromShard", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork uow(opCtx);
+        serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
+                                                             collNss,
+                                                             *collUUID,
+                                                             BSON("msg" << oMessage),
+                                                             o2Message,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none);
+        uow.commit();
+    });
 }
 
 void persistCommitDecision(OperationContext* opCtx,
@@ -589,12 +458,18 @@ void persistCommitDecision(OperationContext* opCtx,
               *migrationDoc.getDecision() == DecisionEnum::kCommitted);
 
     hangInPersistMigrateCommitDecisionInterruptible.pauseWhileSet(opCtx);
-
-    PersistentTaskStore<MigrationCoordinatorDocument> store(
-        NamespaceString::kMigrationCoordinatorsNamespace);
-    store.upsert(opCtx,
-                 QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
-                 migrationDoc.toBSON());
+    try {
+        PersistentTaskStore<MigrationCoordinatorDocument> store(
+            NamespaceString::kMigrationCoordinatorsNamespace);
+        store.update(opCtx,
+                     BSON(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
+                     migrationDoc.toBSON());
+        ShardingStatistics::get(opCtx).countDonorMoveChunkCommitted.addAndFetch(1);
+    } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
+        LOGV2_ERROR(6439800,
+                    "No coordination doc found on disk for migration",
+                    "migration"_attr = redact(migrationDoc.toBSON()));
+    }
 
     if (hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.shouldFail()) {
         hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
@@ -607,96 +482,24 @@ void persistAbortDecision(OperationContext* opCtx,
                           const MigrationCoordinatorDocument& migrationDoc) {
     invariant(migrationDoc.getDecision() && *migrationDoc.getDecision() == DecisionEnum::kAborted);
 
-    hangInPersistMigrateAbortDecisionInterruptible.pauseWhileSet(opCtx);
-
-    PersistentTaskStore<MigrationCoordinatorDocument> store(
-        NamespaceString::kMigrationCoordinatorsNamespace);
-    store.upsert(opCtx,
-                 QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
-                 migrationDoc.toBSON());
+    try {
+        PersistentTaskStore<MigrationCoordinatorDocument> store(
+            NamespaceString::kMigrationCoordinatorsNamespace);
+        store.update(opCtx,
+                     BSON(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
+                     migrationDoc.toBSON());
+        ShardingStatistics::get(opCtx).countDonorMoveChunkAborted.addAndFetch(1);
+    } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
+        LOGV2(6439801,
+              "No coordination doc found on disk for migration",
+              "migration"_attr = redact(migrationDoc.toBSON()));
+    }
 
     if (hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.shouldFail()) {
         hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
         uasserted(ErrorCodes::InternalError,
                   "simulate an error response when persisting migrate abort decision");
     }
-}
-
-void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
-                                        const ShardId& recipientId,
-                                        const UUID& migrationId) {
-    write_ops::DeleteCommandRequest deleteOp(NamespaceString::kRangeDeletionNamespace);
-    write_ops::DeleteOpEntry query(BSON(RangeDeletionTask::kIdFieldName << migrationId),
-                                   false /*multi*/);
-    deleteOp.setDeletes({query});
-
-    hangInDeleteRangeDeletionOnRecipientInterruptible.pauseWhileSet(opCtx);
-
-    sendToRecipient(opCtx,
-                    recipientId,
-                    deleteOp,
-                    BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
-
-    if (hangInDeleteRangeDeletionOnRecipientThenSimulateErrorUninterruptible.shouldFail()) {
-        hangInDeleteRangeDeletionOnRecipientThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
-        uasserted(ErrorCodes::InternalError,
-                  "simulate an error response when deleting range deletion on recipient");
-    }
-}
-
-void deleteRangeDeletionTaskLocally(OperationContext* opCtx,
-                                    const UUID& deletionTaskId,
-                                    const WriteConcernOptions& writeConcern) {
-    hangInDeleteRangeDeletionLocallyInterruptible.pauseWhileSet(opCtx);
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    store.remove(opCtx, QUERY(RangeDeletionTask::kIdFieldName << deletionTaskId), writeConcern);
-
-    if (hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.shouldFail()) {
-        hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
-        uasserted(ErrorCodes::InternalError,
-                  "simulate an error response when deleting range deletion locally");
-    }
-}
-
-void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
-                                             const ShardId& recipientId,
-                                             const UUID& migrationId) {
-    write_ops::UpdateCommandRequest updateOp(NamespaceString::kRangeDeletionNamespace);
-    auto queryFilter = BSON(RangeDeletionTask::kIdFieldName << migrationId);
-    auto updateModification =
-        write_ops::UpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(
-            BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << ""))));
-    write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
-    updateEntry.setMulti(false);
-    updateEntry.setUpsert(false);
-    updateOp.setUpdates({updateEntry});
-
-    retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
-        opCtx, "ready remote range deletion", [&](OperationContext* newOpCtx) {
-            hangInReadyRangeDeletionOnRecipientInterruptible.pauseWhileSet(newOpCtx);
-
-            try {
-                sendToRecipient(
-                    newOpCtx,
-                    recipientId,
-                    updateOp,
-                    BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
-            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& exShardNotFound) {
-                LOGV2_DEBUG(4620232,
-                            1,
-                            "Failed to mark range deletion task on recipient shard as ready",
-                            "migrationId"_attr = migrationId,
-                            "error"_attr = exShardNotFound);
-                return;
-            }
-
-            if (hangInReadyRangeDeletionOnRecipientThenSimulateErrorUninterruptible.shouldFail()) {
-                hangInReadyRangeDeletionOnRecipientThenSimulateErrorUninterruptible.pauseWhileSet(
-                    newOpCtx);
-                uasserted(ErrorCodes::InternalError,
-                          "simulate an error response when initiating range deletion on recipient");
-            }
-        });
 }
 
 void advanceTransactionOnRecipient(OperationContext* opCtx,
@@ -714,77 +517,21 @@ void advanceTransactionOnRecipient(OperationContext* opCtx,
     updateEntry.setUpsert(true);
     updateOp.setUpdates({updateEntry});
 
-    auto passthroughFields = BSON(WriteConcernOptions::kWriteConcernField
-                                  << WriteConcernOptions::Majority << "lsid" << lsid.toBSON()
-                                  << "txnNumber" << currentTxnNumber + 1);
+    updateOp.setWriteConcern(generic_argument_util::kMajorityWriteConcern);
+    updateOp.setLsid(generic_argument_util::toLogicalSessionFromClient(lsid));
+    updateOp.setTxnNumber(currentTxnNumber + 1);
 
     hangInAdvanceTxnNumInterruptible.pauseWhileSet(opCtx);
-    sendToRecipient(opCtx, recipientId, updateOp, passthroughFields);
+    sharding_util::invokeCommandOnShardWithIdempotentRetryPolicy(
+        opCtx,
+        recipientId,
+        NamespaceString::kServerConfigurationNamespace.dbName(),
+        updateOp.toBSON());
 
     if (hangInAdvanceTxnNumThenSimulateErrorUninterruptible.shouldFail()) {
         hangInAdvanceTxnNumThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
         uasserted(ErrorCodes::InternalError,
                   "simulate an error response when initiating range deletion locally");
-    }
-}
-
-void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& migrationId) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    auto query = QUERY(RangeDeletionTask::kIdFieldName << migrationId);
-    auto update = BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << ""));
-
-    hangInReadyRangeDeletionLocallyInterruptible.pauseWhileSet(opCtx);
-    store.update(opCtx, query, update);
-
-    if (hangInReadyRangeDeletionLocallyThenSimulateErrorUninterruptible.shouldFail()) {
-        hangInReadyRangeDeletionLocallyThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
-        uasserted(ErrorCodes::InternalError,
-                  "simulate an error response when initiating range deletion locally");
-    }
-}
-
-void deleteMigrationCoordinatorDocumentLocally(OperationContext* opCtx, const UUID& migrationId) {
-    // Before deleting the migration coordinator document, ensure that in the case of a crash, the
-    // node will start-up from at least the configTime, which it obtained as part of recovery of the
-    // shardVersion, which will ensure that it will see at least the same shardVersion.
-    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
-
-    PersistentTaskStore<MigrationCoordinatorDocument> store(
-        NamespaceString::kMigrationCoordinatorsNamespace);
-    store.remove(opCtx,
-                 QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationId),
-                 {1, WriteConcernOptions::SyncMode::UNSET, Seconds(0)});
-}
-
-void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
-                                     const ChunkRange& range,
-                                     const ChunkVersion& preMigrationChunkVersion) {
-    ConfigsvrEnsureChunkVersionIsGreaterThan ensureChunkVersionIsGreaterThanRequest;
-    ensureChunkVersionIsGreaterThanRequest.setDbName(NamespaceString::kAdminDb);
-    ensureChunkVersionIsGreaterThanRequest.setMinKey(range.getMin());
-    ensureChunkVersionIsGreaterThanRequest.setMaxKey(range.getMax());
-    ensureChunkVersionIsGreaterThanRequest.setVersion(preMigrationChunkVersion);
-    const auto ensureChunkVersionIsGreaterThanRequestBSON =
-        ensureChunkVersionIsGreaterThanRequest.toBSON({});
-
-    hangInEnsureChunkVersionIsGreaterThanInterruptible.pauseWhileSet(opCtx);
-
-    const auto ensureChunkVersionIsGreaterThanResponse =
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(ensureChunkVersionIsGreaterThanRequestBSON),
-            Shard::RetryPolicy::kIdempotent);
-    const auto ensureChunkVersionIsGreaterThanStatus =
-        Shard::CommandResponse::getEffectiveStatus(ensureChunkVersionIsGreaterThanResponse);
-
-    uassertStatusOK(ensureChunkVersionIsGreaterThanStatus);
-
-    if (hangInEnsureChunkVersionIsGreaterThanThenSimulateErrorUninterruptible.shouldFail()) {
-        hangInEnsureChunkVersionIsGreaterThanThenSimulateErrorUninterruptible.pauseWhileSet();
-        uasserted(ErrorCodes::InternalError,
-                  "simulate an error response for _configsvrEnsureChunkVersionIsGreaterThan");
     }
 }
 
@@ -796,18 +543,8 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.forEach(opCtx,
-                  Query{},
+                  BSONObj{},
                   [&opCtx, &unfinishedMigrationsCount](const MigrationCoordinatorDocument& doc) {
-                      // MigrationCoordinators are only created under the MigrationBlockingGuard,
-                      // which means that only one can possibly exist on an instance at a time.
-                      // Furthermore, recovery of an incomplete MigrationCoordator also acquires the
-                      // MigrationBlockingGuard. Because of this it is not possible to have more
-                      // than one unfinished migration.
-                      invariant(unfinishedMigrationsCount == 0,
-                                str::stream()
-                                    << "Upon step-up a second migration coordinator was found"
-                                    << redact(doc.toBSON()));
-
                       unfinishedMigrationsCount++;
                       LOGV2_DEBUG(4798511,
                                   3,
@@ -819,36 +556,12 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
 
                       {
                           AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-                          CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
+                          CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+                              opCtx, nss)
+                              ->clearFilteringMetadata(opCtx);
                       }
 
-                      auto mbg = std::make_shared<MigrationBlockingGuard>(
-                          opCtx,
-                          str::stream() << "Recovery of migration session "
-                                        << doc.getMigrationSessionId().toString()
-                                        << " on collection " << nss);
-
-                      ExecutorFuture<void>(getMigrationUtilExecutor())
-                          .then([serviceContext = opCtx->getServiceContext(), nss, mbg] {
-                              ThreadClient tc("TriggerMigrationRecovery", serviceContext);
-                              {
-                                  stdx::lock_guard<Client> lk(*tc.get());
-                                  tc->setSystemOperationKillableByStepdown(lk);
-                              }
-
-                              auto opCtx = tc->makeOperationContext();
-
-                              hangBeforeFilteringMetadataRefresh.pauseWhileSet();
-
-                              onShardVersionMismatch(
-                                  opCtx.get(), nss, boost::none /* shardVersionReceived */);
-                          })
-                          .onError([](const Status& status) {
-                              LOGV2_WARNING(4798512,
-                                            "Error on deferred shardVersion recovery execution",
-                                            "error"_attr = redact(status));
-                          })
-                          .getAsync([](auto) {});
+                      asyncRecoverMigrationUntilSuccessOrStepDown(opCtx, nss);
 
                       return true;
                   });
@@ -862,61 +575,77 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                 "unfinishedMigrationsCount"_attr = unfinishedMigrationsCount);
 }
 
-void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss) {
-    LOGV2_DEBUG(4798501, 2, "Starting migration recovery", "namespace"_attr = nss);
+void recoverMigrationCoordinations(OperationContext* opCtx,
+                                   NamespaceString nss,
+                                   CancellationToken cancellationToken) {
+    LOGV2_DEBUG(4798501, 2, "Starting migration recovery", logAttrs(nss));
 
     unsigned migrationRecoveryCount = 0;
+
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.forEach(
         opCtx,
-        QUERY(MigrationCoordinatorDocument::kNssFieldName << nss.toString()),
-        [&opCtx, &migrationRecoveryCount](const MigrationCoordinatorDocument& doc) {
+        BSON(MigrationCoordinatorDocument::kNssFieldName
+             << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())),
+        [&opCtx, &nss, &migrationRecoveryCount, &cancellationToken](
+            const MigrationCoordinatorDocument& doc) {
             LOGV2_DEBUG(4798502,
                         2,
                         "Recovering migration",
                         "migrationCoordinatorDocument"_attr = redact(doc.toBSON()));
-            // ensure there is only one migrationCoordinatorDocument
-            // to be recovered for this namespace
-            invariant(++migrationRecoveryCount == 1,
-                      "Found more then one migration to recover for a single namespace");
 
+            // Ensure there is only one migrationCoordinator document to be recovered for this
+            // namespace.
+            invariant(++migrationRecoveryCount == 1,
+                      str::stream() << "Found more then one migration to recover for namespace '"
+                                    << nss.toStringForErrorMsg() << "'");
 
             // Create a MigrationCoordinator to complete the coordination.
             MigrationCoordinator coordinator(doc);
 
             if (doc.getDecision()) {
                 // The decision is already known.
+                coordinator.setShardKeyPattern(
+                    rangedeletionutil::getShardKeyPatternFromRangeDeletionTask(opCtx, doc.getId()));
                 coordinator.completeMigration(opCtx);
                 return true;
             }
 
             // The decision is not known. Recover the decision from the config server.
 
-            ensureChunkVersionIsGreaterThan(
-                opCtx, doc.getRange(), doc.getPreMigrationChunkVersion());
+            ensureChunkVersionIsGreaterThan(opCtx,
+                                            doc.getNss(),
+                                            doc.getCollectionUuid(),
+                                            doc.getRange(),
+                                            doc.getPreMigrationChunkVersion());
 
             hangInRefreshFilteringMetadataUntilSuccessInterruptible.pauseWhileSet(opCtx);
 
-            auto currentMetadata = forceGetCurrentMetadata(opCtx, doc.getNss());
+            auto currentMetadata =
+                FilteringMetadataCache::get(opCtx)->forceGetCurrentMetadata(opCtx, doc.getNss());
 
             if (hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
                     .shouldFail()) {
                 hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
                     .pauseWhileSet();
                 uasserted(ErrorCodes::InternalError,
-                          "simulate an error response for forceShardFilteringMetadataRefresh");
+                          "simulate an error response for forceGetCurrentMetadata");
             }
 
-            auto setFilteringMetadata = [&opCtx, &currentMetadata, &doc]() {
-                AutoGetDb autoDb(opCtx, doc.getNss().db(), MODE_IX);
+            auto setFilteringMetadata = [&opCtx, &currentMetadata, &doc, &cancellationToken]() {
+                AutoGetDb autoDb(opCtx, doc.getNss().dbName(), MODE_IX);
                 Lock::CollectionLock collLock(opCtx, doc.getNss(), MODE_IX);
-                auto* const csr = CollectionShardingRuntime::get(opCtx, doc.getNss());
+                auto scopedCsr =
+                    CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+                        opCtx, doc.getNss());
 
-                auto optMetadata = csr->getCurrentMetadataIfKnown();
+                auto optMetadata = scopedCsr->getCurrentMetadataIfKnown();
                 invariant(!optMetadata);
 
-                csr->setFilteringMetadata(opCtx, std::move(currentMetadata));
+                if (!cancellationToken.isCanceled()) {
+                    scopedCsr->setFilteringMetadata(opCtx, std::move(currentMetadata));
+                }
             };
 
             if (!currentMetadata.isSharded() ||
@@ -939,26 +668,218 @@ void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss)
                           "migrationCoordinatorDocument"_attr = redact(doc.toBSON()),
                           "refreshedMetadataUUID"_attr =
                               currentMetadata.getChunkManager()->getUUID(),
-                          "coordinatorDocumentUUID"_attr = doc.getCollectionUuid());
+                          "coordinatorDocumentUUID"_attr = doc.getCollectionUuid(),
+                          logAttrs(doc.getNss()));
                 }
 
-                deleteRangeDeletionTaskOnRecipient(opCtx, doc.getRecipientShardId(), doc.getId());
-                deleteRangeDeletionTaskLocally(opCtx, doc.getId());
+                // TODO SERVER-77472: remove this once we are sure all operations persist the config
+                // time after a collection drop. Since the collection has been dropped, persist
+                // config time inclusive of the drop collection event before deleting leftover
+                // migration metadata. This will ensure that in case of stepdown the new primary
+                // won't read stale data from config server and think that the sharded collection
+                // still exists.
+                VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+
+                rangedeletionutil::deleteRangeDeletionTaskOnRecipient(opCtx,
+                                                                      doc.getRecipientShardId(),
+                                                                      doc.getCollectionUuid(),
+                                                                      doc.getRange(),
+                                                                      doc.getId());
+                rangedeletionutil::deleteRangeDeletionTaskLocally(
+                    opCtx, doc.getCollectionUuid(), doc.getRange());
                 coordinator.forgetMigration(opCtx);
                 setFilteringMetadata();
                 return true;
             }
 
-            if (currentMetadata.keyBelongsToMe(doc.getRange().getMin())) {
+            // Note this should only extend the range boundaries (if there has been a shard key
+            // refine since the migration began) and never truncate them.
+            auto chunkRangeToCompareToMetadata =
+                extendOrTruncateBoundsForMetadata(currentMetadata, doc.getRange());
+            if (currentMetadata.keyBelongsToMe(chunkRangeToCompareToMetadata.getMin())) {
                 coordinator.setMigrationDecision(DecisionEnum::kAborted);
             } else {
                 coordinator.setMigrationDecision(DecisionEnum::kCommitted);
+                if (!currentMetadata.getChunkManager()->getVersion(doc.getDonorShardId()).isSet()) {
+                    notifyChangeStreamsOnDonorLastChunk(
+                        opCtx, doc.getNss(), doc.getDonorShardId(), doc.getCollectionUuid());
+                }
             }
 
+            coordinator.setShardKeyPattern(KeyPattern(currentMetadata.getKeyPattern()));
             coordinator.completeMigration(opCtx);
             setFilteringMetadata();
             return true;
         });
+}
+
+ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
+    OperationContext* opCtx,
+    const ShardId& recipientShardId,
+    const NamespaceString& nss,
+    const MigrationSessionId& sessionId) {
+    const auto serviceContext = opCtx->getServiceContext();
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+
+    return ExecutorFuture<void>(executor).then([=] {
+        ThreadClient tc("releaseRecipientCritSec",
+                        serviceContext->getService(ClusterRole::ShardServer));
+        auto uniqueOpCtx = tc->makeOperationContext();
+        auto opCtx = uniqueOpCtx.get();
+
+        const auto recipientShard =
+            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, recipientShardId));
+
+        BSONObjBuilder builder;
+        builder.append("_recvChunkReleaseCritSec",
+                       NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+        sessionId.append(&builder);
+        builder.append(WriteConcernOptions::kWriteConcernField,
+                       generic_argument_util::kMajorityWriteConcern.toBSON());
+        const auto commandObj = builder.obj();
+
+        sharding_util::retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
+            opCtx,
+            "release migration critical section on recipient",
+            [&](OperationContext* newOpCtx) {
+                try {
+                    const auto response = recipientShard->runCommandWithFixedRetryAttempts(
+                        newOpCtx,
+                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                        DatabaseName::kAdmin,
+                        commandObj,
+                        Shard::RetryPolicy::kIdempotent);
+
+                    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(response));
+                } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& exShardNotFound) {
+                    LOGV2(5899106,
+                          "Failed to release critical section on recipient",
+                          "shardId"_attr = recipientShardId,
+                          "sessionId"_attr = sessionId,
+                          logAttrs(nss),
+                          "error"_attr = exShardNotFound);
+                }
+            },
+            Backoff(Seconds(1), Milliseconds::max()));
+    });
+}
+
+void persistMigrationRecipientRecoveryDocument(
+    OperationContext* opCtx, const MigrationRecipientRecoveryDocument& migrationRecipientDoc) {
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+    try {
+        store.add(
+            opCtx, migrationRecipientDoc, WriteConcerns::kMajorityWriteConcernShardingTimeout);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // Convert a DuplicateKey error to an anonymous error.
+        uasserted(6064502,
+                  str::stream()
+                      << "While attempting to write migration recipient information for migration "
+                      << ", found document with the same migration id. Attempted migration: "
+                      << migrationRecipientDoc.toBSON());
+    }
+}
+
+void deleteMigrationRecipientRecoveryDocument(OperationContext* opCtx, const UUID& migrationId) {
+    // Before deleting the migration recipient recovery document, ensure that in the case of a
+    // crash, the node will start-up from a configTime that is inclusive of the migration that was
+    // committed during the critical section.
+    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+    store.remove(opCtx,
+                 BSON(MigrationRecipientRecoveryDocument::kIdFieldName << migrationId),
+                 ShardingCatalogClient::kMajorityWriteConcern);
+}
+
+void resumeMigrationRecipientsOnStepUp(OperationContext* opCtx) {
+    LOGV2_DEBUG(6064504, 2, "Starting migration recipient step-up recovery");
+
+    unsigned long long ongoingMigrationRecipientsCount = 0;
+
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+
+    store.forEach(
+        opCtx,
+        BSONObj{},
+        [&opCtx, &ongoingMigrationRecipientsCount](const MigrationRecipientRecoveryDocument& doc) {
+            invariant(ongoingMigrationRecipientsCount == 0,
+                      str::stream()
+                          << "Upon step-up a second migration recipient recovery document was found"
+                          << redact(doc.toBSON()));
+            ongoingMigrationRecipientsCount++;
+            LOGV2_DEBUG(5899102,
+                        3,
+                        "Found ongoing migration recipient critical section on step-up",
+                        "migrationRecipientCoordinatorDoc"_attr = redact(doc.toBSON()));
+
+            const auto& nss = doc.getNss();
+
+            // Register this receiveChunk on the ActiveMigrationsRegistry before completing step-up
+            // to prevent a new migration from starting while a receiveChunk was ongoing. Wait for
+            // any migrations that began in a previous term to complete if there are any.
+            auto scopedReceiveChunk(
+                uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(
+                    opCtx,
+                    nss,
+                    doc.getRange(),
+                    doc.getDonorShardIdForLoggingPurposesOnly(),
+                    true /* waitForCompletionOfConflictingOps */)));
+
+            const auto mdm = MigrationDestinationManager::get(opCtx);
+            uassertStatusOK(
+                mdm->restoreRecoveredMigrationState(opCtx, std::move(scopedReceiveChunk), doc));
+
+            return true;
+        });
+
+    LOGV2_DEBUG(6064505,
+                2,
+                "Finished migration recipient step-up recovery",
+                "ongoingRecipientCritSecCount"_attr = ongoingMigrationRecipientsCount);
+}
+
+void drainMigrationsPendingRecovery(OperationContext* opCtx) {
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+
+    while (store.count(opCtx)) {
+        store.forEach(opCtx, BSONObj(), [opCtx](const MigrationCoordinatorDocument& doc) {
+            try {
+                FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                    opCtx, doc.getNss(), boost::none);
+            } catch (DBException& ex) {
+                ex.addContext(str::stream() << "Failed to recover pending migration for document "
+                                            << doc.toBSON());
+                throw;
+            }
+            return true;
+        });
+    }
+}
+
+void asyncRecoverMigrationUntilSuccessOrStepDown(OperationContext* opCtx,
+                                                 const NamespaceString& nss) noexcept {
+    ExecutorFuture<void>{Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()}
+        .then([svcCtx{opCtx->getServiceContext()}, nss] {
+            ThreadClient tc{"MigrationRecovery", svcCtx->getService(ClusterRole::ShardServer)};
+            auto uniqueOpCtx{tc->makeOperationContext()};
+            auto opCtx{uniqueOpCtx.get()};
+
+            try {
+                refreshFilteringMetadataUntilSuccess(opCtx, nss);
+            } catch (const DBException& ex) {
+                // This is expected in the event of a stepdown.
+                LOGV2(6316100,
+                      "Interrupted deferred migration recovery",
+                      logAttrs(nss),
+                      "error"_attr = redact(ex));
+            }
+        })
+        .getAsync([](auto) {});
 }
 
 }  // namespace migrationutil

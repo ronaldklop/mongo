@@ -31,11 +31,14 @@
 
 #include <boost/filesystem/operations.hpp>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
-Status validateTrafficRecordDestination(const std::string& path) {
+Status validateTrafficRecordDestination(const std::string& path, const boost::optional<TenantId>&) {
     if (!path.empty() && !boost::filesystem::is_directory(path)) {
         return Status(ErrorCodes::FileNotOpen,
                       str::stream()

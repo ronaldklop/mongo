@@ -27,25 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/shard_filter.h"
 
 #include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/storage/snapshot.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/shard_key_pattern.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
-using std::shared_ptr;
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* ShardFilterStage::kStageType = "SHARDING_FILTER";

@@ -1,8 +1,13 @@
 // Tests propagation of RWC defaults across a sharded cluster.
-(function() {
-'use strict';
-
-load("jstests/libs/read_write_concern_defaults_propagation_common.js");
+// @tags: [
+//   # TODO (SERVER-88123): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
+import {
+    ReadWriteConcernDefaultsPropagation
+} from "jstests/libs/read_write_concern_defaults_propagation_common.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({
     shards: 1,
@@ -10,7 +15,9 @@ var st = new ShardingTest({
     other: {
         rs: true,
         rs0: {nodes: 1},
-    }
+    },
+    // The config server needs enough nodes to allow a custom write concern default of w:2
+    config: 3,
 });
 
 const mongosAndConfigNodes = [st.s0, st.s1, st.s2, ...st.configRS.nodes];
@@ -27,4 +34,3 @@ ReadWriteConcernDefaultsPropagation.runDropAndDeleteTests(st.configRS.getPrimary
                                                           mongosAndConfigNodes);
 
 st.stop();
-})();

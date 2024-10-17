@@ -3,24 +3,30 @@
  * committing and aborting.
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: endSession.
+ *   not_allowed_with_signed_security_token,
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/create_collection_txn_helpers.js");
-load("jstests/libs/fixture_helpers.js");  // for isMongos
-load("jstests/libs/auto_retry_transaction_in_sharding.js");
+import {
+    withAbortAndRetryOnTransientTxnError,
+    withTxnAndAutoRetryOnMongos
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {
+    assertCollCreateFailedWithCode,
+    createCollAndCRUDInTxn
+} from "jstests/libs/create_collection_txn_helpers.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 function runCollectionCreateTest(command, explicitCreate) {
     const session = db.getMongo().startSession();
+    const dbName = 'test_txns_create_collection';
     const collName = "create_new_collection";
     // Note: using strange collection name here to test sorting of operations by namespace,
     // SERVER-48628
     const secondCollName = "\n" + collName + "_second";
 
-    let sessionDB = session.getDatabase("test");
+    let sessionDB = session.getDatabase(dbName);
     let sessionColl = sessionDB[collName];
     let secondSessionColl = sessionDB[secondCollName];
     sessionColl.drop({writeConcern: {w: "majority"}});
@@ -53,20 +59,20 @@ function runCollectionCreateTest(command, explicitCreate) {
     secondSessionColl.drop({writeConcern: {w: "majority"}});
 
     jsTest.log("Testing createCollection in a transaction that aborts");
-    session.startTransaction({writeConcern: {w: "majority"}});
-    retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({writeConcern: {w: "majority"}});
         createCollAndCRUDInTxn(sessionDB, collName, command, explicitCreate);
-    }, {writeConcern: {w: "majority"}});
+    });
     assert.commandWorked(session.abortTransaction_forTesting());
 
     assert.eq(sessionColl.find({}).itcount(), 0);
 
     jsTest.log("Testing multiple createCollections in a transaction that aborts");
-    session.startTransaction({writeConcern: {w: "majority"}});
-    retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({writeConcern: {w: "majority"}});
         createCollAndCRUDInTxn(sessionDB, collName, command, explicitCreate);
         createCollAndCRUDInTxn(sessionDB, secondCollName, command, explicitCreate);
-    }, {writeConcern: {w: "majority"}});
+    });
     session.abortTransaction();
     assert.eq(sessionColl.find({}).itcount(), 0);
     assert.eq(secondSessionColl.find({}).itcount(), 0);
@@ -77,10 +83,10 @@ function runCollectionCreateTest(command, explicitCreate) {
     jsTest.log(
         "Testing createCollection on an existing collection in a transaction (SHOULD ABORT)");
     assert.commandWorked(sessionDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
-    session.startTransaction({writeConcern: {w: "majority"}});
-    retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({writeConcern: {w: "majority"}});
         createCollAndCRUDInTxn(sessionDB, secondCollName, command, explicitCreate);
-    }, {writeConcern: {w: "majority"}});
+    });
 
     assert.commandFailedWithCode(sessionDB.runCommand({create: collName}),
                                  ErrorCodes.NamespaceExists);
@@ -117,4 +123,3 @@ runCollectionCreateTest("update", true /*explicitCreate*/);
 runCollectionCreateTest("update", false /*explicitCreate*/);
 runCollectionCreateTest("findAndModify", true /*explicitCreate*/);
 runCollectionCreateTest("findAndModify", false /*explicitCreate*/);
-}());

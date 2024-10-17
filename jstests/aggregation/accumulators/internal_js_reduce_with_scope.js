@@ -2,11 +2,12 @@
 // specified in runtimeConstants.
 //
 // Do not run in sharded passthroughs since 'runtimeConstants' is disallowed on mongos.
-// @tags: [assumes_unsharded_collection]
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');
+// Must also set 'fromMongos: true' as otherwise 'runtimeConstants' is disallowed on mongod.
+// @tags: [
+//   assumes_against_mongod_not_mongos,
+//   requires_scripting,
+// ]
+import {resultsEq} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.js_reduce_with_scope;
 coll.drop();
@@ -38,6 +39,7 @@ const command = {
             }
         }
     }],
+    fromMongos: true,
 };
 
 const expectedResults = [
@@ -48,4 +50,3 @@ const expectedResults = [
 
 const res = assert.commandWorked(db.runCommand(command));
 assert(resultsEq(res.cursor.firstBatch, expectedResults, res.cursor));
-})();

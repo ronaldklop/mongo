@@ -9,11 +9,17 @@
  * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    assertWriteConcernError,
+    checkWriteConcernTimedOut,
+    restartServerReplication,
+    stopServerReplication,
+} from "jstests/libs/write_concern_util.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 // Waits for the given log to appear a number of times in the shell's rawMongoProgramOutput.
 // Loops because it is not guaranteed the program output will immediately contain all lines
@@ -23,6 +29,10 @@ function waitForLog(logLine, times) {
         const matches = rawMongoProgramOutput().match(new RegExp(logLine, "g")) || [];
         return matches.length === times;
     }, 'Failed to find "' + logLine + '" logged ' + times + ' times');
+}
+
+function getLSID() {
+    return {id: UUID()};
 }
 
 const addTxnFields = function(command, lsid, txnNumber, startTransaction) {
@@ -38,28 +48,46 @@ const addTxnFields = function(command, lsid, txnNumber, startTransaction) {
     return Object.assign({}, command, txnFields);
 };
 
-const defaultCommitCommand = {
-    commitTransaction: 1,
-    writeConcern: {w: "majority", wtimeout: 6000}
+const makeCommitCommand = function(wtimeout) {
+    let writeConcern = {w: "majority"};
+    if (wtimeout) {
+        writeConcern.wtimeout = wtimeout;
+    }
+    return {commitTransaction: 1, writeConcern: writeConcern};
 };
+
 const noop = () => {};
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-// TODO (SERVER-37364): Uncomment this line; otherwise, the coordinator will wait too long to
-// time out waiting for votes and the test will time out.
+const versionSupportsSingleWriteShardCommitOptimization =
+    MongoRunner.compareBinVersions(jsTestOptions().mongosBinVersion, "7.1") >= 0;
+
 // Lower the transaction timeout, since this test exercises cases where the coordinator should
-// time out collecting prepare votes.
-// TestData.transactionLifetimeLimitSeconds = 30;
+// time out collecting prepare votes from participants that cannot majority commit writes.
+TestData.transactionLifetimeLimitSeconds = 30;
 
 let st = new ShardingTest({
     shards: 3,
     // Create shards with more than one node because we test for writeConcern majority failing.
-    config: 1,
+    config: TestData.configShard ? undefined : 1,
+    rsOptions: {
+        setParameter: {
+            // Set this to higher than the deault 5ms to avoid failures due to not being able to
+            // acquire the lock quickly enough.
+            maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS,
+        }
+    },
     other: {
-        mongosOptions: {verbose: 3},
+        // The name of the shards affects the ordering of which shard will be targeted first
+        // for broadcast operations so always use the same names for each test run.
+        alwaysUseTestNameForShardName: true,
+        mongosOptions: {
+            verbose: 3,
+            setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}
+        },
         rs0: {nodes: [{}, {rsConfig: {priority: 0}}]},
         rs1: {nodes: [{}, {rsConfig: {priority: 0}}]},
         rs2: {nodes: [{}, {rsConfig: {priority: 0}}]},
@@ -67,8 +95,8 @@ let st = new ShardingTest({
 });
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard1.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard1.shardName}));
 
 // Create a "dummy" collection for doing noop writes to advance shard's last applied OpTimes.
 assert.commandWorked(st.s.getDB(dbName).getCollection("dummy").insert({dummy: 1}));
@@ -100,7 +128,6 @@ assert.commandWorked(st.s.getDB(dbName).runCommand({
     documents: [{_id: -1 * MAX_TRANSACTIONS}, {_id: 0}, {_id: MAX_TRANSACTIONS}]
 }));
 
-let lsid = {id: UUID()};
 let txnNumber = 1;
 
 const readShard0 = txnNumber => {
@@ -184,12 +211,10 @@ const transactionTypes = {
     writeReadSingleShardExpectSingleShardCommit: txnNumber => {
         return [writeShard0(txnNumber), readShard0(txnNumber)];
     },
-    // TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
-    readOneShardWriteOtherShardExpectTwoPhaseCommit: txnNumber => {
+    readOneShardWriteOtherShardExpectSingleWriteShardCommit: txnNumber => {
         return [readShard0(txnNumber), writeShard1(txnNumber)];
     },
-    // TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
-    writeOneShardReadOtherShardExpectTwoPhaseCommit: txnNumber => {
+    writeOneShardReadOtherShardExpectSingleWriteShardCommit: txnNumber => {
         return [writeShard0(txnNumber), readShard1(txnNumber)];
     },
     readOneShardWriteTwoOtherShardsExpectTwoPhaseCommit: txnNumber => {
@@ -205,7 +230,7 @@ const failureModes = {
         beforeStatements: noop,
         beforeCommit: noop,
         getCommitCommand: (lsid, txnNumber) => {
-            return addTxnFields(defaultCommitCommand, lsid, txnNumber);
+            return addTxnFields(makeCommitCommand(), lsid, txnNumber);
         },
         checkCommitResult: (res) => {
             // Commit should return ok without writeConcern error
@@ -226,7 +251,7 @@ const failureModes = {
             st.rs0.awaitNodesAgreeOnPrimary();
         },
         getCommitCommand: (lsid, txnNumber) => {
-            return addTxnFields(defaultCommitCommand, lsid, txnNumber);
+            return addTxnFields(makeCommitCommand(), lsid, txnNumber);
         },
         checkCommitResult: (res) => {
             // Commit should return NoSuchTransaction.
@@ -238,9 +263,18 @@ const failureModes = {
         },
     },
     participantCannotMajorityCommitWritesClientSendsWriteConcernMajority: {
-        beforeStatements: () => {
-            // Participant cannot majority commit writes.
-            stopServerReplication(st.rs0.getSecondaries());
+        beforeStatements: (expectTwoPhaseCommit) => {
+            // The default WC is majority and stopServerReplication will prevent satisfying any
+            // majority writes.
+            assert.commandWorked(st.s.adminCommand({
+                setDefaultRWConcern: 1,
+                defaultWriteConcern: {w: 1},
+                writeConcern: {w: "majority"}
+            }));
+            // If two-phase commit is involved, rs0 will be the coordinator so we should disable
+            // replication on a different participant.
+            stopServerReplication(expectTwoPhaseCommit ? st.rs1.getSecondaries()
+                                                       : st.rs0.getSecondaries());
 
             // Do a write on rs0 through the router outside the transaction to ensure the
             // transaction will choose a read time that has not been majority committed.
@@ -248,22 +282,80 @@ const failureModes = {
         },
         beforeCommit: noop,
         getCommitCommand: (lsid, txnNumber) => {
-            return addTxnFields(defaultCommitCommand, lsid, txnNumber);
+            return addTxnFields(makeCommitCommand(10 * 1000 /* wtimeout */), lsid, txnNumber);
         },
-        checkCommitResult: (res) => {
-            // Commit should return ok with a writeConcernError with wtimeout.
-            assert.commandWorkedIgnoringWriteConcernErrors(res);
-            checkWriteConcernTimedOut(res);
-            assert.eq(null, res.errorLabels);
+        checkCommitResult: (res, {
+            expectTwoPhaseCommit,
+            expectSingleWriteShardCommit,
+            singleWriteShardCommitFirstShardReadOnly,
+            isRetry,
+            lsid,
+            txnNumber,
+        }) => {
+            if (expectTwoPhaseCommit) {
+                // One of the participants cannot majority commit writes so the coordinator will
+                // timeout waiting for votes, and consequently abort the transaction with
+                // NoSuchTransaction error as the abort reason.
+                assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
+                assert.eq(["TransientTransactionError"], res.errorLabels);
+            } else if (expectSingleWriteShardCommit) {
+                if (singleWriteShardCommitFirstShardReadOnly) {
+                    if (isRetry) {
+                        // Retry of single write shard commit triggers txn recovery, which will
+                        // discover the transaction aborted on the first attempt.
+                        assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
+                        assert.eq(["TransientTransactionError"], res.errorLabels);
+                        return;
+                    }
+
+                    // Router returns whatever error the first failed read commit failed with as a
+                    // command error, even if it was a write concern error, since nothing durable
+                    // could be written. This particular error isn't considered transient since
+                    // WriteWriteConcernFailed is not a transient code.
+                    assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+                    assert(!res.writeConcernError, res);
+                    assert.eq(null, res.errorLabels);
+
+                    // Any read shard failure should have triggered an implicit abort on all shards.
+                    // Note the first shard already received commitTransaction but couldn't majority
+                    // commit it, so it should have already committed the transaction.
+                    const dummyTxnCmd = addTxnFields({commitTransaction: 1}, lsid, txnNumber);
+                    assert.commandWorked(st.rs0.getPrimary().adminCommand(dummyTxnCmd));
+                    assert.commandFailedWithCode(st.rs1.getPrimary().adminCommand(dummyTxnCmd),
+                                                 ErrorCodes.NoSuchTransaction);
+                } else {
+                    // In this case, the router receives a write concern error from the write shard,
+                    // which means the transaction's effects are written to at least the primary
+                    // node, so we can return that shards write concern error with the router's
+                    // commit response to the client.
+                    assert.commandWorkedIgnoringWriteConcernErrors(res);
+                    checkWriteConcernTimedOut(res);
+                    assert.eq(null, res.errorLabels);
+                }
+            } else {
+                // Commit should return ok with a writeConcernError with wtimeout.
+                assert.commandWorkedIgnoringWriteConcernErrors(res);
+                checkWriteConcernTimedOut(res);
+                assert.eq(null, res.errorLabels);
+            }
         },
-        cleanUp: () => {
-            restartServerReplication(st.rs0.getSecondaries());
+        cleanUp: (expectTwoPhaseCommit) => {
+            restartServerReplication(expectTwoPhaseCommit ? st.rs1.getSecondaries()
+                                                          : st.rs0.getSecondaries());
         },
     },
     participantCannotMajorityCommitWritesClientSendsWriteConcern1: {
-        beforeStatements: () => {
-            // Participant cannot majority commit writes.
-            stopServerReplication(st.rs0.getSecondaries());
+        beforeStatements: (expectTwoPhaseCommit) => {
+            // stopServerReplication will prevent fulfil any majority writes.
+            assert.commandWorked(st.s.adminCommand({
+                setDefaultRWConcern: 1,
+                defaultWriteConcern: {w: 1},
+                writeConcern: {w: "majority"}
+            }));
+            // If two-phase commit is involved, rs0 will be the coordinator so we should disable
+            // replication on a different participant.
+            stopServerReplication(expectTwoPhaseCommit ? st.rs1.getSecondaries()
+                                                       : st.rs0.getSecondaries());
 
             // Do a write on rs0 through the router outside the transaction to ensure the
             // transaction will choose a read time that has not been majority committed.
@@ -273,13 +365,27 @@ const failureModes = {
         getCommitCommand: (lsid, txnNumber) => {
             return addTxnFields({commitTransaction: 1, writeConcern: {w: 1}}, lsid, txnNumber);
         },
-        checkCommitResult: (res) => {
-            // Commit should return ok without writeConcern error
-            assert.commandWorked(res);
-            assert.eq(null, res.errorLabels);
+        checkCommitResult: (res, {expectTwoPhaseCommit, expectSingleWriteShardCommit}) => {
+            if (expectTwoPhaseCommit) {
+                // One of the participants cannot majority commit writes so the coordinator will
+                // timeout waiting for votes, and consequently abort the transaction with
+                // NoSuchTransaction error as the abort reason.
+                assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
+                assert.eq(["TransientTransactionError"], res.errorLabels);
+            } else if (expectSingleWriteShardCommit) {
+                // Both the read only and single write shard phases will use the client's write
+                // concern so the commit can succeed without a write concern error.
+                assert.commandWorked(res);
+                assert.eq(null, res.errorLabels);
+            } else {
+                // Commit should return ok without writeConcern error.
+                assert.commandWorked(res);
+                assert.eq(null, res.errorLabels);
+            }
         },
-        cleanUp: () => {
-            restartServerReplication(st.rs0.getSecondaries());
+        cleanUp: (expectTwoPhaseCommit) => {
+            restartServerReplication(expectTwoPhaseCommit ? st.rs1.getSecondaries()
+                                                          : st.rs0.getSecondaries());
         },
     },
     clientSendsInvalidWriteConcernOnCommit: {
@@ -290,7 +396,28 @@ const failureModes = {
             return addTxnFields(
                 {commitTransaction: 1, writeConcern: {w: "invalid"}}, lsid, txnNumber);
         },
-        checkCommitResult: (res) => {
+        checkCommitResult: (res, {expectSingleWriteShardCommit, isRetry, lsid, txnNumber}) => {
+            if (expectSingleWriteShardCommit) {
+                if (isRetry) {
+                    // The retry triggers decision recovery which finds the transaction aborted,
+                    // and then fails waiting for the invalid write concern.
+                    assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
+                    assertWriteConcernError(res);
+                    assert.eq(ErrorCodes.UnknownReplWriteConcern, res.writeConcernError.code);
+                    assert(!res.writeConcernError.errInfo ||
+                           !res.writeConcernError.errInfo.wtimeout);
+                    assert.eq(null, res.errorLabels);
+                    return;
+                }
+
+                // The invalid write concern will fail on a read only shard, which we treat as a
+                // command error because the commit cannot be durable on the write shard.
+                assert.commandFailedWithCode(res, ErrorCodes.UnknownReplWriteConcern);
+                assert(!res.writeConcernError, res);
+                assert.eq(null, res.errorLabels, res);
+                return;
+            }
+
             // Commit should return ok with writeConcernError without wtimeout.
             assert.commandWorkedIgnoringWriteConcernErrors(res);
             assertWriteConcernError(res);
@@ -304,14 +431,8 @@ const failureModes = {
 
 for (const failureModeName in failureModes) {
     for (const type in transactionTypes) {
-        // If the participants cannot majority commit writes, the coordinator will timeout
-        // waiting for votes, and consequently send out abortTransaction to the participants
-        // who will then respond with NoSuchTransaction error.
-        if (failureModeName.includes("participantCannotMajorityCommitWrites") &&
-            type.includes("ExpectTwoPhaseCommit")) {
-            continue;
-        }
-
+        clearRawMongoProgramOutput();
+        const lsid = getLSID();
         txnNumber++;
         assert.lt(txnNumber,
                   MAX_TRANSACTIONS,
@@ -323,8 +444,21 @@ for (const failureModeName in failureModes) {
 
         const failureMode = failureModes[failureModeName];
 
+        const commitOpts = {
+            expectSingleShardCommit: type.includes("ExpectSingleShardCommit"),
+            expectReadOnlyCommit: type.includes("ExpectReadOnlyCommit"),
+            expectSingleWriteShardCommit: type.includes("ExpectSingleWriteShardCommit") &&
+                versionSupportsSingleWriteShardCommitOptimization,
+            expectTwoPhaseCommit: type.includes("ExpectTwoPhaseCommit") ||
+                (type.includes("ExpectSingleWriteShardCommit") &&
+                 !versionSupportsSingleWriteShardCommitOptimization),
+            singleWriteShardCommitFirstShardReadOnly: type.includes("readOneShardWriteOther"),
+            lsid,
+            txnNumber,
+        };
+
         // Run the statements.
-        failureMode.beforeStatements();
+        failureMode.beforeStatements(commitOpts.expectTwoPhaseCommit);
         let startTransaction = true;
         transactionTypes[type](txnNumber).forEach(command => {
             assert.commandWorked(st.s.getDB(dbName).runCommand(
@@ -336,19 +470,20 @@ for (const failureModeName in failureModes) {
         const commitCmd = failureMode.getCommitCommand(lsid, txnNumber);
         failureMode.beforeCommit();
         const commitRes = st.s.adminCommand(commitCmd);
-        failureMode.checkCommitResult(commitRes);
+        failureMode.checkCommitResult(commitRes, commitOpts);
 
         // Re-running commit should return the same response.
         const commitRetryRes = st.s.adminCommand(commitCmd);
-        failureMode.checkCommitResult(commitRetryRes);
+        commitOpts.isRetry = true;
+        failureMode.checkCommitResult(commitRetryRes, commitOpts);
 
-        if (type.includes("ExpectSingleShardCommit")) {
+        if (commitOpts.expectSingleShardCommit) {
             waitForLog("Committing single-shard transaction", 2);
-        } else if (type.includes("ExpectReadOnlyCommit")) {
+        } else if (commitOpts.expectReadOnlyCommit) {
             waitForLog("Committing read-only transaction", 2);
-        } else if (type.includes("ExpectSingleWriteShardCommit")) {
+        } else if (commitOpts.expectSingleWriteShardCommit) {
             waitForLog("Committing single-write-shard transaction", 2);
-        } else if (type.includes("ExpectTwoPhaseCommit")) {
+        } else if (commitOpts.expectTwoPhaseCommit) {
             waitForLog("Committing using two-phase commit", 2);
         } else {
             assert(false, `Unknown transaction type: ${type}`);
@@ -356,9 +491,8 @@ for (const failureModeName in failureModes) {
 
         clearRawMongoProgramOutput();
 
-        failureMode.cleanUp();
+        failureMode.cleanUp(commitOpts.expectTwoPhaseCommit);
     }
 }
 
 st.stop();
-})();

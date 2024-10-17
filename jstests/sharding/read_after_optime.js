@@ -1,10 +1,14 @@
 // Test read after opTime functionality with maxTimeMS on config servers (CSRS only)`.
-load("jstests/libs/logv2_helpers.js");
+// @tags: [
+//   # TODO (SERVER-88123): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var shardingTest = new ShardingTest({shards: 0});
+var shardingTest = new ShardingTest({shards: TestData.configShard ? 1 : 0});
+
 assert(shardingTest.configRS, 'this test requires config servers to run in CSRS mode');
 
 var configReplSetTest = shardingTest.configRS;
@@ -13,7 +17,6 @@ var primaryConn = configReplSetTest.getPrimary();
 var lastOp = configReplSetTest.awaitLastOpCommitted();
 assert(lastOp, 'invalid op returned from ReplSetTest.awaitLastOpCommitted()');
 
-var config = configReplSetTest.getReplSetConfigFromNode();
 var term = lastOp.t;
 
 var runFindCommand = function(ts) {
@@ -36,10 +39,7 @@ assert.commandFailedWithCode(
     runFindCommand(new Timestamp(lastOp.ts.getTime() + pingIntervalSeconds * 5, 0)),
     ErrorCodes.MaxTimeMSExpired);
 
-var msg = 'Command on database local timed out waiting for read concern to be satisfied';
-if (isJsonLogNoConn()) {
-    msg = /Command timed out waiting for read concern to be satisfied.*"db":"local"/;
-}
+var msg = /Command timed out waiting for read concern to be satisfied.*"db":"local"/;
 
 assert.soon(function() {
     var logMessages = assert.commandWorked(primaryConn.adminCommand({getLog: 'global'})).log;
@@ -51,4 +51,3 @@ assert.soon(function() {
     return false;
 }, 'Did not see any log entries containing the following message: ' + msg, 60000, 300);
 shardingTest.stop();
-})();

@@ -1,10 +1,5 @@
 // Tests that text search requires a text index.
-// TODO SERVER-29159: Enable test on passthroughs with sharded collections.
-// @tags: [assumes_unsharded_collection]
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.coll;
 const from = db.from;
@@ -36,4 +31,3 @@ assert.commandWorked(from.createIndex({a: "text"}));
 // Should run when you have the text index.
 assert.eq(from.aggregate(textPipeline).itcount(), 1);
 assert.eq(coll.aggregate(pipeline).itcount(), 1);
-}());

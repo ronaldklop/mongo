@@ -1,13 +1,10 @@
 /**
  * Tests $dateDiff expression.
  * @tags: [
- *   requires_fcv_49
  * ]
  */
-(function() {
-"use strict";
-load("jstests/libs/sbe_assert_error_override.js");
-load("jstests/libs/aggregation_pipeline_utils.js");  // For executeAggregationTestCase.
+import "jstests/libs/query/sbe_assert_error_override.js";
+import {executeAggregationTestCase} from "jstests/libs/query/aggregation_pipeline_utils.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 const coll = testDB.collection;
@@ -166,7 +163,7 @@ const testCases = [
         // Invalid 'unit' value.
         pipeline: aggregationPipelineWithDateDiff,
         inputDocuments: [{startDate: someDate, endDate: someDate, unit: "decade", timeZone: "UTC"}],
-        expectedErrorCode: 5439014,
+        expectedErrorCode: ErrorCodes.FailedToParse,
     },
     {
         // Null 'timezone'.
@@ -175,10 +172,12 @@ const testCases = [
         expectedResults: [{date_diff: null}],
     },
     {
-        // Missing 'timezone' value in the document, invalid other fields.
+        // Missing 'timezone' value in the document, invalid other fields. Result could be a null
+        // answer or an error code depending whether pipeline is optimized.
         pipeline: aggregationPipelineWithDateDiff,
         inputDocuments: [{startDate: 1, endDate: 2, unit: "century"}],
         expectedResults: [{date_diff: null}],
+        expectedErrorCode: ErrorCodes.FailedToParse,
     },
     {
         // Invalid 'timezone' type.
@@ -273,4 +272,3 @@ const testCases = [
     }
 ];
 testCases.forEach(testCase => executeAggregationTestCase(coll, testCase));
-}());

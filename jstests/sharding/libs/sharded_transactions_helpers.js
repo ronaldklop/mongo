@@ -1,6 +1,6 @@
-load("jstests/libs/logv2_helpers.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
-const kSnapshotErrors =
+export const kSnapshotErrors =
     [ErrorCodes.SnapshotTooOld, ErrorCodes.SnapshotUnavailable, ErrorCodes.StaleChunkHistory];
 
 // List of failpoints in the coordinator's two-phase commit code. The associated data describes how
@@ -11,31 +11,33 @@ const kSnapshotErrors =
 //   be hit two times in the prepare phase.
 // - skip: N means turn on the failpoint after the failpoint has been hit N times; it's used to turn
 //   on the remote and local targeting failpoints for the prepare and decision phase separately.
-function getCoordinatorFailpoints() {
+export function getCoordinatorFailpoints() {
     const coordinatorFailpointDataArr = [
         {failpoint: "hangBeforeWritingParticipantList", numTimesShouldBeHit: 1},
         {
             // Test targeting remote nodes for prepare
             failpoint: "hangWhileTargetingRemoteHost",
-            numTimesShouldBeHit: 2 /* once per remote participant */
+            numTimesShouldBeHit: 2, /* once per remote participant */
+            data: {twoPhaseCommitStage: "prepare"}
         },
         {
             // Test targeting local node for prepare
             failpoint: "hangWhileTargetingLocalHost",
-            numTimesShouldBeHit: 1
+            numTimesShouldBeHit: 1,
+            data: {twoPhaseCommitStage: "prepare"}
         },
         {failpoint: "hangBeforeWritingDecision", numTimesShouldBeHit: 1},
         {
             // Test targeting remote nodes for decision
             failpoint: "hangWhileTargetingRemoteHost",
             numTimesShouldBeHit: 2, /* once per remote participant */
-            skip: 2                 /* to skip when the failpoint is hit for prepare */
+            data: {twoPhaseCommitStage: "decision"},
         },
         {
             // Test targeting local node for decision
             failpoint: "hangWhileTargetingLocalHost",
             numTimesShouldBeHit: 1,
-            skip: 1 /* to skip when the failpoint is hit for prepare */
+            data: {twoPhaseCommitStage: "decision"},
         },
         {failpoint: "hangBeforeDeletingCoordinatorDoc", numTimesShouldBeHit: 1},
     ];
@@ -44,33 +46,20 @@ function getCoordinatorFailpoints() {
     return coordinatorFailpointDataArr.map(failpoint => Object.assign({}, failpoint));
 }
 
-function setFailCommandOnShards(st, mode, commands, code, numShards, ns) {
+export function setFailCommandOnShards(st, mode, data, numShards) {
     for (let i = 0; i < numShards; i++) {
         const shardConn = st["rs" + i].getPrimary();
         // Sharding tests require failInternalCommands: true, since the mongos appears to mongod to
         // be an internal client.
-        if (ns) {
-            assert.commandWorked(shardConn.adminCommand({
-                configureFailPoint: "failCommand",
-                mode: mode,
-                data: {
-                    namespace: ns,
-                    errorCode: code,
-                    failCommands: commands,
-                    failInternalCommands: true
-                }
-            }));
-        } else {
-            assert.commandWorked(shardConn.adminCommand({
-                configureFailPoint: "failCommand",
-                mode: mode,
-                data: {errorCode: code, failCommands: commands, failInternalCommands: true}
-            }));
-        }
+        assert.commandWorked(shardConn.adminCommand({
+            configureFailPoint: "failCommand",
+            mode: mode,
+            data: {...data, failInternalCommands: true}
+        }));
     }
 }
 
-function unsetFailCommandOnEachShard(st, numShards) {
+export function unsetFailCommandOnEachShard(st, numShards) {
     for (let i = 0; i < numShards; i++) {
         const shardConn = st["rs" + i].getPrimary();
         assert.commandWorked(
@@ -78,13 +67,13 @@ function unsetFailCommandOnEachShard(st, numShards) {
     }
 }
 
-function assertNoSuchTransactionOnAllShards(st, lsid, txnNumber) {
+export function assertNoSuchTransactionOnAllShards(st, lsid, txnNumber) {
     st._rs.forEach(function(rs) {
         assertNoSuchTransactionOnConn(rs.test.getPrimary(), lsid, txnNumber);
     });
 }
 
-function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
+export function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
     assert.commandFailedWithCode(
         conn.getDB("foo").runCommand({
             find: "bar",
@@ -97,18 +86,16 @@ function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
             ", txnNumber: " + tojson(txnNumber) + ", connection: " + tojson(conn));
 }
 
-function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
+export function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
     // Don't run the hang analyzer because we don't expect waitForFailpoint() to always succeed.
-    if (isJsonLogNoConn()) {
-        const hitFailpointRe = /Hit (\w+) failpoint/;
-        const hitRe = /Hit (\w+)/;
-        const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
-        const matchHit = hitFailpointStr.match(hitRe);
-        if (matchHitFailpoint) {
-            hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
-        } else {
-            hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
-        }
+    const hitFailpointRe = /Hit (\w+) failpoint/;
+    const hitRe = /Hit (\w+)/;
+    const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
+    const matchHit = hitFailpointStr.match(hitRe);
+    if (matchHitFailpoint) {
+        hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
+    } else {
+        hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
     }
     assert.soon(
         function() {
@@ -126,11 +113,7 @@ function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
  * making the transaction coordinator return decision early to true.
  * TODO (SERVER-48114): Remove this function.
  */
-function enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st) {
-    if (jsTest.options().shardMixedBinVersions ||
-        jsTest.options().useRandomBinVersionsWithinReplicaSet)
-        return;
-
+export function enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st) {
     st._rs.forEach(rs => {
         rs.nodes.forEach(node => {
             assert.commandWorked(node.getDB('admin').runCommand({
@@ -145,7 +128,7 @@ function enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st) {
 // errors within a transaction.
 //
 // TODO SERVER-39704: Remove this function.
-function enableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
+export function enableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
     assert.commandWorked(st.s.adminCommand({
         configureFailPoint: "enableStaleVersionAndSnapshotRetriesWithinTransactions",
         mode: "alwaysOn"
@@ -160,7 +143,9 @@ function enableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
 }
 
 // TODO SERVER-39704: Remove this function.
-function disableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
+// Note: tests relying on this function should use kShardOptionsForDisabledStaleShardVersionRetries
+// as part of their ShardingTest initialisation.
+export function disableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
     assert.commandWorked(st.s.adminCommand({
         configureFailPoint: "enableStaleVersionAndSnapshotRetriesWithinTransactions",
         mode: "off"
@@ -174,11 +159,23 @@ function disableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
     });
 }
 
+// Override value for the ShardingTest.other.shardOptions field to safely use
+// disableStaleVersionAndSnapshotRetriesWithinTransactions().
+export const kShardOptionsForDisabledStaleShardVersionRetries = {
+    // Relax the default constraint for in-transaction metadata refreshes to avoid spurious
+    // timeouts on low-performant test environments.
+    // For ease of implementation, this reconfiguration is preferred  over the usage of
+    // transaction retry loops, since:
+    // - failpoints are used to alter the behaviour of the transaction machinery
+    // - tests disabling retries are expected check for specific transaction error codes.
+    setParameter: {metadataRefreshInTransactionMaxWaitMS: 5000}
+};
+
 // Flush each router's metadata and force refreshes on each shard for the given namespace and/or
 // database names.
 //
 // TODO SERVER-39704: Remove this function.
-function flushRoutersAndRefreshShardMetadata(st, {ns, dbNames = []} = {}) {
+export function flushRoutersAndRefreshShardMetadata(st, {ns, dbNames = []} = {}) {
     st._mongos.forEach((s) => {
         assert.commandWorked(s.adminCommand({flushRouterConfig: 1}));
     });
@@ -194,4 +191,79 @@ function flushRoutersAndRefreshShardMetadata(st, {ns, dbNames = []} = {}) {
                 rs.test.getPrimary().adminCommand({_flushDatabaseCacheUpdates: dbName}));
         });
     });
+}
+
+export function makeLsidFilter(lsid, fieldName) {
+    const filter = {};
+    for (let k of ["id", "txnUUID", "txnNumber"]) {
+        if (k in lsid) {
+            filter[fieldName + "." + k] = lsid[k];
+        } else {
+            filter[fieldName + "." + k] = {"$exists": false};
+        }
+    }
+    return filter;
+}
+
+export function getOplogEntriesForTxnOnNode(node, lsid, txnNumber) {
+    const filter = Object.assign(makeLsidFilter(lsid, "lsid"), {txnNumber: NumberLong(txnNumber)});
+    return node.getCollection("local.oplog.rs").find(filter).sort({_id: 1}).toArray();
+}
+
+export function getOplogEntriesForTxn(rs, lsid, txnNumber) {
+    return getOplogEntriesForTxnOnNode(rs.getPrimary(), lsid, txnNumber);
+}
+
+export function getTxnEntriesForSessionOnNode(node, lsid) {
+    return node.getCollection("config.transactions")
+        .find(makeLsidFilter(lsid, "_id"))
+        .sort({_id: 1})
+        .toArray();
+}
+
+export function getTxnEntriesForSession(rs, lsid) {
+    return getTxnEntriesForSessionOnNode(rs.getPrimary(), lsid);
+}
+
+export function getImageEntriesForTxnOnNode(node, lsid, txnNumber) {
+    const filter = Object.assign(makeLsidFilter(lsid, "_id"), {txnNum: NumberLong(txnNumber)});
+    return node.getCollection("config.image_collection").find(filter).sort({_id: 1}).toArray();
+}
+
+export function getImageEntriesForTxn(rs, lsid, txnNumber) {
+    return getImageEntriesForTxnOnNode(rs.getPrimary(), lsid, txnNumber);
+}
+
+export function makeAbortTransactionCmdObj(lsid, txnNumber) {
+    return {
+        abortTransaction: 1,
+        lsid: lsid,
+        txnNumber: NumberLong(txnNumber),
+        autocommit: false,
+    };
+}
+
+export function makeCommitTransactionCmdObj(lsid, txnNumber) {
+    return {
+        commitTransaction: 1,
+        lsid: lsid,
+        txnNumber: NumberLong(txnNumber),
+        autocommit: false,
+    };
+}
+
+export function makePrepareTransactionCmdObj(lsid, txnNumber) {
+    return {
+        prepareTransaction: 1,
+        lsid: lsid,
+        txnNumber: NumberLong(txnNumber),
+        autocommit: false,
+        writeConcern: {w: "majority"},
+    };
+}
+
+export function isUpdateDocumentShardKeyUsingTransactionApiEnabled(conn) {
+    return jsTestOptions().mongosBinVersion !== "last-lts" &&
+        jsTestOptions().mongosBinVersion !== "last-continuous" &&
+        FeatureFlagUtil.isEnabled(conn, "UpdateDocumentShardKeyUsingTransactionApi");
 }

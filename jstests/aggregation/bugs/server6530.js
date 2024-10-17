@@ -1,9 +1,7 @@
 /**
  * Test that $near queries are disallowed in $match stages.
  */
-(function() {
-"use strict";
-load("jstests/aggregation/extras/utils.js");
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.getCollection("no_near_in_match");
 coll.drop();
@@ -32,7 +30,6 @@ assert.eq(1, coll.find(nearSphereQuery).count());
 assert.eq(1, coll.find(geoNearQuery).count());
 
 // Test that we refuse to run $match with a near query.
-assertErrorCode(coll, {$match: nearQuery}, ErrorCodes.BadValue);
-assertErrorCode(coll, {$match: nearSphereQuery}, ErrorCodes.BadValue);
-assertErrorCode(coll, {$match: geoNearQuery}, ErrorCodes.BadValue);
-}());
+assertErrorCode(coll, {$match: nearQuery}, 5626500);
+assertErrorCode(coll, {$match: nearSphereQuery}, 5626500);
+assertErrorCode(coll, {$match: geoNearQuery}, 5626500);

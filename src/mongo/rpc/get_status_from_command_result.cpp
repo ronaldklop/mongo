@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/rpc/get_status_from_command_result.h"
+#include <string>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/util/str.h"
 
@@ -47,10 +48,8 @@ const std::string kCmdResponseWriteErrorsField = "writeErrors";
 
 Status getStatusFromCommandResult(const BSONObj& result) {
     BSONElement okElement = result["ok"];
-    BSONElement codeElement = result["code"];
-    BSONElement errmsgElement = result["errmsg"];
 
-    // StaleConfigException doesn't pass "ok" in legacy servers
+    // StaleConfig doesn't pass "ok" in legacy servers
     BSONElement dollarErrElement = result["$err"];
 
     if (okElement.eoo() && dollarErrElement.eoo()) {
@@ -60,6 +59,13 @@ Status getStatusFromCommandResult(const BSONObj& result) {
     if (okElement.trueValue()) {
         return Status::OK();
     }
+    return getErrorStatusFromCommandResult(result);
+}
+
+Status getErrorStatusFromCommandResult(const BSONObj& result) {
+    BSONElement codeElement = result["code"];
+    BSONElement errmsgElement = result["errmsg"];
+
     int code = codeElement.numberInt();
     if (0 == code) {
         code = ErrorCodes::UnknownError;
@@ -140,12 +146,82 @@ Status getFirstWriteErrorStatusFromCommandResult(const BSONObj& cmdResponse) {
                   firstWriteErrorObj);
 }
 
+Status getFirstWriteErrorStatusFromBulkWriteResult(const BSONObj& cmdResponse) {
+    BSONElement cursorElem;
+    Status status = bsonExtractTypedField(cmdResponse, "cursor", Object, &cursorElem);
+    if (!status.isOK()) {
+        if (status == ErrorCodes::NoSuchKey) {
+            return Status::OK();
+        } else {
+            return status;
+        }
+    }
+
+    BSONElement firstBatchElem;
+    status = bsonExtractTypedField(cursorElem.Obj(), "firstBatch", Array, &firstBatchElem);
+    if (!status.isOK()) {
+        if (status == ErrorCodes::NoSuchKey) {
+            return Status::OK();
+        } else {
+            return status;
+        }
+    }
+
+    // Iterate over firstBatch. Must manually parse the elements since including
+    // bulk_write_parser invokes a circular dependency.
+    for (const auto& elem : firstBatchElem.Array()) {
+        // extract ok field.
+        BSONElement okElem;
+        status = bsonExtractTypedField(elem.Obj(), "ok", NumberDouble, &okElem);
+        if (!status.isOK()) {
+            if (status == ErrorCodes::NoSuchKey) {
+                continue;
+            } else {
+                return status;
+            }
+        }
+        if (okElem.Double() == 1.0) {
+            continue;
+        }
+        // extract error code field.
+        BSONElement codeElem;
+        status = bsonExtractTypedField(elem.Obj(), "code", NumberInt, &codeElem);
+        if (!status.isOK()) {
+            if (status == ErrorCodes::NoSuchKey) {
+                continue;
+            } else {
+                return status;
+            }
+        }
+
+        // extract errmsg field.
+        BSONElement errMsgElem;
+        std::string errmsg = "";
+        status = bsonExtractTypedField(elem.Obj(), "errmsg", String, &errMsgElem);
+        if (!status.isOK()) {
+            if (status != ErrorCodes::NoSuchKey) {
+                return status;
+            }
+        } else {
+            errmsg = errMsgElem.str();
+        }
+
+        return Status(ErrorCodes::Error(codeElem.Int()), errmsg, elem.Obj());
+    }
+
+    return Status::OK();
+}
+
 Status getStatusFromWriteCommandReply(const BSONObj& cmdResponse) {
     auto status = getStatusFromCommandResult(cmdResponse);
     if (!status.isOK()) {
         return status;
     }
     status = getFirstWriteErrorStatusFromCommandResult(cmdResponse);
+    if (!status.isOK()) {
+        return status;
+    }
+    status = getFirstWriteErrorStatusFromBulkWriteResult(cmdResponse);
     if (!status.isOK()) {
         return status;
     }

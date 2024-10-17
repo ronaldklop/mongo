@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/scripting/mozjs/exception.h"
 
-#include <jsfriendapi.h>
-#include <limits>
+#include <js/Exception.h>
+#include <js/RootingAPI.h>
+#include <js/friend/ErrorMessages.h>
+#include <mongo/scripting/mozjs/mongoErrorReportToString.h>
+#include <utility>
 
+#include <js/ErrorReport.h>
+#include <js/TypeDecls.h>
 
-#include "mongo/base/static_assert.h"
+#include "mongo/scripting/mozjs/error.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
-#include "mongo/scripting/mozjs/mongoErrorReportToString.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/status.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wraptype.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -50,10 +54,12 @@ void mongoToJSException(JSContext* cx) {
     auto status = exceptionToStatus();
 
     if (status.code() != ErrorCodes::JSUncatchableError) {
-        JS::RootedValue val(cx);
-        statusToJSException(cx, status, &val);
+        if (!JS_IsExceptionPending(cx)) {
+            JS::RootedValue val(cx);
+            statusToJSException(cx, status, &val);
 
-        JS_SetPendingException(cx, val);
+            JS_SetPendingException(cx, val);
+        }
     } else {
         // If a JSAPI callback returns false without setting a pending exception, SpiderMonkey will
         // treat it as an uncatchable error.

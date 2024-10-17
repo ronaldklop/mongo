@@ -27,67 +27,56 @@
  *    it in the license file.
  */
 
+
+#include <absl/container/flat_hash_map.h>
+#include <fmt/format.h>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_gen.h"
+#include "mongo/db/catalog/validate_state.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/catalog/validate_state.h"
-
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_consistency.h"
-#include "mongo/db/catalog/validate_adaptor.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DEFINE(hangDuringYieldingLocksForValidation);
+MONGO_FAIL_POINT_DEFINE(hangDuringValidationInitialization);
 
 namespace CollectionValidation {
 
 ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
-                             ValidateMode mode,
-                             RepairMode repairMode,
-                             bool turnOnExtraLoggingForTest)
-    : _nss(nss),
-      _mode(mode),
-      _repairMode(repairMode),
-      _dataThrottle(opCtx),
-      _extraLoggingForTest(turnOnExtraLoggingForTest) {
-
-    // Subsequent re-locks will use the UUID when 'background' is true.
-    if (isBackground()) {
-        // Avoid taking the PBWM lock, which will stall replication if this is a secondary node
-        // being validated.
-        _noPBWM.emplace(opCtx->lockState());
-
-        _globalLock.emplace(opCtx, MODE_IS);
-        _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
-        _collectionLock.emplace(opCtx, _nss, MODE_IS);
-    } else {
-        _databaseLock.emplace(opCtx, _nss.db(), MODE_IX);
-        _collectionLock.emplace(opCtx, _nss, MODE_X);
-    }
-
-    _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
-    if (_database)
-        _collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
-
-    if (!_collection) {
-        if (_database && ViewCatalog::get(_database)->lookup(opCtx, _nss.ns())) {
-            uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
-        }
-
-        uasserted(ErrorCodes::NamespaceNotFound,
-                  str::stream() << "Collection '" << _nss << "' does not exist to validate.");
-    }
+                             ValidationOptions options)
+    : ValidationOptions(std::move(options)),
+      _nss(nss),
+      _dataThrottle(opCtx, [&]() { return gMaxValidateMBperSec.load(); }) {
 
     // RepairMode is incompatible with the ValidateModes kBackground and
     // kForegroundFullEnforceFastCount.
@@ -99,22 +88,34 @@ ValidateState::ValidateState(OperationContext* opCtx,
     if (adjustMultikey()) {
         invariant(!isBackground());
     }
-
-    _uuid = _collection->uuid();
-    _catalogGeneration = opCtx->getServiceContext()->getCatalogGeneration();
 }
 
 bool ValidateState::shouldEnforceFastCount() const {
-    if (_mode == ValidateMode::kForegroundFullEnforceFastCount) {
-        if (_nss.isOplog()) {
+    if (enforceFastCountRequested()) {
+        if (_nss.isOplog() || _nss.isChangeCollection() ||
+            _nss.isChangeStreamPreImagesCollection()) {
             // Oplog writers only take a global IX lock, so the oplog can still be written to even
             // during full validation despite its collection X lock. This can cause validate to
             // incorrectly report an incorrect fast count on the oplog when run in enforceFastCount
             // mode.
+            // The oplog entries are also written to the change collections and pre-images
+            // collections, these collections are also prone to fast count failures.
             return false;
         } else if (_nss == NamespaceString::kIndexBuildEntryNamespace) {
             // Do not enforce fast count on the 'config.system.indexBuilds' collection. This is an
             // internal collection that should not be queried and is empty most of the time.
+            return false;
+        } else if (_nss == NamespaceString::kSessionTransactionsTableNamespace) {
+            // The 'config.transactions' collection is an implicitly replicated collection used for
+            // internal bookkeeping for retryable writes and multi-statement transactions.
+            // Replication rollback won't adjust the size storer counts for the
+            // 'config.transactions' collection. We therefore do not enforce fast count on it.
+            return false;
+        } else if (_nss == NamespaceString::kConfigImagesNamespace) {
+            // The 'config.image_collection' collection is an implicitly replicated collection used
+            // for internal bookkeeping for retryable writes. Replication rollback won't adjust the
+            // size storer counts for the 'config.image_collection' collection. We therefore do not
+            // enforce fast count on it.
             return false;
         }
 
@@ -124,36 +125,7 @@ bool ValidateState::shouldEnforceFastCount() const {
     return false;
 }
 
-void ValidateState::yield(OperationContext* opCtx) {
-    if (isBackground()) {
-        _yieldLocks(opCtx);
-    }
-    _yieldCursors(opCtx);
-}
-
-void ValidateState::_yieldLocks(OperationContext* opCtx) {
-    invariant(isBackground());
-
-    // Drop and reacquire the locks.
-    _relockDatabaseAndCollection(opCtx);
-
-    uassert(ErrorCodes::Interrupted,
-            str::stream() << "Interrupted due to: catalog restart: " << _nss << " (" << *_uuid
-                          << ") while validating the collection",
-            _catalogGeneration == opCtx->getServiceContext()->getCatalogGeneration());
-
-    // Check if any of the indexes we were validating were dropped. Indexes created while
-    // yielding will be ignored.
-    for (const auto& index : _indexes) {
-        uassert(ErrorCodes::Interrupted,
-                str::stream()
-                    << "Interrupted due to: index being validated was dropped from collection: "
-                    << _nss << " (" << *_uuid << "), index: " << index->descriptor()->indexName(),
-                !index->isDropped());
-    }
-};
-
-void ValidateState::_yieldCursors(OperationContext* opCtx) {
+void ValidateState::yieldCursors(OperationContext* opCtx) {
     // Save all the cursors.
     for (const auto& indexCursor : _indexCursors) {
         indexCursor.second->save();
@@ -161,30 +133,6 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
 
     _traverseRecordStoreCursor->save();
     _seekRecordStoreCursor->save();
-
-    if (isBackground() && _validateTs) {
-        // End current transaction and begin a new one, to help ameliorate WiredTiger cache
-        // pressure.
-
-        // First, move all cursor objects off our operation context, which has the effect of closing
-        // all storage engine cursors in the active transaction.
-        for (const auto& indexCursor : _indexCursors) {
-            indexCursor.second->detachFromOperationContext();
-        }
-        _traverseRecordStoreCursor->detachFromOperationContext();
-        _seekRecordStoreCursor->detachFromOperationContext();
-
-        // This begins a new transaction and then ends the current transaction, in order to preserve
-        // the history required to construct the same snapshot as before.
-        opCtx->recoveryUnit()->refreshSnapshot();
-
-        // Move the cursor objects back in preparation for restoring.
-        for (const auto& indexCursor : _indexCursors) {
-            indexCursor.second->reattachToOperationContext(opCtx);
-        }
-        _traverseRecordStoreCursor->reattachToOperationContext(opCtx);
-        _seekRecordStoreCursor->reattachToOperationContext(opCtx);
-    }
 
     // Restore all the cursors.
     for (const auto& indexCursor : _indexCursors) {
@@ -199,31 +147,83 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
             _seekRecordStoreCursor->restore());
 }
 
-void ValidateState::initializeCursors(OperationContext* opCtx) {
-    invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
-              _indexes.size() == 0);
+Status ValidateState::initializeCollection(OperationContext* opCtx) {
+    _validateTs = opCtx->getServiceContext()->getStorageEngine()->getLastStableRecoveryTimestamp();
 
-    // Background validation (on replica sets) will read from a snapshot opened on the kNoOverlap
-    // read source, which is the minimum of the last applied and all durable timestamps, instead of
-    // the latest data. Using the kNoOverlap read source prevents us from having to take the PBWM
-    // lock, which blocks replication. We cannot solely rely on the all durable timestamp as it can
-    // be set while we're in the middle of applying a batch on secondary nodes.
-    // Background validation on standalones uses the kNoTimestamp read source because standalones
-    // have no timestamps to use for maintaining a consistent snapshot.
-    RecoveryUnit::ReadSource rs = RecoveryUnit::ReadSource::kNoTimestamp;
+    // Background validation reads data from the last stable checkpoint.
     if (isBackground()) {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        // Background validation is expecting to read from the no overlap timestamp, but
-        // standalones do not support timestamps. Therefore, if this process is currently running as
-        // a standalone, don't use a timestamp.
-
-        if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
-            rs = RecoveryUnit::ReadSource::kNoOverlap;
-        } else {
-            rs = RecoveryUnit::ReadSource::kNoTimestamp;
+        if (!_validateTs) {
+            return Status(
+                ErrorCodes::NamespaceNotFound,
+                fmt::format("Cannot run background validation on collection {} because there "
+                            "is no checkpoint yet",
+                            _nss.toStringForErrorMsg()));
         }
-        opCtx->recoveryUnit()->setTimestampReadSource(rs);
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, *_validateTs);
+
+        _globalLock.emplace(opCtx, MODE_IS);
+
+        try {
+            shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
+        } catch (const ExceptionFor<ErrorCodes::SnapshotTooOld>&) {
+            // This will throw SnapshotTooOld to indicate we cannot find an available snapshot at
+            // the provided timestamp. This is likely because minSnapshotHistoryWindowInSeconds has
+            // been changed to a lower value from the default of 5 minutes.
+            return Status(
+                ErrorCodes::NamespaceNotFound,
+                fmt::format("Cannot run background validation on collection {} because the "
+                            "snapshot history is no longer available",
+                            _nss.toStringForErrorMsg()));
+        }
+
+        _catalog = CollectionCatalog::get(opCtx);
+        _collection =
+            CollectionPtr(_catalog->establishConsistentCollection(opCtx, _nss, _validateTs));
+    } else {
+        _globalLock.emplace(opCtx, MODE_IX);
+        _databaseLock.emplace(opCtx, _nss.dbName(), MODE_IX);
+        _collectionLock.emplace(opCtx, _nss, MODE_X);
+        _catalog = CollectionCatalog::get(opCtx);
+        _collection = CollectionPtr(_catalog->lookupCollectionByNamespace(opCtx, _nss));
     }
+
+    if (!_collection) {
+        auto view = _catalog->lookupView(opCtx, _nss);
+        if (!view) {
+            return Status(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "Collection '" << _nss.toStringForErrorMsg()
+                                        << "' does not exist to validate.");
+        }
+
+        // For validation on time-series collections, we need to use the bucket namespace.
+        if (!view->timeseries()) {
+            return Status(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
+        }
+
+        _nss = _nss.makeTimeseriesBucketsNamespace();
+        if (isBackground()) {
+            _collection =
+                CollectionPtr(_catalog->establishConsistentCollection(opCtx, _nss, _validateTs));
+        } else {
+            _collectionLock.emplace(opCtx, _nss, MODE_X);
+            _collection = CollectionPtr(_catalog->lookupCollectionByNamespace(opCtx, _nss));
+        }
+
+        if (!_collection) {
+            return Status(ErrorCodes::NamespaceNotFound,
+                          fmt::format("Cannot validate a time-series collection without its "
+                                      "bucket collection {}.",
+                                      _nss.toStringForErrorMsg()));
+        }
+    }
+
+    if (MONGO_unlikely(hangDuringValidationInitialization.shouldFail())) {
+        LOGV2(7490901, "Hanging on fail point 'hangDuringValidationInitialization'");
+        hangDuringValidationInitialization.pauseWhileSet();
+    }
+
+    _uuid = _collection->uuid();
 
     // We want to share the same data throttle instance across all the cursors used during this
     // validation. Validations started on other collections will not share the same data
@@ -232,32 +232,27 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         _dataThrottle.turnThrottlingOff();
     }
 
+    return Status::OK();
+}
+
+void ValidateState::initializeCursors(OperationContext* opCtx) {
     _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
         opCtx, _collection->getRecordStore(), &_dataThrottle);
     _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
         opCtx, _collection->getRecordStore(), &_dataThrottle);
 
-    if (rs != RecoveryUnit::ReadSource::kNoTimestamp) {
-        invariant(rs == RecoveryUnit::ReadSource::kNoOverlap);
-        invariant(isBackground());
-        _validateTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
-    }
-
     const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
     // The index iterator for ready indexes is timestamp-aware and will only return indexes that
     // are visible at our read time.
-    const std::unique_ptr<IndexCatalog::IndexIterator> it =
-        indexCatalog->getIndexIterator(opCtx, /*includeUnfinished*/ false);
+    const auto it = indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
     while (it->more()) {
         const IndexCatalogEntry* entry = it->next();
         const IndexDescriptor* desc = entry->descriptor();
-
-        _indexCursors.emplace(desc->indexName(),
-                              std::make_unique<SortedDataInterfaceThrottleCursor>(
-                                  opCtx, entry->accessMethod(), &_dataThrottle));
-
-
-        _indexes.push_back(indexCatalog->getEntryShared(desc));
+        const auto iam = entry->accessMethod()->asSortedData();
+        auto indexCursor =
+            std::make_unique<SortedDataInterfaceThrottleCursor>(opCtx, iam, &_dataThrottle);
+        _indexCursors.emplace(desc->indexName(), std::move(indexCursor));
+        _indexIdents.push_back(desc->getEntry()->getIdent());
     }
 
     // Because SeekableRecordCursors don't have a method to reset to the start, we save and then
@@ -267,45 +262,8 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     // use cursor->next() to get subsequent Records. However, if the Record Store is empty,
     // there is no first record. In this case, we set the first Record Id to an invalid RecordId
     // (RecordId()), which will halt iteration at the initialization step.
-    const boost::optional<Record> record = _traverseRecordStoreCursor->next(opCtx);
-    _firstRecordId = record ? record->id : RecordId();
-}
-
-void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
-    invariant(isBackground());
-
-    _collectionLock.reset();
-    _databaseLock.reset();
-
-    if (MONGO_unlikely(hangDuringYieldingLocksForValidation.shouldFail())) {
-        LOGV2(20411, "Hanging on fail point 'hangDuringYieldingLocksForValidation'");
-        hangDuringYieldingLocksForValidation.pauseWhileSet();
-    }
-
-    std::string dbErrMsg = str::stream()
-        << "Interrupted due to: database drop: " << _nss.db()
-        << " while validating collection: " << _nss << " (" << *_uuid << ")";
-
-    _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
-    _database = DatabaseHolder::get(opCtx)->getDb(opCtx, _nss.db());
-    uassert(ErrorCodes::Interrupted, dbErrMsg, _database);
-    uassert(ErrorCodes::Interrupted, dbErrMsg, !_database->isDropPending(opCtx));
-
-    std::string collErrMsg = str::stream() << "Interrupted due to: collection drop: " << _nss
-                                           << " (" << *_uuid << ") while validating the collection";
-
-    try {
-        NamespaceStringOrUUID nssOrUUID(std::string(_nss.db()), *_uuid);
-        _collectionLock.emplace(opCtx, nssOrUUID, MODE_IS);
-    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-        uasserted(ErrorCodes::Interrupted, collErrMsg);
-    }
-
-    _collection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, *_uuid);
-    uassert(ErrorCodes::Interrupted, collErrMsg, _collection);
-
-    // The namespace of the collection can be changed during a same database collection rename.
-    _nss = _collection->ns();
+    auto record = _traverseRecordStoreCursor->next(opCtx);
+    _firstRecordId = record ? std::move(record->id) : RecordId();
 }
 
 }  // namespace CollectionValidation

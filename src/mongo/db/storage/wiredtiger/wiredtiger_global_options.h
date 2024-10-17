@@ -29,18 +29,23 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/util/options_parser/environment.h"
 
 namespace mongo {
 
 class WiredTigerGlobalOptions {
 public:
+    static constexpr auto kDefaultTimeseriesCollectionCompressor = "zstd"_sd;
+
     WiredTigerGlobalOptions()
         : cacheSizeGB(0),
           statisticsLogDelaySecs(0),
+          zstdCompressorLevel(0),
           directoryForIndexes(false),
           maxCacheOverflowFileSizeGBDeprecated(0),
           useCollectionPrefixCompression(false),
@@ -51,12 +56,12 @@ public:
     double cacheSizeGB;
     size_t statisticsLogDelaySecs;
     std::string journalCompressor;
+    int zstdCompressorLevel;
     bool directoryForIndexes;
     double maxCacheOverflowFileSizeGBDeprecated;
     std::string engineConfig;
 
     std::string collectionBlockCompressor;
-    std::string indexBlockCompressor;
     bool useCollectionPrefixCompression;
     bool useIndexPrefixCompression;
     std::string collectionConfig;

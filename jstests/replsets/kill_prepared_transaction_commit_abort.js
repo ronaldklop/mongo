@@ -4,10 +4,9 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/parallelTester.js");  // for ScopedThread.
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "kill_prepared_transaction_commit_abort";
 const rst = new ReplSetTest({
@@ -30,7 +29,7 @@ const testDB = primary.getDB(dbName);
 
 // A latch that will act as a signal to shut down the killOp thread.
 let shutdownLatch = new CountDownLatch(1);
-assert.commandWorked(testDB.runCommand({create: collName}));
+assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
 /**
  * A function that continuously kills any running 'commitTransaction' or 'abortTransaction' commands
@@ -169,4 +168,3 @@ for (let i = 0; i < sessions.length; i++) {
 }
 
 rst.stopSet();
-})();

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/session/logical_session_id_gen.h"
 
 namespace mongo {
 
@@ -52,7 +53,9 @@ private:
     using OplogEntry = repl::OplogEntry;
 
 public:
-    ReshardingOplogBatchPreparer(std::unique_ptr<CollatorInterface> defaultCollator);
+    ReshardingOplogBatchPreparer(std::size_t oplogBatchTaskCount,
+                                 std::unique_ptr<CollatorInterface> defaultCollator,
+                                 bool isCapped = false);
 
     using OplogBatchToPrepare = std::vector<OplogEntry>;
     using OplogBatchToApply = std::vector<const OplogEntry*>;
@@ -82,15 +85,13 @@ public:
      * to the config.transactions record for a higher txnNumber will cause any updates in `batch`
      * for lower txnNumbers to be elided.
      *
-     * The returned writer vectors refer to memory owned by `batch`. The caller must take care to
-     * ensure `batch` outlives the writer vectors all being applied and must take care not to modify
-     * `batch` until after the writer vectors have all been applied.
-     *
-     * As a performance optimization, to avoid creating a separate copy of `batch`, this function
-     * mutates the contained oplog entries. The caller should take care to apply the writer vectors
-     * from `makeCrudOpWriterVectors(batch)` first.
+     * The returned writer vectors refer to memory owned by `batch` and `derivedOps`. The caller
+     * must take care to ensure both `batch` and `derivedOps` outlive the writer vectors all being
+     * applied and must take care not to modify `batch` or `derivedOps` until after the writer
+     * vectors have all been applied.
      */
-    WriterVectors makeSessionOpWriterVectors(OplogBatchToPrepare& batch) const;
+    WriterVectors makeSessionOpWriterVectors(const OplogBatchToPrepare& batch,
+                                             std::list<OplogEntry>& derivedOps) const;
 
     static void throwIfUnsupportedCommandOp(const OplogEntry& op);
 
@@ -103,11 +104,13 @@ private:
                                         const OplogEntry* op,
                                         WriterVectors& writerVectors) const;
 
-    void _appendOpToWriterVector(std::uint32_t hash,
+    void _appendOpToWriterVector(size_t hash,
                                  const OplogEntry* op,
                                  WriterVectors& writerVectors) const;
 
+    const std::size_t _oplogBatchTaskCount;
     const std::unique_ptr<CollatorInterface> _defaultCollator;
+    const bool _isCapped;
 };
 
 }  // namespace mongo

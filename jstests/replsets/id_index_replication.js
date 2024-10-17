@@ -2,10 +2,8 @@
  * Tests that the exact _id index spec is replicated when v>=2, and a v=1 index is implicitly
  * created on the secondary when the index spec is not included in the oplog.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/get_index_helpers.js");
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var rst = new ReplSetTest({nodes: 2});
 rst.startSet();
@@ -30,7 +28,7 @@ function testOplogEntryIdIndexSpec(collectionName, idIndexSpec) {
 
 assert.commandWorked(primaryDB.createCollection("without_version"));
 var allIndexes = primaryDB.without_version.getIndexes();
-var spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+var spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(2, spec.v, "Expected primary to build a v=2 _id index: " + tojson(spec));
 testOplogEntryIdIndexSpec("without_version", spec);
@@ -38,7 +36,7 @@ testOplogEntryIdIndexSpec("without_version", spec);
 assert.commandWorked(
     primaryDB.createCollection("version_v2", {idIndex: {key: {_id: 1}, name: "_id_", v: 2}}));
 allIndexes = primaryDB.version_v2.getIndexes();
-spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(2, spec.v, "Expected primary to build a v=2 _id index: " + tojson(spec));
 testOplogEntryIdIndexSpec("version_v2", spec);
@@ -46,7 +44,7 @@ testOplogEntryIdIndexSpec("version_v2", spec);
 assert.commandWorked(
     primaryDB.createCollection("version_v1", {idIndex: {key: {_id: 1}, name: "_id_", v: 1}}));
 allIndexes = primaryDB.version_v1.getIndexes();
-spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(1, spec.v, "Expected primary to build a v=1 _id index: " + tojson(spec));
 testOplogEntryIdIndexSpec("version_v1", null);
@@ -56,23 +54,22 @@ rst.awaitReplication();
 // Verify that the secondary built _id indexes with the same version as on the primary.
 
 allIndexes = secondaryDB.without_version.getIndexes();
-spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(2,
           spec.v,
           "Expected secondary to build a v=2 _id index when explicitly requested: " + tojson(spec));
 
 allIndexes = secondaryDB.version_v2.getIndexes();
-spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(2,
           spec.v,
           "Expected secondary to build a v=2 _id index when explicitly requested: " + tojson(spec));
 
 allIndexes = secondaryDB.version_v1.getIndexes();
-spec = GetIndexHelpers.findByKeyPattern(allIndexes, {_id: 1});
+spec = IndexCatalogHelpers.findByKeyPattern(allIndexes, {_id: 1});
 assert.neq(null, spec, "_id index not found: " + tojson(allIndexes));
 assert.eq(1, spec.v, "Expected secondary to implicitly build a v=1 _id index: " + tojson(spec));
 
 rst.stopSet();
-})();

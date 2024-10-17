@@ -29,17 +29,28 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <vector>
 
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
+class CollectionPtr;
 class CollatorInterface;
+
 struct TwoDIndexingParams;
 struct S2IndexingParams;
 
@@ -57,6 +68,14 @@ class FTSSpec;
 class ExpressionKeysPrivate {
 public:
     //
+    // Common
+    //
+
+    static void validateDocumentCommon(const CollectionPtr& collection,
+                                       const BSONObj& obj,
+                                       const BSONObj& keyPattern);
+
+    //
     // 2d
     //
 
@@ -64,9 +83,9 @@ public:
                           const BSONObj& obj,
                           const TwoDIndexingParams& params,
                           KeyStringSet* keys,
-                          KeyString::Version keyStringVersion,
+                          key_string::Version keyStringVersion,
                           Ordering ordering,
-                          boost::optional<RecordId> id = boost::none);
+                          const boost::optional<RecordId>& id = boost::none);
 
     //
     // FTS
@@ -76,9 +95,9 @@ public:
                            const BSONObj& obj,
                            const fts::FTSSpec& ftsSpec,
                            KeyStringSet* keys,
-                           KeyString::Version keyStringVersion,
+                           key_string::Version keyStringVersion,
                            Ordering ordering,
-                           boost::optional<RecordId> id = boost::none);
+                           const boost::optional<RecordId>& id = boost::none);
 
     //
     // Hash
@@ -90,51 +109,21 @@ public:
     static void getHashKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
                             const BSONObj& obj,
                             const BSONObj& keyPattern,
-                            HashSeed seed,
                             int hashVersion,
                             bool isSparse,
                             const CollatorInterface* collator,
                             KeyStringSet* keys,
-                            KeyString::Version keyStringVersion,
+                            key_string::Version keyStringVersion,
                             Ordering ordering,
                             bool ignoreArraysAlongPath,
-                            boost::optional<RecordId> id = boost::none);
+                            const boost::optional<RecordId>& id = boost::none);
 
     /**
      * Hashing function used by both getHashKeys and the cursors we create.
      * Exposed for testing in dbtests/namespacetests.cpp and
      * so mongo/db/index_legacy.cpp can use it.
      */
-    static long long int makeSingleHashKey(const BSONElement& e, HashSeed seed, int v);
-
-    //
-    // Haystack
-    //
-
-    /**
-     * Generates keys for haystack access method.
-     */
-    static void getHaystackKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
-                                const BSONObj& obj,
-                                const std::string& geoField,
-                                const std::vector<std::string>& otherFields,
-                                double bucketSize,
-                                KeyStringSet* keys,
-                                KeyString::Version keyStringVersion,
-                                Ordering ordering,
-                                boost::optional<RecordId> id = boost::none);
-
-    /**
-     * Returns a hash of a BSON element.
-     * Used by getHaystackKeys and HaystackAccessMethod::searchCommand.
-     */
-    static int hashHaystackElement(const BSONElement& e, double bucketSize);
-
-    /**
-     * Joins two strings using underscore as separator.
-     * Used by getHaystackKeys and HaystackAccessMethod::searchCommand.
-     */
-    static std::string makeHaystackString(int hashedX, int hashedY);
+    static long long int makeSingleHashKey(const BSONElement& e, int v);
 
     //
     // S2
@@ -149,9 +138,10 @@ public:
                           const S2IndexingParams& params,
                           KeyStringSet* keys,
                           MultikeyPaths* multikeyPaths,
-                          KeyString::Version keyStringVersion,
+                          key_string::Version keyStringVersion,
+                          SortedDataIndexAccessMethod::GetKeysContext context,
                           Ordering ordering,
-                          boost::optional<RecordId> id = boost::none);
+                          const boost::optional<RecordId>& id = boost::none);
 };
 
 }  // namespace mongo

@@ -1,9 +1,8 @@
-//
-// Tests upgrading then downgrading a replica set
-//
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load('./jstests/multiVersion/libs/multi_rs.js');
-load('./jstests/libs/test_background_ops.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isFinished, startParallelOps} from "jstests/libs/test_background_ops.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 for (let oldVersion of ["last-lts", "last-continuous"]) {
     jsTest.log("Testing upgrade/downgrade with " + oldVersion);
@@ -34,8 +33,7 @@ for (let oldVersion of ["last-lts", "last-continuous"]) {
 
         while (!isFinished()) {
             try {
-                coll.insert({_id: count, hello: "world"});
-                assert.eq(null, coll.getDB().getLastError());
+                assert.commandWorked(coll.insert({_id: count, hello: "world"}));
                 assert.neq(null, coll.findOne({_id: count}));
             } catch (e) {
                 printjson(e);

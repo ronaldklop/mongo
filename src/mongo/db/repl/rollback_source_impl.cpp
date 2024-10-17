@@ -27,14 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <list>
+#include <memory>
 
-#include "mongo/db/repl/rollback_source_impl.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/replication_auth.h"
+#include "mongo/db/repl/rollback_source_impl.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -43,12 +54,8 @@ namespace repl {
 
 RollbackSourceImpl::RollbackSourceImpl(GetConnectionFn getConnection,
                                        const HostAndPort& source,
-                                       const std::string& collectionName,
                                        int batchSize)
-    : _getConnection(getConnection),
-      _source(source),
-      _collectionName(collectionName),
-      _oplog(source, getConnection, collectionName, batchSize) {}
+    : _getConnection(getConnection), _source(source), _oplog(source, getConnection, batchSize) {}
 
 const OplogInterface& RollbackSourceImpl::getOplog() const {
     return _oplog;
@@ -60,44 +67,57 @@ const HostAndPort& RollbackSourceImpl::getSource() const {
 
 
 int RollbackSourceImpl::getRollbackId() const {
-    bo info;
-    _getConnection()->simpleCommand("admin", &info, "replSetGetRBID");
+    BSONObj info;
+    _getConnection()->runCommand(DatabaseName::kAdmin, BSON("replSetGetRBID" << 1), info);
     return info["rbid"].numberInt();
 }
 
 BSONObj RollbackSourceImpl::getLastOperation() const {
-    const Query query = Query().sort(BSON("$natural" << -1));
-    return _getConnection()->findOne(_collectionName,
-                                     query,
-                                     nullptr,
-                                     QueryOption_SecondaryOk,
-                                     ReadConcernArgs::kImplicitDefault);
+    FindCommandRequest findCmd{NamespaceString::kRsOplogNamespace};
+    findCmd.setSort(BSON("$natural" << -1));
+    findCmd.setReadConcern(ReadConcernArgs::kLocal);
+    return _getConnection()->findOne(std::move(findCmd),
+                                     ReadPreferenceSetting{ReadPreference::SecondaryPreferred});
 }
 
 BSONObj RollbackSourceImpl::findOne(const NamespaceString& nss, const BSONObj& filter) const {
+    FindCommandRequest findCmd{nss};
+    findCmd.setFilter(filter);
+    findCmd.setReadConcern(ReadConcernArgs::kLocal);
     return _getConnection()
-        ->findOne(nss.toString(),
-                  filter,
-                  nullptr,
-                  QueryOption_SecondaryOk,
-                  ReadConcernArgs::kImplicitDefault)
+        ->findOne(std::move(findCmd), ReadPreferenceSetting{ReadPreference::SecondaryPreferred})
         .getOwned();
 }
 
-std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std::string& db,
+std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const DatabaseName& db,
                                                                       UUID uuid,
                                                                       const BSONObj& filter) const {
-    return _getConnection()->findOneByUUID(db, uuid, filter, ReadConcernArgs::kImplicitDefault);
+    FindCommandRequest findRequest{NamespaceStringOrUUID{db, uuid}};
+    findRequest.setFilter(filter);
+    findRequest.setReadConcern(ReadConcernArgs::kLocal);
+    findRequest.setLimit(1);
+    findRequest.setSingleBatch(true);
+
+    auto cursor =
+        std::make_unique<DBClientCursor>(_getConnection(),
+                                         std::move(findRequest),
+                                         ReadPreferenceSetting{ReadPreference::SecondaryPreferred},
+                                         false /*isExhaust*/);
+    uassert(6138500, "find one by UUID failed", cursor->init());
+    BSONObj result = cursor->more() ? cursor->nextSafe() : BSONObj{};
+    NamespaceString nss = cursor->getNamespaceString();
+    return {std::move(result), std::move(nss)};
 }
 
-StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::string& db,
+StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const DatabaseName& dbName,
                                                                 const UUID& uuid) const {
-    std::list<BSONObj> info = _getConnection()->getCollectionInfos(db, BSON("info.uuid" << uuid));
+    std::list<BSONObj> info =
+        _getConnection()->getCollectionInfos(dbName, BSON("info.uuid" << uuid));
     if (info.empty()) {
-        return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
-                                   str::stream()
-                                       << "No collection info found for collection with uuid: "
-                                       << uuid.toString() << " in db: " << db);
+        return StatusWith<BSONObj>(
+            ErrorCodes::NoSuchKey,
+            str::stream() << "No collection info found for collection with uuid: "
+                          << uuid.toString() << " in db: " << dbName.toStringForErrorMsg());
     }
     invariant(info.size() == 1U);
     return info.front();
@@ -105,10 +125,11 @@ StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::strin
 
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfo(const NamespaceString& nss) const {
     std::list<BSONObj> info =
-        _getConnection()->getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
+        _getConnection()->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
     if (info.empty()) {
         return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
-                                   str::stream() << "no collection info found: " << nss.ns());
+                                   str::stream() << "no collection info found: "
+                                                 << nss.toStringForErrorMsg());
     }
     invariant(info.size() == 1U);
     return info.front();

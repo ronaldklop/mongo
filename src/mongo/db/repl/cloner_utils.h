@@ -29,11 +29,16 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/serverless/serverless_types_gen.h"
+#include "mongo/db/tenant_id.h"
 
 namespace mongo {
 namespace repl {
@@ -64,12 +69,9 @@ public:
     /**
      * Checks if the database belongs to the given tenant.
      */
-    static bool isDatabaseForTenant(StringData db, StringData prefix);
-
-    /**
-     * Checks if the collection belongs to the given tenant.
-     */
-    static bool isNamespaceForTenant(NamespaceString nss, StringData prefix);
+    static bool isDatabaseForTenant(const DatabaseName& db,
+                                    const boost::optional<TenantId>& tenant,
+                                    MigrationProtocolEnum protocol);
 };
 
 

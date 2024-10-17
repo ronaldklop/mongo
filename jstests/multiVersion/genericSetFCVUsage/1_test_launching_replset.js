@@ -1,8 +1,6 @@
-//
-// Tests launching multi-version ReplSetTest replica sets
-//
+import "jstests/multiVersion/libs/verify_versions.js";
 
-load('./jstests/multiVersion/libs/verify_versions.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 for (let version of ["last-lts", "last-continuous", "latest"]) {
     jsTestLog("Testing single version: " + version);
@@ -41,8 +39,43 @@ for (let versions of [["last-lts", "latest"], ["last-continuous", "latest"]]) {
     rst.stopSet();
 }
 
-jsTestLog("Done!");
+if (MongoRunner.areBinVersionsTheSame("last-continuous", "last-lts")) {
+    jsTest.log("Skipping test because 'last-continuous' == 'last-lts'");
+    quit();
+}
 
-//
-// End
-//
+for (let versions of [["last-lts", "last-continuous"], ["last-continuous", "last-lts"]]) {
+    jsTestLog("Testing mixed versions: " + tojson(versions));
+
+    var rst = new ReplSetTest({nodes: 2});
+    rst.startSet({binVersion: versions});
+    let err = assert.throws(() => rst.initiate());
+    assert(err.message.includes(
+               "Can only specify one of 'last-lts' and 'last-continuous' in binVersion, not both."),
+           err);
+    rst.stopSet();
+}
+
+for (let versions of [["last-lts", "last-continuous"], ["last-continuous", "last-lts"]]) {
+    jsTestLog("Testing mixed versions: " + tojson(versions));
+
+    const rst = new ReplSetTest({
+        nodes: [
+            {
+                binVersion: versions[0],
+            },
+            {
+                binVersion: versions[1],
+            },
+        ]
+    });
+    rst.startSet();
+
+    let err = assert.throws(() => rst.initiate());
+    assert(err.message.includes(
+               "Can only specify one of 'last-lts' and 'last-continuous' in binVersion, not both."),
+           err);
+    rst.stopSet();
+}
+
+jsTestLog("Done!");

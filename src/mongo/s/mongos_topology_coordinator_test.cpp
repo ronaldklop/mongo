@@ -27,26 +27,43 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+#include <ratio>
+#include <string>
 
-#include "mongo/logv2/log.h"
+#include <boost/none.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/platform/basic.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/mongos_topology_coordinator.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/hello_metrics.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
-using std::unique_ptr;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
 class MongosTopoCoordTest : public ServiceContextTest {
 public:
-    virtual void setUp() {
+    MongosTopoCoordTest() = default;
+
+    void setUp() override {
         _topo = std::make_unique<MongosTopologyCoordinator>();
 
         // The fast clock is used by OperationContext::hasDeadlineExpired.
@@ -57,7 +74,7 @@ public:
             std::make_unique<SharedClockSourceAdapter>(_clkSource));
     }
 
-    virtual void tearDown() {}
+    void tearDown() override {}
 
 protected:
     /**
@@ -120,7 +137,7 @@ TEST_F(MongosTopoCoordTest, AwaitHelloResponseReturnsCurrentMongosTopologyVersio
 
     bool helloReturned = false;
     stdx::thread getHelloThread([&] {
-        Client::setCurrent(getServiceContext()->makeClient("getHelloThread"));
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
         auto threadOpCtx = cc().makeOperationContext();
         const auto response =
             getTopoCoord().awaitHelloResponse(threadOpCtx.get(), currentTopologyVersion, deadline);
@@ -265,11 +282,11 @@ TEST_F(MongosTopoCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
     auto quiesceTime = Milliseconds(0);
 
     // This will cause the hello request to hang.
-    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponseMongos");
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
     stdx::thread getHelloThread([&] {
-        Client::setCurrent(getServiceContext()->makeClient("getHelloThread"));
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
         auto threadOpCtx = cc().makeOperationContext();
         auto maxAwaitTime = Milliseconds(5000);
         auto deadline = now() + maxAwaitTime;
@@ -286,6 +303,54 @@ TEST_F(MongosTopoCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
                   getTopoCoord().getTopologyVersion().getCounter());
     waitForHelloFailPoint->setMode(FailPoint::off);
     getHelloThread.join();
+}
+
+TEST_F(MongosTopoCoordTest, AlwaysDecrementNumAwaitingTopologyChangesOnErrorMongoS) {
+    auto opCtx = makeOperationContext();
+    ASSERT_EQUALS(0, HelloMetrics::get(opCtx.get())->getNumAwaitingTopologyChanges());
+
+    auto hangFP = globalFailPointRegistry().find("hangWhileWaitingForHelloResponseMongos");
+    auto timesEnteredHangFP = hangFP->setMode(FailPoint::alwaysOn);
+
+    // Use a novel error code to test this functionality.
+    auto expectedErrorCode = 6208203;
+    auto customErrorFP = globalFailPointRegistry().find("setCustomErrorInHelloResponseMongoS");
+    customErrorFP->setMode(FailPoint::alwaysOn, 0, BSON("errorType" << expectedErrorCode));
+    ON_BLOCK_EXIT([&] { customErrorFP->setMode(FailPoint::off, 0); });
+
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = now() + maxAwaitTime;
+    auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
+
+    AtomicWord<bool> helloReturned{false};
+    stdx::thread getHelloThread([&] {
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
+        auto threadOpCtx = cc().makeOperationContext();
+        ASSERT_THROWS_CODE(
+            getTopoCoord().awaitHelloResponse(threadOpCtx.get(), currentTopologyVersion, deadline),
+            AssertionException,
+            ErrorCodes::Error(expectedErrorCode));
+        helloReturned.store(true);
+    });
+
+    advanceTime(maxAwaitTime);
+
+    hangFP->waitForTimesEntered(timesEnteredHangFP + 1);
+
+    // Observe that the counter has been incremented.
+    ASSERT_EQUALS(1, HelloMetrics::get(opCtx.get())->getNumAwaitingTopologyChanges());
+
+    hangFP->setMode(FailPoint::off, 0);
+
+    // Advance the clock so that pauseWhileSet() will wake up.
+    while (!helloReturned.load()) {
+        advanceTime(Milliseconds(100));
+    }
+    getHelloThread.join();
+    ASSERT_TRUE(helloReturned.load());
+
+    // Make sure we still decremented the counter.
+    ASSERT_EQUALS(0, HelloMetrics::get(opCtx.get())->getNumAwaitingTopologyChanges());
 }
 
 }  // namespace

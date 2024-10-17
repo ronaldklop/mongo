@@ -27,160 +27,191 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <fmt/format.h>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
-#include <pcrecpp.h>
-
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/commands/notify_sharding_event_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/dist_lock_manager.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/resource_yielder.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/ddl_lock_manager.h"
+#include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/transaction_api.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/db/write_concern.h"
+#include "mongo/executor/inline_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_database.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_namespace_placement_gen.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/routing_information_cache.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/pcre_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
-/**
- * Selects an optimal shard on which to place a newly created database from the set of available
- * shards. Will return ShardNotFound if shard could not be found.
- */
-ShardId selectShardForNewDatabase(OperationContext* opCtx, ShardRegistry* shardRegistry) {
-    // Ensure the shard registry contains the most up-to-date list of available shards
-    shardRegistry->reload(opCtx);
-    auto allShardIds = shardRegistry->getAllShardIds(opCtx);
-    uassert(ErrorCodes::ShardNotFound, "No shards found", !allShardIds.empty());
-    // TODO SERVER-54231 stop sorting this vector.
-    // Ideally it should be shuffled so that the we choose a random candidate based only
-    // on shard size and not on their lexical order.
-    std::sort(allShardIds.begin(), allShardIds.end());
-
-    ShardId candidateShardId = allShardIds[0];
-
-    auto candidateSize =
-        uassertStatusOK(shardutil::retrieveTotalShardSize(opCtx, candidateShardId));
-
-    for (size_t i = 1; i < allShardIds.size(); i++) {
-        const ShardId shardId = allShardIds[i];
-
-        const auto currentSize = uassertStatusOK(shardutil::retrieveTotalShardSize(opCtx, shardId));
-
-        if (currentSize < candidateSize) {
-            candidateSize = currentSize;
-            candidateShardId = shardId;
-        }
-    }
-
-    return candidateShardId;
-}
+using namespace fmt::literals;
 
 }  // namespace
 
-DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
-                                                    StringData dbName,
-                                                    const boost::optional<ShardId>& optPrimaryShard,
-                                                    bool enableSharding) {
-    if (dbName == NamespaceString::kConfigDb) {
-        return DatabaseType(
-            dbName.toString(), ShardId::kConfigServerId, true, DatabaseVersion::makeFixed());
+DatabaseType ShardingCatalogManager::createDatabase(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const boost::optional<ShardId>& optPrimaryShard,
+    const SerializationContext& serializationContext) {
+    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+    if (dbName.isConfigDB()) {
+        return DatabaseType(dbName, ShardId::kConfigServerId, DatabaseVersion::makeFixed());
     }
 
+    // It is not allowed to create the 'admin' or 'local' databases, including any alternative
+    // casing. It is allowed to create the 'config' database (handled by the early return above),
+    // but only with that exact casing.
     uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "Cannot manually create or shard database '" << dbName << "'",
-            dbName != NamespaceString::kAdminDb && dbName != NamespaceString::kLocalDb);
+            str::stream() << "Cannot manually create database '" << dbName.toStringForErrorMsg()
+                          << "'",
+            !(dbName.equalCaseInsensitive(DatabaseName::kAdmin)) &&
+                !(dbName.equalCaseInsensitive(DatabaseName::kLocal)) &&
+                !(dbName.equalCaseInsensitive(DatabaseName::kConfig)));
 
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid db name specified: " << dbName,
-            NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow));
+            str::stream() << "Invalid db name specified: " << dbName.toStringForErrorMsg(),
+            DatabaseName::isValid(dbName, DatabaseName::DollarInDbNameBehavior::Disallow));
 
     // Make sure to force update of any stale metadata
-    ON_BLOCK_EXIT([&] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
+    ON_BLOCK_EXIT([&] { RoutingInformationCache::get(opCtx)->purgeDatabase(dbName); });
+
+    auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
 
     DBDirectClient client(opCtx);
 
-    boost::optional<DistLockManager::ScopedDistLock> dbDistLock;
+    // Resolve the shard against the received parameter (which may encode either a shard ID or a
+    // connection string).
+    const boost::optional<ShardId> optResolvedPrimaryShard = [&]() -> boost::optional<ShardId> {
+        if (optPrimaryShard) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "invalid shard name: " << *optPrimaryShard,
+                    optPrimaryShard->isValid());
+            return uassertStatusOK(shardRegistry->getShard(opCtx, *optPrimaryShard))->getId();
+        }
+        return boost::none;
+    }();
 
-    // First perform an optimistic attempt to write the 'sharded' field to the database entry, in
-    // case this is the only thing, which is missing. If that doesn't succeed, go through the
-    // expensive createDatabase flow.
+    const auto dbNameStr = DatabaseNameUtil::serialize(dbName, serializationContext);
+    const auto dbMatchFilter = [&] {
+        BSONObjBuilder filterBuilder;
+        filterBuilder.append(DatabaseType::kDbNameFieldName, dbNameStr);
+        if (optResolvedPrimaryShard) {
+            filterBuilder.append(DatabaseType::kPrimaryFieldName, *optResolvedPrimaryShard);
+        }
+        return filterBuilder.obj();
+    }();
+
+    boost::optional<DDLLockManager::ScopedBaseDDLLock> dbLock;
+
+    // First perform an optimistic attempt without taking the lock to check if database exists.
+    // If the database is not found take the lock and try again.
     while (true) {
-        auto response = client.findAndModify([&] {
-            write_ops::FindAndModifyCommandRequest findAndModify(DatabaseType::ConfigNS);
-            findAndModify.setQuery([&] {
-                BSONObjBuilder queryFilterBuilder;
-                queryFilterBuilder.append(DatabaseType::name.name(), dbName);
-                if (optPrimaryShard) {
-                    uassert(ErrorCodes::BadValue,
-                            str::stream() << "invalid shard name: " << *optPrimaryShard,
-                            optPrimaryShard->isValid());
-                    queryFilterBuilder.append(DatabaseType::primary.name(),
-                                              optPrimaryShard->toString());
-                }
-                return queryFilterBuilder.obj();
-            }());
-            findAndModify.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(
-                BSON("$set" << BSON(DatabaseType::sharded(enableSharding)))));
-            findAndModify.setUpsert(false);
-            findAndModify.setNew(true);
-            return findAndModify;
-        }());
-
-        if (response.getLastErrorObject().getNumDocs()) {
-            uassert(528120, "Missing value in the response", response.getValue());
-            return uassertStatusOK(DatabaseType::fromBSON(*response.getValue()));
+        auto dbObj = client.findOne(NamespaceString::kConfigDatabasesNamespace, dbMatchFilter);
+        if (!dbObj.isEmpty()) {
+            replClient.setLastOpToSystemLastOpTime(opCtx);
+            return DatabaseType::parse(IDLParserContext("DatabaseType"), dbObj);
         }
 
-        if (dbDistLock) {
+        if (dbLock) {
             break;
         }
 
-        // Do another loop, with the dist lock held in order to avoid taking the expensive path on
+        // Do another loop, with the db lock held in order to avoid taking the expensive path on
         // concurrent create database operations
-        dbDistLock.emplace(uassertStatusOK(DistLockManager::get(opCtx)->lock(
-            opCtx, dbName, "createDatabase", DistLockManager::kDefaultLockTimeout)));
+        dbLock.emplace(opCtx,
+                       shard_role_details::getLocker(opCtx),
+                       DatabaseNameUtil::deserialize(
+                           boost::none, str::toLower(dbNameStr), serializationContext),
+                       "createDatabase" /* reason */,
+                       MODE_X,
+                       true /*waitForRecovery*/);
     }
 
     // Expensive createDatabase code path
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-    auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
 
-    // Check if a database already exists with the same name (case sensitive), and if so, return the
-    // existing entry.
+    // Check if a database already exists with the same name (case insensitive), and if so, return
+    // the existing entry.
     BSONObjBuilder queryBuilder;
-    queryBuilder.appendRegex(DatabaseType::name(),
-                             (std::string) "^" + pcrecpp::RE::QuoteMeta(dbName.toString()) + "$",
-                             "i");
+    queryBuilder.appendRegex(
+        DatabaseType::kDbNameFieldName, "^{}$"_format(pcre_util::quoteMeta(dbNameStr)), "i");
 
-    auto dbDoc = client.findOne(DatabaseType::ConfigNS.ns(), {queryBuilder.obj()});
-    auto const [primaryShardPtr, database] = [&] {
+    auto dbDoc = client.findOne(NamespaceString::kConfigDatabasesNamespace, queryBuilder.obj());
+    auto returnDatabaseValue = [&] {
         if (!dbDoc.isEmpty()) {
-            auto actualDb = uassertStatusOK(DatabaseType::fromBSON(dbDoc));
+            auto actualDb = DatabaseType::parse(IDLParserContext("DatabaseType"), dbDoc);
 
             uassert(ErrorCodes::DatabaseDifferCase,
                     str::stream() << "can't have 2 databases that just differ on case "
-                                  << " have: " << actualDb.getName()
-                                  << " want to add: " << dbName.toString(),
-                    actualDb.getName() == dbName.toString());
+                                  << " have: " << actualDb.getDbName().toStringForErrorMsg()
+                                  << " want to add: " << dbName.toStringForErrorMsg(),
+                    actualDb.getDbName() == dbName);
 
             uassert(
                 ErrorCodes::NamespaceExists,
                 str::stream() << "database already created on a primary which is different from "
-                              << *optPrimaryShard,
-                !optPrimaryShard || *optPrimaryShard == actualDb.getPrimary());
+                              << optResolvedPrimaryShard,
+                !optResolvedPrimaryShard || *optResolvedPrimaryShard == actualDb.getPrimary());
 
             // We did a local read of the database entry above and found that the database already
             // exists. However, the data may not be majority committed (a previous createDatabase
@@ -189,51 +220,47 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
             // entry, make it wait for the last opTime in the system when we wait for writeConcern.
             replClient.setLastOpToSystemLastOpTime(opCtx);
 
-            return std::make_pair(
-                uassertStatusOK(shardRegistry->getShard(opCtx, actualDb.getPrimary())), actualDb);
+            return actualDb;
         } else {
-            // The database does not exist. Insert an entry for the new database into the sharding
-            // catalog.
-            auto const shardPtr = uassertStatusOK(shardRegistry->getShard(
-                opCtx,
-                optPrimaryShard ? *optPrimaryShard
-                                : selectShardForNewDatabase(opCtx, shardRegistry)));
+            while (true) {
+                // If there was no explicit dbPrimary shard choosen by the caller, then select one
+                // here (the least loaded non-draining shard).
+                const ShardId candidatePrimaryShardId = optResolvedPrimaryShard
+                    ? *optResolvedPrimaryShard
+                    : shardutil::selectLeastLoadedNonDrainingShard(opCtx);
 
-            boost::optional<Timestamp> clusterTime;
-            if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
-                const auto now = VectorClock::get(opCtx)->getTime();
-                clusterTime = now.clusterTime().asTimestamp();
+                auto retries = 10;
+                try {
+                    return _commitCreateDatabase(opCtx, dbName, candidatePrimaryShardId);
+                } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+                    LOGV2_DEBUG(8917900,
+                                1,
+                                "Commit create database failed",
+                                "dbName"_attr = dbName.toStringForErrorMsg(),
+                                "ex"_attr = redact(ex));
+                    // The proposed primaryShard was found to not exist or be draining when
+                    // attempting to commit.
+                    if (optResolvedPrimaryShard) {
+                        // If a primary shard was explicitly selected by the caller, then throw the
+                        // error.
+                        throw;
+                    } else {
+                        // If no primary shard was explicitly selected by the caller, then choose a
+                        // new one and retry.
+                        retries--;
+                        if (retries > 0) {
+                            continue;
+                        } else {
+                            LOGV2_WARNING(8917901,
+                                          "Exhausted retries trying to commit create database",
+                                          "dbName"_attr = dbName);
+                            throw;
+                        }
+                    }
+                }
             }
-
-            // Pick a primary shard for the new database.
-            DatabaseType db(dbName.toString(),
-                            shardPtr->getId(),
-                            enableSharding,
-                            DatabaseVersion(UUID::gen(), clusterTime));
-
-            LOGV2(21938,
-                  "Registering new database {db} in sharding catalog",
-                  "Registering new database in sharding catalog",
-                  "db"_attr = db);
-
-            // Do this write with majority writeConcern to guarantee that the shard sees the write
-            // when it receives the _flushDatabaseCacheUpdates.
-            uassertStatusOK(
-                catalogClient->insertConfigDocument(opCtx,
-                                                    DatabaseType::ConfigNS,
-                                                    db.toBSON(),
-                                                    ShardingCatalogClient::kMajorityWriteConcern));
-
-            return std::make_pair(shardPtr, db);
         }
     }();
-
-    WriteConcernResult unusedResult;
-    uassertStatusOK(waitForWriteConcern(opCtx,
-                                        replClient.getLastOp(),
-                                        ShardingCatalogClient::kMajorityWriteConcern,
-                                        &unusedResult));
 
     // Note, making the primary shard refresh its databaseVersion here is not required for
     // correctness, since either:
@@ -248,89 +275,261 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
     // would fail with StaleDbVersion. Making the primary shard refresh here allows that first
     // transaction to succeed. This allows our transaction passthrough suites and transaction demos
     // to succeed without additional special logic.
+    const auto primaryShardPtr =
+        uassertStatusOK(shardRegistry->getShard(opCtx, returnDatabaseValue.getPrimary()));
     auto cmdResponse = uassertStatusOK(primaryShardPtr->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        "admin",
-        BSON("_flushDatabaseCacheUpdates" << dbName),
+        DatabaseName::kAdmin,
+        BSON("_flushDatabaseCacheUpdates"
+             << DatabaseNameUtil::serialize(dbName, serializationContext)),
         Shard::RetryPolicy::kIdempotent));
     uassertStatusOK(cmdResponse.commandStatus);
 
-    return database;
+    return returnDatabaseValue;
 }
 
-Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
-                                                 const StringData dbname,
-                                                 const ShardId& toShard) {
+void ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
+                                               const DatabaseName& dbName,
+                                               const DatabaseVersion& expectedDbVersion,
+                                               const ShardId& toShardId,
+                                               const SerializationContext& serializationContext) {
+    // Hold the shard lock until the entire commit finishes to serialize with removeShard.
+    Lock::SharedLock shardLock(opCtx, _kShardMembershipLock);
 
-    auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    const auto toShardDoc = [&] {
+        DBDirectClient dbClient(opCtx);
+        return dbClient.findOne(NamespaceString::kConfigsvrShardsNamespace,
+                                BSON(ShardType::name << toShardId));
+    }();
+    uassert(ErrorCodes::ShardNotFound,
+            "Requested primary shard {} does not exist"_format(toShardId.toString()),
+            !toShardDoc.isEmpty());
 
-    // Must use local read concern because we will perform subsequent writes.
-    auto findResponse = uassertStatusOK(
-        configShard->exhaustiveFindOnConfig(opCtx,
-                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                            repl::ReadConcernLevel::kLocalReadConcern,
-                                            DatabaseType::ConfigNS,
-                                            BSON(DatabaseType::name << dbname),
-                                            BSON(DatabaseType::name << -1),
-                                            1));
+    const auto toShardEntry = uassertStatusOK(ShardType::fromBSON(toShardDoc));
+    uassert(ErrorCodes::ShardNotFound,
+            "Requested primary shard {} is draining"_format(toShardId.toString()),
+            !toShardEntry.getDraining());
 
-    const auto databasesVector = std::move(findResponse.docs);
-    uassert(ErrorCodes::IncompatibleShardingMetadata,
-            str::stream() << "Tried to find max database version for database '" << dbname
-                          << "', but found no databases",
-            !databasesVector.empty());
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
+    const auto validAfter = currentTime.clusterTime().asTimestamp();
 
-    const auto dbType = uassertStatusOK(DatabaseType::fromBSON(databasesVector.front()));
+    const auto transactionChain =
+        [dbName, expectedDbVersion, toShardId, validAfter, serializationContext](
+            const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
+            int currStmtId = 0;
+            // Find database entry to get current dbPrimary
+            FindCommandRequest findDb(NamespaceString::kConfigDatabasesNamespace);
+            const auto query = [&] {
+                BSONObjBuilder bsonBuilder;
+                bsonBuilder.append(DatabaseType::kDbNameFieldName,
+                                   DatabaseNameUtil::serialize(dbName, serializationContext));
+                // Include the version in the update filter to be resilient to potential
+                // network retries and delayed messages.
+                for (const auto [fieldName, fieldValue] : expectedDbVersion.toBSON()) {
+                    const auto dottedFieldName = DatabaseType::kVersionFieldName + "." + fieldName;
+                    bsonBuilder.appendAs(fieldValue, dottedFieldName);
+                }
+                return bsonBuilder.obj();
+            }();
+            findDb.setFilter(query);
+            findDb.setSingleBatch(true);
+            auto dbs = txnClient.exhaustiveFindSync(findDb);
 
-    if (dbType.getPrimary() == toShard) {
-        // The primary has already been set to the destination shard. It's likely that there was a
-        // network error and the shard resent the command.
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-        return Status::OK();
+            // If we didn't find a database entry, this must be a retry of the transaction
+            if (dbs.size() == 0) {
+                return SemiFuture<void>::makeReady();
+            }
+
+            auto dbEntry = DatabaseType::parse(IDLParserContext("DatabaseType"), dbs.front());
+
+            // Update the database entry and insert a placement history entry for the database.
+            const auto updateDatabaseEntryOp = [&] {
+                const auto query = [&] {
+                    BSONObjBuilder bsonBuilder;
+                    bsonBuilder.append(DatabaseType::kDbNameFieldName,
+                                       DatabaseNameUtil::serialize(dbName, serializationContext));
+                    // Include the version in the update filter to be resilient to potential
+                    // network retries and delayed messages.
+                    for (const auto [fieldName, fieldValue] : expectedDbVersion.toBSON()) {
+                        const auto dottedFieldName =
+                            DatabaseType::kVersionFieldName + "." + fieldName;
+                        bsonBuilder.appendAs(fieldValue, dottedFieldName);
+                    }
+                    return bsonBuilder.obj();
+                }();
+
+                const auto update = [&] {
+                    auto newDbVersion = expectedDbVersion.makeUpdated();
+                    newDbVersion.setTimestamp(validAfter);
+
+                    tassert(8235300,
+                            "New database timestamp must be newer than previous one",
+                            newDbVersion.getTimestamp() > expectedDbVersion.getTimestamp());
+
+                    BSONObjBuilder bsonBuilder;
+                    bsonBuilder.append(DatabaseType::kPrimaryFieldName, toShardId);
+                    bsonBuilder.append(DatabaseType::kVersionFieldName, newDbVersion.toBSON());
+                    return BSON("$set" << bsonBuilder.obj());
+                }();
+
+                write_ops::UpdateCommandRequest updateOp(
+                    NamespaceString::kConfigDatabasesNamespace);
+                updateOp.setUpdates({[&] {
+                    write_ops::UpdateOpEntry entry;
+                    entry.setQ(query);
+                    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+                    return entry;
+                }()});
+
+                return updateOp;
+            }();
+
+            auto updateDatabaseEntryResponse =
+                txnClient.runCRUDOpSync(updateDatabaseEntryOp, {currStmtId++});
+            uassertStatusOK(updateDatabaseEntryResponse.toStatus());
+
+            NamespacePlacementType placementInfo(
+                NamespaceString(dbName), validAfter, std::vector<mongo::ShardId>{toShardId});
+
+            write_ops::InsertCommandRequest insertPlacementHistoryOp(
+                NamespaceString::kConfigsvrPlacementHistoryNamespace);
+            insertPlacementHistoryOp.setDocuments({placementInfo.toBSON()});
+
+            auto insertDatabasePlacementHistoryResponse =
+                txnClient.runCRUDOpSync(insertPlacementHistoryOp, {currStmtId++});
+            uassertStatusOK(insertDatabasePlacementHistoryResponse.toStatus());
+
+            return SemiFuture<void>::makeReady();
+        };
+
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+
+    txn_api::SyncTransactionWithRetries txn(opCtx,
+                                            executor,
+                                            nullptr, /*resourceYielder*/
+                                            inlineExecutor);
+    txn.run(opCtx, transactionChain);
+}
+
+DatabaseType ShardingCatalogManager::_commitCreateDatabase(OperationContext* opCtx,
+                                                           const DatabaseName& dbName,
+                                                           const ShardId& primaryShard) {
+    // The database does not exist. Insert an entry for the new database into the sharding
+    // catalog. Assign also a primary shard if the caller hasn't specified one.
+    ShardingLogging::get(opCtx)->logChange(opCtx,
+                                           "createDatabase.start",
+                                           NamespaceString(dbName),
+                                           /* details */ BSONObj(),
+                                           ShardingCatalogClient::kMajorityWriteConcern,
+                                           _localConfigShard,
+                                           _localCatalogClient.get());
+
+    // The creation of a new database is described by the notification of multiple events, following
+    // a 2-phase protocol:
+    // - a "prepare" notification prior to the write into config.databases will ensure that
+    // change streams will start collecting events on the new database before the first user
+    // write on one of its future collection occurs
+    // - a "commitSuccessful" notification after completing the write into config.databases
+    // will allow change streams to stop collecting events on the namespace created from
+    // shards != primaryShard.
+    const auto allShards = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    {
+        DatabasesAdded prepareCommitEvent(
+            {dbName}, false /*areImported*/, CommitPhaseEnum::kPrepare);
+        prepareCommitEvent.setPrimaryShard(primaryShard);
+        uassertStatusOK(_notifyClusterOnNewDatabases(opCtx, prepareCommitEvent, allShards));
     }
 
-    auto newDbType = dbType;
-    newDbType.setPrimary(toShard);
+    DatabaseType db = [&]() {
+        // Hold _kShardMembershipLock until the entire commit finishes to serialize with removeShard
+        // in order to guarantee that the proposed dbPrimary shard continues to exist (and is not
+        // draining) throughout the commit.
+        Lock::SharedLock shardLock(opCtx, _kShardMembershipLock);
 
-    auto const currentDatabaseVersion = dbType.getVersion();
+        // Under _kShardMembershipLock, make sure that the selected shard still exists and
+        // is not draining.
+        const auto shardDocs = uassertStatusOK(_localConfigShard->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            NamespaceString::kConfigsvrShardsNamespace,
+            BSON(ShardType::name << primaryShard),
+            {},
+            1));
+        uassert(ErrorCodes::ShardNotFound,
+                "Selected primary shard for new database does not exist",
+                !shardDocs.docs.empty());
+        const auto shardDoc = uassertStatusOK(ShardType::fromBSON(shardDocs.docs.front()));
+        uassert(ErrorCodes::ShardNotFound,
+                "Cannot select draining shard as primary for new database",
+                !shardDoc.getDraining());
 
-    newDbType.setVersion(currentDatabaseVersion.makeUpdated());
+        // Pick a clusterTime that will be used as the 'timestamp' of the new database.
+        const auto now = VectorClock::get(opCtx)->getTime();
+        const auto clusterTime = now.clusterTime().asTimestamp();
 
-    auto updateQueryBuilder = BSONObjBuilder(BSON(DatabaseType::name << dbname));
-    updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion.toBSON());
+        DatabaseType db(dbName, primaryShard, DatabaseVersion(UUID::gen(), clusterTime));
 
-    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-        opCtx,
-        DatabaseType::ConfigNS,
-        updateQueryBuilder.obj(),
-        newDbType.toBSON(),
-        false,
-        ShardingCatalogClient::kLocalWriteConcern);
+        LOGV2(21938, "Registering new database in sharding catalog", "db"_attr = db);
+        const auto transactionChain = [db](const txn_api::TransactionClient& txnClient,
+                                           ExecutorPtr txnExec) {
+            write_ops::InsertCommandRequest insertDatabaseEntryOp(
+                NamespaceString::kConfigDatabasesNamespace);
+            insertDatabaseEntryOp.setDocuments({db.toBSON()});
+            return txnClient.runCRUDOp(insertDatabaseEntryOp, {})
+                .thenRunOn(txnExec)
+                .then([&txnClient, &txnExec, &db](
+                          const BatchedCommandResponse& insertDatabaseEntryResponse) {
+                    uassertStatusOK(insertDatabaseEntryResponse.toStatus());
+                    NamespacePlacementType placementInfo(
+                        NamespaceString(db.getDbName()),
+                        db.getVersion().getTimestamp(),
+                        std::vector<mongo::ShardId>{db.getPrimary()});
+                    write_ops::InsertCommandRequest insertPlacementHistoryOp(
+                        NamespaceString::kConfigsvrPlacementHistoryNamespace);
+                    insertPlacementHistoryOp.setDocuments({placementInfo.toBSON()});
 
-    if (!updateStatus.isOK()) {
-        LOGV2(21940,
-              "Error committing movePrimary for {db}: {error}",
-              "Error committing movePrimary",
-              "db"_attr = dbname,
-              "error"_attr = redact(updateStatus.getStatus()));
-        return updateStatus.getStatus();
+                    return txnClient.runCRUDOp(insertPlacementHistoryOp, {});
+                })
+                .thenRunOn(txnExec)
+                .then([](const BatchedCommandResponse& insertPlacementHistoryResponse) {
+                    uassertStatusOK(insertPlacementHistoryResponse.toStatus());
+                })
+                .semi();
+        };
+
+        auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+        auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+
+        txn_api::SyncTransactionWithRetries txn(
+            opCtx, executor, nullptr /*resourceYielder*/, inlineExecutor);
+        txn.run(opCtx, transactionChain);
+
+        return db;
+    }();
+
+    DatabasesAdded commitCompletedEvent(
+        {dbName}, false /*areImported*/, CommitPhaseEnum::kSuccessful);
+    const auto notificationOutcome =
+        _notifyClusterOnNewDatabases(opCtx, commitCompletedEvent, allShards);
+    if (!notificationOutcome.isOK()) {
+        LOGV2_WARNING(7175500,
+                      "Unable to send out notification of successful createDatabase",
+                      "db"_attr = db,
+                      "err"_attr = notificationOutcome);
     }
 
-    // If this assertion is tripped, it means that the request sent fine, but no documents were
-    // updated. This is likely because the database version was changed in between the query and
-    // the update, so no documents were found to change. This shouldn't happen however, because we
-    // are holding the dist lock during the movePrimary operation.
-    uassert(ErrorCodes::IncompatibleShardingMetadata,
-            str::stream() << "Tried to update primary shard for database '" << dbname
-                          << " with version " << currentDatabaseVersion.getLastMod(),
-            updateStatus.getValue());
+    ShardingLogging::get(opCtx)->logChange(opCtx,
+                                           "createDatabase",
+                                           NamespaceString(dbName),
+                                           /* details */ BSONObj(),
+                                           ShardingCatalogClient::kMajorityWriteConcern,
+                                           _localConfigShard,
+                                           _localCatalogClient.get());
 
-    // Ensure the next attempt to retrieve the database or any of its collections will do a full
-    // reload
-    Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname);
-
-    return Status::OK();
+    return db;
 }
 
 }  // namespace mongo

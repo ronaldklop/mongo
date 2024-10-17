@@ -27,9 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <ratio>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/repl/initial_sync_shared_data.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 namespace repl {

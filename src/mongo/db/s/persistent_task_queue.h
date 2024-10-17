@@ -29,10 +29,33 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
 
 namespace mongo {
 
@@ -105,12 +128,15 @@ private:
 
 template <typename T>
 PersistentTaskQueue<T>::PersistentTaskQueue(OperationContext* opCtx, NamespaceString storageNss)
-    : _storageNss(std::move(storageNss)), _mutex("persistentQueueLock:" + _storageNss.toString()) {
+    : _storageNss(std::move(storageNss)),
+      _mutex("persistentQueueLock:" +
+             NamespaceStringUtil::serialize(_storageNss, SerializationContext::stateDefault())) {
 
     DBDirectClient client(opCtx);
 
-    auto projection = BSON("_id" << 1);
-    auto cursor = client.query(_storageNss, Query(), 0, 0, &projection);
+    FindCommandRequest findRequest{_storageNss};
+    findRequest.setProjection(BSON("_id" << 1));
+    auto cursor = client.find(std::move(findRequest));
     _count = cursor->itcount();
 
     if (_count > 0)
@@ -119,13 +145,11 @@ PersistentTaskQueue<T>::PersistentTaskQueue(OperationContext* opCtx, NamespaceSt
 
 template <typename T>
 TaskId PersistentTaskQueue<T>::push(OperationContext* opCtx, const T& t) {
-    DBDirectClient dbClient(opCtx);
-
     TaskId recordId = 0;
     BSONObjBuilder builder;
 
     {
-        Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
+        Lock::ExclusiveLock lock(opCtx, _mutex);
 
         uassert(ErrorCodes::Interrupted, "Task queue was closed", !_closed);
 
@@ -133,7 +157,9 @@ TaskId PersistentTaskQueue<T>::push(OperationContext* opCtx, const T& t) {
         builder.append("_id", recordId);
         builder.append("task", t.toBSON());
 
-        dbClient.insert(_storageNss.toString(), builder.obj());
+        DBDirectClient dbClient(opCtx);
+        auto response = write_ops::checkWriteErrors(
+            dbClient.insert(write_ops::InsertCommandRequest(_storageNss, {builder.obj()})));
         _count++;
     }
 
@@ -147,7 +173,7 @@ TaskId PersistentTaskQueue<T>::pop(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
     BSONObjBuilder builder;
 
-    Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
+    Lock::ExclusiveLock lock(opCtx, _mutex);
 
     uassert(ErrorCodes::Interrupted, "Task queue was closed", !_closed);
 
@@ -155,7 +181,10 @@ TaskId PersistentTaskQueue<T>::pop(OperationContext* opCtx) {
     invariant(_count > 0);
 
     builder.append("_id", _currentFront->id);
-    client.remove(_storageNss.toString(), builder.obj());
+
+    write_ops::DeleteCommandRequest deleteOp(_storageNss);
+    deleteOp.setDeletes({write_ops::DeleteOpEntry(builder.obj(), false)});
+    write_ops::checkWriteErrors(client.remove(deleteOp));
     _count--;
 
     TaskId id = _currentFront->id;
@@ -166,13 +195,11 @@ TaskId PersistentTaskQueue<T>::pop(OperationContext* opCtx) {
 
 template <typename T>
 const typename BlockingTaskQueue<T>::Record& PersistentTaskQueue<T>::peek(OperationContext* opCtx) {
-    DBDirectClient client(opCtx);
-
-    Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
-
+    Lock::ExclusiveLock lock(opCtx, _mutex);
     opCtx->waitForConditionOrInterrupt(_cv, lock, [this] { return _count > 0 || _closed; });
     uassert(ErrorCodes::Interrupted, "Task queue was closed", !_closed);
 
+    DBDirectClient client(opCtx);
     _currentFront = _loadNextRecord(client);
     uassert(ErrorCodes::InternalError, "Task queue is in an invalid state.", _currentFront);
 
@@ -181,7 +208,7 @@ const typename BlockingTaskQueue<T>::Record& PersistentTaskQueue<T>::peek(Operat
 
 template <typename T>
 void PersistentTaskQueue<T>::close(OperationContext* opCtx) {
-    Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
+    Lock::ExclusiveLock lock(opCtx, _mutex);
 
     _closed = true;
     _cv.notify_all();
@@ -189,36 +216,42 @@ void PersistentTaskQueue<T>::close(OperationContext* opCtx) {
 
 template <typename T>
 size_t PersistentTaskQueue<T>::size(OperationContext* opCtx) const {
-    Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
+    Lock::ExclusiveLock lock(opCtx, _mutex);
+
     return _count;
 }
 
 template <typename T>
 bool PersistentTaskQueue<T>::empty(OperationContext* opCtx) const {
-    Lock::ExclusiveLock lock(opCtx->lockState(), _mutex);
+    Lock::ExclusiveLock lock(opCtx, _mutex);
 
     return _count == 0;
 }
 
 template <typename T>
 TaskId PersistentTaskQueue<T>::_loadLastId(DBDirectClient& client) {
-    auto fieldsToReturn = BSON("_id" << 1);
-    auto maxId =
-        client.findOne(_storageNss.toString(), Query().sort(BSON("_id" << -1)), &fieldsToReturn);
+    FindCommandRequest findCmd{_storageNss};
+    findCmd.setSort(BSON("_id" << -1));
+    findCmd.setProjection(BSON("_id" << 1));
+    auto maxId = client.findOne(std::move(findCmd));
     return maxId.getField("_id").Long();
 }
 
 template <typename T>
 typename boost::optional<typename BlockingTaskQueue<T>::Record>
 PersistentTaskQueue<T>::_loadNextRecord(DBDirectClient& client) {
-    auto bson = client.findOne(_storageNss.toString(), Query().sort("_id"));
+    FindCommandRequest findCmd{_storageNss};
+    findCmd.setSort(BSON("_id" << 1));
+    auto bson = client.findOne(std::move(findCmd));
 
     boost::optional<typename PersistentTaskQueue<T>::Record> result;
 
     if (!bson.isEmpty()) {
         result = typename PersistentTaskQueue<T>::Record{
             bson.getField("_id").Long(),
-            T::parse(IDLParserErrorContext("PersistentTaskQueue:" + _storageNss.toString()),
+            T::parse(IDLParserContext("PersistentTaskQueue:" +
+                                      NamespaceStringUtil::serialize(
+                                          _storageNss, SerializationContext::stateDefault())),
                      bson.getObjectField("task"))};
     }
 

@@ -1,6 +1,7 @@
 """Interactions with the undodb tool-suite."""
 
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
+
 from . import fetch
 
 _HELP = """
@@ -44,8 +45,13 @@ class UndoDbPlugin(PluginInterface):
         """
         parser = subparsers.add_parser(_COMMAND, help=_HELP)
         # Accept arbitrary args like 'resmoke.py undodb foobar', but ignore them.
-        parser.add_argument("--fetch", '-f', action="store", type=str,
-                            help="Fetch UndoDB recordings archive with the given Evergreen task ID")
+        parser.add_argument(
+            "--fetch",
+            "-f",
+            action="store",
+            type=str,
+            help="Fetch UndoDB recordings archive with the given Evergreen task ID",
+        )
         parser.add_argument("args", nargs="*")
 
     def parse(self, subcommand, parser, parsed_args, **kwargs):

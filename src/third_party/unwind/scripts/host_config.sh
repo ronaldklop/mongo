@@ -6,7 +6,7 @@ IFS=$'\n\t'
 
 set -vx
 
-TOOLCHAIN_ROOT=/opt/mongodbtoolchain/v3
+TOOLCHAIN_ROOT=/opt/mongodbtoolchain/v4
 PATH="$TOOLCHAIN_ROOT/bin:$PATH"
 
 DEST_DIR=$(git rev-parse --show-toplevel)/src/third_party/unwind
@@ -33,6 +33,7 @@ $SRC_DIR/configure \
     --disable-dependency-tracking \
     --disable-documentation \
     --disable-minidebuginfo \
+    --disable-zlibdebuginfo \
     --disable-ptrace \
     --disable-setjmp \
     --disable-shared \

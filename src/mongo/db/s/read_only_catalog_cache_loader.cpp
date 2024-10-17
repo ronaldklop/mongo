@@ -27,9 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/read_only_catalog_cache_loader.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -37,15 +36,6 @@ using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunk
 
 ReadOnlyCatalogCacheLoader::~ReadOnlyCatalogCacheLoader() {
     shutDown();
-}
-
-void ReadOnlyCatalogCacheLoader::waitForCollectionFlush(OperationContext* opCtx,
-                                                        const NamespaceString& nss) {
-    MONGO_UNREACHABLE;
-}
-
-void ReadOnlyCatalogCacheLoader::waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) {
-    MONGO_UNREACHABLE;
 }
 
 void ReadOnlyCatalogCacheLoader::shutDown() {
@@ -57,7 +47,7 @@ SemiFuture<CollectionAndChangedChunks> ReadOnlyCatalogCacheLoader::getChunksSinc
     return _configServerLoader.getChunksSince(nss, version);
 }
 
-SemiFuture<DatabaseType> ReadOnlyCatalogCacheLoader::getDatabase(StringData dbName) {
+SemiFuture<DatabaseType> ReadOnlyCatalogCacheLoader::getDatabase(const DatabaseName& dbName) {
     return _configServerLoader.getDatabase(dbName);
 }
 

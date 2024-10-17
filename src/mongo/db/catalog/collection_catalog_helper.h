@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
@@ -40,6 +43,15 @@ class CollectionPtr;
 class CollectionCatalogEntry;
 
 namespace catalog {
+
+/**
+ * Returns ErrorCodes::NamespaceExists if a collection or any type of views exists on the given
+ * namespace 'nss'. Otherwise returns Status::OK().
+ *
+ * Note: If the caller calls this method without locking the collection, then the returned result
+ * could be stale right after this call.
+ */
+Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
  * Iterates through all the collections in the given database and runs the callback function on each
@@ -53,7 +65,7 @@ namespace catalog {
  * Iterating through the remaining collections stops when the callback returns false.
  */
 void forEachCollectionFromDb(OperationContext* opCtx,
-                             StringData dbName,
+                             const DatabaseName& dbName,
                              LockMode collLockMode,
                              CollectionCatalog::CollectionInfoFn callback,
                              CollectionCatalog::CollectionInfoFn predicate = nullptr);

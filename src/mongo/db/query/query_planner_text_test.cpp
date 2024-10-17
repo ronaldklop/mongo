@@ -27,12 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -61,7 +66,7 @@ TEST_F(QueryPlannerTest, SimpleText) {
 
 // If you create an index {a:1, b: "text"} you can't use it for queries on just 'a'.
 TEST_F(QueryPlannerTest, CantUseTextUnlessHaveTextPred) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -73,7 +78,7 @@ TEST_F(QueryPlannerTest, CantUseTextUnlessHaveTextPred) {
 // But if you create an index {a:1, b:"text"} you can use it if it has a pred on 'a'
 // and a text query.
 TEST_F(QueryPlannerTest, HaveOKPrefixOnTextIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -92,7 +97,7 @@ TEST_F(QueryPlannerTest, HaveOKPrefixOnTextIndex) {
 
 // But the prefixes must be points.
 TEST_F(QueryPlannerTest, HaveBadPrefixOnTextIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -105,7 +110,7 @@ TEST_F(QueryPlannerTest, HaveBadPrefixOnTextIndex) {
 
 // Outside predicates are not yet pushed into contained ORs for text indexes.
 TEST_F(QueryPlannerTest, PrefixOnTextIndexIsOutsidePred) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -115,7 +120,7 @@ TEST_F(QueryPlannerTest, PrefixOnTextIndexIsOutsidePred) {
 
 // There can be more than one prefix, but they all require points.
 TEST_F(QueryPlannerTest, ManyPrefixTextIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "b" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -140,7 +145,7 @@ TEST_F(QueryPlannerTest, ManyPrefixTextIndex) {
 
 // And, suffixes.  They're optional and don't need to be points.
 TEST_F(QueryPlannerTest, SuffixOptional) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1 << "b" << 1));
@@ -155,23 +160,23 @@ TEST_F(QueryPlannerTest, SuffixOptional) {
 }
 
 TEST_F(QueryPlannerTest, RemoveFromSubtree) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1 << "b" << 1));
 
-    runQuery(fromjson("{a:1, $or: [{a:1}, {b:7}], $text:{$search: 'blah'}}"));
+    runQuery(fromjson("{a:2, $or: [{a:1}, {b:7}], $text:{$search: 'blah'}}"));
     assertNumSolutions(1);
 
     assertSolutionExists(
         "{fetch: {filter: {$or:[{a:1},{b:7}]},"
-        "node: {text: {prefix: {a:1}, search: 'blah'}}}}");
+        "node: {text: {prefix: {a:2}, search: 'blah'}}}}");
 }
 
 // Text is quite often multikey.  None of the prefixes can be arrays, and suffixes are indexed
 // as-is, so we should compound even if it's multikey.
 TEST_F(QueryPlannerTest, CompoundPrefixEvenIfMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "b" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1),
@@ -184,7 +189,7 @@ TEST_F(QueryPlannerTest, CompoundPrefixEvenIfMultikey) {
 }
 
 TEST_F(QueryPlannerTest, IndexOnOwnFieldButNotLeafPrefix) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1 << "b" << 1));
@@ -195,7 +200,7 @@ TEST_F(QueryPlannerTest, IndexOnOwnFieldButNotLeafPrefix) {
 }
 
 TEST_F(QueryPlannerTest, IndexOnOwnFieldButNotLeafSuffixNoPrefix) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("_fts"
                   << "text"
                   << "_ftsx" << 1 << "b" << 1));
@@ -205,7 +210,7 @@ TEST_F(QueryPlannerTest, IndexOnOwnFieldButNotLeafSuffixNoPrefix) {
 }
 
 TEST_F(QueryPlannerTest, TextInsideAndWithCompoundIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -218,7 +223,7 @@ TEST_F(QueryPlannerTest, TextInsideAndWithCompoundIndex) {
 // SERVER-15639: Test that predicates on index prefix fields which are not assigned to the index
 // prefix are correctly included in the solution node filter.
 TEST_F(QueryPlannerTest, TextInsideAndWithCompoundIndexAndMultiplePredsOnIndexPrefix) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -231,7 +236,7 @@ TEST_F(QueryPlannerTest, TextInsideAndWithCompoundIndexAndMultiplePredsOnIndexPr
 // SERVER-13039: Test that we don't generate invalid solutions when the TEXT node
 // is buried beneath a logical node.
 TEST_F(QueryPlannerTest, TextInsideOrBasic) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -247,7 +252,7 @@ TEST_F(QueryPlannerTest, TextInsideOrBasic) {
 
 // SERVER-13039
 TEST_F(QueryPlannerTest, TextInsideOrWithAnotherOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -258,7 +263,7 @@ TEST_F(QueryPlannerTest, TextInsideOrWithAnotherOr) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {$or: [{a: 3}, {a: 4}]}, node: "
+        "{fetch: {filter: {a: {$in: [3, 4]}}, node: "
         "{or: {nodes: ["
         "{text: {search: 'foo'}}, "
         "{ixscan: {filter: null, pattern: {a: 1}}}]}}}}");
@@ -266,7 +271,7 @@ TEST_F(QueryPlannerTest, TextInsideOrWithAnotherOr) {
 
 // SERVER-13039
 TEST_F(QueryPlannerTest, TextInsideOrOfAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -286,7 +291,34 @@ TEST_F(QueryPlannerTest, TextInsideOrOfAnd) {
 
 // SERVER-13039
 TEST_F(QueryPlannerTest, TextInsideAndOrAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    RAIIServerParameterControllerForTest controller(
+        "internalQueryEnableBooleanExpressionsSimplifier", true);
+
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("_fts"
+                  << "text"
+                  << "_ftsx" << 1));
+    runQuery(
+        fromjson("{a: 1, $or: [{a:2}, {b:2}, "
+                 "{a: 1, $text: {$search: 'foo'}}]}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        R"--({fetch: {filter: {a: 1}, node: {or: {nodes: [
+                {text: {search: 'foo'}},
+                {ixscan: {pattern: {a: 1}}},
+                {ixscan: {pattern: {b: 1}}}
+            ]}}}})--");
+}
+
+// SERVER-13039
+TEST_F(QueryPlannerTest, TextInsideAndOrAnd_DisabledSimplifier) {
+    RAIIServerParameterControllerForTest controller(
+        "internalQueryEnableBooleanExpressionsSimplifier", false);
+
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
     addIndex(BSON("_fts"
@@ -306,7 +338,7 @@ TEST_F(QueryPlannerTest, TextInsideAndOrAnd) {
 
 // SERVER-13039
 TEST_F(QueryPlannerTest, TextInsideAndOrAndOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -329,7 +361,7 @@ TEST_F(QueryPlannerTest, TextInsideAndOrAndOr) {
 // If only one branch of the $or can be indexed, then no indexed
 // solutions are generated, even if one branch is $text.
 TEST_F(QueryPlannerTest, TextInsideOrOneBranchNotIndexed) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -342,7 +374,7 @@ TEST_F(QueryPlannerTest, TextInsideOrOneBranchNotIndexed) {
 // If the unindexable $or is not the one containing the $text predicate,
 // then we should still be able to generate an indexed solution.
 TEST_F(QueryPlannerTest, TextInsideOrWithAnotherUnindexableOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1));
     addIndex(BSON("_fts"
                   << "text"
@@ -503,7 +535,7 @@ TEST_F(QueryPlannerTest, InexactFetchPredicateOverTrailingFieldHandledCorrectlyM
 }
 
 TEST_F(QueryPlannerTest, ExprEqCannotUsePrefixOfTextIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
@@ -512,7 +544,7 @@ TEST_F(QueryPlannerTest, ExprEqCannotUsePrefixOfTextIndex) {
 }
 
 TEST_F(QueryPlannerTest, ExprEqCanUseSuffixOfTextIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("_fts"
                   << "text"
                   << "_ftsx" << 1 << "a" << 1));

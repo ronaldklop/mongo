@@ -27,33 +27,39 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
 
 #include <algorithm>
 
-#include "mongo/db/rebuild_indexes.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/rebuild_indexes.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
-StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
-                                           RecordId catalogId,
+StatusWith<IndexNameObjs> getIndexNameObjs(const Collection* collection,
                                            std::function<bool(const std::string&)> filter) {
     IndexNameObjs ret;
     std::vector<std::string>& indexNames = ret.first;
     std::vector<BSONObj>& indexSpecs = ret.second;
-    auto durableCatalog = DurableCatalog::get(opCtx);
     {
         // Fetch all indexes
-        durableCatalog->getAllIndexes(opCtx, catalogId, &indexNames);
+        collection->getAllIndexes(&indexNames);
         auto newEnd =
             std::remove_if(indexNames.begin(),
                            indexNames.end(),
@@ -64,7 +70,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
 
 
         for (const auto& name : indexNames) {
-            BSONObj spec = durableCatalog->getIndexSpec(opCtx, catalogId, name);
+            BSONObj spec = collection->getIndexSpec(name);
             using IndexVersion = IndexDescriptor::IndexVersion;
             IndexVersion indexVersion = IndexVersion::kV1;
             if (auto indexVersionElem = spec[IndexDescriptor::kIndexVersionFieldName]) {
@@ -92,7 +98,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
 }
 
 Status rebuildIndexesOnCollection(OperationContext* opCtx,
-                                  const CollectionPtr& collection,
+                                  CollectionWriter& collWriter,
                                   const std::vector<BSONObj>& indexSpecs,
                                   RepairData repair) {
     // Skip the rest if there are no indexes to rebuild.
@@ -103,19 +109,15 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
     IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     UUID buildUUID = UUID::gen();
     auto swRebuild = indexBuildsCoord->rebuildIndexesForRecovery(
-        opCtx, collection->ns(), indexSpecs, buildUUID, repair);
+        opCtx, collWriter, indexSpecs, buildUUID, repair);
     if (!swRebuild.isOK()) {
         return swRebuild.getStatus();
     }
 
     auto [numRecords, dataSize] = swRebuild.getValue();
 
-    auto rs = collection->getRecordStore();
-
     // Update the record store stats after finishing and committing the index builds.
-    WriteUnitOfWork wuow(opCtx);
-    rs->updateStatsAfterRepair(opCtx, numRecords, dataSize);
-    wuow.commit();
+    collWriter->getRecordStore()->updateStatsAfterRepair(opCtx, numRecords, dataSize);
 
     return Status::OK();
 }

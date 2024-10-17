@@ -29,13 +29,25 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/mutable/api.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/platform/visibility.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/safe_num.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace mutablebson {
@@ -112,7 +124,7 @@ class Document;
  *    be removed.
  */
 
-class MONGO_API(mutable_bson) Element {
+class MONGO_MUTABLE_BSON_API Element {
 public:
     typedef uint32_t RepIdx;
 
@@ -283,7 +295,7 @@ public:
      *  BSONObj. However, the contents of the BSONElement returned here must be treated as
      *  const.
      */
-    const BSONElement getValue() const;
+    BSONElement getValue() const;
 
     /** Get the value from a double valued Element. */
     inline double getValueDouble() const;
@@ -355,7 +367,7 @@ public:
      *   Returns 1 if this > other according to BSONElement::woCompare
      */
     int compareWithElement(const ConstElement& other,
-                           const StringData::ComparatorInterface* comparator,
+                           const StringDataComparator* comparator,
                            bool considerFieldName = true) const;
 
     /** Compare this Element with BSONElement 'other'. You should not call this on the root
@@ -367,7 +379,7 @@ public:
      *   Returns 1 if this > other according to BSONElement::woCompare
      */
     int compareWithBSONElement(const BSONElement& other,
-                               const StringData::ComparatorInterface* comparator,
+                               const StringDataComparator* comparator,
                                bool considerFieldName = true) const;
 
     /** Compare this Element, which must be an Object or an Array, with 'other'.
@@ -377,7 +389,7 @@ public:
      *   Returns 1 if this object > other according to BSONElement::woCompare
      */
     int compareWithBSONObj(const BSONObj& other,
-                           const StringData::ComparatorInterface* comparator,
+                           const StringDataComparator* comparator,
                            bool considerFieldName = true) const;
 
 
@@ -491,7 +503,7 @@ public:
     /** Set the value of this Element to a numeric type appropriate to hold the given
      *  SafeNum value.
      */
-    Status setValueSafeNum(const SafeNum value);
+    Status setValueSafeNum(SafeNum value);
 
     /** Set the value of this Element to the value from another Element.
      *
@@ -760,10 +772,7 @@ inline Element::Element(Document* doc, RepIdx repIdx) : _doc(doc), _repIdx(repId
 }
 
 inline StringData Element::getValueStringOrSymbol() const {
-    const BSONElement value = getValue();
-    const char* str = value.valuestr();
-    const size_t size = value.valuestrsize() - 1;
-    return StringData(str, size);
+    return getValue().valueStringData();
 }
 
 inline bool operator==(const Element& l, const Element& r) {

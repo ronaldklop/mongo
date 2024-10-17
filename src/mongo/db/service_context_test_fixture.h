@@ -29,45 +29,105 @@
 
 #pragma once
 
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace service_context_test {
+
+/**
+ * "Literal" and "structural" type to stand-in for a `ClusterRole` value.
+ * Necessary until `ClusterRole` can be used as a NTTP.
+ */
+enum class ServerRoleIndex { shard, router };
+
+inline ClusterRole getClusterRole(ServerRoleIndex i) {
+    switch (i) {
+        case ServerRoleIndex::shard:
+            return {ClusterRole::ShardServer, ClusterRole::RouterServer};
+        case ServerRoleIndex::router:
+            return ClusterRole::RouterServer;
+    }
+    MONGO_UNREACHABLE;
+}
+
+/**
+ * Virtual base for tests that need to set SC role before the
+ * ServiceContextTest constructor. Necessary since ServiceContextTest
+ * is often a virtual base and those run before all non-virtual bases.
+ */
+template <ServerRoleIndex roleIndex>
+class RoleOverride {
+public:
+    ~RoleOverride() {
+        serverGlobalParams.clusterRole = _saved;
+    }
+
+private:
+    ClusterRole _saved{std::exchange(serverGlobalParams.clusterRole, getClusterRole(roleIndex))};
+};
+
+using ShardRoleOverride = RoleOverride<ServerRoleIndex::shard>;
+using RouterRoleOverride = RoleOverride<ServerRoleIndex::router>;
 
 class ScopedGlobalServiceContextForTest {
 public:
-    /**
-     * Returns a service context, which is only valid for this instance of the test.
-     * Must not be called before setUp or after tearDown.
-     */
-    ServiceContext* getServiceContext();
-
-protected:
     ScopedGlobalServiceContextForTest();
     virtual ~ScopedGlobalServiceContextForTest();
+
+    /**
+     * Returns a service context, which is only valid for this instance of the test.
+     */
+    ServiceContext* getServiceContext() const;
+
+    Service* getService() const;
 };
 
 /**
  * Test fixture for tests that require a properly initialized global service context.
  */
-class ServiceContextTest : public unittest::Test, public ScopedGlobalServiceContextForTest {
+class ServiceContextTest : public unittest::Test {
 public:
     /**
      * Returns the default Client for this test.
      */
-    Client* getClient();
+    Client* getClient() {
+        return Client::getCurrent();
+    }
 
     ServiceContext::UniqueOperationContext makeOperationContext() {
         return getClient()->makeOperationContext();
     }
 
+    ServiceContext* getServiceContext() const {
+        return _scopedServiceContext->getServiceContext();
+    }
+
+    Service* getService() const {
+        return _scopedServiceContext->getService();
+    }
+
 protected:
     ServiceContextTest();
-    virtual ~ServiceContextTest();
+    explicit ServiceContextTest(
+        std::unique_ptr<ScopedGlobalServiceContextForTest> scopedServiceContext,
+        std::shared_ptr<transport::Session> session = nullptr);
+    ~ServiceContextTest() override;
+
+    ScopedGlobalServiceContextForTest* scopedServiceContext() const {
+        return _scopedServiceContext.get();
+    }
 
 private:
+    std::unique_ptr<ScopedGlobalServiceContextForTest> _scopedServiceContext;
     ThreadClient _threadClient;
 };
+
+}  // namespace service_context_test
+
+using service_context_test::ScopedGlobalServiceContextForTest;
+using service_context_test::ServiceContextTest;
 
 }  // namespace mongo

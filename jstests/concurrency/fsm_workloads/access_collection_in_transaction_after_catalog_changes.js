@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Transactions with local (and majority) readConcern perform untimestamped reads and do not check
  * the min visible snapshot for collections, so they can access collections whose catalog
@@ -14,7 +12,11 @@
  * @tags: [uses_transactions, requires_replication]
  */
 
-var $config = (function() {
+import {
+    withTxnAndAutoRetry
+} from "jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js";
+
+export const $config = (function() {
     var states = (function() {
         function init(db, collName) {
             this.session = db.getMongo().startSession();
@@ -25,50 +27,30 @@ var $config = (function() {
             const startColl = session.getDatabase(db.getName())[startCollName];
             const ddlColl = session.getDatabase(ddlDBName)[ddlCollName];
 
-            // Start the transaction and run an operation on 'startColl'.
-            session.startTransaction();
-            assertWhenOwnColl.eq(1, startColl.find({_id: "startTxnDoc"}).itcount());
+            const expectedTxnErrorCodes = [
+                ErrorCodes.OperationNotSupportedInTransaction,
+                // As of SERVER-45405, inserts that implicitly create collections inside of
+                // multi- document transactions can fail at commit time with WriteConflict
+                // errors, if a conflicting collection does not get created until commit time.
+                ErrorCodes.WriteConflict,
+            ];
 
-            // Run the specified operation on 'ddlColl'. Another thread may have performed a DDL
-            // operation on 'ddlColl' since the transaction started. The operation may fail with one
-            // of the allowed error codes, but it must not crash the server.
             let success = false;
+
             try {
-                op(ddlColl);
+                withTxnAndAutoRetry(session, () => {
+                    assert.eq(1, startColl.find({_id: "startTxnDoc"}).itcount());
+                    op(ddlColl);
+                });
                 success = true;
             } catch (e) {
-                assertWhenOwnColl.contains(e.code,
-                                           [
-                                               ErrorCodes.LockTimeout,
-                                               ErrorCodes.WriteConflict,
-                                               ErrorCodes.SnapshotUnavailable,
-                                               ErrorCodes.OperationNotSupportedInTransaction
-                                           ],
-                                           () => tojson(e));
-            }
-
-            // Commit or abort the transaction.
-            if (success) {
-                let commitRes = session.commitTransaction_forTesting();
-                if (!commitRes.ok && commitRes.hasOwnProperty("code") &&
-                    commitRes["code"] == ErrorCodes.WriteConflict) {
-                    // As of SERVER-45405, inserts that implicitly create collections inside of
-                    // multi- document transactions can fail at commit time with WriteConflict
-                    // errors, if a conflicting collection does not get created until commit time.
-                    success = false;
-                } else {
-                    assertWhenOwnColl.commandWorked(commitRes);
+                if (!e.hasOwnProperty("code") || !expectedTxnErrorCodes.includes(e.code)) {
+                    throw e;
                 }
-            } else {
-                // The failed operation already aborted the transaction. Run abortTransaction to
-                // update the transaction state in the shell.
-                assertWhenOwnColl.commandFailedWithCode(session.abortTransaction_forTesting(),
-                                                        ErrorCodes.NoSuchTransaction);
             }
 
             // Record whether the operation succeeded or failed.
-            assertWhenOwnColl.commandWorked(
-                db[loggingCollName].insert({op: opName, success: success}));
+            assert.commandWorked(db[loggingCollName].insert({op: opName, success: success}));
         }
 
         /**
@@ -179,7 +161,7 @@ var $config = (function() {
                 if (res instanceof WriteResult && res.hasWriteError()) {
                     throw _getErrorWithCode(res.getWriteError(), res.getWriteError().errmsg);
                 } else if (!res.ok) {
-                    assertWhenOwnColl.commandWorked(res);
+                    assert.commandWorked(res);
                 }
             };
             runOpInTxn(this.session,
@@ -194,7 +176,7 @@ var $config = (function() {
 
         function remove(db, collName) {
             const op = function(ddlColl) {
-                assertWhenOwnColl.commandWorked(ddlColl.remove({}, {justOne: true}));
+                assert.commandWorked(ddlColl.remove({}, {justOne: true}));
             };
             runOpInTxn(this.session,
                        db,
@@ -208,7 +190,7 @@ var $config = (function() {
 
         function update(db, collName) {
             const op = function(ddlColl) {
-                assertWhenOwnColl.commandWorked(ddlColl.update({}, {$inc: {x: 1}}));
+                assert.commandWorked(ddlColl.update({}, {$inc: {x: 1}}));
             };
             runOpInTxn(this.session,
                        db,
@@ -227,18 +209,17 @@ var $config = (function() {
         function createColl(db, collName) {
             // Insert a document to ensure the collection exists and provide data that can be
             // accessed in the transaction states.
-            assertWhenOwnColl.commandWorked(
-                db.getSiblingDB(this.ddlDBName)[this.ddlCollName].insert({x: 1}));
+            assert.commandWorked(db.getSiblingDB(this.ddlDBName)[this.ddlCollName].insert({x: 1}));
         }
 
         function createIndex(db, collName) {
-            assertWhenOwnColl.commandWorkedOrFailedWithCode(
+            assert.commandWorkedOrFailedWithCode(
                 db.getSiblingDB(this.ddlDBName)[this.ddlCollName].createIndex({x: 1}),
-                [ErrorCodes.IndexBuildAborted]);
+                [ErrorCodes.IndexBuildAborted, ErrorCodes.NoMatchingDocument]);
         }
 
         function dropColl(db, collName) {
-            assertWhenOwnColl.commandWorkedOrFailedWithCode(
+            assert.commandWorkedOrFailedWithCode(
                 db.getSiblingDB(this.ddlDBName).runCommand({drop: this.ddlCollName}),
                 ErrorCodes.NamespaceNotFound);
         }
@@ -247,7 +228,7 @@ var $config = (function() {
             const ddlCollFullName = db.getSiblingDB(this.ddlDBName)[this.ddlCollName].getFullName();
             const renameCollFullName =
                 db.getSiblingDB(this.ddlDBName)[this.renameCollName].getFullName();
-            assertWhenOwnColl.commandWorkedOrFailedWithCode(
+            assert.commandWorkedOrFailedWithCode(
                 db.adminCommand(
                     {renameCollection: ddlCollFullName, to: renameCollFullName, dropTarget: true}),
                 ErrorCodes.NamespaceNotFound);
@@ -273,8 +254,8 @@ var $config = (function() {
     })();
 
     function setup(db, collName, cluster) {
-        assertWhenOwnColl.commandWorked(db[collName].insert({_id: "startTxnDoc"}));
-        assertWhenOwnColl.commandWorked(db.runCommand({create: this.loggingCollName}));
+        assert.commandWorked(db[collName].insert({_id: "startTxnDoc"}));
+        assert.commandWorked(db.runCommand({create: this.loggingCollName}));
     }
 
     function teardown(db, collName, cluster) {

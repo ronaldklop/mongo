@@ -29,12 +29,23 @@
 
 #include "mongo/db/exec/count_scan.h"
 
+#include <absl/container/node_hash_map.h>
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
+#include <vector>
 
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/exec/scoped_timer.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -62,10 +73,14 @@ BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames)
 
     return bob.obj();
 }
+
+bool isCompoundWildcardIndex(const IndexDescriptor* indexDescriptor) {
+    return indexDescriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
+        indexDescriptor->keyPattern().nFields() > 1;
+}
 }  // namespace
 
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* CountScan::kStageType = "COUNT_SCAN";
@@ -74,13 +89,13 @@ const char* CountScan::kStageType = "COUNT_SCAN";
 // the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
 // from the descriptor's contents.
 CountScan::CountScan(ExpressionContext* expCtx,
-                     const CollectionPtr& collection,
+                     VariantCollectionPtrOrAcquisition collection,
                      CountScanParams params,
                      WorkingSet* workingSet)
     : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
-      _shouldDedup(params.isMultiKey),
+      _shouldDedup(params.isMultiKey || isCompoundWildcardIndex(params.indexDescriptor)),
       _startKey(std::move(params.startKey)),
       _startKeyInclusive(params.startKeyInclusive),
       _endKey(std::move(params.endKey)),
@@ -109,32 +124,42 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
 
     boost::optional<IndexKeyEntry> entry;
     const bool needInit = !_cursor;
-    try {
-        // We don't care about the keys.
-        const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
 
-        if (needInit) {
-            // First call to work().  Perform cursor init.
-            _cursor = indexAccessMethod()->newCursor(opCtx());
-            _cursor->setEndPosition(_endKey, _endKeyInclusive);
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "CountScan",
+        [&] {
+            if (needInit) {
+                // First call to work().  Perform cursor init.
+                _cursor = indexAccessMethod()->newCursor(opCtx());
+                _cursor->setEndPosition(_endKey, _endKeyInclusive);
 
-            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-                _startKey,
-                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
-                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
-                true, /* forward */
-                _startKeyInclusive);
-            entry = _cursor->seek(keyStringForSeek);
-        } else {
-            entry = _cursor->next(kWantLoc);
-        }
-    } catch (const WriteConflictException&) {
-        if (needInit) {
-            // Release our cursor and try again next time.
-            _cursor.reset();
-        }
-        *out = WorkingSet::INVALID_ID;
-        return PlanStage::NEED_YIELD;
+                key_string::Builder builder(
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion());
+                auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                    _startKey,
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    true, /* forward */
+                    _startKeyInclusive,
+                    builder);
+                entry = _cursor->seek(keyStringForSeek,
+                                      SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            } else {
+                entry = _cursor->next(SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            if (needInit) {
+                // Release our cursor and try again next time.
+                _cursor.reset();
+            }
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     ++_specificStats.keysExamined;

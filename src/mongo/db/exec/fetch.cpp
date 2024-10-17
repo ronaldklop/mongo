@@ -27,24 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/fetch.h"
-
 #include <memory>
+#include <utility>
+#include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/str.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/util/assert_util.h"
+
+namespace {
+MONGO_FAIL_POINT_DEFINE(hangFetchDoWork);
+}  // namespace
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* FetchStage::kStageType = "FETCH";
@@ -53,7 +54,7 @@ FetchStage::FetchStage(ExpressionContext* expCtx,
                        WorkingSet* ws,
                        std::unique_ptr<PlanStage> child,
                        const MatchExpression* filter,
-                       const CollectionPtr& collection)
+                       VariantCollectionPtrOrAcquisition collection)
     : RequiresCollectionStage(kStageType, expCtx, collection),
       _ws(ws),
       _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
@@ -73,6 +74,10 @@ bool FetchStage::isEOF() {
 }
 
 PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
+    if (MONGO_unlikely(hangFetchDoWork.shouldFail())) {
+        hangFetchDoWork.pauseWhileSet();
+    }
+
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -96,27 +101,36 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
             ++_specificStats.alreadyHasObj;
         } else {
             // We need a valid RecordId to fetch from and this is the only state that has one.
-            verify(WorkingSetMember::RID_AND_IDX == member->getState());
-            verify(member->hasRecordId());
+            MONGO_verify(WorkingSetMember::RID_AND_IDX == member->getState());
+            MONGO_verify(member->hasRecordId());
 
-            try {
-                if (!_cursor)
-                    _cursor = collection()->getCursor(opCtx());
+            const auto ret = handlePlanStageYield(
+                expCtx(),
+                "FetchStage",
+                [&] {
+                    const auto& coll = collectionPtr();
+                    if (!_cursor)
+                        _cursor = coll->getCursor(opCtx());
 
-                if (!WorkingSetCommon::fetch(opCtx(), _ws, id, _cursor, collection()->ns())) {
-                    _ws->free(id);
-                    return NEED_TIME;
-                }
-            } catch (const WriteConflictException&) {
-                // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may
-                // be freed when we yield.
-                member->makeObjOwnedIfNeeded();
-                _idRetrying = id;
-                *out = WorkingSet::INVALID_ID;
-                return NEED_YIELD;
+                    if (!WorkingSetCommon::fetch(
+                            opCtx(), _ws, id, _cursor.get(), coll, coll->ns())) {
+                        _ws->free(id);
+                        return NEED_TIME;
+                    }
+                    return PlanStage::ADVANCED;
+                },
+                [&] {
+                    // yieldHandler
+                    // Ensure that the BSONObj underlying the WorkingSetMember is owned because it
+                    // may be freed when we yield.
+                    member->makeObjOwnedIfNeeded();
+                    _idRetrying = id;
+                    *out = WorkingSet::INVALID_ID;
+                });
+            if (ret != PlanStage::ADVANCED) {
+                return ret;
             }
         }
-
         return returnIfMatches(member, id, out);
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
@@ -180,10 +194,8 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (nullptr != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
     }
 
     unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);

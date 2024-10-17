@@ -1,29 +1,25 @@
 // Verifies basic sharded transaction behavior with the supported read concern levels.
 //
 // @tags: [
-//   requires_find_command,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-const st = new ShardingTest({shards: 2, config: 1});
+const st = new ShardingTest({shards: 2});
 
 // Set up a sharded collection with 2 chunks, one on each shard.
-
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: -1}, {writeConcern: {w: "majority"}}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 1}, {writeConcern: {w: "majority"}}));
-
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
@@ -82,4 +78,3 @@ for (let readConcernLevel of kAllowedReadConcernLevels) {
 }
 
 st.stop();
-})();

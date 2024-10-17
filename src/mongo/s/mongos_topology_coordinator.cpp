@@ -27,15 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/logv2/log.h"
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <mutex>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shutdown_in_progress_quiesce_info.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/s/mongos_topology_coordinator.h"
+#include "mongo/transport/hello_metrics.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -54,13 +81,15 @@ MONGO_INITIALIZER(GenerateMongosInstanceId)(InitializerContext*) {
 }
 
 // Signals that a hello request has started waiting.
-MONGO_FAIL_POINT_DEFINE(waitForHelloResponse);
+MONGO_FAIL_POINT_DEFINE(waitForHelloResponseMongos);
 // Awaitable hello requests with the proper topologyVersions are expected to wait for
 // maxAwaitTimeMS on mongos. When set, this failpoint will hang right before waiting on a
 // topology change.
-MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponse);
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponseMongos);
 // Failpoint for hanging during quiesce mode on mongos.
-MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceMode);
+MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceModeMongos);
+// Simulates returning a specified error in the hello response.
+MONGO_FAIL_POINT_DEFINE(setCustomErrorInHelloResponseMongoS);
 
 template <typename T>
 StatusOrStatusWith<T> futureGetNoThrowWithDeadline(OperationContext* opCtx,
@@ -150,36 +179,62 @@ std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHello
     invariant(deadline);
 
     HelloMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+
     lk.unlock();
 
-    if (MONGO_unlikely(waitForHelloResponse.shouldFail())) {
+    if (MONGO_unlikely(waitForHelloResponseMongos.shouldFail())) {
         // Used in tests that wait for this failpoint to be entered before shutting down mongos,
         // which is the only action that triggers a topology change.
-        LOGV2(4695704, "waitForHelloResponse failpoint enabled");
+        LOGV2(4695704, "waitForHelloResponseMongos failpoint enabled");
     }
 
-    if (MONGO_unlikely(hangWhileWaitingForHelloResponse.shouldFail())) {
-        LOGV2(4695501, "hangWhileWaitingForHelloResponse failpoint enabled");
-        hangWhileWaitingForHelloResponse.pauseWhileSet(opCtx);
+    if (MONGO_unlikely(hangWhileWaitingForHelloResponseMongos.shouldFail())) {
+        LOGV2(4695501, "hangWhileWaitingForHelloResponseMongos failpoint enabled");
+        hangWhileWaitingForHelloResponseMongos.pauseWhileSet(opCtx);
     }
 
     // Wait for a mongos topology change with timeout set to deadline.
     LOGV2_DEBUG(4695502,
                 1,
                 "Waiting for a hello response from a topology change or until deadline",
-                "deadline"_attr = deadline.get(),
+                "deadline"_attr = deadline.value(),
                 "currentMongosTopologyVersionCounter"_attr = _topologyVersion.getCounter());
 
     auto statusWithHello =
-        futureGetNoThrowWithDeadline(opCtx, future, deadline.get(), opCtx->getTimeoutError());
+        futureGetNoThrowWithDeadline(opCtx, future, deadline.value(), opCtx->getTimeoutError());
     auto status = statusWithHello.getStatus();
 
-    if (status == ErrorCodes::ExceededTimeLimit) {
+    setCustomErrorInHelloResponseMongoS.execute([&](const BSONObj& data) {
+        auto errorCode = data["errorType"].safeNumberInt();
+        LOGV2(6208202,
+              "Triggered setCustomErrorInHelloResponseMongoS fail point.",
+              "errorCode"_attr = errorCode);
+
+        status = Status(ErrorCodes::Error(errorCode),
+                        "Set by setCustomErrorInHelloResponseMongoS fail point.");
+    });
+    ON_BLOCK_EXIT([&, opCtx] {
+        // We decrement the counter. Note that some errors may already be covered
+        // by calls to resetNumAwaitingTopologyChanges(), which sets the counter to zero, so we
+        // only decrement non-zero counters. This is safe so long as:
+        // 1) Increment + decrement calls always occur at a 1:1 ratio and in that order.
+        // 2) All callers to increment/decrement/reset take locks.
+        stdx::lock_guard lk(_mutex);
+        if (status != ErrorCodes::SplitHorizonChange &&
+            HelloMetrics::get(opCtx)->getNumAwaitingTopologyChanges() > 0) {
+            HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
+        }
+    });
+
+    if (!status.isOK()) {
+        LOGV2_DEBUG(6208205, 1, "Error while waiting for hello response", "status"_attr = status);
+
         // Return a MongosHelloResponse with the current topology version on timeout when
         // waiting for a topology change.
-        stdx::lock_guard lk(_mutex);
-        HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
-        return _makeHelloResponse(lk);
+        if (status == ErrorCodes::ExceededTimeLimit) {
+            stdx::lock_guard lk(_mutex);
+            return _makeHelloResponse(lk);
+        }
     }
 
     // A topology change has happened so we return a MongosHelloResponse with the updated
@@ -204,12 +259,13 @@ void MongosTopologyCoordinator::enterQuiesceModeAndWait(OperationContext* opCtx,
 
         // Reset counter to 0 since we will respond to all waiting hello requests with an error.
         // All new hello requests will immediately fail with ShutdownInProgress.
-        HelloMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
+        HelloMetrics::resetNumAwaitingTopologyChangesForAllSessionManagers(
+            getGlobalServiceContext());
     }
 
-    if (MONGO_unlikely(hangDuringQuiesceMode.shouldFail())) {
-        LOGV2(4695700, "hangDuringQuiesceMode failpoint enabled");
-        hangDuringQuiesceMode.pauseWhileSet(opCtx);
+    if (MONGO_unlikely(hangDuringQuiesceModeMongos.shouldFail())) {
+        LOGV2(4695700, "hangDuringQuiesceModeMongos failpoint enabled");
+        hangDuringQuiesceModeMongos.pauseWhileSet(opCtx);
     }
 
     LOGV2(4695701, "Entering quiesce mode for mongos shutdown", "quiesceTime"_attr = quiesceTime);

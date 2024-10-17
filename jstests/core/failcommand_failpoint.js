@@ -1,15 +1,19 @@
 /**
  * Tests the "failCommand" failpoint.
+ *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: whatsmyuri.
+ *   not_allowed_with_signed_security_token,
  *   assumes_read_concern_unchanged,
  *   assumes_read_preference_unchanged,
+ *   no_selinux,
+ *   # This test expects that the connection (i.e. 'threadName') does not change throughout each
+ *   # test case. That is not always true when there is a background tenant migration.
+ *   tenant_migration_incompatible,
+ *   does_not_support_repeated_reads,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");
-load("jstests/libs/retryable_writes_util.js");
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const testDB = db.getSiblingDB("test_failcommand");
 const adminDB = db.getSiblingDB("admin");
@@ -550,13 +554,11 @@ assert.commandWorked(adminDB.runCommand({
 }));
 assert.commandWorked(testDB.runCommand({ping: 1}));
 
-// Only run error labels override tests for replica set if storage engine supports document-level
-// locking because the tests require retryable writes.
+// Only run error labels override tests for replica set because the tests require retryable writes.
 // And mongos doesn't return RetryableWriteError labels.
-if (!FixtureHelpers.isReplSet(adminDB) ||
-    !RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+if (!FixtureHelpers.isReplSet(adminDB)) {
     jsTestLog("Skipping error labels override tests");
-    return;
+    quit();
 }
 
 // Test error labels override.
@@ -632,4 +634,3 @@ res = testDB.runCommand(
 assert.eq(res.writeConcernError, {code: ErrorCodes.NotWritablePrimary, errmsg: "hello"});
 // There should be no errorLabels field if no error labels provided in failCommand.
 assert(!res.hasOwnProperty("errorLabels"), res);
-}());

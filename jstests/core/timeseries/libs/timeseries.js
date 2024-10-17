@@ -1,13 +1,71 @@
 // Helper functions for testing time-series collections.
 
-var TimeseriesTest = class {
+import {documentEq} from "jstests/aggregation/extras/utils.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+
+export var TimeseriesTest = class {
+    static insertManyDocs(coll) {
+        jsTestLog("Inserting documents to a bucket.");
+        coll.insertMany(
+            [...Array(10).keys()].map(i => ({
+                                          "metadata": {"sensorId": 1, "type": "temperature"},
+                                          "timestamp": ISODate(),
+                                          "temp": i
+                                      })),
+            {ordered: false});
+    }
+    static getBucketMaxSpanSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60 * 60;
+            case 'minutes':
+                return 60 * 60 * 24;
+            case 'hours':
+                return 60 * 60 * 24 * 30;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
+    }
+
+    static getBucketRoundingSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60;
+            case 'minutes':
+                return 60 * 60;
+            case 'hours':
+                return 60 * 60 * 24;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
+    }
+
+    static bucketsMayHaveMixedSchemaData(coll) {
+        const catalog = coll.aggregate([{$listCatalog: {}}]).toArray()[0];
+        const tsMixedSchemaOptionNewFormat = catalog.md.options.storageEngine &&
+            catalog.md.options.storageEngine.wiredTiger &&
+            catalog.md.options.storageEngine.wiredTiger.configString;
+        // TODO SERVER-92533 Simplify once SERVER-91195 is backported to all supported branches
+        if (tsMixedSchemaOptionNewFormat !== undefined) {
+            return tsMixedSchemaOptionNewFormat ==
+                "app_metadata=(timeseriesBucketsMayHaveMixedSchemaData=true)";
+        } else {
+            return catalog.md.timeseriesBucketsMayHaveMixedSchemaData;
+        }
+    }
+
     /**
-     * Returns whether time-series collections are supported.
+     * Returns whether time-series always use compressed buckets are enabled.
+     * TODO SERVER-70605 remove this helper.
      */
-    static timeseriesCollectionsEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagTimeseriesCollection: 1}))
-            .featureFlagTimeseriesCollection.value;
+    static timeseriesAlwaysUseCompressedBucketsEnabled(conn) {
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "TimeseriesAlwaysUseCompressedBuckets");
+    }
+
+    // TODO SERVER-68058 remove this helper.
+    static arbitraryUpdatesEnabled(conn) {
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "TimeseriesUpdatesSupport");
     }
 
     /**
@@ -20,6 +78,28 @@ var TimeseriesTest = class {
             fields[field] = Math.max(fields[field], 0);
             fields[field] = Math.min(fields[field], 100);
         }
+    }
+
+    /**
+     * Decompresses a compressed bucket document. Replaces the compressed data in-place.
+     */
+    static decompressBucket(compressedBucket) {
+        assert.hasFields(
+            compressedBucket,
+            ["control"],
+            "TimeseriesTest.decompressBucket() should only be called on a bucket document");
+        if (compressedBucket.control.version == 1) {
+            // Bucket is already decompressed.
+            return;
+        }
+
+        for (const column in compressedBucket.data) {
+            compressedBucket.data[column] = decompressBSONColumn(compressedBucket.data[column]);
+        }
+
+        // The control object should reflect that the data is uncompressed.
+        compressedBucket.control.version = TimeseriesTest.BucketVersion.kUncompressed;
+        delete compressedBucket.control.count;
     }
 
     /**
@@ -134,4 +214,100 @@ var TimeseriesTest = class {
 
         return hosts;
     }
+
+    /**
+     * Runs the provided test with both ordered and unordered inserts.
+     */
+    static run(testFn, theDb) {
+        const insert = function(ordered) {
+            jsTestLog('Running test with {ordered: ' + ordered + '} inserts');
+            return function(coll, docs, options) {
+                return coll.insert(docs, Object.extend({ordered: ordered}, options));
+            };
+        };
+
+        testFn(insert(true));
+        testFn(insert(false));
+    }
+
+    static ensureDataIsDistributedIfSharded(coll, splitPointDate) {
+        const db = coll.getDB();
+        const buckets = db[this.getBucketsCollName(coll.getName())];
+        if (FixtureHelpers.isSharded(buckets)) {
+            const timeFieldName =
+                db.getCollectionInfos({name: coll.getName()})[0].options.timeseries.timeField;
+
+            const splitPoint = {[`control.min.${timeFieldName}`]: splitPointDate};
+            assert.commandWorked(db.adminCommand(
+                {split: `${db.getName()}.${buckets.getName()}`, middle: splitPoint}));
+
+            const allShards = db.getSiblingDB("config").shards.find().sort({_id: 1}).toArray().map(
+                doc => doc._id);
+            const currentShards = buckets
+                                      .aggregate([
+                                          {"$collStats": {storageStats: {}}},
+                                          {$project: {shard: 1}},
+                                          {$sort: {shard: 1}}
+                                      ])
+                                      .toArray()
+                                      .map(doc => doc.shard);
+
+            if (!documentEq(allShards, currentShards)) {
+                let otherShard;
+                for (let i in allShards) {
+                    if (!currentShards.includes(allShards[i])) {
+                        otherShard = allShards[i];
+                        break;
+                    }
+                }
+                assert(otherShard);
+
+                assert.commandWorked(db.adminCommand({
+                    movechunk: `${db.getName()}.${buckets.getName()}`,
+                    find: splitPoint,
+                    to: otherShard,
+                    _waitForDelete: true
+                }));
+
+                const updatedShards = buckets
+                                          .aggregate([
+                                              {"$collStats": {storageStats: {}}},
+                                              {$project: {shard: 1}},
+                                              {$sort: {shard: 1}}
+                                          ])
+                                          .toArray()
+                                          .map(doc => doc.shard);
+                assert.eq(updatedShards.length, currentShards.length + 1);
+            }
+        }
+    }
+
+    static getBucketsCollName(collName) {
+        return `system.buckets.${collName}`;
+    }
+
+    static assertInsertWorked(res) {
+        // TODO (SERVER-85548): Remove helper and revert to assert.commandWorked, no expected error
+        // codes
+        return assert.commandWorkedOrFailedWithCode(res, [8555700, 8555701]);
+    }
+
+    static isBucketCompressed(version) {
+        return (version == TimeseriesTest.BucketVersion.kCompressedSorted ||
+                version == TimeseriesTest.BucketVersion.kCompressedUnsorted);
+    }
+
+    // Timeseries stats are not returned if there are no timeseries collection. This is a helper to
+    // handle that case when tests drop their timeseries collections.
+    static getStat(stats, name) {
+        if (stats.hasOwnProperty(name))
+            return stats[name];
+        return 0;
+    }
+};
+
+TimeseriesTest.BucketVersion = {
+    kUncompressed: 1,
+    kCompressedSorted: 2,
+    kCompressedUnsorted: 3
 };

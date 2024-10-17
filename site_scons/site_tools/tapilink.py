@@ -21,10 +21,10 @@
 #
 
 import SCons
-import subprocess
 
 # TODO: DRY this with abilink.py by moving duplicated code out to a common
 # support module.
+
 
 def _detect(env):
     try:
@@ -45,7 +45,7 @@ def _add_emitter(builder):
         new_targets = []
         for t in target:
             base, ext = SCons.Util.splitext(str(t))
-            if not ext == env['SHLIBSUFFIX']:
+            if not ext == env["SHLIBSUFFIX"]:
                 continue
 
             tbd_target = (t.builder.target_factory or env.File)(base + ".tbd")
@@ -70,8 +70,10 @@ def _add_scanner(builder):
         return (getattr(env.Entry(o).attributes, "tbd", o) for o in old_scanner(node, env, path))
 
     builder.target_scanner = SCons.Scanner.Scanner(
-        function=new_scanner, path_function=path_function
+        function=new_scanner,
+        path_function=path_function,
     )
+
 
 def _add_action(builder):
     actions = builder.action
@@ -86,17 +88,17 @@ def _add_action(builder):
     builder.action = actions + SCons.Action.Action(
         [
             "$TAPI stubify -o ${TARGET.base}.tbd ${TARGET}",
-            "$TAPI stubify --no-uuids -o ${TARGET.base}.tbd.no_uuid ${TARGET}"
+            "$TAPI stubify --no-uuids -o ${TARGET.base}.tbd.no_uuid ${TARGET}",
         ]
     )
 
+
 def exists(env):
-    result = _detect(env) != None
+    result = _detect(env) is not None
     return result
 
 
 def generate(env):
-
     if not exists(env):
         return
 

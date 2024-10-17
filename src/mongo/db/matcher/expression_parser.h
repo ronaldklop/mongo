@@ -29,10 +29,17 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <functional>
+#include <limits>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
@@ -66,6 +73,7 @@ enum class PathAcceptingKeyword {
     INTERNAL_EXPR_GTE,
     INTERNAL_EXPR_LT,
     INTERNAL_EXPR_LTE,
+    INTERNAL_EQ_HASHED_KEY,
     INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
     INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
     INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,

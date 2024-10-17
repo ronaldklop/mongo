@@ -29,10 +29,34 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
 #include <type_traits>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/exclusion_projection_executor.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/single_document_transformation_processor.h"
+#include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -44,24 +68,23 @@ namespace mongo {
  */
 class DocumentSourceSingleDocumentTransformation final : public DocumentSource {
 public:
-    virtual boost::intrusive_ptr<DocumentSource> clone() const {
-        auto list = DocumentSource::parse(pExpCtx, serialize().getDocument().toBson());
-        invariant(list.size() == 1);
-        return list.front();
-    }
-
     DocumentSourceSingleDocumentTransformation(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         std::unique_ptr<TransformerInterface> parsedTransform,
-        const StringData name,
+        StringData name,
         bool independentOfAnyCollection);
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
 
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kSingleDocumentTransformation;
+    }
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
     GetModPathsReturn getModifiedPaths() const final;
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -72,7 +95,7 @@ public:
                                      TransactionRequirement::kAllowed,
                                      LookupRequirement::kAllowed,
                                      UnionRequirement::kAllowed,
-                                     ChangeStreamRequirement::kWhitelist);
+                                     ChangeStreamRequirement::kAllowlist);
         constraints.canSwapWithMatch = true;
         constraints.canSwapWithSkippingOrLimitingStage = true;
         constraints.isAllowedWithinUpdatePipeline = true;
@@ -86,36 +109,55 @@ public:
         return boost::none;
     }
 
-    TransformerInterface::TransformerType getType() const {
-        return _parsedTransform->getType();
+    TransformerInterface::TransformerType getTransformerType() const {
+        return _transformationProcessor->getTransformer().getType();
     }
 
     const auto& getTransformer() const {
-        return *_parsedTransform;
+        return _transformationProcessor->getTransformer();
+    }
+    auto& getTransformer() {
+        return _transformationProcessor->getTransformer();
+    }
+
+    SingleDocumentTransformationProcessor* getTransformationProcessor() {
+        return _transformationProcessor.get_ptr();
     }
 
     /**
-     * Substitute the occurence of 'oldName' as first field path element for a 'newName' in all
-     * expressions in the transformation object.
+     * Extract computed projection(s) depending on the 'oldName' argument if the transformation is
+     * of type inclusion projection or computed projection. Extraction is not allowed if the name of
+     * the projection is in the 'reservedNames' set. The function returns a pair of <BSONObj, bool>.
+     * The BSONObj contains the computed projections in which the 'oldName' is substituted for the
+     * 'newName'. The boolean flag is true if the original projection has become empty after the
+     * extraction and can be deleted by the caller.
+     *
+     * For transformation of type inclusion projection the computed projections are replaced with a
+     * projected field or an identity projection depending on their position in the order of
+     * additional fields.
+     * For transformation of type computed projection the extracted computed projections are
+     * removed.
+     *
+     * The function has no effect for exclusion projections, or if there are no computed
+     * projections, or the computed expression depends on other fields than the oldName.
      */
-    void substituteFieldPathElement(const std::string& oldName, const std::string& newName) {
-        _parsedTransform->substituteFieldPathElement(oldName, newName);
+    std::pair<BSONObj, bool> extractComputedProjections(StringData oldName,
+                                                        StringData newName,
+                                                        const std::set<StringData>& reservedNames) {
+        return _transformationProcessor->getTransformer().extractComputedProjections(
+            oldName, newName, reservedNames);
     }
 
     /**
-     * If this transformation is an inclusion projection, the function extracts the computed
-     * projection(s) depending on the oldName argument. Extraction is not allowed if the name of the
-     * projection is in the 'reservedNames' set. The computed projection is returned as a BSONObj,
-     * where the oldName is substituted for the newName. In the original inclusion projection it is
-     * replaced with a projected field or an identity projection depending on its position in the
-     * order of additional fields. The function has no effect for exclusion projections, or if there
-     * are no computed projections, or the computed expression depends on other fields than the
-     * oldName.
+     * If this transformation is a project, removes and returns a BSONObj representing the part of
+     * this project that depends only on 'oldName'. Also returns a bool indicating whether this
+     * entire project is extracted. In the extracted $project, 'oldName' is renamed to 'newName'.
+     * 'oldName' should not be dotted.
      */
-    BSONObj extractComputedProjections(const std::string& oldName,
-                                       const std::string& newName,
-                                       const std::set<StringData>& reservedNames) {
-        return _parsedTransform->extractComputedProjections(oldName, newName, reservedNames);
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                            StringData newName) {
+        return _transformationProcessor->getTransformer().extractProjectOnFieldAndRename(oldName,
+                                                                                         newName);
     }
 
 protected:
@@ -126,8 +168,14 @@ protected:
                                                      Pipeline::SourceContainer* container) final;
 
 private:
-    // Stores transformation logic.
-    std::unique_ptr<TransformerInterface> _parsedTransform;
+    Pipeline::SourceContainer::iterator maybeCoalesce(
+        Pipeline::SourceContainer::iterator itr,
+        Pipeline::SourceContainer* container,
+        DocumentSourceSingleDocumentTransformation* nextSingleDocTransform);
+
+    boost::optional<SingleDocumentTransformationProcessor> _transformationProcessor;
+
+    projection_executor::ExclusionNode& getExclusionNode();
 
     // Specific name of the transformation.
     std::string _name;

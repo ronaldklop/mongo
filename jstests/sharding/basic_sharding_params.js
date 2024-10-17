@@ -1,15 +1,30 @@
 /**
  * Test of complex sharding initialization
+ * @tags: [
+ *   # This test is testing CMD parameters passed specifically to mongoS, which expects to be
+ *   # different from other nodes. That's not possible with an embedded router.
+ *   embedded_router_incompatible,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function shardingTestUsingObjects() {
     var st = new ShardingTest({
         mongos: {s0: {verbose: 6}, s1: {verbose: 5}},
         config: {c0: {verbose: 4}},
-        shards: {d0: {verbose: 3}, rs1: {nodes: {d0: {verbose: 2}, a1: {verbose: 1}}}}
+        shards: {
+            d0: {verbose: 3},
+            rs1: {
+                nodes: {
+                    d0: {verbose: 2},
+                    a1: {verbose: 1},
+                    d2: {verbose: 2},
+                    d3: {verbose: 2},
+                    d4: {verbose: 2}
+                }
+            }
+        }
     });
 
     var s0 = st.s0;
@@ -19,7 +34,7 @@ function shardingTestUsingObjects() {
     assert.eq(s1, st._mongos[1]);
 
     var c0 = st.c0;
-    assert.eq(c0, st._configServers[0]);
+    assert.eq(c0, st.configRS.nodes[0]);
 
     var rs0 = st.rs0;
     assert.eq(rs0, st._rsObjects[0]);
@@ -34,7 +49,12 @@ function shardingTestUsingObjects() {
 
     assert(s0.commandLine.hasOwnProperty("vvvvvv"));
     assert(s1.commandLine.hasOwnProperty("vvvvv"));
-    assert(c0.commandLine.hasOwnProperty("vvvv"));
+    if (!TestData.configShard) {
+        assert(c0.commandLine.hasOwnProperty("vvvv"));
+    } else {
+        // Same as shard 1.
+        assert(c0.commandLine.hasOwnProperty("vvv"));
+    }
     assert(rs0_d0.commandLine.hasOwnProperty("vvv"));
     assert(rs1_d0.commandLine.hasOwnProperty("vv"));
     assert(rs1_a1.commandLine.hasOwnProperty("v"));
@@ -56,7 +76,7 @@ function shardingTestUsingArrays() {
     assert.eq(s1, st._mongos[1]);
 
     var c0 = st.c0;
-    assert.eq(c0, st._configServers[0]);
+    assert.eq(c0, st.configRS.nodes[0]);
 
     var rs0 = st.rs0;
     assert.eq(rs0, st._rsObjects[0]);
@@ -70,7 +90,12 @@ function shardingTestUsingArrays() {
 
     assert(s0.commandLine.hasOwnProperty("vvvvv"));
     assert(s1.commandLine.hasOwnProperty("vvvv"));
-    assert(c0.commandLine.hasOwnProperty("vvv"));
+    if (!TestData.configShard) {
+        assert(c0.commandLine.hasOwnProperty("vvv"));
+    } else {
+        // Same as shard 1.
+        assert(c0.commandLine.hasOwnProperty("vv"));
+    }
     assert(rs0_d0.commandLine.hasOwnProperty("vv"));
     assert(rs1_d0.commandLine.hasOwnProperty("v"));
 
@@ -79,4 +104,3 @@ function shardingTestUsingArrays() {
 
 shardingTestUsingObjects();
 shardingTestUsingArrays();
-})();

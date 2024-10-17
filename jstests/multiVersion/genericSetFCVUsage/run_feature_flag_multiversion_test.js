@@ -7,8 +7,7 @@
  * @tags: [featureFlagToaster, featureFlagSpoon]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 let numLastLTSRuns = 0;
 let numLastContRuns = 0;
@@ -22,11 +21,16 @@ function runTest(downgradeFCV) {
 
     let primary = rst.getPrimary();
     let adminDB = primary.getDB("admin");
-    assert.commandWorked(adminDB.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
-    checkFCV(adminDB, downgradeFCV);
+    assert.commandWorked(
+        primary.adminCommand({configureFailPoint: 'failDowngrading', mode: "alwaysOn"}));
+    assert.commandFailedWithCode(
+        adminDB.adminCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}),
+        549181);
+    checkFCV(adminDB, downgradeFCV, downgradeFCV);
     if (downgradeFCV === lastLTSFCV) {
         numLastLTSRuns++;
-    } else {
+    }
+    if (downgradeFCV === lastContinuousFCV) {
         numLastContRuns++;
     }
     rst.stopSet();
@@ -47,15 +51,28 @@ runFeatureFlagMultiversionTest("featureFlagFryer", runTest);
 assert.eq(numLastLTSRuns, 0);
 assert.eq(numLastContRuns, 0);
 
+// The counters for both lastLTS and lastContinuous runs will be incremented when the two FCVs are
+// equal.
+jsTestLog(`The lastLTSFCV and lastContinousFCV are equal: ${lastLTSFCV === lastContinuousFCV}`);
+
 // Pass in a feature flag that is slated for release in the latest version. This should run against
 // both the last-lts and last-continuous FCV.
 runFeatureFlagMultiversionTest("featureFlagToaster", runTest);
-assert.eq(numLastLTSRuns, 1);
-assert.eq(numLastContRuns, 1);
+if (lastLTSFCV === lastContinuousFCV) {
+    assert.eq(numLastLTSRuns, 2);
+    assert.eq(numLastContRuns, 2);
+} else {
+    assert.eq(numLastLTSRuns, 1);
+    assert.eq(numLastContRuns, 1);
+}
 
 // Pass in a feature flag that was released in an older version. This should only run against the
 // last-lts FCV.
 runFeatureFlagMultiversionTest("featureFlagSpoon", runTest);
-assert.eq(numLastLTSRuns, 2);
-assert.eq(numLastContRuns, 1);
-})();
+if (lastLTSFCV === lastContinuousFCV) {
+    assert.eq(numLastLTSRuns, 3);
+    assert.eq(numLastContRuns, 3);
+} else {
+    assert.eq(numLastLTSRuns, 2);
+    assert.eq(numLastContRuns, 1);
+}

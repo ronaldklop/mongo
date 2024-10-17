@@ -1,20 +1,18 @@
 //
 // Tests that merging chunks via mongos works/doesn't work with different chunk configurations
 //
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var st = new ShardingTest({shards: 2, mongos: 2});
 
 var mongos = st.s0;
 var staleMongos = st.s1;
 var admin = mongos.getDB("admin");
-var coll = mongos.getCollection("foo.bar");
+const kDbName = "foo";
 
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard('foo', st.shard0.shardName);
+assert.commandWorked(admin.runCommand({enableSharding: kDbName, primaryShard: st.shard0.name}));
+var coll = mongos.getCollection(kDbName + ".bar");
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
 // Create ranges MIN->0,0->10,(hole),20->40,40->50,50->90,(hole),100->110,110->MAX on first
@@ -58,12 +56,6 @@ assert.commandFailed(admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 20
 assert.commandFailed(
     admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 105}, {_id: MaxKey}]}));
 
-// Make sure merging single chunks is invalid
-assert.commandFailed(admin.runCommand({mergeChunks: coll + "", bounds: [{_id: MinKey}, {_id: 0}]}));
-assert.commandFailed(admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 20}, {_id: 40}]}));
-assert.commandFailed(
-    admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 110}, {_id: MaxKey}]}));
-
 // Make sure merging over holes is invalid
 assert.commandFailed(admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 0}, {_id: 40}]}));
 assert.commandFailed(admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 40}, {_id: 110}]}));
@@ -77,6 +69,32 @@ assert.eq(4, staleCollection.find().itcount());
 
 jsTest.log("Trying merges that should succeed...");
 
+// Merging single chunks should be treated as a no-op
+// (or fail because 'the range specifies one single chunk' in multiversion test environments)
+try {
+    assert.commandWorked(
+        admin.runCommand({mergeChunks: coll + "", bounds: [{_id: MinKey}, {_id: 0}]}));
+} catch (e) {
+    if (!e.message.match(/could not merge chunks, collection .* already contains chunk for/)) {
+        throw e;
+    }
+}
+try {
+    assert.commandWorked(
+        admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 20}, {_id: 40}]}));
+} catch (e) {
+    if (!e.message.match(/could not merge chunks, collection .* already contains chunk for/)) {
+        throw e;
+    }
+}
+try {
+    assert.commandWorked(
+        admin.runCommand({mergeChunks: coll + "", bounds: [{_id: 110}, {_id: MaxKey}]}));
+} catch (e) {
+    if (!e.message.match(/could not merge chunks, collection .* already contains chunk for/)) {
+        throw e;
+    }
+}
 // Make sure merge including the MinKey works
 assert.commandWorked(
     admin.runCommand({mergeChunks: coll + "", bounds: [{_id: MinKey}, {_id: 10}]}));
@@ -135,4 +153,3 @@ assert.eq(1,
               .itcount());
 
 st.stop();
-})();

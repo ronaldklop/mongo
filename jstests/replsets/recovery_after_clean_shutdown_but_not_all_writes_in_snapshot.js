@@ -4,8 +4,7 @@
  *
  * @tags: [requires_persistence, requires_replication]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     name: "recoveryAfterCleanShutdown",
@@ -17,6 +16,11 @@ rst.initiate();
 
 const dbName = "recovery_clean_shutdown";
 let primaryDB = rst.getPrimary().getDB(dbName);
+// The default WC is majority and disableSnapshotting failpoint will prevent satisfying any majority
+// writes.
+assert.commandWorked(primaryDB.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 const wMajority = {
     writeConcern: {w: "majority", wtimeout: ReplSetTest.kDefaultTimeoutMS}
 };
@@ -60,9 +64,6 @@ assert.commandWorked(primaryDB[collNoStableCreation].runCommand("create", w1));
         primaryDB[coll].insert({_id: "insertedAfterSnapshottingDisabled"}, w1)));
 rst.awaitReplication();
 
-jsTestLog("Checking collection counts after snapshotting has been disabled");
-rst.checkCollectionCounts();
-
 // Perform a clean shutdown and restart. Note that the 'disableSnapshotting' failpoint will be
 // unset on each node following the restart.
 nodes.forEach(node => rst.restart(node));
@@ -75,8 +76,4 @@ assert.commandWorked(
     primaryDB[collCreatedAfterRestart].insert({_id: "insertedAfterRestart", wMajority}));
 
 // Fast metadata count should be correct after restart in the face of a clean shutdown.
-jsTestLog("Checking collection counts after clean restart of all nodes");
-rst.checkCollectionCounts();
-
 rst.stopSet();
-}());

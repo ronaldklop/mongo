@@ -30,15 +30,17 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
 class BSONObj;
-class NamespaceString;
+
 class OperationContext;
-template <typename T>
-class StatusWith;
 
 /**
  * Given a chunk, determines whether it can be split and returns the split points if so. This

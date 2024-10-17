@@ -1,7 +1,0 @@
-networkx
-flask
-flask_socketio
-flask_cors
-lxml
-eventlet
-gevent

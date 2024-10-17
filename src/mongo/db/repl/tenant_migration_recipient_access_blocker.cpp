@@ -27,21 +27,40 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+#include <mutex>
+#include <tuple>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tenant_migration_access_blocker_executor.h"
-#include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_access_blocker.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/cancellation.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/future_util.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 
@@ -49,46 +68,38 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(tenantMigrationRecipientNotRejectReads);
 
-}
+}  // namespace
 
 TenantMigrationRecipientAccessBlocker::TenantMigrationRecipientAccessBlocker(
-    ServiceContext* serviceContext,
-    UUID migrationId,
-    std::string tenantId,
-    std::string donorConnString)
-    : _serviceContext(serviceContext),
-      _migrationId(migrationId),
-      _tenantId(std::move(tenantId)),
-      _donorConnString(std::move(donorConnString)) {
-    _asyncBlockingOperationsExecutor = TenantMigrationAccessBlockerExecutor::get(serviceContext)
-                                           .getOrCreateBlockedOperationsExecutor();
-}
+    ServiceContext* serviceContext, const UUID& migrationId)
+    : TenantMigrationAccessBlocker(BlockerType::kRecipient, migrationId),
+      _serviceContext(serviceContext) {}
 
-Status TenantMigrationRecipientAccessBlocker::checkIfCanWrite() {
+Status TenantMigrationRecipientAccessBlocker::checkIfCanWrite(Timestamp writeTs) {
     // This is guaranteed by the migration protocol. The recipient will not get any writes until the
     // migration is committed on the donor.
     return Status::OK();
 }
 
-Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(
-    OperationContext* opCtx, OperationType operationType) {
+Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(OperationContext* opCtx) {
     // Recipient nodes will not throw TenantMigrationConflict errors and so we should never need
     // to wait for a migration to commit/abort on the recipient set.
     MONGO_UNREACHABLE;
 }
 
-SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
-    OperationContext* opCtx) {
+SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanRunCommandFuture(
+    OperationContext* opCtx, StringData command) {
+    using namespace fmt::literals;
     if (MONGO_unlikely(tenantMigrationRecipientNotRejectReads.shouldFail())) {
         return SharedSemiFuture<void>();
     }
 
-    // Exclude internal reads decorated with 'tenantMigrationRecipientInfo' from any logic.
-    if (repl::tenantMigrationRecipientInfo(opCtx).has_value()) {
-        LOGV2_DEBUG(5492000,
+    if (tenant_migration_access_blocker::shouldExclude(opCtx)) {
+        LOGV2_DEBUG(5739900,
                     1,
-                    "Internal tenant read got excluded from the MTAB filtering",
-                    "tenantId"_attr = _tenantId,
+                    "Internal tenant command got excluded from the MTAB filtering",
+                    "migrationId"_attr = getMigrationId(),
+                    "command"_attr = command,
                     "opId"_attr = opCtx->getOpID());
         return SharedSemiFuture<void>();
     }
@@ -103,25 +114,52 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
         return boost::none;
     }();
 
-    stdx::lock_guard<Latch> lk(_mutex);
-    if (_state == State::kReject) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_state.isRejectReadsAndWrites()) {
+        // Something is likely wrong with the proxy if we end up here. Traffic should not be routed
+        // to the recipient while in the `kRejectReadsAndWrites` state.
+        LOGV2_DEBUG(5749100,
+                    1,
+                    "Tenant command is blocked on the recipient before migration completes",
+                    "migrationId"_attr = getMigrationId(),
+                    "opId"_attr = opCtx->getOpID(),
+                    "command"_attr = command);
         return SharedSemiFuture<void>(Status(
-            ErrorCodes::SnapshotTooOld, "Tenant read is not allowed before migration completes"));
+            ErrorCodes::IllegalOperation,
+            "Tenant command '{}' is not allowed before migration completes"_format(command)));
     }
-    invariant(_state == State::kRejectBefore);
+    invariant(_state.isRejectReadsBefore());
     invariant(_rejectBeforeTimestamp);
     if (atClusterTime && *atClusterTime < *_rejectBeforeTimestamp) {
+        LOGV2_DEBUG(5749101,
+                    1,
+                    "Tenant command is blocked on the recipient before migration completes",
+                    "migrationId"_attr = getMigrationId(),
+                    "opId"_attr = opCtx->getOpID(),
+                    "command"_attr = command,
+                    "atClusterTime"_attr = *atClusterTime,
+                    "rejectBeforeTimestamp"_attr = *_rejectBeforeTimestamp);
         return SharedSemiFuture<void>(Status(
-            ErrorCodes::SnapshotTooOld, "Tenant read is not allowed before migration completes"));
+            ErrorCodes::SnapshotTooOld,
+            "Tenant command '{}' is not allowed before migration completes"_format(command)));
     }
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
         // Speculative majority reads are only used for change streams (against the oplog
-        // collection) or when enableMajorityReadConcern=false. So we don't expect speculative
-        // majority reads in serverless.
+        // collection). So we don't expect speculative majority reads in serverless.
+
+        auto executor = TenantMigrationAccessBlockerRegistry::get(_serviceContext)
+                            .getAsyncBlockingOperationsExecutor();
+
         invariant(readConcernArgs.getMajorityReadMechanism() !=
                   repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative);
-        return ExecutorFuture(_asyncBlockingOperationsExecutor)
+        return ExecutorFuture(executor)
             .then([timestamp = *_rejectBeforeTimestamp, deadline = opCtx->getDeadline()] {
+                // Donor traffic is redirected to the recipient for migrating tenants only after all
+                // recipient nodes have successfully applied `rejectBeforeTimestamp` state doc
+                // change. So, it's safe to synchronously wait for rejectBeforeTimestamp to reach
+                // the current committed snapshot in asyncBlockingOperationsExecutor (unkillable by
+                // step down and rollback) without worrying about rejectBeforeTimestamp  state doc
+                // change getting rolled back, and causing potential executor thread exhaustion.
                 auto uniqueOpCtx = cc().makeOperationContext();
                 auto opCtx = uniqueOpCtx.get();
                 opCtx->setDeadlineByDate(deadline, ErrorCodes::MaxTimeMSExpired);
@@ -147,13 +185,21 @@ Status TenantMigrationRecipientAccessBlocker::checkIfCanBuildIndex() {
     return Status::OK();
 }
 
+Status TenantMigrationRecipientAccessBlocker::checkIfCanOpenChangeStream() {
+    return Status::OK();
+}
+
+Status TenantMigrationRecipientAccessBlocker::checkIfCanGetMoreChangeStream() {
+    return Status::OK();
+}
+
 bool TenantMigrationRecipientAccessBlocker::checkIfShouldBlockTTL() const {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     return _ttlIsBlocked;
 }
 
 void TenantMigrationRecipientAccessBlocker::stopBlockingTTL() {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     _ttlIsBlocked = false;
 }
 
@@ -164,43 +210,34 @@ void TenantMigrationRecipientAccessBlocker::onMajorityCommitPointUpdate(repl::Op
 
 void TenantMigrationRecipientAccessBlocker::appendInfoForServerStatus(
     BSONObjBuilder* builder) const {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    BSONObjBuilder tenantBuilder;
-    tenantBuilder.append("state", _stateToString(_state));
+    getMigrationId().appendToBuilder(builder, "migrationId");
+    builder->append("state", _state.toString());
     if (_rejectBeforeTimestamp) {
-        tenantBuilder.append("rejectBeforeTimestamp", _rejectBeforeTimestamp.get());
+        builder->append("rejectBeforeTimestamp", _rejectBeforeTimestamp.value());
     }
-    tenantBuilder.append("ttlIsBlocked", _ttlIsBlocked);
-    builder->append(_tenantId, tenantBuilder.obj());
+    builder->append("ttlIsBlocked", _ttlIsBlocked);
 }
 
-std::string TenantMigrationRecipientAccessBlocker::_stateToString(State state) const {
-    switch (state) {
-        case State::kReject:
-            return "reject";
-        case State::kRejectBefore:
-            return "rejectBefore";
+std::string TenantMigrationRecipientAccessBlocker::BlockerState::toString() const {
+    switch (_state) {
+        case State::kRejectReadsAndWrites:
+            return "rejectReadsAndWrites";
+        case State::kRejectReadsBefore:
+            return "rejectReadsBefore";
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-UUID TenantMigrationRecipientAccessBlocker::getMigrationId() const {
-    return _migrationId;
-}
-
-BSONObj TenantMigrationRecipientAccessBlocker::getDebugInfo() const {
-    return BSON("tenantId" << _tenantId << "donorConnectionString" << _donorConnString);
-}
-
 void TenantMigrationRecipientAccessBlocker::startRejectingReadsBefore(const Timestamp& timestamp) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _state = State::kRejectBefore;
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _state.transitionToRejectReadsBefore();
     if (!_rejectBeforeTimestamp || timestamp > *_rejectBeforeTimestamp) {
         LOGV2(5358100,
               "Tenant migration recipient starting to reject reads before timestamp",
-              "tenantId"_attr = _tenantId,
+              "migrationId"_attr = getMigrationId(),
               "timestamp"_attr = timestamp);
         _rejectBeforeTimestamp = timestamp;
     }

@@ -2,11 +2,10 @@
  * Test to verify when majority commit quorum is enabled for index build, the primary index builder
  * should not commit the index until majority of nodes finishes building their index.
  */
-(function() {
-
-"use strict";
-load("jstests/replsets/rslib.js");
-load('jstests/noPassthrough/libs/index_build.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 var rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
@@ -29,8 +28,7 @@ const docFilter = {
 };
 
 jsTestLog("Do some document writes.");
-assert.commandWorked(
-        primaryColl.insert({_id: 0, x: 0}, {"writeConcern": {"w": "majority"}}));
+assert.commandWorked(primaryColl.insert({_id: 0, x: 0}, {"writeConcern": {"w": "majority"}}));
 rst.awaitReplication();
 
 function isIndexBuildInProgress(conn, indexName) {
@@ -53,14 +51,6 @@ function sanityChecks() {
     IndexBuildTest.assertIndexes(primaryColl, 2, ['_id_'], ['x_1']);
 }
 
-function pauseIndexBuild(conn, failpoint) {
-    assert.commandWorked(conn.adminCommand({configureFailPoint: failpoint, mode: 'alwaysOn'}));
-}
-
-function resumeIndexBuild(conn, failpoint) {
-    assert.commandWorked(conn.adminCommand({configureFailPoint: failpoint, mode: 'off'}));
-}
-
 function createIndex(dbName, collName, indexName) {
     jsTestLog("Create index '" + indexName + "'.");
     assert.commandWorked(db.getSiblingDB(dbName).runCommand({
@@ -71,23 +61,26 @@ function createIndex(dbName, collName, indexName) {
 }
 
 // Make secondary index build to hang after collection scan phase.
-pauseIndexBuild(secondary, "hangAfterIndexBuildDumpsInsertsFromBulk");
+const insertDumpFailPoint =
+    configureFailPoint(secondary, "hangAfterIndexBuildDumpsInsertsFromBulk");
 // Start the index build on primary in parallel shell.
 const joinCreateIndexThread =
     startParallelShell(funWithArgs(createIndex, dbName, collName, indexName), primary.port);
 
 jsTestLog("Waiting for Collection scan phase to complete");
-checkLog.contains(secondary, "Hanging after dumping inserts from bulk builder");
+insertDumpFailPoint.wait();
+// Wait for the index to become visible in listIndexes, the above failpoint does not guarantee this.
+rst.awaitReplication();
 sanityChecks();
-pauseIndexBuild(secondary, "hangAfterIndexBuildFirstDrain");
-resumeIndexBuild(secondary, "hangAfterIndexBuildDumpsInsertsFromBulk");
+const firstDrainFailPoint = configureFailPoint(secondary, "hangAfterIndexBuildFirstDrain");
+insertDumpFailPoint.off();
 
 jsTestLog("Waiting for first drain phase to complete");
-checkLog.contains(secondary, "Hanging after index build first drain");
+firstDrainFailPoint.wait();
 sanityChecks();
 // Make secondary to resume index build. This should allow secondary to vote
 // and make primary to commit index build.
-resumeIndexBuild(secondary, "hangAfterIndexBuildFirstDrain");
+firstDrainFailPoint.off();
 
 jsTestLog("Wait for create index thread to join");
 joinCreateIndexThread();
@@ -105,4 +98,3 @@ assert.eq(false, isIndexBuildInProgress(secondary, indexName));
 IndexBuildTest.assertIndexes(primaryColl, 2, ['_id_', 'x_1']);
 
 rst.stopSet();
-})();

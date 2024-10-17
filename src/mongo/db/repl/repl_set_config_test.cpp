@@ -27,30 +27,63 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <limits>
+#include <utility>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/repl_set_config_checks.h"
+#include "mongo/db/repl/repl_set_config_test.h"
 #include "mongo/db/server_options.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/safe_num.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
-// Creates a bson document reprsenting a replica set config doc with the given members, and votes
-BSONObj createConfigDoc(int members, int voters = ReplSetConfig::kMaxVotingMembers) {
+// Creates a bson document representing a replica set config doc with the given members and votes.
+BSONObj createConfigDocWithVoters(int members, int voters = ReplSetConfig::kMaxVotingMembers) {
     str::stream configJson;
     configJson << "{_id:'rs0', version:1, protocolVersion:1, members:[";
     for (int i = 0; i < members; ++i) {
         configJson << "{_id:" << i << ", host:'node" << i << "'";
         if (i >= voters) {
             configJson << ", votes:0, priority:0";
+        }
+        configJson << "}";
+        if (i != (members - 1))
+            configJson << ",";
+    }
+    configJson << "]}";
+    return fromjson(configJson);
+}
+
+// Creates a bson document representing a replica set config doc with the given members and
+// arbiters.
+BSONObj createConfigDocWithArbiters(int members, int arbiters = 0) {
+    str::stream configJson;
+    configJson << "{_id:'rs0', version:1, protocolVersion:1, members:[";
+    for (int i = 0; i < members; ++i) {
+        configJson << "{_id:" << i << ", host:'node" << i << "'";
+        if (i < arbiters) {
+            configJson << ", arbiterOnly:true";
         }
         configJson << "}";
         if (i != (members - 1))
@@ -74,15 +107,15 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
     ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(0), config.membersBegin()->getId());
-    ASSERT_EQUALS(1, config.getDefaultWriteConcern().wNumNodes);
-    ASSERT_EQUALS("", config.getDefaultWriteConcern().wMode);
+    ASSERT(holds_alternative<int64_t>(config.getDefaultWriteConcern().w));
+    ASSERT_EQUALS(1, get<int64_t>(config.getDefaultWriteConcern().w));
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatInterval, config.getHeartbeatInterval());
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatTimeoutPeriod,
                   config.getHeartbeatTimeoutPeriod());
     ASSERT_EQUALS(ReplSetConfig::kDefaultElectionTimeoutPeriod, config.getElectionTimeoutPeriod());
     ASSERT_TRUE(config.isChainingAllowed());
     ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     ASSERT_EQUALS(1, config.getProtocolVersion());
     ASSERT_EQUALS(
         ConnectionString::forReplicaSet("rs0", {HostAndPort{"localhost:12345"}}).toString(),
@@ -100,10 +133,7 @@ TEST(ReplSetConfig, ParseLargeConfigAndCheckAccessors) {
                                                            << BSON("NYC"
                                                                    << "NY")))
                                   << "protocolVersion" << 1 << "settings"
-                                  << BSON("getLastErrorDefaults"
-                                          << BSON("w"
-                                                  << "majority")
-                                          << "getLastErrorModes"
+                                  << BSON("getLastErrorModes"
                                           << BSON("eastCoast" << BSON("NYC" << 1))
                                           << "chainingAllowed" << false << "heartbeatIntervalMillis"
                                           << 5000 << "heartbeatTimeoutSecs" << 120
@@ -114,11 +144,9 @@ TEST(ReplSetConfig, ParseLargeConfigAndCheckAccessors) {
     ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(234), config.membersBegin()->getId());
-    ASSERT_EQUALS(0, config.getDefaultWriteConcern().wNumNodes);
-    ASSERT_EQUALS("majority", config.getDefaultWriteConcern().wMode);
     ASSERT_FALSE(config.isChainingAllowed());
     ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     ASSERT_EQUALS(Seconds(5), config.getHeartbeatInterval());
     ASSERT_EQUALS(Seconds(120), config.getHeartbeatTimeoutPeriod());
     ASSERT_EQUALS(Milliseconds(10), config.getElectionTimeoutPeriod());
@@ -175,6 +203,7 @@ TEST(ReplSetConfig, MajorityCalculationThreeVotersNoArbiters) {
 }
 
 TEST(ReplSetConfig, MajorityCalculationNearlyHalfArbiters) {
+    RAIIServerParameterControllerForTest controller{"allowMultipleArbiters", true};
     ReplSetConfig config(
         ReplSetConfig::parse(BSON("_id"
                                   << "mySet"
@@ -257,14 +286,6 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingIdField) {
                                             << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                      << "localhost:12345")))),
         DBException);
-
-    // Replica set name must be non-empty.
-    ASSERT_THROWS(ReplSetConfig::parse(BSON("_id"
-                                            << ""
-                                            << "version" << 1 << "protocolVersion" << 1 << "members"
-                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                     << "localhost:12345")))),
-                  DBException);
 }
 
 TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
@@ -298,15 +319,15 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))),
         DBException);
-    ASSERT_THROWS(
+    config =
         ReplSetConfig::parse(BSON("_id"
                                   << "rs0"
                                   << "version"
                                   << static_cast<long long>(std::numeric_limits<int>::max()) + 1
                                   << "protocolVersion" << 1 << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                           << "localhost:12345")))),
-        DBException);
+                                                           << "localhost:12345"))));
+    ASSERT_OK(config.validate());
 }
 
 TEST(ReplSetConfig, ParseFailsWithBadOrMissingTermField) {
@@ -489,9 +510,10 @@ TEST(ReplSetConfig, ParseFailsWithTooFewVoters) {
 
 TEST(ReplSetConfig, ParseFailsWithTooManyVoters) {
     ReplSetConfig config(
-        ReplSetConfig::parse(createConfigDoc(8, ReplSetConfig::kMaxVotingMembers)));
+        ReplSetConfig::parse(createConfigDocWithVoters(8, ReplSetConfig::kMaxVotingMembers)));
     ASSERT_OK(config.validate());
-    config = ReplSetConfig::parse(createConfigDoc(8, ReplSetConfig::kMaxVotingMembers + 1));
+    config =
+        ReplSetConfig::parse(createConfigDocWithVoters(8, ReplSetConfig::kMaxVotingMembers + 1));
     ASSERT_NOT_OK(config.validate());
 }
 
@@ -651,7 +673,6 @@ TEST(ReplSetConfig, ParseFailsWithNonObjectSettingsField) {
 }
 
 TEST(ReplSetConfig, ParseFailsWithGetLastErrorDefaultsFieldUnparseable) {
-    ReplSetConfig config;
     ASSERT_THROWS(ReplSetConfig::parse(BSON("_id"
                                             << "rs0"
                                             << "version" << 1 << "protocolVersion" << 1 << "members"
@@ -660,7 +681,7 @@ TEST(ReplSetConfig, ParseFailsWithGetLastErrorDefaultsFieldUnparseable) {
                                             << "settings"
                                             << BSON("getLastErrorDefaults" << BSON("fsync"
                                                                                    << "seven")))),
-                  ExceptionFor<ErrorCodes::FailedToParse>);
+                  ExceptionFor<ErrorCodes::TypeMismatch>);
 }
 
 TEST(ReplSetConfig, ParseFailsWithNonObjectGetLastErrorDefaultsField) {
@@ -820,23 +841,6 @@ TEST(ReplSetConfig, ValidateFailsWithDuplicateMemberId) {
     ASSERT_EQUALS(ErrorCodes::BadValue, status);
 }
 
-TEST(ReplSetConfig, ValidateFailsWithBothDelaySecsFieldNames) {
-    ReplSetConfig config(ReplSetConfig::parse(
-        BSON("_id"
-             << "rs0"
-             << "protocolVersion" << 1 << "version" << 1 << "configsvr" << true << "members"
-             << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                      << "localhost:12345")
-                           << BSON("_id" << 1 << "host"
-                                         << "localhost:54321"
-                                         << "priority" << 0 << "secondaryDelaySecs" << 10
-                                         << "slaveDelay" << 10)))));
-    Status status = config.validate();
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
-    ASSERT_STRING_CONTAINS(status.reason(),
-                           "Cannot specify both secondaryDelaySecs and slaveDelay");
-}
-
 TEST(ReplSetConfig, InitializeFailsWithInvalidMember) {
     ReplSetConfig config;
     ASSERT_THROWS(ReplSetConfig::parse(BSON("_id"
@@ -877,7 +881,7 @@ TEST(ReplSetConfig, ConfigServerField) {
                                   << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))));
-    ASSERT_TRUE(config.getConfigServer());
+    ASSERT_TRUE(config.getConfigServer_deprecated());
     // When the field is true it should be serialized.
     BSONObj configBSON = config.toBSON();
     ASSERT_TRUE(configBSON.getField("configsvr").isBoolean());
@@ -890,13 +894,13 @@ TEST(ReplSetConfig, ConfigServerField) {
                                         << false << "members"
                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                  << "localhost:12345"))));
-    ASSERT_FALSE(config2.getConfigServer());
+    ASSERT_FALSE(config2.getConfigServer_deprecated());
     // When the field is false it should not be serialized.
     configBSON = config2.toBSON();
     ASSERT_FALSE(configBSON.hasField("configsvr"));
 
     // Configs in which configsvr is not the same as the --configsvr flag are invalid.
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
 
     ASSERT_OK(config.validate());
@@ -1088,7 +1092,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                   << "protocolVersion" << 1 << "version" << 1 << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))));
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     // Default false configsvr field should not be serialized.
     BSONObj configBSON = config.toBSON();
     ASSERT_FALSE(configBSON.hasField("configsvr"));
@@ -1101,9 +1105,10 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                       << "localhost:12345"))),
                                         OID::gen()));
-    ASSERT_FALSE(config2.getConfigServer());
+    ASSERT_FALSE(config2.getConfigServer_deprecated());
 
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
 
     ReplSetConfig config3;
@@ -1112,7 +1117,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                         << "protocolVersion" << 1 << "version" << 1 << "members"
                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                  << "localhost:12345"))));
-    ASSERT_FALSE(config3.getConfigServer());
+    ASSERT_FALSE(config3.getConfigServer_deprecated());
 
     ReplSetConfig config4(
         ReplSetConfig::parseForInitiate(BSON("_id"
@@ -1122,7 +1127,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                       << "localhost:12345"))),
                                         OID::gen()));
-    ASSERT_TRUE(config4.getConfigServer());
+    ASSERT_TRUE(config4.getConfigServer_deprecated());
     // Default true configsvr field should be serialized (even though it wasn't included
     // originally).
     configBSON = config4.toBSON();
@@ -1211,141 +1216,26 @@ TEST(ReplSetConfig, HeartbeatTimeoutField) {
                   DBException);
 }
 
-TEST(ReplSetConfig, GleDefaultField) {
-    ReplSetConfig config(
-        ReplSetConfig::parse(BSON("_id"
-                                  << "rs0"
-                                  << "version" << 1 << "protocolVersion" << 1 << "members"
-                                  << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                           << "localhost:12345"))
-                                  << "settings"
-                                  << BSON("getLastErrorDefaults" << BSON("w"
-                                                                         << "majority")))));
-    ASSERT_OK(config.validate());
-    ASSERT_EQUALS("majority", config.getDefaultWriteConcern().wMode);
-
-    config = ReplSetConfig::parse(BSON("_id"
-                                       << "rs0"
-                                       << "version" << 1 << "protocolVersion" << 1 << "members"
-                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                << "localhost:12345"))
-                                       << "settings"
-                                       << BSON("getLastErrorDefaults" << BSON("w"
-                                                                              << "frim"))));
-    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
-
-    // Test that default write concern must have at least one member.
-    ASSERT_THROWS(
-        ReplSetConfig::parse(BSON("_id"
-                                  << "rs0"
-                                  << "version" << 1 << "protocolVersion" << 1 << "members"
-                                  << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                           << "localhost:12345"))
-                                  << "settings" << BSON("getLastErrorDefaults" << BSON("w" << 0)))),
-        DBException);
-
-
-    config = ReplSetConfig::parse(BSON("_id"
-                                       << "rs0"
-                                       << "version" << 1 << "protocolVersion" << 1 << "members"
-                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                << "localhost:12345"
-                                                                << "tags"
-                                                                << BSON("a"
-                                                                        << "v")))
-                                       << "settings"
-                                       << BSON("getLastErrorDefaults"
-                                               << BSON("w"
-                                                       << "frim")
-                                               << "getLastErrorModes"
-                                               << BSON("frim" << BSON("a" << 1)))));
-    ASSERT_OK(config.validate());
-    ASSERT_EQUALS("frim", config.getDefaultWriteConcern().wMode);
-    ASSERT_OK(config.findCustomWriteMode("frim").getStatus());
-}
-
-bool operator==(const MemberConfig& a, const MemberConfig& b) {
-    // do tag comparisons
-    for (MemberConfig::TagIterator itrA = a.tagsBegin(); itrA != a.tagsEnd(); ++itrA) {
-        if (std::find(b.tagsBegin(), b.tagsEnd(), *itrA) == b.tagsEnd()) {
-            return false;
-        }
-    }
-    return a.getId() == b.getId() && a.getHostAndPort() == b.getHostAndPort() &&
-        a.getPriority() == b.getPriority() && a.getSecondaryDelay() == b.getSecondaryDelay() &&
-        a.isVoter() == b.isVoter() && a.isArbiter() == b.isArbiter() &&
-        a.isNewlyAdded() == b.isNewlyAdded() && a.isHidden() == b.isHidden() &&
-        a.shouldBuildIndexes() == b.shouldBuildIndexes() && a.getNumTags() == b.getNumTags() &&
-        a.getHorizonMappings() == b.getHorizonMappings() &&
-        a.getHorizonReverseHostMappings() == b.getHorizonReverseHostMappings();
-}
-
-bool operator==(const ReplSetConfig& a, const ReplSetConfig& b) {
-    // compare WriteConcernModes
-    std::vector<std::string> modeNames = a.getWriteConcernNames();
-    for (std::vector<std::string>::iterator it = modeNames.begin(); it != modeNames.end(); it++) {
-        ReplSetTagPattern patternA = a.findCustomWriteMode(*it).getValue();
-        ReplSetTagPattern patternB = b.findCustomWriteMode(*it).getValue();
-        for (ReplSetTagPattern::ConstraintIterator itrA = patternA.constraintsBegin();
-             itrA != patternA.constraintsEnd();
-             itrA++) {
-            bool same = false;
-            for (ReplSetTagPattern::ConstraintIterator itrB = patternB.constraintsBegin();
-                 itrB != patternB.constraintsEnd();
-                 itrB++) {
-                if (itrA->getKeyIndex() == itrB->getKeyIndex() &&
-                    itrA->getMinCount() == itrB->getMinCount()) {
-                    same = true;
-                    break;
-                }
-            }
-            if (!same) {
-                return false;
-            }
-        }
-    }
-
-    // compare the members
-    for (ReplSetConfig::MemberIterator memA = a.membersBegin(); memA != a.membersEnd(); memA++) {
-        bool same = false;
-        for (ReplSetConfig::MemberIterator memB = b.membersBegin(); memB != b.membersEnd();
-             memB++) {
-            if (*memA == *memB) {
-                same = true;
-                break;
-            }
-        }
-        if (!same) {
-            return false;
-        }
-    }
-
-    // simple comparisons
-    return a.getReplSetName() == b.getReplSetName() &&
-        a.getConfigVersion() == b.getConfigVersion() && a.getNumMembers() == b.getNumMembers() &&
-        a.getHeartbeatInterval() == b.getHeartbeatInterval() &&
-        a.getHeartbeatTimeoutPeriod() == b.getHeartbeatTimeoutPeriod() &&
-        a.getElectionTimeoutPeriod() == b.getElectionTimeoutPeriod() &&
-        a.isChainingAllowed() == b.isChainingAllowed() &&
-        a.getConfigServer() == b.getConfigServer() &&
-        a.getDefaultWriteConcern().wNumNodes == b.getDefaultWriteConcern().wNumNodes &&
-        a.getDefaultWriteConcern().wMode == b.getDefaultWriteConcern().wMode &&
-        a.getProtocolVersion() == b.getProtocolVersion() &&
-        a.getReplicaSetId() == b.getReplicaSetId();
-}
-
 TEST(ReplSetConfig, toBSONRoundTripAbility) {
     ReplSetConfig configA;
     ReplSetConfig configB;
+    const std::string recipientTagName{"recipient"};
+    const auto donorReplSetId = OID::gen();
+    const auto recipientMemberBSON =
+        BSON("_id" << 1 << "host"
+                   << "localhost:20002"
+                   << "priority" << 0 << "votes" << 0 << "tags" << BSON(recipientTagName << "one"));
+
     configA = ReplSetConfig::parse(BSON("_id"
                                         << "rs0"
                                         << "version" << 1 << "protocolVersion" << 1 << "members"
                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                 << "localhost:12345"))
+                                                                 << "localhost:12345")
+                                                      << recipientMemberBSON)
                                         << "settings"
                                         << BSON("heartbeatIntervalMillis"
                                                 << 5000 << "heartbeatTimeoutSecs" << 20
-                                                << "replicaSetId" << OID::gen())));
+                                                << "replicaSetId" << donorReplSetId)));
     configB = ReplSetConfig::parse(configA.toBSON());
     ASSERT_TRUE(configA == configB);
 }
@@ -1397,14 +1287,11 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
                                             << "true")))
         << "protocolVersion" << 1 << "settings"
 
-        << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20
-                                          << "electionTimeoutMillis" << 4 << "chainingAllowed"
-                                          << true << "getLastErrorDefaults"
-                                          << BSON("w"
-                                                  << "majority")
-                                          << "getLastErrorModes"
-                                          << BSON("disks" << BSON("ssd" << 1 << "hdd" << 1)
-                                                          << "coasts" << BSON("coast" << 2)))));
+        << BSON("heartbeatIntervalMillis"
+                << 5000 << "heartbeatTimeoutSecs" << 20 << "electionTimeoutMillis" << 4
+                << "chainingAllowed" << true << "getLastErrorModes"
+                << BSON("disks" << BSON("ssd" << 1 << "hdd" << 1) << "coasts"
+                                << BSON("coast" << 2)))));
     BSONObj configObjA = configA.toBSON();
     configB = ReplSetConfig::parse(configObjA);
     ASSERT_TRUE(configA == configB);
@@ -1488,34 +1375,34 @@ TEST(ReplSetConfig, CheckIfWriteConcernCanBeSatisfied) {
                             << BSON("dc" << 3) << "invalidNotEnoughNodes" << BSON("rack" << 6)))));
 
     WriteConcernOptions validNumberWC;
-    validNumberWC.wNumNodes = 5;
+    validNumberWC.w = 5;
     ASSERT_OK(configA.checkIfWriteConcernCanBeSatisfied(validNumberWC));
 
     WriteConcernOptions invalidNumberWC;
-    invalidNumberWC.wNumNodes = 6;
+    invalidNumberWC.w = 6;
     ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidNumberWC));
 
     WriteConcernOptions majorityWC;
-    majorityWC.wMode = "majority";
+    majorityWC.w = "majority";
     ASSERT_OK(configA.checkIfWriteConcernCanBeSatisfied(majorityWC));
 
     WriteConcernOptions validModeWC;
-    validModeWC.wMode = "valid";
+    validModeWC.w = "valid";
     ASSERT_OK(configA.checkIfWriteConcernCanBeSatisfied(validModeWC));
 
     WriteConcernOptions fakeModeWC;
-    fakeModeWC.wMode = "fake";
+    fakeModeWC.w = "fake";
     ASSERT_EQUALS(ErrorCodes::UnknownReplWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(fakeModeWC));
 
     WriteConcernOptions invalidModeNotEnoughValuesWC;
-    invalidModeNotEnoughValuesWC.wMode = "invalidNotEnoughValues";
+    invalidModeNotEnoughValuesWC.w = "invalidNotEnoughValues";
     ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidModeNotEnoughValuesWC));
 
     WriteConcernOptions invalidModeNotEnoughNodesWC;
-    invalidModeNotEnoughNodesWC.wMode = "invalidNotEnoughNodes";
+    invalidModeNotEnoughNodesWC.w = "invalidNotEnoughNodes";
     ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidModeNotEnoughNodesWC));
 }
@@ -1524,7 +1411,7 @@ TEST(ReplSetConfig, CheckMaximumNodesOkay) {
     ReplSetConfig configA;
     ReplSetConfig configB;
     const int memberCount = 50;
-    configA = ReplSetConfig::parse(createConfigDoc(memberCount));
+    configA = ReplSetConfig::parse(createConfigDocWithVoters(memberCount));
     configB = ReplSetConfig::parse(configA.toBSON());
     ASSERT_OK(configA.validate());
     ASSERT_OK(configB.validate());
@@ -1535,7 +1422,7 @@ TEST(ReplSetConfig, CheckBeyondMaximumNodesFailsValidate) {
     ReplSetConfig configA;
     ReplSetConfig configB;
     const int memberCount = 51;
-    configA = ReplSetConfig::parse(createConfigDoc(memberCount));
+    configA = ReplSetConfig::parse(createConfigDocWithVoters(memberCount));
     configB = ReplSetConfig::parse(configA.toBSON());
     ASSERT_NOT_OK(configA.validate());
     ASSERT_NOT_OK(configB.validate());
@@ -1592,7 +1479,8 @@ TEST(ReplSetConfig, CheckConfigServerCantHaveSecondaryDelaySecs) {
 }
 
 TEST(ReplSetConfig, CheckConfigServerMustHaveTrueForWriteConcernMajorityJournalDefault) {
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
     ReplSetConfig configA;
     configA = ReplSetConfig::parse(BSON("_id"
@@ -1999,6 +1887,283 @@ TEST(ReplSetConfig, ConfigVersionAndTermToString) {
     ASSERT_EQ(ConfigVersionAndTerm(1, 2).toString(), "{version: 1, term: 2}");
     ASSERT_EQ(ConfigVersionAndTerm(1, -1).toString(), "{version: 1, term: -1}");
 }
+TEST(ReplSetConfig, IsImplicitDefaultWriteConcernMajority) {
+    RAIIServerParameterControllerForTest controller{"allowMultipleArbiters", true};
+
+    ReplSetConfig config(ReplSetConfig::parse(createConfigDocWithArbiters(1, 0)));
+    ASSERT_OK(config.validate());
+    ASSERT(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(2, 0));
+    ASSERT_OK(config.validate());
+    ASSERT(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(3, 0));
+    ASSERT_OK(config.validate());
+    ASSERT(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(3, 1));
+    ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(4, 1));
+    ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(5, 1));
+    ASSERT_OK(config.validate());
+    ASSERT(config.isImplicitDefaultWriteConcernMajority());
+
+    config = ReplSetConfig::parse(createConfigDocWithArbiters(5, 2));
+    ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.isImplicitDefaultWriteConcernMajority());
+}
+
+TEST(ReplSetConfig, MakeCustomWriteMode) {
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "rs0"
+                                            << "version" << 1 << "term" << 1.0 << "protocolVersion"
+                                            << 1 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                     << "localhost:12345"
+                                                                     << "tags"
+                                                                     << BSON("NYC"
+                                                                             << "NY")))));
+
+    auto swPattern = config.makeCustomWriteMode({{"NonExistentTag", 1}});
+    ASSERT_FALSE(swPattern.isOK());
+    ASSERT_EQ(swPattern.getStatus().code(), ErrorCodes::NoSuchKey);
+
+    swPattern = config.makeCustomWriteMode({{"NYC", 1}});
+    ASSERT_TRUE(swPattern.isOK());
+}
+
+TEST(ReplSetConfig, SameWriteConcernModesNoCustom) {
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "rs0"
+                                            << "version" << 1 << "term" << 1.0 << "protocolVersion"
+                                            << 1 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                     << "localhost:12345"))));
+
+    auto otherConfig = ReplSetConfig::parse(BSON("_id"
+                                                 << "rs0"
+                                                 << "version" << 2 << "term" << 1.0
+                                                 << "protocolVersion" << 1 << "members"
+                                                 << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                          << "localhost:6789"))));
+
+    ASSERT(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, SameWriteConcernModesOneCustom) {
+    auto config = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("NYC" << 1)))));
+
+    auto otherConfig = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 2 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:6789"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("NYC" << 1)))));
+
+    ASSERT(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, DifferentWriteConcernModesOneCustomDifferentName) {
+    auto config = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("somename" << BSON("NYC" << 1)))));
+
+    auto otherConfig = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 2 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:6789"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("othername" << BSON("NYC" << 1)))));
+
+    ASSERT_FALSE(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT_FALSE(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, DifferentWriteConcernModesOneCustomDifferentCounts) {
+    auto config = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY"))
+                           << BSON("_id" << 1 << "host"
+                                         << "otherhost:12345"
+                                         << "tags"
+                                         << BSON("NYC"
+                                                 << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("NYC" << 1)))));
+
+    auto otherConfig = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY"))
+                           << BSON("_id" << 1 << "host"
+                                         << "otherhost:12345"
+                                         << "tags"
+                                         << BSON("NYC"
+                                                 << "NY")))
+             << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("NYC" << 2)))));
+
+    ASSERT_FALSE(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT_FALSE(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, DifferentWriteConcernModesExtraTag) {
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "rs0"
+                                            << "version" << 1 << "term" << 1.0 << "protocolVersion"
+                                            << 1 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                     << "localhost:12345"
+                                                                     << "tags"
+                                                                     << BSON("NYC"
+                                                                             << "NY"))
+                                                          << BSON("_id" << 1 << "host"
+                                                                        << "otherhost:12345"
+                                                                        << "tags"
+                                                                        << BSON("Boston"
+                                                                                << "MA")))
+                                            << "settings"
+                                            << BSON("getLastErrorModes"
+                                                    << BSON("nyonly" << BSON("NYC" << 1) << "maonly"
+                                                                     << BSON("Boston" << 1)))));
+
+    auto otherConfig = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY"))
+                           << BSON("_id" << 1 << "host"
+                                         << "otherhost:12345"
+                                         << "tags"
+                                         << BSON("Boston"
+                                                 << "MA")))
+             << "settings" << BSON("getLastErrorModes" << BSON("nyonly" << BSON("NYC" << 1)))));
+
+    ASSERT_FALSE(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT_FALSE(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, DifferentWriteConcernModesSameNameDifferentDefinition) {
+    auto config = ReplSetConfig::parse(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                      << "localhost:12345"
+                                      << "tags"
+                                      << BSON("NYC"
+                                              << "NY"))
+                           << BSON("_id" << 1 << "host"
+                                         << "otherhost:12345"
+                                         << "tags"
+                                         << BSON("Boston"
+                                                 << "MA")))
+             << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("NYC" << 1)))));
+
+    auto otherConfig = ReplSetConfig::parse(BSON(
+        "_id"
+        << "rs0"
+        << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1 << "members"
+        << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                 << "localhost:12345"
+                                 << "tags"
+                                 << BSON("NYC"
+                                         << "NY"))
+                      << BSON("_id" << 1 << "host"
+                                    << "otherhost:12345"
+                                    << "tags"
+                                    << BSON("Boston"
+                                            << "MA")))
+        << "settings" << BSON("getLastErrorModes" << BSON("eastCoast" << BSON("Boston" << 1)))));
+
+    ASSERT_FALSE(config.areWriteConcernModesTheSame(&otherConfig));
+    ASSERT_FALSE(otherConfig.areWriteConcernModesTheSame(&config));
+}
+
+TEST(ReplSetConfig, MutableCompatibilityForRecipientConfig) {
+    const std::string recipientTagName{"recipient"};
+    const auto donorReplSetId = OID::gen();
+    const std::string recipientConfigSetName{"recipientSetName"};
+    BSONObj recipientConfigBSON = BSON(
+        "_id" << recipientConfigSetName << "version" << 1 << "protocolVersion" << 1 << "members"
+              << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                       << "localhost:20002"
+                                       << "priority" << 1 << "votes" << 1 << "tags"
+                                       << BSON(recipientTagName << "one")))
+              << "settings"
+              << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20));
+    BSONObj replSetConfigWithRecipientConfig = BSON("_id"
+                                                    << "rs0"
+                                                    << "version" << 1 << "protocolVersion" << 1
+                                                    << "members"
+                                                    << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                             << "localhost:12345"))
+                                                    << "settings"
+                                                    << BSON("heartbeatIntervalMillis"
+                                                            << 5000 << "heartbeatTimeoutSecs" << 20
+                                                            << "replicaSetId" << donorReplSetId)
+                                                    << "recipientConfig" << recipientConfigBSON);
+
+    ReplSetConfig config(ReplSetConfig::parse(replSetConfigWithRecipientConfig));
+    ASSERT_OK(config.validate());
+    auto mutableConfig = config.getMutable();
+    mutableConfig.setConfigVersion(1);
+    mutableConfig.setConfigTerm(1);
+    ReplSetConfig rolledBackConfig = ReplSetConfig(std::move(mutableConfig));
+    ASSERT_OK(rolledBackConfig.validate());
+    ASSERT_EQUALS("rs0", rolledBackConfig.getReplSetName());
+    ASSERT_EQUALS(1, rolledBackConfig.getConfigVersion());
+    ASSERT_EQUALS(1, rolledBackConfig.getConfigTerm());
+    ASSERT_EQUALS(1, rolledBackConfig.getNumMembers());
+    ASSERT_TRUE(sameConfigContents(config, rolledBackConfig));
+    ASSERT_FALSE(rolledBackConfig.getRecipientConfig() == nullptr);
+}
+
 }  // namespace
 }  // namespace repl
 }  // namespace mongo

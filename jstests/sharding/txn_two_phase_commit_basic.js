@@ -5,10 +5,12 @@
  * @tags: [uses_transactions, uses_prepare_transaction, uses_multi_shard_transaction]
  */
 
-(function() {
-'use strict';
-
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    checkDecisionIs,
+    checkDocumentDeleted
+} from 'jstests/sharding/libs/txn_two_phase_commit_util.js';
 
 const dbName = "test";
 const collName = "foo";
@@ -33,26 +35,6 @@ const checkParticipantListMatches = function(
                        .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
     assert.neq(null, coordDoc);
     assert.sameMembers(coordDoc.participants, expectedParticipantList);
-};
-
-const checkDecisionIs = function(coordinatorConn, lsid, txnNumber, expectedDecision) {
-    let coordDoc = coordinatorConn.getDB("config")
-                       .getCollection("transaction_coordinators")
-                       .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
-    assert.neq(null, coordDoc);
-    assert.eq(expectedDecision, coordDoc.decision.decision);
-    if (expectedDecision === "commit") {
-        assert.neq(null, coordDoc.decision.commitTimestamp);
-    } else {
-        assert.eq(null, coordDoc.decision.commitTimestamp);
-    }
-};
-
-const checkDocumentDeleted = function(coordinatorConn, lsid, txnNumber) {
-    let coordDoc = coordinatorConn.getDB("config")
-                       .getCollection("transaction_coordinators")
-                       .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
-    return null === coordDoc;
 };
 
 const runCommitThroughMongosInParallelShellExpectSuccess = function() {
@@ -129,8 +111,8 @@ const setUp = function() {
     // shard0: [-inf, 0)
     // shard1: [0, 10)
     // shard2: [10, +inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: coordinator.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: coordinator.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -184,14 +166,11 @@ const testCommitProtocol = function(shouldCommit, simulateNetworkFailures) {
 
     // Turn on failpoints so that the coordinator hangs after each write it does, so that the
     // test can check that the write happened correctly.
-    assert.commandWorked(coordinator.adminCommand({
-        configureFailPoint: "hangBeforeWaitingForParticipantListWriteConcern",
-        mode: "alwaysOn",
-    }));
-    assert.commandWorked(coordinator.adminCommand({
-        configureFailPoint: "hangBeforeWaitingForDecisionWriteConcern",
-        mode: "alwaysOn",
-    }));
+    const hangBeforeWaitingForParticipantListWriteConcernFp = configureFailPoint(
+        coordinator, "hangBeforeWaitingForParticipantListWriteConcern", {}, "alwaysOn");
+
+    const hangBeforeWaitingForDecisionWriteConcernFp =
+        configureFailPoint(coordinator, "hangBeforeWaitingForDecisionWriteConcern", {}, "alwaysOn");
 
     // Run commitTransaction through a parallel shell.
     let awaitResult;
@@ -202,21 +181,15 @@ const testCommitProtocol = function(shouldCommit, simulateNetworkFailures) {
     }
 
     // Check that the coordinator wrote the participant list.
-    waitForFailpoint("Hit hangBeforeWaitingForParticipantListWriteConcern failpoint", txnNumber);
+    hangBeforeWaitingForParticipantListWriteConcernFp.wait();
     checkParticipantListMatches(coordinator, lsid, txnNumber, expectedParticipantList);
-    assert.commandWorked(coordinator.adminCommand({
-        configureFailPoint: "hangBeforeWaitingForParticipantListWriteConcern",
-        mode: "off",
-    }));
+    hangBeforeWaitingForParticipantListWriteConcernFp.off();
 
     // Check that the coordinator wrote the decision.
-    waitForFailpoint("Hit hangBeforeWaitingForDecisionWriteConcern failpoint", txnNumber);
+    hangBeforeWaitingForDecisionWriteConcernFp.wait();
     checkParticipantListMatches(coordinator, lsid, txnNumber, expectedParticipantList);
     checkDecisionIs(coordinator, lsid, txnNumber, (shouldCommit ? "commit" : "abort"));
-    assert.commandWorked(coordinator.adminCommand({
-        configureFailPoint: "hangBeforeWaitingForDecisionWriteConcern",
-        mode: "off",
-    }));
+    hangBeforeWaitingForDecisionWriteConcernFp.off();
 
     // Check that the coordinator deleted its persisted state.
     awaitResult();
@@ -252,4 +225,3 @@ testCommitProtocol(false /* test abort */, true /* with network failures */);
 testCommitProtocol(true /* test commit */, true /* with network failures */);
 
 st.stop();
-})();

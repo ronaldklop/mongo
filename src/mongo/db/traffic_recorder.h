@@ -30,13 +30,15 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/service_context.h"
 #include "mongo/db/traffic_recorder_gen.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/rpc/message.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -61,10 +63,13 @@ public:
     void start(const StartRecordingTraffic& options);
     void stop();
 
-    void observe(const transport::SessionHandle& ts, Date_t now, const Message& message);
+    void observe(const std::shared_ptr<transport::Session>& ts,
+                 const Message& message,
+                 ServiceContext* svcCtx);
+
+    class TrafficRecorderSSS;
 
 private:
-    class TrafficRecorderSSS;
     class Recording;
 
     std::shared_ptr<Recording> _getCurrentRecording() const;
@@ -72,7 +77,7 @@ private:
     AtomicWord<bool> _shouldRecord;
 
     // The mutex only protects the last recording shared_ptr
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TrafficRecorder::_mutex");
+    mutable stdx::mutex _mutex;
     std::shared_ptr<Recording> _recording;
 };
 

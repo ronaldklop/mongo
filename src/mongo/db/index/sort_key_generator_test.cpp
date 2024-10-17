@@ -27,17 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <utility>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -208,22 +217,13 @@ TEST(SortKeyGeneratorTest, SortPatternComponentWithNonStringMetaKeywordUasserts)
                                 "Illegal $meta sort: $meta: 0.1");
 }
 
-TEST(SortKeyGeneratorTest, SortPatternComponentWithSearchScoreMetaKeywordUasserts) {
-    ASSERT_THROWS_CODE_AND_WHAT(makeSortKeyGen(BSON("a" << BSON("$meta"
-                                                                << "searchScore")),
-                                               nullptr),
-                                AssertionException,
-                                31218,
-                                "$meta sort by 'searchScore' metadata is not supported");
-}
-
 TEST(SortKeyGeneratorTest, SortPatternComponentWithSearchHighlightsMetaKeywordUasserts) {
     ASSERT_THROWS_CODE_AND_WHAT(makeSortKeyGen(BSON("a" << BSON("$meta"
                                                                 << "searchHighlights")),
                                                nullptr),
                                 AssertionException,
-                                31219,
-                                "$meta sort by 'searchHighlights' metadata is not supported");
+                                31138,
+                                "Illegal $meta sort: $meta: \"searchHighlights\"");
 }
 
 TEST(SortKeyGeneratorTest, SortPatternComponentWithSearchScoreDetailsMetaKeywordUasserts) {
@@ -253,6 +253,37 @@ TEST(SortKeyGeneratorTest, CanGenerateKeysForRandValMetaSort) {
     ASSERT_VALUE_EQ(sortKey, Value{0.3});
 }
 
+TEST(SortKeyGeneratorTest, CanGenerateKeysForGeoDistanceSort) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << BSON("$meta"
+                                                      << "geoNearDistance")),
+                                     nullptr);
+    auto sortKey = sortKeyGen->computeSortKeyFromDocument(
+        Document::fromBsonWithMetaData(BSON(Document::metaFieldGeoNearDistance << 10.3)));
+    ASSERT_VALUE_EQ(sortKey, Value{10.3});
+}
+
+TEST(SortKeyGeneratorTest, CanGenerateKeysForSearchScoreSort) {
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagSearchHybridScoringPrerequisites", true);
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << BSON("$meta"
+                                                      << "searchScore")),
+                                     nullptr);
+    auto sortKey = sortKeyGen->computeSortKeyFromDocument(
+        Document::fromBsonWithMetaData(BSON(Document::metaFieldSearchScore << 10.3)));
+    ASSERT_VALUE_EQ(sortKey, Value{10.3});
+}
+
+TEST(SortKeyGeneratorTest, CanGenerateKeysForVectorSearchScoreSort) {
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagSearchHybridScoringPrerequisites", true);
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << BSON("$meta"
+                                                      << "vectorSearchScore")),
+                                     nullptr);
+    auto sortKey = sortKeyGen->computeSortKeyFromDocument(
+        Document::fromBsonWithMetaData(BSON(Document::metaFieldVectorSearchScore << 10.3)));
+    ASSERT_VALUE_EQ(sortKey, Value{10.3});
+}
+
 TEST(SortKeyGeneratorTest, CanGenerateKeysForCompoundMetaSort) {
     BSONObj pattern = fromjson(
         "{a: 1, b: {$meta: 'randVal'}, c: {$meta: 'textScore'}, d: -1, e: {$meta: 'textScore'}}");
@@ -263,6 +294,68 @@ TEST(SortKeyGeneratorTest, CanGenerateKeysForCompoundMetaSort) {
     ASSERT_VALUE_EQ(
         sortKey,
         (Value{std::vector<Value>{Value{4}, Value{0.3}, Value{1.5}, Value{5}, Value{1.5}}}));
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorTopLevelFieldTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << 1), nullptr);
+    std::vector<BSONElement> elemOut(1);
+    auto inputObj = BSON("a" << 5);
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    auto expectedObj = BSON("a" << 5);
+    std::vector<BSONElement> expected{expectedObj["a"]};
+    ASSERT_BSONELT_EQ(elemOut[0], expected[0]);
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorNestedFieldTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a.b" << 1), nullptr);
+    std::vector<BSONElement> elemOut(1);
+    auto inputObj = BSON("a" << BSON("b" << 5));
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    auto expectedObj = BSON("a" << BSON("b" << 5));
+    std::vector<BSONElement> expected{expectedObj["a"]["b"]};
+    ASSERT_BSONELT_EQ(elemOut[0], expected[0]);
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorArrayTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << 1), nullptr);
+    std::vector<BSONElement> elemOut(1);
+    auto inputObj = BSON("a" << BSON_ARRAY(1 << 2 << 3));
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    auto expectedObj = BSON("" << 1);
+    std::vector<BSONElement> expected{expectedObj[""]};
+    ASSERT_BSONELT_EQ(elemOut[0], expected[0]);
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorNestedArrayTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << 1), nullptr);
+    std::vector<BSONElement> elemOut(1);
+    auto inputObj = BSON("a" << BSON_ARRAY(BSON_ARRAY(1 << 2 << 3) << BSON_ARRAY(2 << 3 << 4)));
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    auto expectedObj = BSON("" << BSON_ARRAY(1 << 2 << 3));
+    std::vector<BSONElement> expected{expectedObj[""]};
+    ASSERT_BSONELT_EQ(elemOut[0], expected[0]);
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorCompoundSortPatternTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a" << 1 << "b" << 1), nullptr);
+    std::vector<BSONElement> elemOut(2);
+    auto inputObj = BSON("a" << 5 << "b" << 3);
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    BSONObj expectedObj = BSON("a" << 5 << "b" << 3);
+    std::vector<BSONElement> expected{expectedObj["a"], expectedObj["b"]};
+    for (size_t i = 0; i < elemOut.size(); ++i) {
+        ASSERT_BSONELT_EQ(elemOut[i], expected[i]);
+    }
+}
+
+TEST(SortKeyGeneratorTest, SortKeyComponentVectorArrayWithNestedPathsTest) {
+    auto sortKeyGen = makeSortKeyGen(BSON("a.b" << 1), nullptr);
+    std::vector<BSONElement> elemOut(1);
+    auto inputObj = BSON("a" << BSON_ARRAY(BSON("b" << 1) << BSON("b" << 2) << BSON("b" << 3)));
+    sortKeyGen->generateSortKeyComponentVector(inputObj, &elemOut);
+    BSONObj expectedObj = BSON("" << 1);
+    std::vector<BSONElement> expected{expectedObj[""]};
+    ASSERT_BSONELT_EQ(elemOut[0], expected[0]);
 }
 
 // A test fixture which creates a WorkingSet and allocates a WorkingSetMember inside of it. Used for
@@ -347,7 +440,7 @@ DEATH_TEST_REGEX_F(SortKeyGeneratorWorkingSetTest,
     auto sortKeyGen = makeSortKeyGen(pattern, nullptr);
     setRecordIdAndIdx(BSON("a" << 1 << "b" << 1), BSON("" << 2 << "" << 3));
     member().metadata().setTextScore(9.9);
-    MONGO_COMPILER_VARIABLE_UNUSED auto ignored = sortKeyGen->computeSortKey(member());
+    [[maybe_unused]] auto ignored = sortKeyGen->computeSortKey(member());
 }
 
 }  // namespace

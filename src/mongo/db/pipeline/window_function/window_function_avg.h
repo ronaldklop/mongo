@@ -29,10 +29,22 @@
 
 #pragma once
 
+#include <cmath>
+#include <memory>
+#include <utility>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/window_function/window_function.h"
 #include "mongo/db/pipeline/window_function/window_function_sum.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -41,7 +53,7 @@ public:
     explicit WindowFunctionAvg(ExpressionContext* const expCtx) : RemovableSum(expCtx), _count(0) {
         // Note that RemovableSum manages the memory usage tracker directly for calls to add/remove.
         // Here we only add the members that this class holds.
-        _memUsageBytes += sizeof(long long);
+        _memUsageTracker.add(sizeof(long long));
     }
 
     static std::unique_ptr<WindowFunctionState> create(ExpressionContext* const expCtx) {
@@ -93,10 +105,10 @@ public:
         }
     }
 
-    void reset() {
+    void reset() override {
         RemovableSum::reset();
         _count = 0;
-        _memUsageBytes += sizeof(long long);
+        _memUsageTracker.add(sizeof(long long));
     }
 
 private:

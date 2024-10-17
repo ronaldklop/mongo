@@ -1,13 +1,13 @@
 // Check that OCSP verification works
 // @tags: [requires_http_client]
 
-load("jstests/ocsp/lib/mock_ocsp.js");
-
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {FAULT_REVOKED, MockOCSPServer} from "jstests/ocsp/lib/mock_ocsp.js";
+import {clearOCSPCache, OCSP_CA_CERT, OCSP_SERVER_CERT} from "jstests/ocsp/lib/ocsp_helpers.js";
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 if (determineSSLProvider() === "apple") {
-    return;
+    quit();
 }
 
 const ocsp_options = {
@@ -39,6 +39,7 @@ function test() {
 
 clearOCSPCache();
 
+jsTest.log("Test a ShardingTest without MockOCSPServer.");
 test();
 
 let mock_ocsp = new MockOCSPServer("", 10000);
@@ -46,6 +47,7 @@ mock_ocsp.start();
 
 clearOCSPCache();
 
+jsTest.log("Test a ShardingTest with MockOCSPServer and expect to have valid OCSP response.");
 test();
 
 // We don't want to invoke the hang analyzer because we
@@ -55,6 +57,7 @@ MongoRunner.runHangAnalyzer.disable();
 clearOCSPCache();
 
 // Leave the OCSP responder on so that the other nodes all have valid responses.
+jsTest.log("Test another ShardingTest with MockOCSPServer and expect to have valid OCSP response.");
 var st = new ShardingTest(sharding_config);
 
 mock_ocsp.stop();
@@ -64,6 +67,7 @@ mock_ocsp.start();
 clearOCSPCache();
 sleep(2000);
 
+jsTest.log("Restart the mongos with MockOCSPServer and expect to have REVOKED response.");
 const err = assert.throws(() => {
     st.restartMongos(0);
 });
@@ -82,8 +86,8 @@ mock_ocsp = new MockOCSPServer("", 10000);
 mock_ocsp.start();
 
 // Get the mongos back up again so that we can shutdown the ShardingTest.
+jsTest.log("Restart the mongos with MockOCSPServer and expect to have valid OCSP response.");
 st.restartMongos(0);
 
 mock_ocsp.stop();
 st.stop();
-}());

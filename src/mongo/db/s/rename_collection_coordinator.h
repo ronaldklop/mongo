@@ -29,24 +29,42 @@
 
 #pragma once
 
-#include "mongo/db/s/rename_collection_coordinator_document_gen.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <set>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-class RenameCollectionCoordinator final : public ShardingDDLCoordinator {
+class RenameCollectionCoordinator final
+    : public RecoverableShardingDDLCoordinator<RenameCollectionCoordinatorDocument,
+                                               RenameCollectionCoordinatorPhaseEnum> {
 public:
     using StateDoc = RenameCollectionCoordinatorDocument;
     using Phase = RenameCollectionCoordinatorPhaseEnum;
 
-    RenameCollectionCoordinator(const BSONObj& initialState);
+    RenameCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                const BSONObj& initialState);
 
     void checkIfOptionsConflict(const BSONObj& doc) const override;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
     /**
      * Waits for the rename to complete and returns the collection version.
@@ -57,38 +75,28 @@ public:
         return *_response;
     }
 
+protected:
+    logv2::DynamicAttributes getCoordinatorLogAttrs() const override;
+
 private:
+    StringData serializePhase(const Phase& phase) const override {
+        return RenameCollectionCoordinatorPhase_serializer(phase);
+    }
+
+    bool _mustAlwaysMakeProgress() override {
+        return _doc.getPhase() >= Phase::kFreezeMigrations;
+    };
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    std::vector<DistLockManager::ScopedDistLock> _acquireAdditionalLocks(
-        OperationContext* opCtx) override;
+    std::set<NamespaceString> _getAdditionalLocksToAcquire(OperationContext* opCtx) override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
-
-    void _insertStateDocument(StateDoc&& doc);
-    void _updateStateDocument(StateDoc&& newStateDoc);
-    void _removeStateDocument();
-    void _enterPhase(Phase newPhase);
-
-    RenameCollectionCoordinatorDocument _doc;
+    // TODO (SERVER-80704): Get rid of this method once v8.0 branches out
+    void _updateNewOptTrackedCollInfoFieldAfterBinaryUpgrade();
 
     boost::optional<RenameCollectionResponse> _response;
+    const RenameCollectionRequest _request;
 };
 
 }  // namespace mongo

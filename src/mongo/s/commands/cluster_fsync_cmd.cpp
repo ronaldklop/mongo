@@ -27,14 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -59,64 +82,62 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::fsync);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()), ActionType::fsync)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    void unlockLockedShards(OperationContext* opCtx, const DatabaseName& dbname) {
+        auto request = OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::get(opCtx), dbname, BSON("fsyncUnlock" << 1));
+        auto response = CommandHelpers::runCommandDirectly(opCtx, request);
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
+                   const DatabaseName& dbName,
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
+        BSONObj fsyncCmdObj = cmdObj;
+
         if (cmdObj["lock"].trueValue()) {
-            errmsg = "can't do lock through mongos";
-            return false;
+            auto forBackupField = BSON("forBackup" << true);
+            fsyncCmdObj = fsyncCmdObj.addFields(forBackupField);
         }
 
-        BSONObjBuilder sub;
+        auto shardResults = scatterGatherUnversionedTargetConfigServerAndShards(
+            opCtx,
+            dbName,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(fsyncCmdObj)),
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            Shard::RetryPolicy::kIdempotent);
 
-        bool ok = true;
-
-        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
-        const auto shardIds = shardRegistry->getAllShardIdsNoReload();
-
-        for (const ShardId& shardId : shardIds) {
-            auto shardStatus = shardRegistry->getShard(opCtx, shardId);
-            if (!shardStatus.isOK()) {
-                continue;
-            }
-            const auto s = shardStatus.getValue();
-
-            auto response = uassertStatusOK(s->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                BSON("fsync" << 1),
-                Shard::RetryPolicy::kIdempotent));
-            uassertStatusOK(response.commandStatus);
-            BSONObj x = std::move(response.response);
-
-            sub.append(s->getId().toString(), x);
-
-            if (!x["ok"].trueValue()) {
-                ok = false;
-                errmsg = x["errmsg"].String();
-            }
-        }
+        BSONObjBuilder rawResult;
+        const auto response = appendRawResponses(opCtx, &errmsg, &rawResult, shardResults);
 
         // This field has had dummy value since MMAP went away. It is undocumented.
         // Maintaining it so as not to cause unnecessary user pain across upgrades.
         result.append("numFiles", 1);
-        result.append("all", sub.obj());
+        result.append("all", rawResult.obj());
+        if (!response.responseOK) {
+            if (cmdObj["lock"].trueValue()) {
+                unlockLockedShards(opCtx, dbName);
+            }
+            return false;
+        }
 
-        return ok;
+        return true;
     }
-
-} clusterFsyncCmd;
+};
+MONGO_REGISTER_COMMAND(FsyncCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

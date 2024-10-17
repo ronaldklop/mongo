@@ -27,10 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <memory>
 #include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
@@ -43,6 +43,11 @@
 #include "mongo/db/pipeline/document_source_count.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -65,10 +70,15 @@ public:
             dynamic_cast<DocumentSourceSingleDocumentTransformation*>(result.back().get());
         ASSERT(projectStage);
 
-        auto explain = ExplainOptions::Verbosity::kQueryPlanner;
         vector<Value> explainedStages;
-        groupStage->serializeToArray(explainedStages, explain);
-        projectStage->serializeToArray(explainedStages, explain);
+        groupStage->serializeToArray(
+            explainedStages,
+            SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)});
+        projectStage->serializeToArray(
+            explainedStages,
+            SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)});
         ASSERT_EQUALS(explainedStages.size(), 2UL);
 
         StringData countName = countSpec.firstElement().valueStringData();
@@ -134,5 +144,12 @@ TEST_F(InvalidCountSpec, PeriodInStringSpec) {
                         << "test.string");
     ASSERT_THROWS_CODE(createCount(spec), AssertionException, 40160);
 }
+
+TEST_F(InvalidCountSpec, IDAsStringSpec) {
+    BSONObj spec = BSON("$count"
+                        << "_id");
+    ASSERT_THROWS_CODE(createCount(spec), AssertionException, 9039800);
+}
+
 }  // namespace
 }  // namespace mongo

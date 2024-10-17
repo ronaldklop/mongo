@@ -2,10 +2,7 @@
  * This test ensures that indexes created by running applyOps are both successful and replicated
  * correctly (see SERVER-31435).
  */
-(function() {
-"use strict";
-
-load('jstests/noPassthrough/libs/index_build.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 let rst = new ReplSetTest({nodes: 3});
 rst.startSet();
@@ -40,4 +37,3 @@ res = primaryTestDB.runCommand(cmd);
 assert.commandFailedWithCode(res, ErrorCodes.CommandNotSupported);
 
 rst.stopSet();
-}());

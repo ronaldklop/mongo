@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -36,14 +39,15 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/internal_auth.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/sasl_client_session.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/database_name.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/util/future.h"
-#include "mongo/util/md5.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -54,21 +58,17 @@ namespace auth {
 
 using RunCommandHook = std::function<Future<BSONObj>(OpMsgRequest request)>;
 
-/* Hook for legacy MONGODB-CR support provided by shell client only */
-using AuthMongoCRHandler = std::function<Future<void>(RunCommandHook, const BSONObj&)>;
-extern AuthMongoCRHandler authMongoCR;
-
 /**
  * Names for supported authentication mechanisms.
  */
 
-constexpr auto kMechanismMongoCR = "MONGODB-CR"_sd;
 constexpr auto kMechanismMongoX509 = "MONGODB-X509"_sd;
 constexpr auto kMechanismSaslPlain = "PLAIN"_sd;
 constexpr auto kMechanismGSSAPI = "GSSAPI"_sd;
 constexpr auto kMechanismScramSha1 = "SCRAM-SHA-1"_sd;
 constexpr auto kMechanismScramSha256 = "SCRAM-SHA-256"_sd;
 constexpr auto kMechanismMongoAWS = "MONGODB-AWS"_sd;
+constexpr auto kMechanismMongoOIDC = "MONGODB-OIDC"_sd;
 constexpr auto kInternalAuthFallbackMechanism = kMechanismScramSha1;
 
 constexpr auto kSaslSupportedMechanisms = "saslSupportedMechs"_sd;
@@ -136,7 +136,7 @@ Future<void> authenticateClient(const BSONObj& params,
  * but the __system user's credentials will be filled in automatically.
  *
  * The "mechanismHint" parameter will force authentication with a specific mechanism
- * (e.g. SCRAM-SHA-256). If it is boost::none, then an isMaster will be called to negotiate
+ * (e.g. SCRAM-SHA-256). If it is boost::none, then a "hello" will be called to negotiate
  * a SASL mechanism with the server.
  *
  * The "stepDownBehavior" parameter controls whether replication will kill the connection on
@@ -147,6 +147,7 @@ Future<void> authenticateClient(const BSONObj& params,
  */
 Future<void> authenticateInternalClient(
     const std::string& clientSubjectName,
+    const HostAndPort& remote,
     boost::optional<std::string> mechanismHint,
     StepDownBehavior stepDownBehavior,
     RunCommandHook runCommand,
@@ -159,15 +160,15 @@ Future<void> authenticateInternalClient(
  *     @dbname: The database target of the auth command.
  *     @username: The std::string name of the user to authenticate.
  *     @passwordText: The std::string representing the user's password.
- *     @digestPassword: Set to true if the password is undigested.
+ *     @mechanism: The std::string authentication mechanism to be used
  */
-BSONObj buildAuthParams(StringData dbname,
+BSONObj buildAuthParams(const DatabaseName& dbname,
                         StringData username,
                         StringData passwordText,
-                        bool digestPassword);
+                        StringData mechanism);
 
 /**
- * Run an isMaster exchange to negotiate a SASL mechanism for authentication.
+ * Run a "hello" exchange to negotiate a SASL mechanism for authentication.
  */
 Future<std::string> negotiateSaslMechanism(RunCommandHook runCommand,
                                            const UserName& username,
@@ -194,18 +195,19 @@ enum class SpeculativeAuthType {
 };
 
 /**
- * Constructs a "speculativeAuthenticate" or "speculativeSaslStart"
- * payload for an isMaster request based on a given URI.
+ * Constructs a "speculativeAuthenticate" or "speculativeSaslStart" payload for an "hello" request
+ * based on a given URI.
  */
-SpeculativeAuthType speculateAuth(BSONObjBuilder* isMasterRequest,
+SpeculativeAuthType speculateAuth(BSONObjBuilder* helloRequestBuilder,
                                   const MongoURI& uri,
                                   std::shared_ptr<SaslClientSession>* saslClientSession);
 
 /**
- * Constructs a "speculativeAuthenticate" or "speculativeSaslStart"
- * payload for an isMaster request using internal (intracluster) authentication.
+ * Constructs a "speculativeAuthenticate" or "speculativeSaslStart" payload for an "hello" request
+ * using internal (intracluster) authentication.
  */
-SpeculativeAuthType speculateInternalAuth(BSONObjBuilder* isMasterRequest,
+SpeculativeAuthType speculateInternalAuth(const HostAndPort& remoteHost,
+                                          BSONObjBuilder* helloRequestBuilder,
                                           std::shared_ptr<SaslClientSession>* saslClientSession);
 
 }  // namespace auth

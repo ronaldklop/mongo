@@ -1,27 +1,25 @@
 // Test mongo shell connect strings.
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const SERVER_CERT = "jstests/libs/server.pem";
 const CAFILE = "jstests/libs/ca.pem";
 
 var opts = {
-    sslMode: "allowSSL",
-    sslPEMKeyFile: SERVER_CERT,
-    sslAllowInvalidCertificates: "",
-    sslAllowConnectionsWithoutCertificates: "",
-    sslCAFile: CAFILE,
+    tlsMode: "allowTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsAllowInvalidCertificates: "",
+    tlsAllowConnectionsWithoutCertificates: "",
+    tlsCAFile: CAFILE,
     setParameter: "authenticationMechanisms=MONGODB-X509,SCRAM-SHA-1"
 };
 
-var rst = new ReplSetTest({name: 'sslSet', nodes: 3, nodeOptions: opts});
+var rst = new ReplSetTest({name: 'tlsSet', nodes: 3, nodeOptions: opts});
 
 rst.startSet();
 rst.initiate();
 
 const mongod = rst.getPrimary();
 const host = mongod.host;
-const port = mongod.port;
 
 const username = "user";
 const usernameNotTest = "userNotTest";
@@ -42,9 +40,9 @@ function testConnect(expectPasswordPrompt, expectSuccess, ...args) {
         'newLineAfterPasswordPromptForTest=true',
         '--eval',
         ';',
-        '--ssl',
-        '--sslAllowInvalidHostnames',
-        '--sslCAFile',
+        '--tls',
+        '--tlsAllowInvalidHostnames',
+        '--tlsCAFile',
         CAFILE,
         ...args
     ];
@@ -162,37 +160,35 @@ testSuccessfulConnect(false,
 
 // TODO: Enable this set of tests in the future -- needs proper encoding for X509 username in
 // URI
-if (false) {
-    testSuccessfulConnect(
-        false,
-        `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`);
-    testSuccessfulConnect(
-        false,
-        `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
-        '--username',
-        usernameX509);
-    testSuccessfulConnect(false,
-                          `mongodb://${usernameX509}@${host}/test?authSource=$external`,
-                          '--authenticationMechanism',
-                          'MONGODB-X509');
+// testSuccessfulConnect(
+//     false,
+//     `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`);
+// testSuccessfulConnect(
+//     false,
+//     `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
+//     '--username',
+//     usernameX509);
+// testSuccessfulConnect(false,
+//                       `mongodb://${usernameX509}@${host}/test?authSource=$external`,
+//                       '--authenticationMechanism',
+//                       'MONGODB-X509');
 
-    testSuccessfulConnect(
-        false,
-        `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
-        '--authenticationMechanism',
-        'MONGODB-X509');
-    testSuccessfulConnect(
-        false,
-        `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
-        '--authenticationMechanism',
-        'MONGODB-X509',
-        '--username',
-        usernameX509);
-    testSuccessfulConnect(false,
-                          `mongodb://${usernameX509}@${host}/test?authSource=$external`,
-                          '--authenticationMechanism',
-                          'MONGODB-X509');
-}
+// testSuccessfulConnect(
+//     false,
+//     `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
+//     '--authenticationMechanism',
+//     'MONGODB-X509');
+// testSuccessfulConnect(
+//     false,
+//     `mongodb://${usernameX509}@${host}/test?authMechanism=MONGODB-X509&authSource=$external`,
+//     '--authenticationMechanism',
+//     'MONGODB-X509',
+//     '--username',
+//     usernameX509);
+// testSuccessfulConnect(false,
+//                       `mongodb://${usernameX509}@${host}/test?authSource=$external`,
+//                       '--authenticationMechanism',
+//                       'MONGODB-X509');
 /* */
 
 testFailedConnect(false, `mongodb://${host}/test?authMechanism=MONGODB-X509&authSource=$external`);
@@ -212,4 +208,3 @@ testFailedConnect(false,
                   '--authenticationMechanism',
                   'MONGODB-X509');
 rst.stopSet();
-})();

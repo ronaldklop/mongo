@@ -3,15 +3,14 @@
 //
 // @tags: [uses_change_streams, requires_replication]
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // Checking UUID consistency uses cached connections, which are not valid across restarts or
 // stepdowns.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-"use strict";
-
-load("jstests/multiVersion/libs/multi_rs.js");       // Used by upgradeSet.
-load("jstests/multiVersion/libs/multi_cluster.js");  // For upgradeCluster.
+await import("jstests/multiVersion/libs/multi_rs.js");
+await import("jstests/multiVersion/libs/multi_cluster.js");
 
 const dbName = "test";
 const collName = "change_streams_multi_version_sortkey";
@@ -34,8 +33,10 @@ function runTest(downgradeVersion) {
     });
 
     let mongosConn = st.s;
+    assert.commandWorked(
+        mongosConn.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+
     assert.commandWorked(mongosConn.getDB(dbName).getCollection(collName).createIndex({shard: 1}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
     // Shard the test collection and split it into two chunks: one that contains all {shard: 1}
     // documents and one that contains all {shard: 2} documents.
@@ -110,7 +111,8 @@ function runTest(downgradeVersion) {
     // Set the FCV to the "latest" version, and then open and read a change stream on the completely
     // upgraded cluster.
     //
-    assert.commandWorked(mongosConn.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        mongosConn.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
     checkFCV(st.configRS.getPrimary().getDB("admin"), latestFCV);
     checkFCV(st.rs0.getPrimary().getDB("admin"), latestFCV);
     checkFCV(st.rs1.getPrimary().getDB("admin"), latestFCV);
@@ -125,4 +127,3 @@ function runTest(downgradeVersion) {
 
 runTest("last-continuous");
 runTest("last-lts");
-}());

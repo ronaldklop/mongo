@@ -1,11 +1,17 @@
 // Check that rotation works for the cluster certificate in a sharded cluster
-// @tags: [live_record_incompatible]
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {copyCertificateFile} from "jstests/ssl/libs/ssl_helpers.js";
+
+const OLD_CA = "jstests/libs/ca.pem";
+const OLD_CLIENT = "jstests/libs/client.pem";
+const OLD_SERVER = "jstests/libs/server.pem";
+
+const NEW_CA = "jstests/libs/trusted-ca.pem";
+const NEW_CLIENT = "jstests/libs/trusted-client.pem";
+const NEW_SERVER = "jstests/libs/trusted-server.pem";
 
 (function() {
-"use strict";
-
-load('jstests/ssl/libs/ssl_helpers.js');
-
 let mongos;
 function getConnPoolHosts() {
     const ret = mongos.adminCommand({connPoolStats: 1});
@@ -17,27 +23,27 @@ function getConnPoolHosts() {
 const dbPath = MongoRunner.toRealDir("$dataDir/cluster_x509_rotate_test/");
 mkdir(dbPath);
 
-copyCertificateFile("jstests/libs/ca.pem", dbPath + "/ca-test.pem");
-copyCertificateFile("jstests/libs/client.pem", dbPath + "/client-test.pem");
-copyCertificateFile("jstests/libs/server.pem", dbPath + "/server-test.pem");
+copyCertificateFile(OLD_CA, dbPath + "/ca-test.pem");
+copyCertificateFile(OLD_CLIENT, dbPath + "/client-test.pem");
+copyCertificateFile(OLD_SERVER, dbPath + "/server-test.pem");
 
 // server certificate is held constant so that shell can still connect
 // we start a cluster using the old certificates, then rotate one shard to use new certificates.
 // Make sure that mongos can communicate with every connected host EXCEPT that shard before a
 // rotate, and make sure it can communicate with ONLY that shard after a rotate.
 const mongosOptions = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: "jstests/libs/server.pem",
-    sslCAFile: dbPath + "/ca-test.pem",
-    sslClusterFile: dbPath + "/client-test.pem",
-    sslAllowInvalidHostnames: "",
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: "jstests/libs/server.pem",
+    tlsCAFile: dbPath + "/ca-test.pem",
+    tlsClusterFile: dbPath + "/client-test.pem",
+    tlsAllowInvalidHostnames: "",
 };
 
 const configOptions = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: dbPath + "/server-test.pem",
-    sslCAFile: dbPath + "/ca-test.pem",
-    sslAllowInvalidHostnames: "",
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: dbPath + "/server-test.pem",
+    tlsCAFile: dbPath + "/ca-test.pem",
+    tlsAllowInvalidHostnames: "",
 };
 
 const sharding_config = {
@@ -67,16 +73,31 @@ for (let key in output.hosts) {
 
 const rst = st.rs0;
 const primary = rst.getPrimary();
+const primaryHost = "localhost:" + primary.port;
+
+// Assert we can connect to the primary shard using the old certificates since these have not
+// changed.
+let conn = new Mongo(primaryHost, undefined, {
+    tls: {certificateKeyFile: OLD_CLIENT, CAFile: OLD_CA, allowInvalidCertificates: false}
+});
+assert.commandWorked(conn.adminCommand({connectionStatus: 1}));
 
 // Swap out the certificate files and rotate the primary shard.
-copyCertificateFile("jstests/libs/trusted-ca.pem", dbPath + "/ca-test.pem");
-copyCertificateFile("jstests/libs/trusted-client.pem", dbPath + "/client-test.pem");
-copyCertificateFile("jstests/libs/trusted-server.pem", dbPath + "/server-test.pem");
+copyCertificateFile(NEW_CA, dbPath + "/ca-test.pem");
+copyCertificateFile(NEW_CLIENT, dbPath + "/client-test.pem");
+copyCertificateFile(NEW_SERVER, dbPath + "/server-test.pem");
 
 assert.commandWorked(primary.adminCommand({rotateCertificates: 1}));
 
 // Make sure the primary is initially present
 assert(primary.host in getConnPoolHosts());
+
+// Connecting with the old certificates to the now rotated primary shard should fail.
+assert.throws(() => {
+    new Mongo(primaryHost, undefined, {
+        tls: {certificateKeyFile: OLD_CLIENT, CAFile: OLD_CA, allowInvalidCertificates: false}
+    });
+});
 
 // Drop connection to all hosts to see what we can reconnect to
 assert.commandWorked(mongos.adminCommand({dropConnections: 1, hostAndPort: keys}));
@@ -138,6 +159,13 @@ assert.soon(() => {
     }
     return true;
 });
+
+// Assert we can connect to the primary using the new certificates.
+conn = new Mongo(primaryHost, undefined, {
+    tls: {certificateKeyFile: NEW_CLIENT, CAFile: NEW_CA, allowInvalidCertificates: false}
+});
+assert.commandWorked(conn.adminCommand({connectionStatus: 1}));
+
 // Don't call st.stop() -- breaks because cluster is only partially rotated (this is hard to fix)
 return;
 }());

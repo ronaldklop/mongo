@@ -3,12 +3,10 @@
  * primary to incorrectly acknowledge a w:majority write that's about to be rolled back, even if the
  * stale primary is re-elected primary before waiting for the write concern acknowledgement.
  */
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 var name = "writeConcernStepDownAndBackUp";
 var dbName = "wMajorityCheck";
@@ -45,6 +43,12 @@ stepUp(nodes[0]);
 var primary = rst.getPrimary();
 var secondaries = rst.getSecondaries();
 assert.eq(nodes[0], primary);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
+
 // Wait for all data bearing nodes to get up to date.
 assert.commandWorked(nodes[0].getDB(dbName).getCollection(collName).insert(
     {a: 1}, {writeConcern: {w: 3, wtimeout: rst.kDefaultTimeoutMS}}));
@@ -120,4 +124,3 @@ hangBeforeWaitingForWriteConcern.off();
 joinMajorityWriter();
 
 rst.stopSet();
-}());

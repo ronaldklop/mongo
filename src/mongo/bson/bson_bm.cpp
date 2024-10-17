@@ -27,15 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
 
 #include <benchmark/benchmark.h>
+#include <cstddef>
+#include <cstdint>
+#include <fmt/format.h>
+#include <string>
+#include <utility>
 
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bson_validate_gen.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -77,7 +92,7 @@ void BM_arrayBuilder(benchmark::State& state) {
 void BM_arrayLookup(benchmark::State& state) {
     BSONArrayBuilder builder;
     auto len = state.range(0);
-    auto totalLen = len * 0;
+    auto totalBytes = len * 0;
     for (auto j = 0; j < len; j++)
         builder.append(j);
     BSONObj array = builder.done();
@@ -85,9 +100,111 @@ void BM_arrayLookup(benchmark::State& state) {
     for (auto _ : state) {
         benchmark::ClobberMemory();
         benchmark::DoNotOptimize(array[len]);
-        totalLen += len;
+        totalBytes += array.objsize();
     }
-    state.SetItemsProcessed(totalLen);
+    state.SetBytesProcessed(totalBytes);
+}
+
+
+void BM_arrayStlIterate(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        for (auto&& e : array) {
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_arrayNonStlIterate(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        auto it = BSONObjIterator(array);
+        while (it.more()) {
+            auto e = it.next();
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_arrayStlIterateWithSize(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+    const auto emptyBSONObjSize = BSONObj().objsize();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        auto objBytes = 0;
+        for (auto&& e : array) {
+            objBytes += e.size();
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        invariant(objBytes + emptyBSONObjSize == array.objsize());
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BSONnFields(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(array.nFields());
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_bsonIteratorSortedConstruction(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(BSONObjIteratorSorted(array));
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
 }
 
 void BM_validate(benchmark::State& state) {
@@ -102,7 +219,7 @@ void BM_validate(benchmark::State& state) {
     auto status = validateBSON(elem.objdata(), elem.objsize());
     if (!status.isOK())
         LOGV2(4440100, "Validate failed", "elem"_attr = elem, "status"_attr = status);
-    invariant(status.isOK());
+    invariant(status);
 
     for (auto _ : state) {
         benchmark::ClobberMemory();
@@ -112,8 +229,37 @@ void BM_validate(benchmark::State& state) {
     state.SetBytesProcessed(totalSize);
 }
 
+void BM_validate_contents(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    size_t totalSize = 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(buildSampleObj(j));
+    BSONObj array = builder.done();
+
+    const auto& elem = array[0].Obj();
+    auto status = validateBSON(elem.objdata(), elem.objsize(), BSONValidateModeEnum::kFull);
+    if (!status.isOK())
+        LOGV2(6752100, "Validate failed", "elem"_attr = elem, "status"_attr = status);
+    invariant(status);
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(
+            validateBSON(array.objdata(), array.objsize(), BSONValidateModeEnum::kFull));
+        totalSize += array.objsize();
+    }
+    state.SetBytesProcessed(totalSize);
+}
+
 BENCHMARK(BM_arrayBuilder)->Ranges({{{1}, {100'000}}});
 BENCHMARK(BM_arrayLookup)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayNonStlIterate)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayStlIterate)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayStlIterateWithSize)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BSONnFields)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_bsonIteratorSortedConstruction)->Ranges({{{1}, {100'000}}});
 BENCHMARK(BM_validate)->Ranges({{{1}, {1'000}}});
+BENCHMARK(BM_validate_contents)->Ranges({{{1}, {1'000}}});
 
 }  // namespace mongo

@@ -6,11 +6,10 @@
  * @tags: [multiversion_incompatible]
  */
 
-(function() {
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/libs/fail_point_util.js");
-
-rst = new ReplSetTest({nodes: 1});
+let rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
 
@@ -41,4 +40,3 @@ const secondaryAdminDb = secondary.getDB("admin");
 // Assert that the FCV document was cloned through initial sync on the secondary.
 checkFCV(secondaryAdminDb, latestFCV);
 rst.stopSet();
-}());

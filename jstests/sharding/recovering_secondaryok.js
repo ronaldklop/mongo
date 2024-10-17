@@ -1,15 +1,19 @@
 /**
  * This tests that secondaryOk'd queries in sharded setups get correctly routed when a secondary
  * goes into RECOVERING state, and don't break
+ * @tags: [
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
 // Shard secondaries are restarted, which may cause that shard's primary to stepdown while it does
 // not see the secondaries. Either the primary connection gets reset, or the primary could change.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-'use strict';
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var shardTest =
     new ShardingTest({name: "recovering_secondaryok", shards: 2, mongos: 2, other: {rs: true}});
@@ -18,13 +22,9 @@ var mongos = shardTest.s0;
 var mongosSOK = shardTest.s1;
 mongosSOK.setSecondaryOk();
 
-var admin = mongos.getDB("admin");
-var config = mongos.getDB("config");
-
 const dbName = "test";
 var dbase = mongos.getDB(dbName);
 var coll = dbase.getCollection("foo");
-var dbaseSOk = mongosSOK.getDB("" + dbase);
 var collSOk = mongosSOK.getCollection("" + coll);
 
 var rsA = shardTest.rs0;
@@ -55,7 +55,6 @@ print("3: test normal and secondaryOk queries");
 // Make shardA and rsA the same
 var shardA = shardTest.getShard(coll, {_id: -1});
 var shardAColl = shardA.getCollection("" + coll);
-var shardB = shardTest.getShard(coll, {_id: 1});
 
 if (shardA.name == rsB.getURL()) {
     var swap = rsB;
@@ -94,11 +93,14 @@ assert.eq(2, collSOk.find().itcount());
 
 print("8: restart both our secondaries clean");
 
-rsA.restart(rsA.getSecondaries(), {remember: true, startClean: true}, undefined, 5 * 60 * 1000);
+rsA.getSecondaries().forEach(
+    secondary =>
+        rsA.restart(secondary, {remember: true, startClean: true}, undefined, 5 * 60 * 1000));
 
 print("9: wait for recovery");
 
-rsA.waitForState(rsA.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000);
+rsA.getSecondaries().forEach(
+    secondary => rsA.waitForState(secondary, ReplSetTest.State.SECONDARY, 5 * 60 * 1000));
 
 print("10: check our regular and secondaryOk query");
 
@@ -131,4 +133,3 @@ try {
 assert.eq(collCount, sOKCount);
 
 shardTest.stop();
-})();

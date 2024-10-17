@@ -2,12 +2,12 @@
 // Do not run in whole-cluster passthrough since this test assumes that the change stream will be
 // invalidated by a database drop.
 // @tags: [do_not_run_in_whole_cluster_passthrough]
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
+import {
+    assertDropAndRecreateCollection,
+    assertDropCollection
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 // Drop and recreate the collections to be used in this set of tests.
 const testDB = db.getSiblingDB(jsTestName());
@@ -21,7 +21,7 @@ let resumeCursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], co
 assert.commandWorked(coll.insert({_id: 1}));
 assert.commandWorked(otherColl.insert({_id: 2}));
 const firstInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(firstInsertChangeDoc.fullDocument, {_id: 1});
+assert.docEq({_id: 1}, firstInsertChangeDoc.fullDocument);
 assert.eq(firstInsertChangeDoc.ns, {db: testDB.getName(), coll: coll.getName()});
 
 // Test resuming the change stream after the first insert should pick up the insert on the
@@ -33,13 +33,13 @@ resumeCursor = cst.startWatchingChanges({
 });
 
 const secondInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(secondInsertChangeDoc.fullDocument, {_id: 2});
+assert.docEq({_id: 2}, secondInsertChangeDoc.fullDocument);
 assert.eq(secondInsertChangeDoc.ns, {db: testDB.getName(), coll: otherColl.getName()});
 
 // Insert a third document to the first collection and test that the change stream picks it up.
 assert.commandWorked(coll.insert({_id: 3}));
 const thirdInsertChangeDoc = cst.getOneChange(resumeCursor);
-assert.docEq(thirdInsertChangeDoc.fullDocument, {_id: 3});
+assert.docEq({_id: 3}, thirdInsertChangeDoc.fullDocument);
 assert.eq(thirdInsertChangeDoc.ns, {db: testDB.getName(), coll: coll.getName()});
 
 // Test resuming after the first insert again.
@@ -48,8 +48,8 @@ resumeCursor = cst.startWatchingChanges({
     collection: 1,
     aggregateOptions: {cursor: {batchSize: 0}},
 });
-assert.docEq(cst.getOneChange(resumeCursor), secondInsertChangeDoc);
-assert.docEq(cst.getOneChange(resumeCursor), thirdInsertChangeDoc);
+assert.docEq(secondInsertChangeDoc, cst.getOneChange(resumeCursor));
+assert.docEq(thirdInsertChangeDoc, cst.getOneChange(resumeCursor));
 
 // Test resume after second insert.
 resumeCursor = cst.startWatchingChanges({
@@ -57,7 +57,7 @@ resumeCursor = cst.startWatchingChanges({
     collection: 1,
     aggregateOptions: {cursor: {batchSize: 0}},
 });
-assert.docEq(cst.getOneChange(resumeCursor), thirdInsertChangeDoc);
+assert.docEq(thirdInsertChangeDoc, cst.getOneChange(resumeCursor));
 
 // Rename the collection and attempt to resume from the 'rename' notification. Skip this
 // test when running on a sharded collection, since these cannot be renamed.
@@ -198,4 +198,3 @@ cst.consumeDropUpTo({
 });
 
 cst.cleanUp();
-})();

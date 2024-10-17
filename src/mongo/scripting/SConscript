@@ -1,159 +1,63 @@
 # -*- mode: python -*-
 
-Import([
-    'env',
-    'get_option',
-    'serverJs',
-    'usemozjs',
-])
-
-env.Library(
-    target='scripting_common',
-    source=[
-        'deadline_monitor.cpp',
-        'deadline_monitor.idl',
-        'dbdirectclient_factory.cpp',
-        'engine.cpp',
-        'jsexception.cpp',
-        'utils.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/shell/mongojs',
-        '$BUILD_DIR/mongo/util/md5',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/server_parameter',
-    ],
-)
-
-env.Library(
-    target='bson_template_evaluator',
-    source=[
-        "bson_template_evaluator.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
-    target='scripting_none',
-    source=[
-        'engine_none.cpp',
-    ],
-    LIBDEPS=[
-        'scripting_common',
-    ],
-    LBDEPS_PRIVATE=[
-        'bson_template_evaluator',
+Import(
+    [
+        "env",
+        "get_option",
+        "jsEngine",
+        "serverJs",
     ]
 )
 
-if usemozjs:
+if jsEngine:
     scriptingEnv = env.Clone()
+
+    scriptingEnv.Append(
+        CXXFLAGS=[
+            # See the /Zc:preprocessor comment in third_party/mozjs/SConscript
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ]
+        if scriptingEnv.TargetOSIs("windows")
+        else [
+            # TODO(SERVER-59992): Remove -Wno-class-memacces where possible.
+            "-Wno-unknown-warning-option",
+            "-Wno-class-memaccess",
+            # TODO(SERVER-77205): Review and Possibly Remove '-Wno-deprecated'
+            #                     after Mozjs Update.
+            "-Wno-deprecated",
+        ],
+    )
     scriptingEnv.InjectMozJS()
 
-    scriptingEnv.JSHeader(
-        target='mozjs/mongohelpers_js.cpp',
-        source=[
-            'mozjs/mongohelpers.js'
-        ]
-    )
+    if get_option("spider-monkey-dbg") == "on":
+        scriptingEnv.Prepend(
+            CPPDEFINES=[
+                "MONGO_SPIDERMONKEY_DBG",
+            ]
+        )
 
-    env.Alias('generated-sources', 'mozjs/mongohelpers_js.cpp')
-
-    scriptingEnv.Library(
-        target='scripting',
+    scriptingEnv.CppUnitTest(
+        target="scripting_mozjs_test",
         source=[
-            'mozjs/base.cpp',
-            'mozjs/bindata.cpp',
-            'mozjs/bson.cpp',
-            'mozjs/code.cpp',
-            'mozjs/countdownlatch.cpp',
-            'mozjs/cursor.cpp',
-            'mozjs/cursor_handle.cpp',
-            'mozjs/db.cpp',
-            'mozjs/dbcollection.cpp',
-            'mozjs/dbpointer.cpp',
-            'mozjs/dbquery.cpp',
-            'mozjs/dbref.cpp',
-            'mozjs/engine.cpp',
-            'mozjs/error.cpp',
-            'mozjs/exception.cpp',
-            'mozjs/global.cpp',
-            'mozjs/idwrapper.cpp',
-            'mozjs/implscope.cpp',
-            'mozjs/internedstring.cpp',
-            'mozjs/jscustomallocator.cpp',
-            'mozjs/jsstringwrapper.cpp',
-            'mozjs/jsthread.cpp',
-            'mozjs/maxkey.cpp',
-            'mozjs/minkey.cpp',
-            'mozjs/mongo.cpp',
-            'mozjs/mongohelpers.cpp',
-            'mozjs/mongohelpers_js.cpp',
-            'mozjs/nativefunction.cpp',
-            'mozjs/numberdecimal.cpp',
-            'mozjs/numberint.cpp',
-            'mozjs/numberlong.cpp',
-            'mozjs/object.cpp',
-            'mozjs/objectwrapper.cpp',
-            'mozjs/oid.cpp',
-            'mozjs/PosixNSPR.cpp',
-            'mozjs/proxyscope.cpp',
-            'mozjs/regexp.cpp',
-            'mozjs/session.cpp',
-            'mozjs/status.cpp',
-            'mozjs/timestamp.cpp',
-            'mozjs/uri.cpp',
-            'mozjs/valuereader.cpp',
-            'mozjs/valuewriter.cpp',
-            'mozjs/engine.idl',
-            'mozjs/scripting_util.idl',
+            "mozjs/asan_handles_test.cpp",
+            "mozjs/module_loader_test.cpp",
         ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/db/service_context',
-            '$BUILD_DIR/mongo/shell/mongojs',
-            'bson_template_evaluator',
-            'scripting_common',
-        ],
-        LIBDEPS_PRIVATE=[
-            '$BUILD_DIR/mongo/client/clientdriver_network',
-            '$BUILD_DIR/mongo/idl/server_parameter',
-            '$BUILD_DIR/third_party/shim_mozjs',
+            "bson_template_evaluator",
+            "scripting",
         ],
     )
-else:
-    env.Library(
-        target='scripting',
-        source=[
-            'scripting_none.cpp'
-        ],
-        LIBDEPS=[
-            'scripting_none',
-        ],
-    )
-
-env.Library(
-    target='scripting_server',
-    source=[
-        'scripting_server.cpp',
-    ],
-    LIBDEPS=[
-        'scripting' if serverJs else 'scripting_none',
-    ],
-)
 
 env.CppUnitTest(
-    target='scripting_test',
+    target="scripting_test",
     source=[
-        'bson_template_evaluator_test.cpp',
-        'deadline_monitor_test.cpp',
+        "bson_template_evaluator_test.cpp",
+        "deadline_monitor_test.cpp",
     ],
     LIBDEPS=[
-        'bson_template_evaluator',
-        'scripting_common',
+        "$BUILD_DIR/mongo/db/concurrency/lock_manager",
+        "scripting_common",
     ],
 )

@@ -32,20 +32,36 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/db/s/forwardable_operation_metadata.h"
-        - "mongo/s/database_version.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/s/database_version.idl"
+    - "mongo/s/error_status.idl"
 
 enums:
     DDLCoordinatorType:
         description: "Type of the sharding DDL Operation."
         type: string
         values:
-            kDropDatabase: "dropDatabase"
-            kDropCollection: "dropCollection"
-            kRenameCollection: "renameCollection"
-            kCreateCollection: "createCollection"
+            kMovePrimary: "movePrimary"
+            kDropDatabase: "dropDatabase_V2"
+            kDropCollection: "dropCollection_V2"
+            kRenameCollection: "renameCollection_V2"
+            kCreateCollection: "createCollection_V4"
+            # TODO SERVER-79304: Remove once 8.0 becomes last LTS
+            kCreateCollectionPre80Compatible: "createCollection_V3"
+            kRefineCollectionShardKey: "refineCollectionShardKey_V2"
+            kSetAllowMigrations: "setAllowMigrations"
+            kCollMod: "collMod_V3"
+            kReshardCollection: "reshardCollection"
+            # Note: the V3 refers to the coordinator version, not the FLE2 protocol version
+            kCompactStructuredEncryptionData: "compactStructuredEncryptionData_V3"
+            kCleanupStructuredEncryptionData: "cleanupStructuredEncryptionData"
+            kMigrationBlockingOperation: "migrationBlockingOperation"
+            kConvertToCapped: "convertToCapped"
+            kUntrackUnsplittableCollection: "untrackUnsplittableCollection"
+            kCreateDatabase: "createDatabase"
 
 types:
     ForwardableOperationMetadata:
@@ -54,12 +70,8 @@ types:
         bson_serialization_type: object
         serializer: "mongo::ForwardableOperationMetadata::toBSON"
         deserializer: "mongo::ForwardableOperationMetadata"
-    DatabaseVersion:
-        description: ""
-        cpp_type: DatabaseVersion
-        bson_serialization_type: object
-        serializer: "mongo::DatabaseVersion::toBSON"
-        deserializer: "mongo::DatabaseVersion"
+        # ForwardableOperationMetadata has only non view members.
+        is_view: false
 
 structs:
     ShardingDDLCoordinatorId:
@@ -74,7 +86,16 @@ structs:
             operationType:
                 description: "Type of the sharding DDL coordinator."
                 type: DDLCoordinatorType
-    
+
+    ShardingDDLSession:
+        description: "Container for DDL coordinator session."
+        strict: true
+        fields:
+            lsid:
+                type: LogicalSessionId
+            txnNumber:
+                type: TxnNumber
+
     ShardingDDLCoordinatorMetadata:
         description: "Commong metadata for all sharding DDL coordinator."
         generate_comparison_operators: false
@@ -92,4 +113,14 @@ structs:
             databaseVersion:
                 type: DatabaseVersion
                 optional: true
-                
+            session:
+                type: ShardingDDLSession
+                optional: true
+            bucketNss:
+                description: "In case of sharded timeseries this variable will hold the underlying bucket namespace"
+                type: namespacestring
+                optional: true
+            abortReason:
+                description: "Error triggering the cleanup pipeline"
+                type: ErrorStatus
+                optional: true

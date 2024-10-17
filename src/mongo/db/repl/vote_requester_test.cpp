@@ -27,20 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <functional>
+#include <algorithm>
+#include <cstdint>
 #include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/str.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace repl {
@@ -48,7 +55,6 @@ namespace {
 
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
-using unittest::assertGet;
 
 bool stringContains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
@@ -87,7 +93,7 @@ TEST(ReplSetRequestVotes, ResponseAcceptsUnknownField) {
 
 class VoteRequesterTest : public mongo::unittest::Test {
 public:
-    virtual void setUp() {
+    void setUp() override {
         ReplSetConfig config(
             ReplSetConfig::parse(BSON("_id"
                                       << "rs0"
@@ -115,10 +121,11 @@ public:
                                                       term,
                                                       false,  // not a dryRun
                                                       lastOplogEntry,
+                                                      lastOplogEntry,
                                                       -1));
     }
 
-    virtual void tearDown() {
+    void tearDown() override {
         _requester.reset(nullptr);
     }
 
@@ -157,25 +164,27 @@ protected:
 
     RemoteCommandRequest requestFrom(std::string hostname) {
         return RemoteCommandRequest(HostAndPort(hostname),
-                                    "",  // fields do not matter in VoteRequester
+                                    DatabaseName::kEmpty,  // fields do not matter in VoteRequester
                                     BSONObj(),
                                     nullptr,
                                     Milliseconds(0));
     }
 
     RemoteCommandResponse badRemoteCommandResponse() {
-        return RemoteCommandResponse(ErrorCodes::NodeNotFound, "not on my watch");
+        return RemoteCommandResponse::make_forTest(
+            Status(ErrorCodes::NodeNotFound, "not on my watch"));
     }
 
     RemoteCommandResponse callbackCanceledCommandResponse() {
-        return RemoteCommandResponse(ErrorCodes::CallbackCanceled, "Testing canceled callback");
+        return RemoteCommandResponse::make_forTest(
+            Status(ErrorCodes::CallbackCanceled, "Testing canceled callback"));
     }
 
     RemoteCommandResponse votedYes() {
         ReplSetRequestVotesResponse response;
         response.setVoteGranted(true);
         response.setTerm(1);
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedYesStatusNotOkBecauseFailedToStoreLastVote() {
@@ -187,7 +196,7 @@ protected:
         auto status =
             Status(ErrorCodes::InterruptedDueToReplStateChange, "operation was interrupted");
         CommandHelpers::appendCommandStatusNoThrow(result, status);
-        return RemoteCommandResponse(result.obj(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(result.obj(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseConfigVersionDoesNotMatch() {
@@ -195,7 +204,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's config version differs from mine");
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseSetNameDiffers() {
@@ -203,7 +212,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's set name differs from mine");
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseLastOpTimeIsGreater() {
@@ -211,7 +220,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's data is staler than mine");
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseTermIsGreater() {
@@ -219,7 +228,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(3);
         response.setReason("candidate's term is lower than mine");
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseAlreadyVoted() {
@@ -227,7 +236,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(2);
         response.setReason("already voted for another candidate this term");
-        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
     }
 
     std::unique_ptr<VoteRequester::Algorithm> _requester;
@@ -235,7 +244,7 @@ protected:
 
 class VoteRequesterDryRunTest : public VoteRequesterTest {
 public:
-    virtual void setUp() {
+    void setUp() override {
         ReplSetConfig config(
             ReplSetConfig::parse(BSON("_id"
                                       << "rs0"
@@ -263,13 +272,14 @@ public:
                                                       term,
                                                       true,  // dryRun
                                                       lastOplogEntry,
+                                                      lastOplogEntry,
                                                       -1));
     }
 };
 
 class VoteRequesterCatchupTakeoverDryRunTest : public VoteRequesterTest {
 public:
-    virtual void setUp() {
+    void setUp() override {
         ReplSetConfig config(
             ReplSetConfig::parse(BSON("_id"
                                       << "rs0"
@@ -294,6 +304,7 @@ public:
                                                       candidateId,
                                                       term,
                                                       true,  // dryRun
+                                                      lastOplogEntry,
                                                       lastOplogEntry,
                                                       primaryIndex));
     }
@@ -647,6 +658,37 @@ TEST_F(VoteRequesterCatchupTakeoverDryRunTest, CatchupTakeoverPrimarySaysNoLoseE
                                                                       << "host1:27017"))));
     ASSERT_TRUE(hasReceivedSufficientResponses());
     ASSERT(VoteRequester::Result::kPrimaryRespondedNo == getResult());
+    ASSERT_EQUALS(3, getNumResponders());
+    stopCapturingLogMessages();
+}
+
+TEST_F(VoteRequesterCatchupTakeoverDryRunTest,
+       CatchupTakeoverAllNodesRespondedMeansSufficientResponses) {
+    startCapturingLogMessages();
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    // Getting a good response from the other secondaries is insufficient.
+    processResponse(requestFrom("host2"), votedYes());
+    processResponse(requestFrom("host3"), votedYes());
+    processResponse(requestFrom("host4"), votedYes());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    // Getting a bad response from the primary means all targets have responded, and so we have
+    // received sufficient responses.
+    processResponse(requestFrom("host1"), badRemoteCommandResponse());
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("failReason"
+                                                            << "failed to receive response"
+                                                            << "from"
+                                                            << "host1:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+
+    // A bad response from the primary is equivalent to it saying NO.
+    ASSERT(VoteRequester::Result::kPrimaryRespondedNo == getResult());
+
+    // Only the secondaries are counted; the primary is excluded from the responders since it gave a
+    // bad response.
     ASSERT_EQUALS(3, getNumResponders());
     stopCapturingLogMessages();
 }

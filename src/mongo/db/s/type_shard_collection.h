@@ -29,7 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/type_shard_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -42,10 +52,12 @@ public:
     using ShardCollectionTypeBase::kEnterCriticalSectionCounterFieldName;
     using ShardCollectionTypeBase::kEpochFieldName;
     using ShardCollectionTypeBase::kKeyPatternFieldName;
-    using ShardCollectionTypeBase::kLastRefreshedCollectionVersionFieldName;
+    using ShardCollectionTypeBase::kLastRefreshedCollectionMajorMinorVersionFieldName;
     using ShardCollectionTypeBase::kNssFieldName;
     using ShardCollectionTypeBase::kRefreshingFieldName;
     using ShardCollectionTypeBase::kReshardingFieldsFieldName;
+    using ShardCollectionTypeBase::kTimeseriesFieldsFieldName;
+    using ShardCollectionTypeBase::kTimestampFieldName;
     using ShardCollectionTypeBase::kUniqueFieldName;
     using ShardCollectionTypeBase::kUuidFieldName;
 
@@ -54,30 +66,25 @@ public:
     using ShardCollectionTypeBase::getEnterCriticalSectionCounter;
     using ShardCollectionTypeBase::getEpoch;
     using ShardCollectionTypeBase::getKeyPattern;
-    using ShardCollectionTypeBase::getLastRefreshedCollectionVersion;
     using ShardCollectionTypeBase::getNss;
     using ShardCollectionTypeBase::getRefreshing;
     using ShardCollectionTypeBase::getReshardingFields;
+    using ShardCollectionTypeBase::getTimeseriesFields;
     using ShardCollectionTypeBase::getTimestamp;
     using ShardCollectionTypeBase::getUnique;
+    using ShardCollectionTypeBase::getUnsplittable;
     using ShardCollectionTypeBase::getUuid;
     using ShardCollectionTypeBase::setDefaultCollation;
     using ShardCollectionTypeBase::setEnterCriticalSectionCounter;
-    using ShardCollectionTypeBase::setEpoch;
     using ShardCollectionTypeBase::setKeyPattern;
-    using ShardCollectionTypeBase::setLastRefreshedCollectionVersion;
-    using ShardCollectionTypeBase::setNss;
     using ShardCollectionTypeBase::setRefreshing;
     using ShardCollectionTypeBase::setReshardingFields;
-    using ShardCollectionTypeBase::setUnique;
-    using ShardCollectionTypeBase::setUuid;
-
-    ShardCollectionType(
-        NamespaceString nss, OID epoch, UUID uuid, KeyPattern keyPattern, bool unique);
+    using ShardCollectionTypeBase::setTimeseriesFields;
+    using ShardCollectionTypeBase::setUnsplittable;
 
     ShardCollectionType(NamespaceString nss,
                         OID epoch,
-                        boost::optional<Timestamp> creationTime,
+                        Timestamp timestamp,
                         UUID uuid,
                         KeyPattern keyPattern,
                         bool unique);
@@ -91,9 +98,11 @@ public:
     BSONObj toBSON() const;
 
     bool getAllowMigrations() const {
-        return getPre50CompatibleAllowMigrations().get_value_or(true);
+        return getPre50CompatibleAllowMigrations().value_or(true);
     }
     void setAllowMigrations(bool allowMigrations);
+
+    boost::optional<ChunkVersion> getLastRefreshedCollectionPlacementVersion() const;
 };
 
 }  // namespace mongo

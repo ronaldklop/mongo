@@ -27,15 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/logv2/ramlog.h"
-
 #include <map>
+#include <utility>
 
-#include "mongo/base/init.h"
-#include "mongo/base/status.h"
-#include "mongo/util/str.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/logv2/ramlog.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo::logv2 {
 
@@ -43,7 +42,7 @@ using std::string;
 
 namespace {
 typedef std::map<string, RamLog*> RM;
-stdx::mutex* _namedLock = NULL;  // NOLINT
+stdx::mutex* _namedLock = NULL;
 RM* _named = NULL;
 
 }  // namespace
@@ -55,7 +54,7 @@ RamLog::RamLog(StringData name) : _name(name) {
 RamLog::~RamLog() {}
 
 void RamLog::write(const std::string& str) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     _totalLinesWritten++;
 
     if (0 == str.size()) {
@@ -63,7 +62,7 @@ void RamLog::write(const std::string& str) {
     }
 
     // Trim if we are going to go above the threshold
-    trimIfNeeded(str.size(), lk);
+    trimIfNeeded(str.size());
 
     // Add the new line and adjust the space accounting
     _totalSizeBytes -= _lines[_lastLinePosition].size();
@@ -80,14 +79,15 @@ void RamLog::write(const std::string& str) {
     }
 }
 
-void RamLog::trimIfNeeded(size_t newStr, WithLock lock) {
+// warning: this function must be invoked under existing mutex
+void RamLog::trimIfNeeded(size_t newStr) {
     // Check if we are going to go past the size limit
     if ((_totalSizeBytes + newStr) < kMaxSizeBytes) {
         return;
     }
 
     // Worst case, if the user adds a really large line, we will keep just one line
-    if (getLineCount(lock) == 0) {
+    if (getLineCount() == 0) {
         return;
     }
 
@@ -96,7 +96,7 @@ void RamLog::trimIfNeeded(size_t newStr, WithLock lock) {
 
     // Trim down until we make enough space, keep at least one line though
     // This means with the line we are about to have, the log will actually have 2 lines
-    while (getLineCount(lock) > 1 && trimmedSpace < newStr) {
+    while (getLineCount() > 1 && trimmedSpace < newStr) {
         size_t size = _lines[_firstLinePosition].size();
         trimmedSpace += size;
         _totalSizeBytes -= size;
@@ -109,7 +109,7 @@ void RamLog::trimIfNeeded(size_t newStr, WithLock lock) {
 }
 
 void RamLog::clear() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     _totalLinesWritten = 0;
     _firstLinePosition = 0;
     _lastLinePosition = 0;
@@ -121,15 +121,18 @@ void RamLog::clear() {
     }
 }
 
-StringData RamLog::getLine(size_t lineNumber, WithLock lock) const {
-    if (lineNumber >= getLineCount(lock)) {
+StringData RamLog::getLine(size_t lineNumber) const {
+    if (lineNumber >= getLineCount()) {
         return "";
     }
 
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     return _lines[(lineNumber + _firstLinePosition) % kMaxLines].c_str();
 }
 
-size_t RamLog::getLineCount(WithLock) const {
+size_t RamLog::getLineCount() const {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+
     if (_lastLinePosition < _firstLinePosition) {
         return (kMaxLines - _firstLinePosition) + _lastLinePosition;
     }
@@ -141,6 +144,8 @@ RamLog::LineIterator::LineIterator(RamLog* ramlog)
     : _ramlog(ramlog), _lock(ramlog->_mutex), _nextLineIndex(0) {}
 
 size_t RamLog::LineIterator::getTotalLinesWritten() {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_ramlog->_mutex);
+
     return _ramlog->_totalLinesWritten;
 }
 
@@ -151,7 +156,7 @@ size_t RamLog::LineIterator::getTotalLinesWritten() {
 RamLog* RamLog::get(const std::string& name) {
     if (!_namedLock) {
         // Guaranteed to happen before multi-threaded operation.
-        _namedLock = new stdx::mutex();  // NOLINT
+        _namedLock = new stdx::mutex();
     }
 
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
@@ -182,7 +187,7 @@ void RamLog::getNames(std::vector<string>& names) {
 
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
     for (RM::iterator i = _named->begin(); i != _named->end(); ++i) {
-        if (i->second->getLineCount(lk)) {
+        if (i->second->getLineCount()) {
             names.push_back(i->first);
         }
     }
@@ -198,7 +203,7 @@ MONGO_INITIALIZER(RamLogCatalogV2)(InitializerContext*) {
             uasserted(ErrorCodes::InternalError, "Inconsistent intiailization of RamLogCatalog.");
         }
 
-        _namedLock = new stdx::mutex();  // NOLINT
+        _namedLock = new stdx::mutex();
         _named = new RM();
     }
 }

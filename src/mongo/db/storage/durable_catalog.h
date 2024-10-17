@@ -29,119 +29,240 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/import_options.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
+#include "mongo/db/storage/durable_catalog_entry.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/platform/random.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+
+class StorageEngineInterface;
 
 /**
  * An interface to modify the on-disk catalog metadata.
  */
-class DurableCatalog {
+class DurableCatalog final {
     DurableCatalog(const DurableCatalog&) = delete;
     DurableCatalog& operator=(const DurableCatalog&) = delete;
     DurableCatalog(DurableCatalog&&) = delete;
     DurableCatalog& operator=(DurableCatalog&&) = delete;
 
-protected:
-    DurableCatalog() = default;
-
 public:
+    static constexpr auto kIsFeatureDocumentFieldName = "isFeatureDoc"_sd;
+
     /**
      * `Entry` ties together the common identifiers of a single `_mdb_catalog` document.
+     *
+     * Idents can come in 4 forms depending on server parameters:
+     * wtdfi    = --wiredTigerDirectoryForIndexes
+     * dirperdb = --directoryperdb
+     *
+     * default:          <collection|index>-<counter>-<random number>
+     * dirperdb:         <db>/<collection|index>-<counter>-<random number>
+     * wtdfi:            <collection|index>/<counter>-<random number>
+     * dirperdb & wtdfi: <db>/<collection|index>/<counter>-<random number>
      */
-    struct Entry {
-        Entry() {}
-        Entry(RecordId catalogId, std::string ident, NamespaceString nss)
-            : catalogId(catalogId), ident(std::move(ident)), nss(std::move(nss)) {}
+    struct EntryIdentifier {
+        EntryIdentifier() {}
+        EntryIdentifier(RecordId catalogId, std::string ident, NamespaceString nss)
+            : catalogId(std::move(catalogId)), ident(std::move(ident)), nss(std::move(nss)) {}
         RecordId catalogId;
         std::string ident;
         NamespaceString nss;
     };
 
-    virtual ~DurableCatalog() {}
+    DurableCatalog(RecordStore* rs,
+                   bool directoryPerDb,
+                   bool directoryForIndexes,
+                   StorageEngineInterface* engine);
+    DurableCatalog() = delete;
+
 
     static DurableCatalog* get(OperationContext* opCtx) {
         return opCtx->getServiceContext()->getStorageEngine()->getCatalog();
     }
 
-    virtual void init(OperationContext* opCtx) = 0;
+    /**
+     *  Allows featureDocuments to be checked with older versions.
+     */
+    static bool isFeatureDocument(const BSONObj& obj) {
+        BSONElement firstElem = obj.firstElement();
+        if (firstElem.fieldNameStringData() == kIsFeatureDocumentFieldName) {
+            return firstElem.booleanSafe();
+        }
+        return false;
+    }
 
-    virtual std::vector<Entry> getAllCatalogEntries(OperationContext* opCtx) const = 0;
+    static bool isUserDataIdent(StringData ident) {
+        // Indexes and collections are candidates for dropping when the storage engine's metadata
+        // does not align with the catalog metadata.
+        return ident.find("index-") != std::string::npos ||
+            ident.find("index/") != std::string::npos || isCollectionIdent(ident);
+    }
 
-    virtual Entry getEntry(RecordId catalogId) const = 0;
+    static bool isInternalIdent(StringData ident) {
+        return ident.find(_kInternalIdentPrefix) != std::string::npos;
+    }
 
-    virtual std::string getIndexIdent(OperationContext* opCtx,
-                                      RecordId id,
-                                      StringData idxName) const = 0;
+    static bool isResumableIndexBuildIdent(StringData ident) {
+        invariant(isInternalIdent(ident), ident.toString());
+        return ident.find(_kResumableIndexBuildIdentStem) != std::string::npos;
+    }
 
-    virtual BSONObj getCatalogEntry(OperationContext* opCtx, RecordId catalogId) const = 0;
+    static bool isCollectionIdent(StringData ident) {
+        // Internal idents prefixed "internal-" should not be considered collections, because
+        // they are not eligible for orphan recovery through repair.
+        return ident.find("collection-") != std::string::npos ||
+            ident.find("collection/") != std::string::npos;
+    }
 
-    virtual BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx,
-                                                             RecordId id) const = 0;
+    void init(OperationContext* opCtx);
+
+    std::vector<EntryIdentifier> getAllCatalogEntries(OperationContext* opCtx) const;
+
+    /**
+     * Scans the persisted catalog until an entry is found matching 'nss'.
+     */
+    boost::optional<DurableCatalogEntry> scanForCatalogEntryByNss(OperationContext* opCtx,
+                                                                  const NamespaceString& nss) const;
+
+    /**
+     * Scans the persisted catalog until an entry is found matching 'uuid'.
+     */
+    boost::optional<DurableCatalogEntry> scanForCatalogEntryByUUID(OperationContext* opCtx,
+                                                                   const UUID& uuid) const;
+
+    EntryIdentifier getEntry(const RecordId& catalogId) const;
+
+    /**
+     * First tries to return the in-memory entry. If not found, e.g. when collection is dropped
+     * after the provided timestamp, loads the entry from the persisted catalog at the provided
+     * timestamp.
+     */
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx, const RecordId& catalogId) const;
+
+    std::string getIndexIdent(OperationContext* opCtx,
+                              const RecordId& id,
+                              StringData idxName) const;
+
+    std::vector<std::string> getIndexIdents(OperationContext* opCtx, const RecordId& id) const;
+
+    /**
+     * Get a raw catalog entry for catalogId as BSON.
+     */
+    BSONObj getCatalogEntry(OperationContext* opCtx, const RecordId& catalogId) const {
+        auto cursor = _rs->getCursor(opCtx);
+        return _findEntry(*cursor, catalogId).getOwned();
+    }
+
+    /**
+     * Parses the catalog entry object at `catalogId` to common types. Returns boost::none if it
+     * doesn't exist or if the entry is the feature document.
+     */
+    boost::optional<DurableCatalogEntry> getParsedCatalogEntry(OperationContext* opCtx,
+                                                               const RecordId& catalogId) const;
+
+    /**
+     * Helper which constructs a DurableCatalogEntry given 'catalogId' and 'obj'.
+     */
+    boost::optional<DurableCatalogEntry> parseCatalogEntry(const RecordId& catalogId,
+                                                           const BSONObj& obj) const;
 
     /**
      * Updates the catalog entry for the collection 'nss' with the fields specified in 'md'. If
      * 'md.indexes' contains a new index entry, then this method generates a new index ident and
      * adds it to the catalog entry.
      */
-    virtual void putMetaData(OperationContext* opCtx,
-                             RecordId id,
-                             BSONCollectionCatalogEntry::MetaData& md) = 0;
+    void putMetaData(OperationContext* opCtx,
+                     const RecordId& id,
+                     BSONCollectionCatalogEntry::MetaData& md);
 
-    /**
-     * Checks that the metadata for the index exists and matches the given spec.
-     */
-    virtual Status checkMetaDataForIndex(OperationContext* opCtx,
-                                         RecordId catalogId,
-                                         const std::string& indexName,
-                                         const BSONObj& spec) = 0;
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
-    virtual std::vector<std::string> getAllIdents(OperationContext* opCtx) const = 0;
-
-    virtual bool isUserDataIdent(StringData ident) const = 0;
-
-    virtual bool isInternalIdent(StringData ident) const = 0;
-
-    virtual bool isCollectionIdent(StringData ident) const = 0;
-
-    virtual RecordStore* getRecordStore() = 0;
+    RecordStore* getRecordStore() {
+        return _rs;
+    }
 
     /**
      * Create an entry in the catalog for an orphaned collection found in the
      * storage engine. Return the generated ns of the collection.
-     * Note that this function does not recreate the _id index on the collection because it does not
-     * have access to index catalog.
+     * Note that this function does not recreate the _id index on the for non-clustered collections
+     * because it does not have access to index catalog.
      */
-    virtual StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx,
-                                                     std::string ident) = 0;
+    StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx,
+                                             std::string ident,
+                                             const CollectionOptions& optionsWithUUID);
 
-    virtual std::string getFilesystemPathForDb(const std::string& dbName) const = 0;
+    std::string getFilesystemPathForDb(const DatabaseName& dbName) const;
 
     /**
      * Generate an internal ident name.
      */
-    virtual std::string newInternalIdent() = 0;
+    std::string newInternalIdent() {
+        return _newInternalIdent("");
+    }
+
+    /**
+     * Generates a new unique identifier for a new "thing".
+     * @param nss - the containing namespace
+     * @param kind - what this "thing" is, likely collection or index
+     *
+     * Warning: It's only unique as far as we know without checking every file on disk, but it is
+     * possible that this ident collides with an existing one.
+     */
+    std::string generateUniqueIdent(NamespaceString nss, const char* kind);
 
     /**
      * Generate an internal resumable index build ident name.
      */
-    virtual std::string newInternalResumableIndexBuildIdent() = 0;
+    std::string newInternalResumableIndexBuildIdent() {
+        return _newInternalIdent(_kResumableIndexBuildIdentStem);
+    }
 
     /**
      * On success, returns the RecordId which identifies the new record store in the durable catalog
      * in addition to ownership of the new RecordStore.
      */
-    virtual StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> createCollection(
+    StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> createCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         const CollectionOptions& options,
-        bool allocateDefaultSpace) = 0;
+        bool allocateDefaultSpace);
+
+    Status createIndex(OperationContext* opCtx,
+                       const RecordId& catalogId,
+                       const NamespaceString& nss,
+                       const CollectionOptions& collOptions,
+                       const IndexDescriptor* spec);
 
     /**
      * Import a collection by inserting the given metadata into the durable catalog and instructing
@@ -149,7 +270,7 @@ public:
      * catalog entry and contain the following fields:
      * "md": A document representing the BSONCollectionCatalogEntry::MetaData of the collection.
      * "idxIdent": A document containing {<index_name>: <index_ident>} pairs for all indexes.
-     * "ns": Namespace of the collection being imported.
+     * "nss": NamespaceString of the collection being imported.
      * "ident": Ident of the collection file.
      *
      * On success, returns an ImportResult structure containing the RecordId which identifies the
@@ -160,22 +281,22 @@ public:
      */
     struct ImportResult {
         ImportResult(RecordId catalogId, std::unique_ptr<RecordStore> rs, UUID uuid)
-            : catalogId(catalogId), rs(std::move(rs)), uuid(uuid) {}
+            : catalogId(std::move(catalogId)), rs(std::move(rs)), uuid(uuid) {}
         RecordId catalogId;
         std::unique_ptr<RecordStore> rs;
         UUID uuid;
     };
-    enum class ImportCollectionUUIDOption { kKeepOld, kGenerateNew };
-    virtual StatusWith<ImportResult> importCollection(OperationContext* opCtx,
-                                                      const NamespaceString& nss,
-                                                      const BSONObj& metadata,
-                                                      const BSONObj& storageMetadata,
-                                                      ImportCollectionUUIDOption uuidOption) = 0;
 
-    virtual Status renameCollection(OperationContext* opCtx,
-                                    RecordId catalogId,
-                                    const NamespaceString& toNss,
-                                    bool stayTemp) = 0;
+    StatusWith<ImportResult> importCollection(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              const BSONObj& metadata,
+                                              const BSONObj& storageMetadata,
+                                              const ImportOptions& importOptions);
+
+    Status renameCollection(OperationContext* opCtx,
+                            const RecordId& catalogId,
+                            const NamespaceString& toNss,
+                            BSONCollectionCatalogEntry::MetaData& md);
 
     /**
      * Deletes the persisted collection catalog entry identified by 'catalogId'.
@@ -183,108 +304,22 @@ public:
      * Expects (invariants) that all of the index catalog entries have been removed already via
      * removeIndex.
      */
-    virtual Status dropCollection(OperationContext* opCtx, RecordId catalogId) = 0;
-
-    /**
-     * Updates size of a capped Collection.
-     */
-    virtual void updateCappedSize(OperationContext* opCtx, RecordId catalogId, long long size) = 0;
-
-    /**
-     * Updates the expireAfterSeconds option on the clustered index. If no expireAfterSeconds value
-     * is passed in then TTL deletions will be stopped on the clustered index.
-     */
-    virtual void updateClusteredIndexTTLSetting(OperationContext* opCtx,
-                                                RecordId catalogId,
-                                                boost::optional<int64_t> expireAfterSeconds) = 0;
-
-    /*
-     * Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
-     * The specified index must already contain an expireAfterSeconds field, and the value in
-     * that field and newExpireSecs must both be numeric.
-     */
-    virtual void updateTTLSetting(OperationContext* opCtx,
-                                  RecordId catalogId,
-                                  StringData idxName,
-                                  long long newExpireSeconds) = 0;
-
-    /*
-     * Hide or unhide the given index. A hidden index will not be considered for use by the
-     * query planner.
-     */
-    virtual void updateHiddenSetting(OperationContext* opCtx,
-                                     RecordId catalogId,
-                                     StringData idxName,
-                                     bool hidden) = 0;
-
-    /**
-     * Compares the UUID argument to the UUID obtained from the metadata. Returns true if they are
-     * equal, false otherwise.
-     */
-    virtual bool isEqualToMetadataUUID(OperationContext* opCtx,
-                                       RecordId catalogId,
-                                       const UUID& uuid) = 0;
-
-    /**
-     * Updates the 'temp' setting for this collection.
-     */
-    virtual void setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp) = 0;
-
-    /**
-     * Updates whether updates/deletes should store their pre-images in the opLog.
-     */
-    virtual void setRecordPreImages(OperationContext* opCtx, RecordId catalogId, bool val) = 0;
-
-    /**
-     * Updates the validator for this collection.
-     *
-     * An empty validator removes all validation.
-     */
-    virtual void updateValidator(OperationContext* opCtx,
-                                 RecordId catalogId,
-                                 const BSONObj& validator,
-                                 boost::optional<ValidationLevelEnum> newLevel,
-                                 boost::optional<ValidationActionEnum> newAction) = 0;
-
-    /**
-     * Removes the index 'indexName' from the persisted collection catalog entry identified by
-     * 'catalogId'.
-     */
-    virtual void removeIndex(OperationContext* opCtx, RecordId catalogId, StringData indexName) = 0;
-
-    /**
-     * Updates the persisted catalog entry for 'ns' with the new index and creates the index on
-     * disk.
-     *
-     * A passed 'buildUUID' implies that the index is part of a two-phase index build.
-     */
-    virtual Status prepareForIndexBuild(OperationContext* opCtx,
-                                        RecordId catalogId,
-                                        const IndexDescriptor* spec,
-                                        boost::optional<UUID> buildUUID,
-                                        bool isBackgroundSecondaryBuild) = 0;
+    Status dropCollection(OperationContext* opCtx, const RecordId& catalogId);
 
     /**
      * Drops the provided ident and recreates it as empty for use in resuming an index build.
      */
-    virtual Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
-                                                      RecordId catalogId,
-                                                      const IndexDescriptor* spec,
-                                                      StringData ident) = 0;
+    Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              const CollectionOptions& collOptions,
+                                              const IndexDescriptor* spec,
+                                              StringData ident);
 
-    /**
-     * Returns a UUID if the index is being built with the two-phase index build procedure.
-     */
-    virtual boost::optional<UUID> getIndexBuildUUID(OperationContext* opCtx,
-                                                    RecordId catalogId,
-                                                    StringData indexName) const = 0;
+    void getReadyIndexes(OperationContext* opCtx, RecordId catalogId, StringSet* names) const;
 
-    /**
-     * Indicate that an index build is completed and the index is ready to use.
-     */
-    virtual void indexBuildSuccess(OperationContext* opCtx,
-                                   RecordId catalogId,
-                                   StringData indexName) = 0;
+    bool isIndexPresent(OperationContext* opCtx,
+                        const RecordId& catalogId,
+                        StringData indexName) const;
 
     /**
      * Returns true if the index identified by 'indexName' is multikey, and returns false otherwise.
@@ -297,70 +332,69 @@ public:
      * multikey information, then 'multikeyPaths' is initialized as a vector with size equal to the
      * number of elements in the index key pattern of empty sets.
      */
-    virtual bool isIndexMultikey(OperationContext* opCtx,
-                                 RecordId catalogId,
-                                 StringData indexName,
-                                 MultikeyPaths* multikeyPaths) const = 0;
+    bool isIndexMultikey(OperationContext* opCtx,
+                         const RecordId& catalogId,
+                         StringData indexName,
+                         MultikeyPaths* multikeyPaths) const;
+
+    void setRand_forTest(const std::string& rand) {
+        stdx::lock_guard<stdx::mutex> lk(_randLock);
+        _rand = rand;
+    }
+
+    std::string getRand_forTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_randLock);
+        return _rand;
+    }
+
+private:
+    static constexpr auto _kInternalIdentPrefix = "internal-"_sd;
+    static constexpr auto _kResumableIndexBuildIdentStem = "resumable-index-build-"_sd;
+
+    class AddIdentChange;
+
+    friend class StorageEngineImpl;
+    friend class DurableCatalogTest;
+    friend class StorageEngineTest;
 
     /**
-     * Sets the index identified by 'indexName' to be multikey.
-     *
-     * If 'multikeyPaths' is non-empty, then it must be a vector with size equal to the number of
-     * elements in the index key pattern. Additionally, at least one path component of the indexed
-     * fields must cause this index to be multikey.
-     *
-     * This function returns true if the index metadata has changed, and returns false otherwise.
+     * Finds the durable catalog entry using the provided RecordStore cursor.
+     * The returned BSONObj is unowned and is only valid while the cursor is positioned.
      */
-    virtual bool setIndexIsMultikey(OperationContext* opCtx,
-                                    RecordId catalogId,
-                                    StringData indexName,
-                                    const MultikeyPaths& multikeyPaths) = 0;
+    BSONObj _findEntry(SeekableRecordCursor& cursor, const RecordId& catalogId) const;
+    StatusWith<EntryIdentifier> _addEntry(OperationContext* opCtx,
+                                          NamespaceString nss,
+                                          const CollectionOptions& options);
+    StatusWith<EntryIdentifier> _importEntry(OperationContext* opCtx,
+                                             NamespaceString nss,
+                                             const BSONObj& metadata);
+    Status _removeEntry(OperationContext* opCtx, const RecordId& catalogId);
+
+    std::shared_ptr<BSONCollectionCatalogEntry::MetaData> _parseMetaData(
+        const BSONElement& mdElement) const;
+
+
+    std::string _newInternalIdent(StringData identStem);
+
+    std::string _newRand();
 
     /**
-     * Sets the index to be multikey with the provided paths. This performs minimal validation of
-     * the inputs and is intended to be used internally to "correct" multikey metadata that drifts
-     * from the underlying collection data.
-     *
-     * When isMultikey is false, ignores multikeyPaths and resets the metadata appropriately based
-     * on the index descriptor. Otherwise, overwrites the existing multikeyPaths with the ones
-     * provided. This only writes multikey paths if the index type supports path-level tracking, and
-     * only sets the multikey boolean flag otherwise.
+     * The '_randLock' must be passed in.
      */
-    virtual void forceSetIndexIsMultikey(OperationContext* opCtx,
-                                         RecordId catalogId,
-                                         const IndexDescriptor* desc,
-                                         bool isMultikey,
-                                         const MultikeyPaths& multikeyPaths) = 0;
+    bool _hasEntryCollidingWithRand(WithLock) const;
 
-    virtual CollectionOptions getCollectionOptions(OperationContext* opCtx,
-                                                   RecordId catalogId) const = 0;
+    RecordStore* _rs;  // not owned
+    const bool _directoryPerDb;
+    const bool _directoryForIndexes;
 
-    virtual int getTotalIndexCount(OperationContext* opCtx, RecordId catalogId) const = 0;
+    // Protects '_rand' and '_next'.
+    mutable stdx::mutex _randLock;
+    std::string _rand;
+    unsigned long long _next;
 
-    virtual int getCompletedIndexCount(OperationContext* opCtx, RecordId catalogId) const = 0;
+    absl::flat_hash_map<RecordId, EntryIdentifier, RecordId::Hasher> _catalogIdToEntryMap;
+    mutable stdx::mutex _catalogIdToEntryMapLock;
 
-    virtual BSONObj getIndexSpec(OperationContext* opCtx,
-                                 RecordId catalogId,
-                                 StringData indexName) const = 0;
-
-    virtual void getAllIndexes(OperationContext* opCtx,
-                               RecordId catalogId,
-                               std::vector<std::string>* names) const = 0;
-
-    virtual void getReadyIndexes(OperationContext* opCtx,
-                                 RecordId catalogId,
-                                 std::vector<std::string>* names) const = 0;
-
-    virtual bool isIndexPresent(OperationContext* opCtx,
-                                RecordId catalogId,
-                                StringData indexName) const = 0;
-
-    virtual bool isIndexReady(OperationContext* opCtx,
-                              RecordId catalogId,
-                              StringData indexName) const = 0;
-
-    virtual void setRand_forTest(const std::string& rand) = 0;
-
-    virtual std::string getRand_forTest() const = 0;
+    StorageEngineInterface* const _engine;
 };
 }  // namespace mongo

@@ -1,11 +1,8 @@
 /**
  * IPs cannot be used as hostnames for split horizon configurations; replSetInitiate will not work
  * correctly. If previously configured using IP, mongod will still be allowed to start
- * @tags: [ incompatible_with_eft, requires_persistence ]
+ * @tags: [ requires_persistence ]
  */
-
-(function() {
-"use strict";
 
 // Start and configure mongod with invalid split horizons using override setting
 
@@ -48,7 +45,11 @@ startupConfig.port = mongod.port;
 mongod = MongoRunner.runMongod(startupConfig);
 assert(mongod);
 
-let rsConfig2 = mongod.adminCommand({replSetGetConfig: 1});
+let rsConfig2;
+assert.soon(() => {
+    rsConfig2 = mongod.adminCommand({replSetGetConfig: 1});
+    return rsConfig2.ok;
+}, "Failed to get replset config from node");
 jsTestLog("rsConfig2: " + tojson(rsConfig2));
 assert.commandWorked(rsConfig2);
 assert.eq(tojson(rsConfig2.config.members), tojson(rsConfig1.config.members));
@@ -66,4 +67,3 @@ assert.commandFailed(output);
 assert(output.errmsg.includes("Found split horizon configuration using IP"));
 
 MongoRunner.stopMongod(mongod);
-}());

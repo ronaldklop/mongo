@@ -27,13 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <set>
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/expression_find_internal.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::expression_internal_tests {
 constexpr auto kProjectionPostImageVarName =
@@ -114,14 +129,15 @@ TEST_F(ExpressionInternalFindPositionalTest, RecordsProjectionDependencies) {
     auto expr = createExpression(fromjson("{bar: 1, foo: {$gte: 5}}"), "foo");
 
     DepsTracker deps;
-    expr->addDependencies(&deps);
+    expression::addDependencies(expr.get(), &deps);
 
-    ASSERT_EQ(deps.fields.size(), 2UL);
-    ASSERT_EQ(deps.fields.count("bar"), 1UL);
-    ASSERT_EQ(deps.fields.count("foo"), 1UL);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(deps.vars.count(varId), 1UL);
+    ASSERT_EQ(deps.fields.size(), 0UL);
     ASSERT_TRUE(deps.needWholeDocument);
+
+    std::set<Variables::Id> refs;
+    expression::addVariableRefs(expr.get(), &refs);
+    ASSERT_EQ(refs.size(), 1UL);
+    ASSERT_EQ(refs.count(varId), 1UL);
 }
 
 TEST_F(ExpressionInternalFindPositionalTest, AddsArrayUndottedPathToComputedPaths) {
@@ -171,12 +187,15 @@ TEST_F(ExpressionInternalFindSliceTest, RecordsProjectionDependencies) {
     auto expr = createExpression("foo", 1, 2);
 
     DepsTracker deps;
-    expr->addDependencies(&deps);
+    expression::addDependencies(expr.get(), &deps);
 
     ASSERT_EQ(deps.fields.size(), 0UL);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(deps.vars.count(varId), 1UL);
     ASSERT_TRUE(deps.needWholeDocument);
+
+    std::set<Variables::Id> refs;
+    expression::addVariableRefs(expr.get(), &refs);
+    ASSERT_EQ(refs.size(), 1UL);
+    ASSERT_EQ(refs.count(varId), 1UL);
 }
 
 TEST_F(ExpressionInternalFindSliceTest, AddsArrayUndottedPathToComputedPaths) {
@@ -220,11 +239,13 @@ TEST_F(ExpressionInternalFindElemMatchTest, RecordsProjectionDependencies) {
     auto expr = createExpression(fromjson("{foo: {$elemMatch: {bar: {$gte: 5}}}}"), "foo");
 
     DepsTracker deps;
-    expr->addDependencies(&deps);
+    expression::addDependencies(expr.get(), &deps);
 
-    ASSERT_EQ(deps.fields.size(), 1UL);
-    ASSERT_EQ(deps.fields.count("foo"), 1UL);
-    ASSERT_EQ(deps.vars.size(), 0UL);
+    ASSERT_EQ(deps.fields.size(), 0UL);
     ASSERT(deps.needWholeDocument);
+
+    std::set<Variables::Id> refs;
+    expression::addVariableRefs(expr.get(), &refs);
+    ASSERT_EQ(refs.size(), 0UL);
 }
 }  // namespace mongo::expression_internal_tests

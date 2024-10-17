@@ -29,43 +29,108 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 #include <functional>
 
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo::sbe {
 /**
- * A callback which gets called whenever a stage which accesses the storage engine (e.g. "scan",
- * "seek", or "ixscan") obtains or re-obtains its AutoGet*.
+ * A callback which gets called whenever a SCAN stage asks an underlying index scan for a result.
  */
-using LockAcquisitionCallback =
-    std::function<void(OperationContext*, const AutoGetCollectionForReadMaybeLockFree&)>;
+using IndexKeyConsistencyCheckCallback = bool (*)(OperationContext* opCtx,
+                                                  StringMap<const IndexCatalogEntry*>&,
+                                                  value::SlotAccessor* snapshotIdAccessor,
+                                                  value::SlotAccessor* indexIdentAccessor,
+                                                  value::SlotAccessor* indexKeyAccessor,
+                                                  const CollectionPtr& collection,
+                                                  const Record& nextRecord);
+
+using IndexKeyCorruptionCheckCallback = void (*)(OperationContext* opCtx,
+                                                 value::SlotAccessor* snapshotIdAccessor,
+                                                 value::SlotAccessor* indexKeyAccessor,
+                                                 value::SlotAccessor* indexKeyPatternAccessor,
+                                                 const RecordId& rid,
+                                                 const NamespaceString& nss);
 
 /**
- * Given a collection UUID, acquires 'coll', invokes the provided 'lockAcquisiionCallback', and
- * returns the collection's name as well as the current catalog epoch.
- *
- * This is intended for use during the preparation of an SBE plan. The caller must hold the
- * appropriate db_raii object in order to ensure that SBE plan preparation sees a consistent view of
- * the catalog.
+ * Helper class used by SBE PlanStages for acquiring and re-acquiring a CollectionPtr.
  */
-std::pair<NamespaceString, uint64_t> acquireCollection(
-    OperationContext* opCtx,
-    CollectionUUID collUuid,
-    const LockAcquisitionCallback& lockAcquisitionCallback,
-    boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll);
+class CollectionRef {
+public:
+    bool isInitialized() const {
+        return _collPtr.has_value();
+    }
 
-/**
- * Re-acquires 'coll', intended for use during SBE yield recovery or when a closed SBE plan is
- * re-opened. In addition to acquiring 'coll', throws a UserException if the collection has been
- * dropped or renamed, or if the catalog has been closed and re-opened. SBE query execution
- * currently cannot survive such events if they occur during a yield or between getMores.
- */
-void restoreCollection(OperationContext* opCtx,
-                       const NamespaceString& collName,
-                       CollectionUUID collUuid,
-                       uint64_t catalogEpoch,
-                       const LockAcquisitionCallback& lockAcquisitionCallback,
-                       boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll);
+    const CollectionPtr& getPtr() const {
+        dassert(isInitialized());
+        return *_collPtr;
+    }
+
+    operator bool() const {
+        return isInitialized() ? static_cast<bool>(getPtr()) : false;
+    }
+
+    bool operator!() const {
+        return isInitialized() ? !getPtr() : true;
+    }
+
+    void reset() {
+        _collPtr = boost::none;
+    }
+
+    boost::optional<NamespaceString> getCollName() const {
+        return _collName;
+    }
+
+    /**
+     * Given a collection UUID and dbName, establishes a consistent collection instance with respect
+     * to the snapshot and stores it into _collPtr. This method also stores the NamespaceString for
+     * the collection into _collName, and it stores the current catalog epoch into _catalogEpoch.
+     *
+     * This is intended for use during the preparation of an SBE plan. The caller must hold the
+     * appropriate db_raii object in order to ensure that SBE plan preparation sees a consistent
+     * view of the catalog.
+     */
+    void acquireCollection(OperationContext* opCtx,
+                           const DatabaseName& dbName,
+                           const UUID& collUuid);
+
+    /**
+     * Re-acquires a pointer to the collection, after establishing a collection instance consistent
+     * with the snashot, intended for use during SBE yield recovery or when a
+     * closed SBE plan is re-opened. In addition to acquiring the collection pointer, throws a
+     * UserException if the collection has been dropped or renamed, or if the catalog has been
+     * closed and re-opened. SBE query execution currently cannot survive such events if they occur
+     * during a yield or between getMores.
+     */
+    void restoreCollection(OperationContext* opCtx,
+                           const DatabaseName& dbName,
+                           const UUID& collUuid);
+
+private:
+    /*
+     * Establish a collection instance consistent with the opened storage snapshot by calling
+     * 'establishConsistentCollection' and store it into _collPtr
+     */
+    void getConsistentCollection(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const UUID& collUuid);
+    boost::optional<CollectionPtr> _collPtr;
+    boost::optional<NamespaceString> _collName;
+    boost::optional<uint64_t> _catalogEpoch;
+};
 }  // namespace mongo::sbe

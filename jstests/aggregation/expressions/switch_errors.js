@@ -1,10 +1,8 @@
 // SERVER-10689 introduced the $switch expression. In this file, we test the error cases of the
 // expression.
-load("jstests/aggregation/extras/utils.js");        // For assertErrorCode.
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-(function() {
-"use strict";
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 var coll = db.switch;
 coll.drop();
@@ -60,9 +58,25 @@ pipeline = {
 };
 assertErrorCode(coll, pipeline, 40068, "$switch requires at least one branch");
 
-coll.insert({x: 1});
+assert.commandWorked(coll.insert({x: 1}));
 pipeline = {
     "$project": {"output": {"$switch": {"branches": [{"case": {"$eq": ["$x", 0]}, "then": 1}]}}}
 };
 assertErrorCode(coll, pipeline, 40066, "$switch has no default and an input matched no case");
-}());
+
+// This query was designed to reproduce SERVER-70190. The first branch of the $switch can be
+// optimized away and the $ifNull can be optimized to 2. If the field "x" exists in the input
+// document and is truthy, then the expression should return 2. Otherwise it should throw because no
+// case statement matched and there is no "default" expression.
+pipeline = [{
+    $sortByCount: {
+        $switch: {
+            branches:
+                [{case: {$literal: false}, then: 1}, {case: "$x", then: {$ifNull: [2, "$y"]}}]
+        }
+    }
+}];
+assert.eq([{"_id": 2, "count": 1}], coll.aggregate(pipeline).toArray());
+assert.commandWorked(coll.remove({x: 1}));
+assert.commandWorked(coll.insert({z: 1}));
+assertErrorCode(coll, pipeline, 40066, "$switch has no default and an input matched no case");

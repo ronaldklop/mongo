@@ -27,15 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/query/collation/collator_factory_icu.h"
-
 #include <memory>
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collator_factory_icu.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -389,7 +398,7 @@ TEST(CollatorFactoryICUTest, MissingLocaleStringFailsToParse) {
     CollatorFactoryICU factory;
     auto collator = factory.makeFromBSON(BSONObj());
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus().code(), 40414);
+    ASSERT_EQ(collator.getStatus().code(), ErrorCodes::IDLFailedToParse);
 }
 
 TEST(CollatorFactoryICUTest, UnknownSpecFieldFailsToParse) {
@@ -693,7 +702,7 @@ TEST(CollatorFactoryICUTest, TooLargeStrengthFieldFailsToParse) {
                                               << "en_US"
                                               << "strength" << 2147483648LL));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus().code(), 51024);
+    ASSERT_EQ(collator.getStatus().code(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, FractionalStrengthFieldFailsToParse) {
@@ -711,7 +720,7 @@ TEST(CollatorFactoryICUTest, NegativeStrengthFieldFailsToParse) {
                                               << "en_US"
                                               << "strength" << -1));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus().code(), 51024);
+    ASSERT_EQ(collator.getStatus().code(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, InvalidIntegerStrengthFieldFailsToParse) {
@@ -720,7 +729,7 @@ TEST(CollatorFactoryICUTest, InvalidIntegerStrengthFieldFailsToParse) {
                                               << "en_US"
                                               << "strength" << 6));
     ASSERT_NOT_OK(collator.getStatus());
-    ASSERT_EQ(collator.getStatus().code(), 51024);
+    ASSERT_EQ(collator.getStatus().code(), ErrorCodes::BadValue);
 }
 
 TEST(CollatorFactoryICUTest, NonBoolNumericOrderingFieldFailsToParse) {
@@ -849,7 +858,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCollatorIgnoresCaseAndAccents) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"), 0);
+    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"_as_char_ptr), 0);
     ASSERT_EQ(collator.getValue()->compare("a", "A"), 0);
 }
 
@@ -861,7 +870,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthCollatorsIgnoresCaseButNotAccents)
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_LT(collator.getValue()->compare("a", u8"\u00E1"), 0);
+    ASSERT_LT(collator.getValue()->compare("a", u8"\u00E1"_as_char_ptr), 0);
     ASSERT_EQ(collator.getValue()->compare("a", "A"), 0);
 }
 
@@ -873,7 +882,7 @@ TEST(CollatorFactoryICUTest, TertiaryStrengthCollatorConsidersCaseAndAccents) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_LT(collator.getValue()->compare("a", u8"\u00E1"), 0);
+    ASSERT_LT(collator.getValue()->compare("a", u8"\u00E1"_as_char_ptr), 0);
     ASSERT_LT(collator.getValue()->compare("a", "A"), 0);
 }
 
@@ -885,7 +894,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrue) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"), 0);
+    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"_as_char_ptr), 0);
     ASSERT_LT(collator.getValue()->compare("a", "A"), 0);
 }
 
@@ -899,7 +908,7 @@ TEST(CollatorFactoryICUTest, PrimaryStrengthCaseLevelTrueCaseFirstUpper) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"), 0);
+    ASSERT_EQ(collator.getValue()->compare("a", u8"\u00E1"_as_char_ptr), 0);
     ASSERT_LT(collator.getValue()->compare("A", "a"), 0);
 }
 
@@ -974,7 +983,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthBackwardsFalse) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_LT(collator.getValue()->compare(u8"a\u00E1", u8"\u00E1a"), 0);
+    ASSERT_LT(collator.getValue()->compare(u8"a\u00E1"_as_char_ptr, u8"\u00E1a"_as_char_ptr), 0);
 }
 
 TEST(CollatorFactoryICUTest, SecondaryStrengthBackwardsTrue) {
@@ -985,7 +994,7 @@ TEST(CollatorFactoryICUTest, SecondaryStrengthBackwardsTrue) {
     ASSERT_OK(collator.getStatus());
 
     // u8"\u00E1" is latin small letter a with acute.
-    ASSERT_GT(collator.getValue()->compare(u8"a\u00E1", u8"\u00E1a"), 0);
+    ASSERT_GT(collator.getValue()->compare(u8"a\u00E1"_as_char_ptr, u8"\u00E1a"_as_char_ptr), 0);
 }
 
 TEST(CollatorFactoryICUTest, FactoryMadeCollatorComparisonKeysCorrectEnUS) {

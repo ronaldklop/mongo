@@ -30,13 +30,19 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/temporary_record_store.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
@@ -53,30 +59,29 @@ class DuplicateKeyTracker {
 public:
     /**
      * Creates a temporary table in which to store any duplicate key constraint violations.
-     * finalizeTemporaryTable() must be called before destruction.
      */
     DuplicateKeyTracker(OperationContext* opCtx, const IndexCatalogEntry* indexCatalogEntry);
 
     /**
      * Finds the temporary table associated with storing any duplicate key constraint violations for
      * this index build. Only used when resuming an index build and the temporary table already
-     * exists on disk. finalizeTemporaryTable() must be called before destruction.
+     * exists on disk.
      */
     DuplicateKeyTracker(OperationContext* opCtx,
                         const IndexCatalogEntry* indexCatalogEntry,
                         StringData ident);
 
     /**
-     * Deletes or keeps the temporary table for the duplicate key constraint violations. Must be
-     * called before object destruction.
+     * Keeps the temporary table for the duplicate key constraint violations.
      */
-    void finalizeTemporaryTable(OperationContext* opCtx,
-                                TemporaryRecordStore::FinalizationAction action);
+    void keepTemporaryTable();
 
     /**
      * Given a duplicate key, insert it into the key constraint table.
      */
-    Status recordKey(OperationContext* opCtx, const KeyString::Value& key);
+    Status recordKey(OperationContext* opCtx,
+                     const IndexCatalogEntry* indexCatalogEntry,
+                     const key_string::Value& key);
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been
@@ -85,15 +90,14 @@ public:
      *
      * Must not be in a WriteUnitOfWork.
      */
-    Status checkConstraints(OperationContext* opCtx) const;
+    Status checkConstraints(OperationContext* opCtx,
+                            const IndexCatalogEntry* indexCatalogEntry) const;
 
     std::string getTableIdent() const {
         return _keyConstraintsTable->rs()->getIdent();
     }
 
 private:
-    const IndexCatalogEntry* _indexCatalogEntry;
-
     AtomicWord<long long> _duplicateCounter{0};
 
     // This temporary record store is owned by the duplicate key tracker and dropped along with it.

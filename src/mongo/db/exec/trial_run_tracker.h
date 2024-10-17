@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <type_traits>
 
 namespace mongo {
@@ -46,7 +47,8 @@ public:
      * The type of metric which can be collected and tracked during a trial run.
      */
     enum TrialRunMetric : uint8_t {
-        // Number of documents returned during a trial run.
+        // Number of documents returned by the part of the plan that participated in the
+        // multi-planning.
         kNumResults,
         // Number of physical reads performed during a trial run. Once a storage cursor advances,
         // it counts as a single physical read.
@@ -55,36 +57,94 @@ public:
         kLastElem
     };
 
+    /**
+     * Constructs a 'TrialRunTracker' which indicates that the trial period is over when any
+     * 'TrialRunMetric' exceeds the maximum provided at construction.
+     *
+     * Callers can also pass a value of zero to indicate that the given metric should not be
+     * tracked.
+     */
     template <typename... MaxMetrics,
               std::enable_if_t<sizeof...(MaxMetrics) == TrialRunMetric::kLastElem, int> = 0>
     TrialRunTracker(MaxMetrics... maxMetrics) : _maxMetrics{maxMetrics...} {}
 
     /**
+     * Constructs a 'TrialRunTracker' that also has an '_onMetricReached' function, which gets
+     * called when any 'TrialRunMetric' exceeds its maximum. When an '_onMetricReached' callback is
+     * present, it must return true for 'trackProgress' to return true. By returning false,
+     * '_onMetricReached' can prevent tracking from halting plan execution, thereby upgrading a
+     * trial run to a normal run.
+     */
+    template <typename... MaxMetrics>
+    TrialRunTracker(std::function<bool(TrialRunMetric)> onMetricReached, MaxMetrics... maxMetrics)
+        : TrialRunTracker{maxMetrics...} {
+        _onMetricReached = std::move(onMetricReached);
+    }
+
+    /**
      * Increments the trial run metric specified as a template parameter 'metric' by the
-     * 'metricIncrement' value and returns 'true' if the updated metric value has reached
-     * its maximum.
+     * 'metricIncrement' value and, if the updated metric value has exceeded its maximum, calls the
+     * '_onMetricReached' if there is one and returns true (unless '_onMetricReached' returned
+     * false).
      *
-     * If the metric has already reached its maximum value before this call, this method
+     * This is a no-op, and will return false, if the given metric is not being tracked by this
+     * 'TrialRunTracker'.
+     *
+     * If the metric has already exceeded its maximum value before this call, this method
      * returns 'true' immediately without incrementing the metric.
      */
     template <TrialRunMetric metric>
     bool trackProgress(size_t metricIncrement) {
-        static_assert(metric >= 0 && metric < sizeof(_metrics));
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+
+        if (_maxMetrics[metric] == 0) {
+            // This metric is not being tracked.
+            return false;
+        }
 
         if (_done) {
             return true;
         }
 
         _metrics[metric] += metricIncrement;
-        if (_metrics[metric] >= _maxMetrics[metric]) {
-            _done = true;
+        if (metricReached<metric>()) {
+            if (_onMetricReached) {
+                _done = _onMetricReached(metric);
+            } else {
+                _done = true;
+            }
         }
         return _done;
     }
 
+    template <TrialRunMetric metric>
+    size_t getMetric() const {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        return _metrics[metric];
+    }
+
+    template <TrialRunMetric metric>
+    bool metricReached() const {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        return metricTracked<metric>() && _metrics[metric] > _maxMetrics[metric];
+    }
+
+    template <TrialRunMetric metric>
+    bool metricTracked() const {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        return _maxMetrics[metric] != 0;
+    }
+
+    template <TrialRunMetric metric>
+    void updateMaxMetric(size_t newMaxMetric) {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        _maxMetrics[metric] = newMaxMetric;
+    }
+
 private:
-    const size_t _maxMetrics[TrialRunMetric::kLastElem];
+    size_t _maxMetrics[TrialRunMetric::kLastElem];
     size_t _metrics[TrialRunMetric::kLastElem]{0};
     bool _done{false};
+    std::function<bool(TrialRunMetric)> _onMetricReached{};
 };
 }  // namespace mongo

@@ -2,24 +2,26 @@
  * Tests the behaviour of the 'fullDocumentBeforeChange' argument to the $changeStream stage.
  *
  * @tags: [
- *   assumes_against_mongod_not_mongos,
  *   assumes_unsharded_collection,
  *   do_not_wrap_aggregations_in_facets,
  *   uses_multiple_connections,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
+import {
+    assertDropAndRecreateCollection,
+    assertDropCollection
+} from "jstests/libs/collection_drop_recreate.js";
+import {
+    assertChangeStreamEventEq,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
 
 const coll = assertDropAndRecreateCollection(db, "change_stream_pre_images");
 const cst = new ChangeStreamTest(db);
 
 // Enable pre-image recording on the test collection.
-assert.commandWorked(db.runCommand({collMod: coll.getName(), recordPreImages: true}));
+assert.commandWorked(
+    db.runCommand({collMod: coll.getName(), changeStreamPreAndPostImages: {enabled: true}}));
 
 // Open three streams on the collection, one for each "fullDocumentBeforeChange" mode.
 const csNoPreImages = cst.startWatchingChanges({
@@ -43,7 +45,7 @@ assert.commandWorked(coll.insert({_id: "x"}));
 let latestChange = cst.getOneChange(csNoPreImages);
 assert.eq(latestChange.operationType, "insert");
 assert(!latestChange.hasOwnProperty("fullDocumentBeforeChange"));
-assert.docEq(latestChange.fullDocument, {_id: "x"});
+assert.docEq({_id: "x"}, latestChange.fullDocument);
 assert.docEq(latestChange, cst.getOneChange(csPreImageWhenAvailableCursor));
 assert.docEq(latestChange, cst.getOneChange(csPreImageRequiredCursor));
 
@@ -52,7 +54,7 @@ assert.commandWorked(coll.update({_id: "x"}, {foo: "bar"}));
 latestChange = cst.getOneChange(csNoPreImages);
 assert.eq(latestChange.operationType, "replace");
 assert(!latestChange.hasOwnProperty("fullDocumentBeforeChange"));
-assert.docEq(latestChange.fullDocument, {_id: "x", foo: "bar"});
+assert.docEq({_id: "x", foo: "bar"}, latestChange.fullDocument);
 // Add the expected "fullDocumentBeforeChange" and confirm that both pre-image cursors see it.
 latestChange.fullDocumentBeforeChange = {
     _id: "x"
@@ -96,14 +98,15 @@ assert.docEq(latestChange, cst.getOneChange(csPreImageWhenAvailableCursor));
 assert.docEq(latestChange, cst.getOneChange(csPreImageRequiredCursor));
 
 // Now disable pre-image generation on the test collection and re-test.
-assert.commandWorked(db.runCommand({collMod: coll.getName(), recordPreImages: false}));
+assert.commandWorked(
+    db.runCommand({collMod: coll.getName(), changeStreamPreAndPostImages: {enabled: false}}));
 
 // Test pre-image lookup for an insertion. No pre-image exists on any cursor.
 assert.commandWorked(coll.insert({_id: "y"}));
 latestChange = cst.getOneChange(csNoPreImages);
 assert.eq(latestChange.operationType, "insert");
 assert(!latestChange.hasOwnProperty("fullDocumentBeforeChange"));
-assert.docEq(latestChange.fullDocument, {_id: "y"});
+assert.docEq({_id: "y"}, latestChange.fullDocument);
 assert.docEq(latestChange, cst.getOneChange(csPreImageWhenAvailableCursor));
 assert.docEq(latestChange, cst.getOneChange(csPreImageRequiredCursor));
 
@@ -112,12 +115,16 @@ assert.commandWorked(coll.update({_id: "y"}, {foo: "bar"}));
 latestChange = cst.getOneChange(csNoPreImages);
 assert.eq(latestChange.operationType, "replace");
 assert(!latestChange.hasOwnProperty("fullDocumentBeforeChange"));
-assert.docEq(latestChange.fullDocument, {_id: "y", foo: "bar"});
+assert.docEq({_id: "y", foo: "bar"}, latestChange.fullDocument);
+
+// Add the expected "fullDocumentBeforeChange" and confirm that pre-image is not present.
+latestChange.fullDocumentBeforeChange = null;
+
 // The "whenAvailable" cursor retrieves a document without the pre-image...
 assert.docEq(latestChange, cst.getOneChange(csPreImageWhenAvailableCursor));
 // ... but the "required" cursor throws an exception.
-const csErr = assert.throws(() => cst.getOneChange(csPreImageRequiredCursor));
-assert.eq(csErr.code, 51770);
+assert.throwsWithCode(() => cst.getOneChange(csPreImageRequiredCursor),
+                      ErrorCodes.NoMatchingDocument);
 
 // Test pre-image lookup for an op-style update operation.
 assert.commandWorked(coll.update({_id: "y"}, {$set: {foo: "baz"}}));
@@ -133,6 +140,9 @@ latestChange = cst.assertNextChangesEqual({
     }]
 })[0];
 
+// Add the expected "fullDocumentBeforeChange" and confirm that pre-image is not present.
+latestChange.fullDocumentBeforeChange = null;
+
 // The "whenAvailable" cursor returns an event without the pre-image.
 assertChangeStreamEventEq(cst.getOneChange(csPreImageWhenAvailableCursor), latestChange);
 
@@ -142,8 +152,11 @@ latestChange = cst.getOneChange(csNoPreImages);
 assert.eq(latestChange.operationType, "delete");
 assert(!latestChange.hasOwnProperty("fullDocument"));
 assert(!latestChange.hasOwnProperty("fullDocumentBeforeChange"));
+
+// Add the expected "fullDocumentBeforeChange" and confirm that pre-image is not present.
+latestChange.fullDocumentBeforeChange = null;
+
 // The "whenAvailable" cursor returns an event without the pre-image.
 assert.docEq(latestChange, cst.getOneChange(csPreImageWhenAvailableCursor));
 
 assertDropCollection(db, coll.getName());
-})();

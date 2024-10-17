@@ -27,34 +27,44 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <fcntl.h>
 #include <iostream>
 #include <string>
-#include <sys/types.h>
-#include <vector>
+#include <system_error>
 
 #ifdef _WIN32
 #include <io.h>
-#else
-#include <unistd.h>
 #endif
 
-#include "mongo/base/data_cursor.h"
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_endian.h"
-#include "mongo/base/data_type_validated.h"
+#include "mongo/base/data_type_terminated.h"
 #include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/traffic_reader.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/shared_buffer.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
 
 namespace {
 // Taken from src/mongo/gotools/mongoreplay/util.go
@@ -74,8 +84,7 @@ namespace {
 // Packet struct
 struct TrafficReaderPacket {
     uint64_t id;
-    StringData local;
-    StringData remote;
+    StringData session;
     Date_t date;
     uint64_t order;
     MsgData::ConstView message;
@@ -90,12 +99,11 @@ bool readBytes(size_t toRead, char* buf, int fd) {
 #endif
 
         if (r == -1) {
-            auto pair = errnoAndDescription();
-
+            auto ec = lastPosixError();
             uassert(ErrorCodes::FileStreamFailed,
-                    str::stream() << "failed to read bytes: errno(" << pair.first
-                                  << ") : " << pair.second,
-                    pair.first == EINTR);
+                    str::stream() << "failed to read bytes: errno(" << ec.value()
+                                  << ") : " << errorMessage(ec),
+                    ec == posixError(EINTR));
 
             continue;
         } else if (r == 0) {
@@ -124,14 +132,12 @@ boost::optional<TrafficReaderPacket> readPacket(char* buf, int fd) {
     // Read the packet
     cdr.skip<LittleEndian<uint32_t>>();
     uint64_t id = cdr.readAndAdvance<LittleEndian<uint64_t>>();
-    StringData local = cdr.readAndAdvance<Terminated<'\0', StringData>>();
-    StringData remote = cdr.readAndAdvance<Terminated<'\0', StringData>>();
+    StringData session = cdr.readAndAdvance<Terminated<'\0', StringData>>();
     uint64_t date = cdr.readAndAdvance<LittleEndian<uint64_t>>();
     uint64_t order = cdr.readAndAdvance<LittleEndian<uint64_t>>();
     MsgData::ConstView message(cdr.data());
 
-    return TrafficReaderPacket{
-        id, local, remote, Date_t::fromMillisSinceEpoch(date), order, message};
+    return TrafficReaderPacket{id, session, Date_t::fromMillisSinceEpoch(date), order, message};
 }
 
 void getBSONObjFromPacket(TrafficReaderPacket& packet, BSONObjBuilder* builder) {
@@ -166,20 +172,7 @@ void getBSONObjFromPacket(TrafficReaderPacket& packet, BSONObjBuilder* builder) 
         seen.append("nsec", static_cast<int32_t>(packet.order));
     }
 
-    // Figure out which is the src endpoint as opposed to the dest endpoint
-    auto localInd = packet.local.rfind(':');
-    auto remoteInd = packet.remote.rfind(':');
-    if (localInd != std::string::npos && remoteInd != std::string::npos) {
-        auto local = packet.local.substr(localInd + 1);
-        auto remote = packet.remote.substr(remoteInd + 1);
-        if (packet.message.getResponseToMsgId()) {
-            builder->append("srcendpoint", local);
-            builder->append("destendpoint", remote);
-        } else {
-            builder->append("srcendpoint", remote);
-            builder->append("destendpoint", local);
-        }
-    }
+    builder->append("session", packet.session);
 
     // Fill out the remaining fields
     builder->append("order", static_cast<int64_t>(packet.order));
@@ -217,7 +210,7 @@ BSONArray trafficRecordingFileToBSONArr(const std::string& inputFile) {
             str::stream() << "Specified file does not exist (" << inputFile << ")",
             inputFd > 0);
 
-    const auto guard = makeGuard([&] { ::close(inputFd); });
+    const ScopeGuard guard([&] { ::close(inputFd); });
 
     auto buf = SharedBuffer::allocate(MaxMessageSizeBytes);
     while (auto packet = readPacket(buf.get(), inputFd)) {

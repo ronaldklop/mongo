@@ -3,8 +3,7 @@
  *
  * @tags: [requires_replication]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function checkWriteConcern(testFn, checkFn) {
     const mongoRunCommandOriginal = Mongo.prototype.runCommand;
@@ -56,4 +55,3 @@ checkWriteConcern(() => assert.commandFailedWithCode(primaryDB.dropDatabase({w: 
                   });
 
 rst.stopSet();
-})();

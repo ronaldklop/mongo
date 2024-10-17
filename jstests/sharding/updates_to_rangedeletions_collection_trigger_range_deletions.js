@@ -3,10 +3,8 @@
  * config.rangeDeletions collection.
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/uuid_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {getUUIDFromConfigCollections} from "jstests/libs/uuid_util.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -16,8 +14,8 @@ const ns = dbName + "." + collName;
 let st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
 
 // Create a sharded collection with two chunks: [-inf, 50), [50, inf)
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 50}}));
 
@@ -74,6 +72,7 @@ let testColl = testDB.foo;
         collectionUuid: collectionUuid,
         donorShardId: "unused",
         pending: true,
+        numOrphanDocs: orphanCount,
         range: {min: {x: 70}, max: {x: 90}},
         whenToClean: "now"
     };
@@ -126,6 +125,7 @@ let testColl = testDB.foo;
         collectionUuid: UUID(),
         donorShardId: "unused",
         pending: true,
+        numOrphanDocs: 0,
         range: {min: {x: 70}, max: {x: 90}},
         whenToClean: "now"
     };
@@ -153,4 +153,3 @@ let testColl = testDB.foo;
 })();
 
 st.stop();
-})();

@@ -27,24 +27,28 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#include "mongo/s/client/shard.h"
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/batched_command_response.h"
-
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
 const int kOnErrorNumRetries = 3;
-
 }  // namespace
 
 Status Shard::CommandResponse::getEffectiveStatus(
@@ -90,8 +94,6 @@ Status Shard::CommandResponse::processBatchWriteResponse(
     return status;
 }
 
-const Milliseconds Shard::kDefaultConfigCommandTimeout = Seconds{30};
-
 bool Shard::shouldErrorBePropagated(ErrorCodes::Error code) {
     return !isMongosRetriableError(code) && (code != ErrorCodes::NetworkInterfaceExceededTimeLimit);
 }
@@ -99,12 +101,62 @@ bool Shard::shouldErrorBePropagated(ErrorCodes::Error code) {
 Shard::Shard(const ShardId& id) : _id(id) {}
 
 bool Shard::isConfig() const {
-    return _id == "config";
+    return _id == ShardId::kConfigServerId;
+}
+
+bool Shard::localIsRetriableError(ErrorCodes::Error code, RetryPolicy options) {
+    switch (options) {
+        case Shard::RetryPolicy::kNoRetry: {
+            return false;
+        } break;
+
+        case Shard::RetryPolicy::kIdempotent: {
+            return code == ErrorCodes::WriteConcernFailed;
+        } break;
+
+        case Shard::RetryPolicy::kIdempotentOrCursorInvalidated: {
+            return localIsRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
+                ErrorCodes::isCursorInvalidatedError(code);
+        } break;
+
+        case Shard::RetryPolicy::kNotIdempotent: {
+            return false;
+        } break;
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+bool Shard::remoteIsRetriableError(ErrorCodes::Error code, RetryPolicy options) {
+    if (gInternalProhibitShardOperationRetry.loadRelaxed()) {
+        return false;
+    }
+
+    switch (options) {
+        case RetryPolicy::kNoRetry: {
+            return false;
+        } break;
+
+        case RetryPolicy::kIdempotent: {
+            return isMongosRetriableError(code);
+        } break;
+
+        case RetryPolicy::kIdempotentOrCursorInvalidated: {
+            return remoteIsRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
+                ErrorCodes::isCursorInvalidatedError(code);
+        } break;
+
+        case RetryPolicy::kNotIdempotent: {
+            return ErrorCodes::isNotPrimaryError(code);
+        } break;
+    }
+
+    MONGO_UNREACHABLE;
 }
 
 StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
                                                      const ReadPreferenceSetting& readPref,
-                                                     const std::string& dbName,
+                                                     const DatabaseName& dbName,
                                                      const BSONObj& cmdObj,
                                                      RetryPolicy retryPolicy) {
     return runCommand(opCtx, readPref, dbName, cmdObj, Milliseconds::max(), retryPolicy);
@@ -112,7 +164,7 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
 
 StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
                                                      const ReadPreferenceSetting& readPref,
-                                                     const std::string& dbName,
+                                                     const DatabaseName& dbName,
                                                      const BSONObj& cmdObj,
                                                      Milliseconds maxTimeMSOverride,
                                                      RetryPolicy retryPolicy) {
@@ -127,8 +179,6 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
         if (isRetriableError(status.code(), retryPolicy)) {
             LOGV2_DEBUG(22719,
                         2,
-                        "Command {command} failed with retryable error and will be retried. Caused "
-                        "by {error}",
                         "Command failed with retryable error and will be retried",
                         "command"_attr = redact(cmdObj),
                         "error"_attr = redact(status));
@@ -143,7 +193,7 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
 StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const BSONObj& cmdObj,
     RetryPolicy retryPolicy) {
     return runCommandWithFixedRetryAttempts(
@@ -153,7 +203,7 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
 StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const BSONObj& cmdObj,
     Milliseconds maxTimeMSOverride,
     RetryPolicy retryPolicy) {
@@ -166,13 +216,10 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
         auto swResponse = _runCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
         auto status = CommandResponse::getEffectiveStatus(swResponse);
         if (retry < kOnErrorNumRetries && isRetriableError(status.code(), retryPolicy)) {
-            LOGV2_DEBUG(22720,
-                        2,
-                        "Command {command} failed with retryable error and will be retried. Caused "
-                        "by {error}",
-                        "Command failed with retryable error and will be retried",
-                        "command"_attr = redact(cmdObj),
-                        "error"_attr = redact(status));
+            LOGV2(22720,
+                  "Command failed with a retryable error and will be retried",
+                  "command"_attr = redact(cmdObj),
+                  "error"_attr = redact(status));
             continue;
         }
 
@@ -184,7 +231,7 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
 StatusWith<Shard::QueryResponse> Shard::runExhaustiveCursorCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const BSONObj& cmdObj,
     Milliseconds maxTimeMSOverride) {
     for (int retry = 1; retry <= kOnErrorNumRetries; retry++) {
@@ -196,36 +243,6 @@ StatusWith<Shard::QueryResponse> Shard::runExhaustiveCursorCommand(
             continue;
         }
         return result;
-    }
-    MONGO_UNREACHABLE;
-}
-
-BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
-                                                   const Milliseconds maxTimeMS,
-                                                   const BatchedCommandRequest& batchRequest,
-                                                   RetryPolicy retryPolicy) {
-    const StringData dbname = batchRequest.getNS().db();
-    const BSONObj cmdObj = batchRequest.toBSON();
-
-    for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
-        // Note: write commands can only be issued against a primary.
-        auto swResponse = _runCommand(
-            opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, dbname, maxTimeMS, cmdObj);
-
-        BatchedCommandResponse batchResponse;
-        auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
-        if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
-            LOGV2_DEBUG(22721,
-                        2,
-                        "Batch write command to shard {shardId} failed with retryable error "
-                        "and will be retried. Caused by {error}",
-                        "Batch write command failed with retryable error and will be retried",
-                        "shardId"_attr = getId(),
-                        "error"_attr = redact(writeStatus));
-            continue;
-        }
-
-        return batchResponse;
     }
     MONGO_UNREACHABLE;
 }
@@ -255,5 +272,35 @@ StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
     }
     MONGO_UNREACHABLE;
 }
+
+BatchedCommandResponse Shard::_submitBatchWriteCommand(OperationContext* opCtx,
+                                                       const BSONObj& serialisedBatchRequest,
+                                                       const DatabaseName& dbName,
+                                                       Milliseconds maxTimeMS,
+                                                       RetryPolicy retryPolicy) {
+    for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
+        // Note: write commands can only be issued against a primary.
+        auto swResponse = _runCommand(opCtx,
+                                      ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                      dbName,
+                                      maxTimeMS,
+                                      serialisedBatchRequest);
+
+        BatchedCommandResponse batchResponse;
+        auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
+        if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
+            LOGV2_DEBUG(22721,
+                        2,
+                        "Batch write command failed with retryable error and will be retried",
+                        "shardId"_attr = getId(),
+                        "error"_attr = redact(writeStatus));
+            continue;
+        }
+
+        return batchResponse;
+    }
+    MONGO_UNREACHABLE;
+}
+
 
 }  // namespace mongo

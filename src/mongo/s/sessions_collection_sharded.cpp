@@ -27,28 +27,49 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <map>
+#include <memory>
+#include <utility>
 
-#include "mongo/s/sessions_collection_sharded.h"
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/query_request_helper.h"
-#include "mongo/db/sessions_collection_rs.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/query/cluster_find.h"
+#include "mongo/s/query/planner/cluster_find.h"
+#include "mongo/s/sessions_collection_sharded.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
@@ -61,10 +82,11 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 
 std::vector<LogicalSessionId> SessionsCollectionSharded::_groupSessionIdsByOwningShard(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    const auto cm = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+    const auto [cm, _] = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
         opCtx, NamespaceString::kLogicalSessionsNamespace));
     uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Collection " << NamespaceString::kLogicalSessionsNamespace
+            str::stream() << "Collection "
+                          << NamespaceString::kLogicalSessionsNamespace.toStringForErrorMsg()
                           << " is not sharded",
             cm.isSharded());
 
@@ -86,10 +108,11 @@ std::vector<LogicalSessionId> SessionsCollectionSharded::_groupSessionIdsByOwnin
 
 std::vector<LogicalSessionRecord> SessionsCollectionSharded::_groupSessionRecordsByOwningShard(
     OperationContext* opCtx, const LogicalSessionRecordSet& sessions) {
-    const auto cm = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+    const auto [cm, _] = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
         opCtx, NamespaceString::kLogicalSessionsNamespace));
     uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Collection " << NamespaceString::kLogicalSessionsNamespace
+            str::stream() << "Collection "
+                          << NamespaceString::kLogicalSessionsNamespace.toStringForErrorMsg()
                           << " is not sharded",
             cm.isSharded());
 
@@ -119,8 +142,8 @@ void SessionsCollectionSharded::checkSessionsCollectionExists(OperationContext* 
             Grid::get(opCtx)->isShardingInitialized());
 
     // If the collection doesn't exist, fail. Only the config servers generate it.
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+    const auto [cm, _] = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(
             opCtx, NamespaceString::kLogicalSessionsNamespace));
 }
 
@@ -128,13 +151,15 @@ void SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
                                                 const LogicalSessionRecordSet& sessions) {
     auto send = [&](BSONObj toSend) {
         auto opMsg =
-            OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.db(), toSend);
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                        NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                        toSend);
         auto request = BatchedCommandRequest::parseUpdate(opMsg);
 
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
 
-        cluster::write(opCtx, request, &stats, &response);
+        cluster::write(opCtx, request, nullptr /* nss */, &stats, &response);
         uassertStatusOK(response.toStatus());
     };
 
@@ -147,13 +172,15 @@ void SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
                                               const LogicalSessionIdSet& sessions) {
     auto send = [&](BSONObj toSend) {
         auto opMsg =
-            OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.db(), toSend);
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                        NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                        toSend);
         auto request = BatchedCommandRequest::parseDelete(opMsg);
 
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
 
-        cluster::write(opCtx, request, &stats, &response);
+        cluster::write(opCtx, request, nullptr, &stats, &response);
         uassertStatusOK(response.toStatus());
     };
 
@@ -165,23 +192,22 @@ void SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
 LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
 
-    bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
     auto send = [&](BSONObj toSend) -> BSONObj {
         // If there is no '$db', append it.
-        toSend =
-            OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.db(), toSend)
-                .body;
-        auto findCommand = query_request_helper::makeFromFindCommand(
-            toSend, NamespaceString::kLogicalSessionsNamespace, apiStrict);
-
-        const boost::intrusive_ptr<ExpressionContext> expCtx;
-        auto cq = uassertStatusOK(
-            CanonicalQuery::canonicalize(opCtx,
-                                         std::move(findCommand),
-                                         false,
-                                         expCtx,
-                                         ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::kBanAllSpecialFeatures));
+        toSend = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                             NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                             toSend)
+                     .body;
+        auto findCommand =
+            query_request_helper::makeFromFindCommand(toSend,
+                                                      auth::ValidatedTenancyScope::get(opCtx),
+                                                      boost::none,
+                                                      SerializationContext::stateDefault());
+        auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+            .expCtx = makeExpressionContext(opCtx, *findCommand),
+            .parsedFind = ParsedFindCommandParams{
+                .findCommand = std::move(findCommand),
+                .allowedFeatures = MatchExpressionParser::kBanAllSpecialFeatures}});
 
         // Do the work to generate the first batch of results. This blocks waiting to get responses
         // from the shard(s).
@@ -196,7 +222,7 @@ LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
         for (const auto& obj : batch) {
             firstBatch.append(obj);
         }
-        firstBatch.done(cursorId, NamespaceString::kLogicalSessionsNamespace.ns());
+        firstBatch.done(cursorId, NamespaceString::kLogicalSessionsNamespace);
 
         return replyBuilder.releaseBody();
     };

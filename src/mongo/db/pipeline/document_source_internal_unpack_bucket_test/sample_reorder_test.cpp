@@ -27,11 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -39,8 +49,9 @@ namespace {
 using InternalUnpackBucketSampleReorderTest = AggregationContextFixture;
 
 TEST_F(InternalUnpackBucketSampleReorderTest, SampleThenSimpleProject) {
-    auto unpackSpec =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta'}}");
+    auto unpackSpec = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta', "
+        "bucketMaxSpanSeconds: 3600}}");
     auto sampleSpec = fromjson("{$sample: {size: 500}}");
     auto projectSpec = fromjson("{$project: {_id: false, x: false, y: false}}");
 
@@ -57,8 +68,9 @@ TEST_F(InternalUnpackBucketSampleReorderTest, SampleThenSimpleProject) {
 }
 
 TEST_F(InternalUnpackBucketSampleReorderTest, SampleThenComputedProject) {
-    auto unpackSpec =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta'}}");
+    auto unpackSpec = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta', "
+        "bucketMaxSpanSeconds: 3600}}");
     auto sampleSpec = fromjson("{$sample: {size: 500}}");
     auto projectSpec =
         fromjson("{$project: {_id: true, city: '$myMeta.address.city', temp: '$temp.celsius'}}");
@@ -69,17 +81,19 @@ TEST_F(InternalUnpackBucketSampleReorderTest, SampleThenComputedProject) {
     auto serialized = pipeline->serializeToBson();
 
     ASSERT_EQ(3, serialized.size());
-    ASSERT_BSONOBJ_EQ(fromjson("{$_internalUnpackBucket: { include: ['_id', 'temp'], timeField: "
-                               "'foo', metaField: 'myMeta'}}"),
-                      serialized[0]);
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{$_internalUnpackBucket: { include: ['_id', 'temp', 'myMeta'], "
+                 "timeField: 'foo', metaField: 'myMeta', bucketMaxSpanSeconds: 3600}}"),
+        serialized[0]);
     ASSERT_BSONOBJ_EQ(sampleSpec, serialized[1]);
     const UnorderedFieldsBSONObjComparator kComparator;
     ASSERT_EQ(kComparator.compare(projectSpec, serialized[2]), 0);
 }
 
 TEST_F(InternalUnpackBucketSampleReorderTest, SimpleProjectThenSample) {
-    auto unpackSpec =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta'}}");
+    auto unpackSpec = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta', "
+        "bucketMaxSpanSeconds: 3600}}");
     auto projectSpec = fromjson("{$project: {_id: true, x: true}}");
     auto sampleSpec = fromjson("{$sample: {size: 500}}");
 
@@ -90,7 +104,7 @@ TEST_F(InternalUnpackBucketSampleReorderTest, SimpleProjectThenSample) {
 
     ASSERT_EQ(3, serialized.size());
     ASSERT_BSONOBJ_EQ(fromjson("{$_internalUnpackBucket: { include: ['_id', 'x'], timeField: "
-                               "'foo', metaField: 'myMeta'}}"),
+                               "'foo', metaField: 'myMeta', bucketMaxSpanSeconds: 3600}}"),
                       serialized[0]);
     ASSERT_BSONOBJ_EQ(sampleSpec, serialized[1]);
     const UnorderedFieldsBSONObjComparator kComparator;
@@ -98,8 +112,9 @@ TEST_F(InternalUnpackBucketSampleReorderTest, SimpleProjectThenSample) {
 }
 
 TEST_F(InternalUnpackBucketSampleReorderTest, ComputedProjectThenSample) {
-    auto unpackSpec =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta'}}");
+    auto unpackSpec = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta', "
+        "bucketMaxSpanSeconds: 3600}}");
     auto projectSpec =
         fromjson("{$project: {_id: true, city: '$myMeta.address.city', temp: '$temp.celsius'}}");
     auto sampleSpec = fromjson("{$sample: {size: 500}}");
@@ -110,9 +125,10 @@ TEST_F(InternalUnpackBucketSampleReorderTest, ComputedProjectThenSample) {
     auto serialized = pipeline->serializeToBson();
 
     ASSERT_EQ(3, serialized.size());
-    ASSERT_BSONOBJ_EQ(fromjson("{$_internalUnpackBucket: { include: ['_id', 'temp'], timeField: "
-                               "'foo', metaField: 'myMeta'}}"),
-                      serialized[0]);
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{$_internalUnpackBucket: { include: ['_id', 'temp', 'myMeta'], timeField: "
+                 "'foo', metaField: 'myMeta', bucketMaxSpanSeconds: 3600}}"),
+        serialized[0]);
     ASSERT_BSONOBJ_EQ(sampleSpec, serialized[1]);
     const UnorderedFieldsBSONObjComparator kComparator;
     ASSERT_EQ(kComparator.compare(projectSpec, serialized[2]), 0);

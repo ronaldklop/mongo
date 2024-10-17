@@ -1,13 +1,19 @@
 // Test the count command with views.
 //
 // @tags: [
+//   assumes_unsharded_collection,
 //   requires_fastcount,
+//   # Explain of a resolved view must be executed by mongos.
+//   directly_against_shardsvrs_incompatible,
+//   requires_fcv_63,
 // ]
 
-(function() {
-"use strict";
+import {getSingleNodeExplain} from "jstests/libs/query/analyze_plan.js";
+import {checkSbeRestrictedOrFullyEnabled} from "jstests/libs/query/sbe_util.js";
 
-var viewsDB = db.getSiblingDB("views_count");
+const sbeEnabled = checkSbeRestrictedOrFullyEnabled(db);
+
+const viewsDB = db.getSiblingDB("views_count");
 assert.commandWorked(viewsDB.dropDatabase());
 
 // Insert documents into a collection.
@@ -56,26 +62,46 @@ assert.commandWorked(lessThanSevenView.explain().count());
 assert.commandWorked(greaterThanThreeView.explain().count({x: 6}));
 let explainPlan = lessThanSevenView.explain().count({foo: "bar"});
 assert.commandWorked(explainPlan);
-assert.eq(explainPlan["stages"][0]["$cursor"]["queryPlanner"]["namespace"], "views_count.coll");
+explainPlan = getSingleNodeExplain(explainPlan);
+if (explainPlan.hasOwnProperty("stages")) {
+    explainPlan = explainPlan.stages[0].$cursor;
+}
+assert.eq(explainPlan.queryPlanner.namespace, "views_count.coll");
 
 // Count with explicit explain modes works on a view.
 explainPlan = assert.commandWorked(lessThanSevenView.explain("queryPlanner").count({x: {$gte: 5}}));
-assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_count.coll");
-assert(!explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
+explainPlan = getSingleNodeExplain(explainPlan);
+if (explainPlan.hasOwnProperty("stages")) {
+    explainPlan = explainPlan.stages[0].$cursor;
+}
+assert.eq(explainPlan.queryPlanner.namespace, "views_count.coll");
+assert(!explainPlan.hasOwnProperty("executionStats"));
 
 explainPlan =
     assert.commandWorked(lessThanSevenView.explain("executionStats").count({x: {$gte: 5}}));
-assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_count.coll");
-assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 2);
-assert(!explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
+explainPlan = getSingleNodeExplain(explainPlan);
+if (explainPlan.hasOwnProperty("stages")) {
+    explainPlan = explainPlan.stages[0].$cursor;
+}
+assert.eq(explainPlan.queryPlanner.namespace, "views_count.coll");
+assert(explainPlan.hasOwnProperty("executionStats"));
+assert.eq(explainPlan.executionStats.nReturned,
+          sbeEnabled ? 1 : 2,  // SBE group push down causes count to be emitted in first stage.
+          tojson(explainPlan));
+assert(!explainPlan.executionStats.hasOwnProperty("allPlansExecution"));
 
 explainPlan =
     assert.commandWorked(lessThanSevenView.explain("allPlansExecution").count({x: {$gte: 5}}));
-assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_count.coll");
-assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 2);
-assert(explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
+explainPlan = getSingleNodeExplain(explainPlan);
+if (explainPlan.hasOwnProperty("stages")) {
+    explainPlan = explainPlan.stages[0].$cursor;
+}
+assert.eq(explainPlan.queryPlanner.namespace, "views_count.coll");
+assert(explainPlan.hasOwnProperty("executionStats"));
+assert.eq(explainPlan.executionStats.nReturned,
+          sbeEnabled ? 1 : 2,  // SBE group push down causes count to be emitted in first stage.
+          tojson(explainPlan));
+assert(explainPlan.executionStats.hasOwnProperty("allPlansExecution"));
 
 // Count with hint works on a view.
 assert.commandWorked(viewsDB.runCommand({count: "identityView", hint: "_id_"}));
@@ -83,4 +109,3 @@ assert.commandWorked(viewsDB.runCommand({count: "identityView", hint: "_id_"}));
 assert.commandFailedWithCode(
     viewsDB.runCommand({count: "identityView", collation: {locale: "en_US"}}),
     ErrorCodes.OptionNotSupportedOnView);
-}());

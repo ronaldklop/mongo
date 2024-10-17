@@ -27,23 +27,56 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <mutex>
 
-#include "mongo/db/vector_clock.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/crypto/hash_block.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/signed_logical_time.h"
+#include "mongo/db/time_proof_service.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_document_gen.h"
 #include "mongo/db/vector_clock_gen.h"
-#include "mongo/util/static_immortal.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 namespace {
 
+const auto vectorClockCommonDecoration = ServiceContext::declareDecoration<VectorClock>();
+
 const auto vectorClockDecoration = ServiceContext::declareDecoration<VectorClock*>();
 
+ServiceContext::ConstructorActionRegisterer vectorClockRegisterer(
+    "VectorClock", [](ServiceContext* service) {
+        VectorClock::registerVectorClockOnServiceContext(service,
+                                                         &vectorClockCommonDecoration(service));
+    });
+
 }  // namespace
+
+const LogicalTime VectorClock::kInitialComponentTime{Timestamp{0, 1}};
 
 VectorClock* VectorClock::get(ServiceContext* service) {
     return vectorClockDecoration(service);
@@ -61,21 +94,15 @@ const VectorClock* VectorClock::get(const OperationContext* ctx) {
     return get(ctx->getClient()->getServiceContext());
 }
 
-VectorClock::VectorClock() = default;
-
-VectorClock::~VectorClock() = default;
-
 void VectorClock::registerVectorClockOnServiceContext(ServiceContext* service,
                                                       VectorClock* vectorClock) {
-    invariant(!vectorClock->_service);
     vectorClock->_service = service;
     auto& clock = vectorClockDecoration(service);
-    invariant(!clock);
     clock = std::move(vectorClock);
 }
 
 VectorClock::VectorTime VectorClock::getTime() const {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     return VectorTime(_vectorTime);
 }
 
@@ -111,7 +138,7 @@ void VectorClock::_ensurePassesRateLimiter(ServiceContext* service,
 void VectorClock::_advanceTime(LogicalTimeArray&& newTime) {
     _ensurePassesRateLimiter(_service, newTime);
 
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     auto it = _vectorTime.begin();
     auto newIt = newTime.begin();
@@ -125,79 +152,67 @@ void VectorClock::_advanceTime(LogicalTimeArray&& newTime) {
 class VectorClock::PlainComponentFormat : public VectorClock::ComponentFormat {
 public:
     using ComponentFormat::ComponentFormat;
-    virtual ~PlainComponentFormat() = default;
+    ~PlainComponentFormat() override = default;
 
     bool out(ServiceContext* service,
              OperationContext* opCtx,
-             bool permitRefresh,
              BSONObjBuilder* out,
              LogicalTime time,
-             Component component) const override {
+             Component component,
+             bool isInternal) const override {
         out->append(_fieldName, time.asTimestamp());
         return true;
     }
+};
+
+LogicalTime fromOptionalTimestamp(const boost::optional<Timestamp>& time) {
+    return time ? LogicalTime(*time) : LogicalTime();
+}
+
+class VectorClock::ConfigTimeComponent : public VectorClock::PlainComponentFormat {
+public:
+    ConfigTimeComponent() : PlainComponentFormat(VectorClock::kConfigTimeFieldName) {}
+    ~ConfigTimeComponent() override = default;
 
     LogicalTime in(ServiceContext* service,
                    OperationContext* opCtx,
-                   const BSONObj& in,
+                   const GossipedVectorClockComponents& timepoints,
                    bool couldBeUnauthenticated,
                    Component component) const override {
-        const auto componentElem(in[_fieldName]);
-        if (componentElem.eoo()) {
-            // Nothing to gossip in.
-            return LogicalTime();
-        }
-        uassert(ErrorCodes::BadValue,
-                str::stream() << _fieldName << " is not a Timestamp",
-                componentElem.type() == bsonTimestamp);
-        return LogicalTime(componentElem.timestamp());
+        return fromOptionalTimestamp(timepoints.getDollarConfigTime());
     }
 };
 
-template <class ActualFormat>
-class VectorClock::OnlyOutOnNewFCVComponentFormat : public ActualFormat {
+class VectorClock::TopologyTimeComponent : public VectorClock::PlainComponentFormat {
 public:
-    using ActualFormat::ActualFormat;
-    virtual ~OnlyOutOnNewFCVComponentFormat() = default;
-
-    bool out(ServiceContext* service,
-             OperationContext* opCtx,
-             bool permitRefresh,
-             BSONObjBuilder* out,
-             LogicalTime time,
-             Component component) const override {
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To47)) {
-            return ActualFormat::out(service, opCtx, permitRefresh, out, time, component);
-        }
-        return false;
-    }
+    TopologyTimeComponent() : PlainComponentFormat(VectorClock::kTopologyTimeFieldName) {}
+    ~TopologyTimeComponent() override = default;
 
     LogicalTime in(ServiceContext* service,
                    OperationContext* opCtx,
-                   const BSONObj& in,
+                   const GossipedVectorClockComponents& timepoints,
                    bool couldBeUnauthenticated,
                    Component component) const override {
-        return ActualFormat::in(service, opCtx, in, couldBeUnauthenticated, component);
+        return fromOptionalTimestamp(timepoints.getDollarTopologyTime());
     }
 };
 
 class VectorClock::SignedComponentFormat : public VectorClock::ComponentFormat {
 public:
     using ComponentFormat::ComponentFormat;
-    virtual ~SignedComponentFormat() = default;
+    ~SignedComponentFormat() override = default;
 
     bool out(ServiceContext* service,
              OperationContext* opCtx,
-             bool permitRefresh,
              BSONObjBuilder* out,
              LogicalTime time,
-             Component component) const override {
+             Component component,
+             bool isInternal) const override {
         SignedLogicalTime signedTime;
 
-        if (opCtx && LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+        if (isInternal || (opCtx && LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx))) {
             // Authorized clients always receive a dummy-signed $clusterTime (and operationTime).
+            // Internal clients can always be considered authorized.
             signedTime = SignedLogicalTime(time, TimeProofService::TimeProof(), 0);
         } else {
             // Servers without validators (e.g. a shard server not yet added to a cluster) do not
@@ -207,8 +222,10 @@ public:
                 return false;
             }
 
+            // TODO (SERVER-87463): Investigate why the embedded router is not able to sign once the
+            // router port is opened.
             // There are some contexts where refreshing is not permitted.
-            if (permitRefresh && opCtx) {
+            if (opCtx && serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
                 signedTime = validator->signLogicalTime(opCtx, time);
             } else {
                 signedTime = validator->trySignLogicalTime(time);
@@ -221,18 +238,32 @@ public:
             }
         }
 
-        // TODO SERVER-48432: use IDL to do this serialization.
-
         BSONObjBuilder subObjBuilder(out->subobjStart(_fieldName));
         signedTime.getTime().asTimestamp().append(subObjBuilder.bb(), kClusterTimeFieldName);
 
-        BSONObjBuilder signatureObjBuilder(subObjBuilder.subobjStart(kSignatureFieldName));
-        // Cluster time metadata is only written when the LogicalTimeValidator is set, which
-        // means the cluster time should always have a proof.
-        invariant(signedTime.getProof());
-        signedTime.getProof()->appendAsBinData(signatureObjBuilder, kSignatureHashFieldName);
-        signatureObjBuilder.append(kSignatureKeyIdFieldName, signedTime.getKeyId());
-        signatureObjBuilder.doneFast();
+        // TODO SERVER-88458: Remove FCV check when all servers can be assumed to handle a missing
+        // signature.
+        //
+        // (Generic FCV reference): This is not a truly generic FCV reference and will be removed in
+        // the next release branch. It guards a message format change for the vector clock that
+        // isn't worth its own feature flag. This comment avoids a linter error.
+        auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+
+        // As an optimization, send no signature instead of a dummy signature. For legacy
+        // compatibility, external authorized clients always receive a signature.
+        auto shouldSkipSignature = isInternal && signedTime.getKeyId() == 0 &&
+            fcvSnapshot.isVersionInitialized() &&
+            fcvSnapshot.getVersion() == multiversion::GenericFCV::kLatest;
+
+        if (!shouldSkipSignature) {
+            BSONObjBuilder signatureObjBuilder(subObjBuilder.subobjStart(kSignatureFieldName));
+            // Cluster time metadata is only written when the LogicalTimeValidator is set, which
+            // means the cluster time should always have a proof.
+            invariant(signedTime.getProof());
+            signedTime.getProof()->appendAsBinData(signatureObjBuilder, kSignatureHashFieldName);
+            signatureObjBuilder.append(kSignatureKeyIdFieldName, signedTime.getKeyId());
+            signatureObjBuilder.doneFast();
+        }
 
         subObjBuilder.doneFast();
 
@@ -241,43 +272,31 @@ public:
 
     LogicalTime in(ServiceContext* service,
                    OperationContext* opCtx,
-                   const BSONObj& in,
+                   const GossipedVectorClockComponents& timepoints,
                    bool couldBeUnauthenticated,
                    Component component) const override {
-        // TODO SERVER-48432: use IDL to do this deserialization.
-
-        const auto& metadataElem = in.getField(_fieldName);
-        if (metadataElem.eoo()) {
+        if (!timepoints.getDollarClusterTime()) {
             // Nothing to gossip in.
             return LogicalTime();
         }
 
-        const auto& obj = metadataElem.Obj();
+        auto& clusterTime = *(timepoints.getDollarClusterTime());
+        Timestamp ts = clusterTime.getClusterTime();
 
-        Timestamp ts;
-        uassertStatusOK(bsonExtractTimestampField(obj, kClusterTimeFieldName, &ts));
+        // Parse the signature, treating no signature the same as a dummy signed proof.
+        auto proof = TimeProofService::TimeProof();
+        long long keyId = 0;
+        if (clusterTime.getSignature()) {
+            auto hashCDR = clusterTime.getSignature()->getHash();
+            auto hashLength = hashCDR.length();
+            auto rawBinSignature = reinterpret_cast<const unsigned char*>(hashCDR.data());
+            BSONBinData proofBinData(rawBinSignature, hashLength, BinDataType::BinDataGeneral);
+            proof = uassertStatusOK(SHA1Block::fromBinData(proofBinData));
 
-        BSONElement signatureElem;
-        uassertStatusOK(bsonExtractTypedField(obj, kSignatureFieldName, Object, &signatureElem));
+            keyId = clusterTime.getSignature()->getKeyId();
+        }
 
-        const auto& signatureObj = signatureElem.Obj();
-
-        // Extract BinData type signature hash and construct a SHA1Block instance from it.
-        BSONElement hashElem;
-        uassertStatusOK(
-            bsonExtractTypedField(signatureObj, kSignatureHashFieldName, BinData, &hashElem));
-
-        int hashLength = 0;
-        auto rawBinSignature = hashElem.binData(hashLength);
-        BSONBinData proofBinData(rawBinSignature, hashLength, hashElem.binDataType());
-        auto proofStatus = SHA1Block::fromBinData(proofBinData);
-        uassertStatusOK(proofStatus);
-
-        long long keyId;
-        uassertStatusOK(bsonExtractIntegerField(signatureObj, kSignatureKeyIdFieldName, &keyId));
-
-        auto signedTime =
-            SignedLogicalTime(LogicalTime(ts), std::move(proofStatus.getValue()), keyId);
+        auto signedTime = SignedLogicalTime(LogicalTime(ts), std::move(proof), keyId);
 
         if (!opCtx) {
             // If there's no opCtx then this must be coming from a reply, which must be internal,
@@ -286,7 +305,8 @@ public:
         }
 
         // Validate the signature.
-        if (couldBeUnauthenticated && AuthorizationManager::get(service)->isAuthEnabled() &&
+        if (couldBeUnauthenticated &&
+            AuthorizationManager::get(opCtx->getService())->isAuthEnabled() &&
             (!signedTime.getProof() || *signedTime.getProof() == TimeProofService::TimeProof())) {
 
             AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
@@ -298,8 +318,8 @@ public:
             }
         }
 
-        auto logicalTimeValidator = LogicalTimeValidator::get(service);
         if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+            auto logicalTimeValidator = LogicalTimeValidator::get(service);
             if (!logicalTimeValidator) {
                 uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
                           "Cannot accept logicalTime: " + signedTime.getTime().toString() +
@@ -322,63 +342,65 @@ private:
 const VectorClock::ComponentArray<std::unique_ptr<VectorClock::ComponentFormat>>
     VectorClock::_gossipFormatters{
         std::make_unique<VectorClock::SignedComponentFormat>(VectorClock::kClusterTimeFieldName),
-        std::make_unique<
-            VectorClock::OnlyOutOnNewFCVComponentFormat<VectorClock::PlainComponentFormat>>(
-            VectorClock::kConfigTimeFieldName),
-        std::make_unique<
-            VectorClock::OnlyOutOnNewFCVComponentFormat<VectorClock::PlainComponentFormat>>(
-            VectorClock::kTopologyTimeFieldName)};
+        std::make_unique<VectorClock::ConfigTimeComponent>(),
+        std::make_unique<VectorClock::TopologyTimeComponent>()};
 
 bool VectorClock::gossipOut(OperationContext* opCtx,
                             BSONObjBuilder* outMessage,
-                            const transport::Session::TagMask defaultClientSessionTags) const {
+                            bool forceInternal) const {
     if (!isEnabled()) {
         return false;
     }
 
-    auto clientSessionTags = defaultClientSessionTags;
-    if (opCtx && opCtx->getClient()) {
-        const auto session = opCtx->getClient()->session();
-        if (session && !(session->getTags() & transport::Session::kPending)) {
-            clientSessionTags = session->getTags();
+    const auto claimsInternal = [&]() -> bool {
+        if (forceInternal) {
+            return true;
         }
-    }
 
-    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
-        ? _gossipOutInternal()
-        : _gossipOutExternal();
+        if (opCtx) {
+            if (auto client = opCtx->getClient(); client && client->session()) {
+                return opCtx->getClient()->isPossiblyUnauthenticatedInternalClient();
+            }
+        }
+
+        return false;
+    }();
+
+    ComponentSet toGossip =
+        claimsInternal ? _getGossipInternalComponents() : _getGossipExternalComponents();
 
     auto now = getTime();
     bool clusterTimeWasOutput = false;
     for (auto component : toGossip) {
-        clusterTimeWasOutput |= _gossipOutComponent(opCtx, outMessage, now._time, component);
+        clusterTimeWasOutput |=
+            _gossipOutComponent(opCtx, outMessage, now._time, component, claimsInternal);
     }
     return clusterTimeWasOutput;
 }
 
 void VectorClock::gossipIn(OperationContext* opCtx,
-                           const BSONObj& inMessage,
+                           const GossipedVectorClockComponents& timepoints,
                            bool couldBeUnauthenticated,
-                           const transport::Session::TagMask defaultClientSessionTags) {
+                           bool defaultIsInternalClient) {
     if (!isEnabled()) {
         return;
     }
 
-    auto clientSessionTags = defaultClientSessionTags;
-    if (opCtx && opCtx->getClient()) {
-        const auto session = opCtx->getClient()->session();
-        if (session && !(session->getTags() & transport::Session::kPending)) {
-            clientSessionTags = session->getTags();
+    auto isInternal = defaultIsInternalClient;
+    if (opCtx) {
+        if (const auto client = opCtx->getClient()) {
+            if (client->session() && !(client->getTags() & Client::kPending)) {
+                isInternal = client->isInternalClient();
+            }
         }
     }
 
-    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
-        ? _gossipInInternal()
-        : _gossipInExternal();
+    ComponentSet toGossip =
+        isInternal ? _getGossipInternalComponents() : _getGossipExternalComponents();
 
     LogicalTimeArray newTime;
     for (auto component : toGossip) {
-        _gossipInComponent(opCtx, inMessage, couldBeUnauthenticated, &newTime, component);
+        _gossipInComponent(opCtx, timepoints, couldBeUnauthenticated, &newTime, component);
     }
     // Since the times in LogicalTimeArray are default constructed (ie. to Timestamp(0, 0)), any
     // component not present in the input BSONObj won't be advanced.
@@ -388,19 +410,20 @@ void VectorClock::gossipIn(OperationContext* opCtx,
 bool VectorClock::_gossipOutComponent(OperationContext* opCtx,
                                       BSONObjBuilder* out,
                                       const LogicalTimeArray& time,
-                                      Component component) const {
+                                      Component component,
+                                      bool isInternal) const {
     bool wasOutput = _gossipFormatters[component]->out(
-        _service, opCtx, _permitRefreshDuringGossipOut(), out, time[component], component);
+        _service, opCtx, out, time[component], component, isInternal);
     return (component == Component::ClusterTime) ? wasOutput : false;
 }
 
 void VectorClock::_gossipInComponent(OperationContext* opCtx,
-                                     const BSONObj& in,
+                                     const GossipedVectorClockComponents& timepoints,
                                      bool couldBeUnauthenticated,
                                      LogicalTimeArray* newTime,
                                      Component component) {
-    (*newTime)[component] =
-        _gossipFormatters[component]->in(_service, opCtx, in, couldBeUnauthenticated, component);
+    (*newTime)[component] = _gossipFormatters[component]->in(
+        _service, opCtx, timepoints, couldBeUnauthenticated, component);
 }
 
 std::string VectorClock::_componentName(Component component) {
@@ -408,35 +431,44 @@ std::string VectorClock::_componentName(Component component) {
 }
 
 bool VectorClock::isEnabled() const {
-    stdx::lock_guard<Latch> lock(_mutex);
-    return _isEnabled;
+    return _isEnabled.load();
 }
 
 void VectorClock::_disable() {
-    stdx::lock_guard<Latch> lock(_mutex);
-    _isEnabled = false;
-}
-
-void VectorClock::gossipInConfigOpTime(const repl::OpTime& configOpTime) {
-    LogicalTimeArray newTimeArray;
-    newTimeArray[Component::ClusterTime] = LogicalTime(configOpTime.getTimestamp());
-    newTimeArray[Component::ConfigTime] = LogicalTime(configOpTime.getTimestamp());
-    _advanceTime(std::move(newTimeArray));
+    _isEnabled.store(false);
 }
 
 void VectorClock::resetVectorClock_forTest() {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto it = _vectorTime.begin();
     for (; it != _vectorTime.end(); ++it) {
-        *it = LogicalTime();
+        *it = VectorClock::kInitialComponentTime;
     }
-    _isEnabled = true;
+    _isEnabled.store(true);
 }
 
 void VectorClock::_advanceTime_forTest(Component component, LogicalTime newTime) {
     LogicalTimeArray newTimeArray;
     newTimeArray[component] = newTime;
     _advanceTime(std::move(newTimeArray));
+}
+
+bool VectorClock::_permitGossipClusterTimeWithExternalClients() const {
+    // Permit gossiping with external clients in case this node is a standalone mongos.
+    if (serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
+        return true;
+    }
+
+    // If this node has no replication coordinator, permit gossiping with external clients. On
+    // the other hand, if this node has replication coordinator but it is in an unreadable state,
+    // skip gossiping because it may require reading a signing key from the keys collection.
+    auto replicationCoordinator = repl::ReplicationCoordinator::get(_service);
+    return !replicationCoordinator ||
+        (replicationCoordinator->getSettings().isReplSet() &&
+         // Check repl status without locks to prevent deadlocks. This is a best effort check
+         // as the repl state can change right after this check even when inspected under a
+         // lock or mutex.
+         replicationCoordinator->isInPrimaryOrSecondaryState_UNSAFE());
 }
 
 }  // namespace mongo

@@ -6,10 +6,14 @@
  * @tags: [__TEMPORARILY_DISABLED__]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
-load("jstests/sharding/libs/find_chunks_util.js");
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
 let st = new ShardingTest({
     shards: 2,
@@ -18,8 +22,8 @@ let st = new ShardingTest({
 });
 
 let kDbName = "test";
-assert.commandWorked(st.s.adminCommand({enablesharding: kDbName}));
-st.ensurePrimaryShard(kDbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enablesharding: kDbName, primaryShard: st.shard0.shardName}));
 const largeString = 'X'.repeat(10000);
 
 function shardCollectionCreateJumboChunk() {
@@ -140,22 +144,7 @@ st.startBalancer();
 
 // Now remove the shard that the jumbo chunk is on and make sure the chunk moves back to the other
 // shard.
-let res = st.s.adminCommand({removeShard: st.shard1.shardName});
-assert.commandWorked(res);
-assert.soon(function() {
-    res = st.s.adminCommand({removeShard: st.shard1.shardName});
-    if (!res.ok && res.code === ErrorCodes.ShardNotFound) {
-        // If the config server primary steps down right after removing the config.shards doc
-        // for the shard but before responding with "state": "completed", the mongos would retry
-        // the _configsvrRemoveShard command against the new config server primary, which would
-        // not find the removed shard in its ShardRegistry if it has done a ShardRegistry reload
-        // after the config.shards doc for the shard was removed. This would cause the command
-        // to fail with ShardNotFound.
-        return true;
-    }
-    assert.commandWorked(res);
-    return ("completed" == res.state);
-}, "failed to remove shard");
+removeShard(st, st.shard1.shardName);
 
 let jumboChunk = findChunksUtil.findOneChunkByNs(
     st.getDB('config'), 'test.foo', {min: {$lte: {x: 0}}, max: {$gt: {x: 0}}});
@@ -163,4 +152,3 @@ assert.eq(
     st.shard0.shardName, jumboChunk.shard, 'jumbo chunk ' + tojson(jumboChunk) + ' was not moved');
 
 st.stop();
-})();

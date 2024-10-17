@@ -27,62 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 
 namespace mongo {
 namespace {
-
-void checkCollectionOptions(OperationContext* opCtx,
-                            const NamespaceString& ns,
-                            const CollectionOptions& options) {
-    auto dbName = ns.db();
-    auto dbInfo = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
-    BSONObjBuilder listCollCmd;
-    listCollCmd.append("listCollections", 1);
-    listCollCmd.append("filter", BSON("name" << ns.coll()));
-
-    auto response = executeCommandAgainstDatabasePrimary(
-        opCtx,
-        dbName,
-        dbInfo,
-        CommandHelpers::filterCommandRequestForPassthrough(listCollCmd.obj()),
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        Shard::RetryPolicy::kIdempotent);
-    uassertStatusOK(response.swResponse);
-
-    auto responseData = response.swResponse.getValue().data;
-    auto listCollectionsStatus = mongo::getStatusFromCommandResult(responseData);
-    uassertStatusOK(listCollectionsStatus);
-
-    auto cursorObj = responseData["cursor"].Obj();
-    auto collections = cursorObj["firstBatch"].Obj();
-
-    BSONObjIterator collIter(collections);
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "cannot find ns: " << ns.ns(),
-            collIter.more());
-
-    auto collectionDetails = collIter.next();
-    CollectionOptions actualOptions =
-        uassertStatusOK(CollectionOptions::parse(collectionDetails["options"].Obj()));
-    // TODO: SERVER-33048 check idIndex field
-
-    uassert(ErrorCodes::NamespaceExists,
-            str::stream() << "ns: " << ns.ns()
-                          << " already exists with different options: " << actualOptions.toBSON(),
-            options.matchesStorageOptions(
-                actualOptions, CollatorFactoryInterface::get(opCtx->getServiceContext())));
-}
 
 class CreateCmd final : public CreateCmdVersion1Gen<CreateCmd> {
 public:
@@ -92,6 +68,10 @@ public:
 
     bool adminOnly() const final {
         return false;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
     }
 
     class Invocation final : public InvocationBaseGen {
@@ -108,54 +88,50 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
             uassertStatusOK(auth::checkAuthForCreate(
-                AuthorizationSession::get(opCtx->getClient()), request(), true));
+                opCtx, AuthorizationSession::get(opCtx->getClient()), request(), true));
         }
 
         CreateCommandReply typedRun(OperationContext* opCtx) final {
             auto cmd = request();
             auto dbName = cmd.getDbName();
-            cluster::createDatabase(opCtx, dbName);
 
-            uassert(ErrorCodes::InvalidOptions,
-                    "specify size:<n> when capped is true",
-                    !cmd.getCapped() || cmd.getSize());
+            if (cmd.getClusteredIndex()) {
+                clustered_util::checkCreationOptions(cmd);
+            } else {
+                uassert(ErrorCodes::InvalidOptions,
+                        "specify size:<n> when capped is true",
+                        !cmd.getCapped() || cmd.getSize());
+            }
+
             uassert(ErrorCodes::InvalidOptions,
                     "the 'temp' field is an invalid option",
                     !cmd.getTemp());
 
-            // Manually forward the create collection command to the primary shard.
-            const auto dbInfo =
-                uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
-            auto response = uassertStatusOK(
-                executeCommandAgainstDatabasePrimary(
-                    opCtx,
-                    dbName,
-                    dbInfo,
-                    applyReadWriteConcern(
-                        opCtx,
-                        this,
-                        CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({}))),
-                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                    Shard::RetryPolicy::kIdempotent)
-                    .swResponse);
+            auto nss = cmd.getNamespace();
+            ShardsvrCreateCollection shardsvrCollCommand(nss);
 
-            const auto createStatus = mongo::getStatusFromCommandResult(response.data);
-            if (createStatus == ErrorCodes::NamespaceExists &&
-                !opCtx->inMultiDocumentTransaction()) {
-                // NamespaceExists will cause multi-document transactions to implicitly abort, so
-                // mongos should surface this error to the client.
-                auto options = CollectionOptions::fromCreateCommand(cmd);
-                checkCollectionOptions(opCtx, cmd.getNamespace(), options);
-            } else {
-                uassertStatusOK(createStatus);
-            }
+            auto cmdObj = cmd.toBSON();
+            // Creating the ShardsvrCreateCollectionRequest by parsing the {create..} bsonObj
+            // guaratees to propagate the apiVersion and apiStrict paramers. Note that
+            // shardsvrCreateCollection as internal command will skip the apiVersionCheck.
+            // However in case of view, the create command might run an aggregation. Having those
+            // fields propagated guaratees the api version check will keep working within the
+            // aggregation framework
+            auto request =
+                ShardsvrCreateCollectionRequest::parse(IDLParserContext("create"), cmdObj);
 
-            uassertStatusOK(getWriteConcernStatusFromCommandResult(response.data));
+            request.setUnsplittable(true);
+            request.setShardKey(BSON("_id" << 1));
+
+            shardsvrCollCommand.setShardsvrCreateCollectionRequest(request);
+            shardsvrCollCommand.setDbName(nss.dbName());
+
+            cluster::createCollection(opCtx, std::move(shardsvrCollCommand));
             return CreateCommandReply();
         }
     };
-
-} createCmd;
+};
+MONGO_REGISTER_COMMAND(CreateCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

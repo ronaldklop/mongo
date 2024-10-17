@@ -27,26 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/fail_point.h"
-
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <chrono>
 #include <fmt/format.h>
-
 #include <limits>
-#include <memory>
+#include <new>
 #include <random>
+#include <thread>
 
-#include "mongo/base/init.h"
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_server_parameter_gen.h"
-#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 namespace {
@@ -152,10 +164,8 @@ bool FailPoint::Impl::_evaluateByMode() {
             // positive again
             return _modeValue.load() <= 0 || _modeValue.subtractAndFetch(1) < 0;
         default:
-            LOGV2_ERROR(23832,
-                        "FailPoint mode not supported: {mode}",
-                        "FailPoint mode not supported",
-                        "mode"_attr = static_cast<int>(_mode));
+            LOGV2_ERROR(
+                23832, "FailPoint mode not supported", "mode"_attr = static_cast<int>(_mode));
             fassertFailed(16444);
     }
 }
@@ -167,7 +177,7 @@ StatusWith<FailPoint::ModeOptions> FailPoint::parseBSON(const BSONObj& obj) {
     if (modeElem.eoo()) {
         return {ErrorCodes::IllegalOperation, "When setting a failpoint, you must supply a 'mode'"};
     } else if (modeElem.type() == String) {
-        const std::string modeStr(modeElem.valuestr());
+        const std::string modeStr(modeElem.str());
         if (modeStr == "off") {
             mode = FailPoint::off;
         } else if (modeStr == "alwaysOn") {
@@ -275,7 +285,6 @@ auto setGlobalFailPoint(const std::string& failPointName, const BSONObj& cmdObj)
         uasserted(ErrorCodes::FailPointSetFailed, failPointName + " not found");
     auto timesEntered = failPoint->setMode(uassertStatusOK(FailPoint::parseBSON(cmdObj)));
     LOGV2_WARNING(23829,
-                  "Set failpoint {failPointName} to: {failPoint}",
                   "Set failpoint",
                   "failPointName"_attr = failPointName,
                   "failPoint"_attr = failPoint->toBSON());
@@ -298,7 +307,6 @@ FailPointEnableBlock::FailPointEnableBlock(FailPoint* failPoint, BSONObj data)
     _initialTimesEntered = _failPoint->setMode(FailPoint::alwaysOn, 0, std::move(data));
 
     LOGV2_WARNING(23830,
-                  "Set failpoint {failPointName} to: {failPoint}",
                   "Set failpoint",
                   "failPointName"_attr = _failPoint->getName(),
                   "failPoint"_attr = _failPoint->toBSON());
@@ -307,7 +315,6 @@ FailPointEnableBlock::FailPointEnableBlock(FailPoint* failPoint, BSONObj data)
 FailPointEnableBlock::~FailPointEnableBlock() {
     _failPoint->setMode(FailPoint::off);
     LOGV2_WARNING(23831,
-                  "Set failpoint {failPointName} to: {failPoint}",
                   "Set failpoint",
                   "failPointName"_attr = _failPoint->getName(),
                   "failPoint"_attr = _failPoint->toBSON());
@@ -338,8 +345,8 @@ void FailPointRegistry::freeze() {
 
 void FailPointRegistry::registerAllFailPointsAsServerParameters() {
     for (const auto& [name, ptr] : _fpMap) {
-        // Intentionally leaked.
-        new FailPointServerParameter(name, ServerParameterType::kStartupOnly);
+        registerServerParameter(
+            std::make_unique<FailPointServerParameter>(name, ServerParameterType::kStartupOnly));
     }
 }
 
@@ -359,12 +366,13 @@ FailPointServerParameter::FailPointServerParameter(StringData name, ServerParame
 }
 
 void FailPointServerParameter::append(OperationContext* opCtx,
-                                      BSONObjBuilder& b,
-                                      const std::string& name) {
-    b << name << _data->toBSON();
+                                      BSONObjBuilder* b,
+                                      StringData name,
+                                      const boost::optional<TenantId>&) {
+    *b << name << _data->toBSON();
 }
 
-Status FailPointServerParameter::setFromString(const std::string& str) {
+Status FailPointServerParameter::setFromString(StringData str, const boost::optional<TenantId>&) {
     BSONObj failPointOptions;
     try {
         failPointOptions = fromjson(str);

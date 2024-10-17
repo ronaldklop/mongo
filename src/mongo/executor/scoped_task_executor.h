@@ -34,7 +34,6 @@
 
 #include "mongo/base/status.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/fail_point.h"
@@ -57,6 +56,7 @@ namespace executor {
  * - startup()
  * - appendDiagnosticBSON()
  * - appendConnectionStats()
+ * - dropConnections()
  *
  * And certain other methods only pass through this class to the underlying executor:
  * - makeEvent()
@@ -83,6 +83,8 @@ namespace executor {
 class ScopedTaskExecutor {
 public:
     explicit ScopedTaskExecutor(std::shared_ptr<TaskExecutor> executor);
+    // Tasks respond with the supplied status on shutdown. Status must be in the CancellationError
+    // category.
     ScopedTaskExecutor(std::shared_ptr<TaskExecutor> executor, Status shutdownError);
 
     // Delete all move/copy-ability

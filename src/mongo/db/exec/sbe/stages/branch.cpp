@@ -27,11 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <utility>
 
-#include "mongo/db/exec/sbe/stages/branch.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/branch.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace sbe {
@@ -41,8 +54,9 @@ BranchStage::BranchStage(std::unique_ptr<PlanStage> inputThen,
                          value::SlotVector inputThenVals,
                          value::SlotVector inputElseVals,
                          value::SlotVector outputVals,
-                         PlanNodeId planNodeId)
-    : PlanStage("branch"_sd, planNodeId),
+                         PlanNodeId planNodeId,
+                         bool participateInTrialRunTracking)
+    : PlanStage("branch"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _filter(std::move(filter)),
       _inputThenVals(std::move(inputThenVals)),
       _inputElseVals(std::move(inputElseVals)),
@@ -60,7 +74,8 @@ std::unique_ptr<PlanStage> BranchStage::clone() const {
                                          _inputThenVals,
                                          _inputElseVals,
                                          _outputVals,
-                                         _commonStats.nodeId);
+                                         _commonStats.nodeId,
+                                         participateInTrialRunTracking());
 }
 
 void BranchStage::prepare(CompileCtx& ctx) {
@@ -69,25 +84,29 @@ void BranchStage::prepare(CompileCtx& ctx) {
     _children[0]->prepare(ctx);
     _children[1]->prepare(ctx);
 
-    for (auto slot : _inputThenVals) {
-        auto [it, inserted] = dupCheck.insert(slot);
-        uassert(4822829, str::stream() << "duplicate field: " << slot, inserted);
-
-        _inputThenAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
-    }
-
-    for (auto slot : _inputElseVals) {
-        auto [it, inserted] = dupCheck.insert(slot);
-        uassert(4822830, str::stream() << "duplicate field: " << slot, inserted);
-
-        _inputElseAccessors.emplace_back(_children[1]->getAccessor(ctx, slot));
-    }
-
-    for (auto slot : _outputVals) {
-        auto [it, inserted] = dupCheck.insert(slot);
+    // All of the slots listed in '_outputVals' must be unique.
+    for (size_t idx = 0; idx < _outputVals.size(); ++idx) {
+        auto slot = _outputVals[idx];
+        auto [_, inserted] = dupCheck.insert(slot);
         uassert(4822831, str::stream() << "duplicate field: " << slot, inserted);
+    }
 
-        _outValueAccessors.emplace_back(value::ViewOfValueAccessor{});
+    for (size_t idx = 0; idx < _outputVals.size(); ++idx) {
+        auto thenSlot = _inputThenVals[idx];
+        auto elseSlot = _inputElseVals[idx];
+
+        // Slots listed in '_inputThenVals' and '_inputElseVals' may not appear in '_outputVals'.
+        bool thenSlotFound = dupCheck.count(thenSlot);
+        bool elseSlotFound = dupCheck.count(elseSlot);
+        uassert(4822829, str::stream() << "duplicate field: " << thenSlot, !thenSlotFound);
+        uassert(4822830, str::stream() << "duplicate field: " << elseSlot, !elseSlotFound);
+
+        std::vector<value::SlotAccessor*> accessors;
+        accessors.reserve(2);
+        accessors.emplace_back(_children[0]->getAccessor(ctx, thenSlot));
+        accessors.emplace_back(_children[1]->getAccessor(ctx, elseSlot));
+
+        _outValueAccessors.emplace_back(value::SwitchAccessor{std::move(accessors)});
     }
 
     // compile filter
@@ -128,6 +147,9 @@ void BranchStage::open(bool reOpen) {
             _elseOpened = true;
             ++_specificStats.elseBranchOpens;
         }
+        for (auto& outAccessor : _outValueAccessors) {
+            outAccessor.setIndex(*_activeBranch);
+        }
     } else {
         _activeBranch = boost::none;
     }
@@ -140,31 +162,14 @@ PlanState BranchStage::getNext() {
         return trackPlanState(PlanState::IS_EOF);
     }
 
-    if (*_activeBranch == 0) {
-        auto state = _children[0]->getNext();
-        if (state == PlanState::ADVANCED) {
-            for (size_t idx = 0; idx < _outValueAccessors.size(); ++idx) {
-                auto [tag, val] = _inputThenAccessors[idx]->getViewOfValue();
-                _outValueAccessors[idx].reset(tag, val);
-            }
-        }
-        return trackPlanState(state);
-    } else {
-        auto state = _children[1]->getNext();
-        if (state == PlanState::ADVANCED) {
-            for (size_t idx = 0; idx < _outValueAccessors.size(); ++idx) {
-                auto [tag, val] = _inputElseAccessors[idx]->getViewOfValue();
-                _outValueAccessors[idx].reset(tag, val);
-            }
-        }
-        return trackPlanState(state);
-    }
+    auto state = _children[*_activeBranch]->getNext();
+    return trackPlanState(state);
 }
 
 void BranchStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 
     if (_thenOpened) {
         _children[0]->close();
@@ -192,9 +197,9 @@ std::unique_ptr<PlanStageStats> BranchStage::getStats(bool includeDebugInfo) con
         bob.appendNumber("elseBranchCloses",
                          static_cast<long long>(_specificStats.elseBranchCloses));
         bob.append("filter", DebugPrinter{}.print(_filter->debugPrint()));
-        bob.append("thenSlots", _inputThenVals);
-        bob.append("elseSlots", _inputElseVals);
-        bob.append("outputSlots", _outputVals);
+        bob.append("thenSlots", _inputThenVals.begin(), _inputThenVals.end());
+        bob.append("elseSlots", _inputElseVals.begin(), _inputElseVals.end());
+        bob.append("outputSlots", _outputVals.begin(), _outputVals.end());
         ret->debugInfo = bob.obj();
     }
 
@@ -248,6 +253,17 @@ std::vector<DebugPrinter::Block> BranchStage::debugPrint() const {
 
     DebugPrinter::addBlocks(ret, _children[1]->debugPrint());
     return ret;
+}
+
+size_t BranchStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += _filter->estimateSize();
+    size += size_estimator::estimate(_inputThenVals);
+    size += size_estimator::estimate(_inputElseVals);
+    size += size_estimator::estimate(_outputVals);
+    size += size_estimator::estimate(_specificStats);
+    return size;
 }
 
 }  // namespace sbe

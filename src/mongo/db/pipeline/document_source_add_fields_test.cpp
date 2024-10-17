@@ -27,19 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <bitset>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
@@ -274,5 +289,36 @@ TEST_F(AddFieldsTest, TestModifiedPaths) {
     ASSERT_EQUALS(1U, modifiedPaths.paths.size());
     ASSERT_EQUALS(1U, modifiedPaths.renames.size());
 }
+
+TEST_F(AddFieldsTest, AddFieldsRenameModifiesDestination) {
+    auto addFields =
+        DocumentSourceAddFields::create(fromjson("{'somePath' : '$otherField'}"), getExpCtx());
+
+    // Forwards: "somePath" is _not_ preserved by this addFields - any existing value has been
+    // overwritten.
+    auto renames = semantic_analysis::renamedPaths(
+        {"somePath"}, *addFields, semantic_analysis::Direction::kForward);
+    ASSERT_FALSE(renames.has_value());
+
+    // Forwards: "otherField" _is_ preserved by this addFields, and is renamed to "somePath".
+    renames = semantic_analysis::renamedPaths(
+        {"otherField"}, *addFields, semantic_analysis::Direction::kForward);
+    ASSERT_TRUE(renames.has_value());
+    ASSERT_EQUALS(renames->at("otherField"), "somePath");
+
+    // Backwards: "somePath" is the result of a rename, so traversing backwards should map to the
+    // previous name.
+    renames = semantic_analysis::renamedPaths(
+        {"somePath"}, *addFields, semantic_analysis::Direction::kBackward);
+    ASSERT_TRUE(renames.has_value());
+    ASSERT_EQUALS(renames->at("somePath"), "otherField");
+
+    // Backwards: "otherField" still exists, and has not been modified.
+    renames = semantic_analysis::renamedPaths(
+        {"otherField"}, *addFields, semantic_analysis::Direction::kBackward);
+    ASSERT_TRUE(renames.has_value());
+    ASSERT_EQUALS(renames->at("otherField"), "otherField");
+}
+
 }  // namespace
 }  // namespace mongo

@@ -2,14 +2,19 @@
  * Tests that donor shard's secondaries correctly
  * block reads and refresh metadata cache when migration occurs.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("./jstests/libs/chunk_manipulation_util.js");
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 /**
  * @summary This function executes a count command with read preference "secondary" and returns the
@@ -49,9 +54,9 @@ const runReadCmdWithReadPrefSecondary = (db, collectionName, query, {readConcern
  * @param {String} primaryShardName - Used to ensure the desired shard becomes the primary shard.
  */
 const setupShardedCollection = (shardingTest, dbName, collectionNamespace, primaryShardName) => {
-    assert.commandWorked(shardingTest.s.adminCommand({enableSharding: dbName}));
+    assert.commandWorked(
+        shardingTest.s.adminCommand({enableSharding: dbName, primaryShard: primaryShardName}));
 
-    shardingTest.ensurePrimaryShard(dbName, primaryShardName);
     assert.commandWorked(shardingTest.s.adminCommand({
         shardCollection: collectionNamespace,
         key: {_id: 1},
@@ -168,4 +173,3 @@ joinMoveChunk();
 
 MongoRunner.stopMongod(staticMongod);
 st.stop();
-})();

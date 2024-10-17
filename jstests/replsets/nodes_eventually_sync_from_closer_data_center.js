@@ -5,15 +5,18 @@
  * significantly farther away from S2 than S1's data center. Finally, we verify that S2 will decide
  * to sync from S1, since S1's data center is closer.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/sync_source.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    DataCenter,
+    delayMessagesBetweenDataCenters,
+    forceSyncSource
+} from "jstests/replsets/libs/sync_source.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -36,11 +39,15 @@ const rst = new ReplSetTest({
 
 rst.startSet();
 rst.initiateWithHighElectionTimeout();
-rst.awaitReplication();
 
 const primary = rst.getPrimary();
 const centralSecondary = rst.getSecondaries()[0];
 const testNode = rst.getSecondaries()[1];
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 
 const primaryDB = primary.getDB(name);
 const primaryColl = primaryDB["testColl"];
@@ -100,7 +107,13 @@ assert.soon(() => {
     const syncSourcePingTime = replSetGetStatus.members[0].pingMs;
     const receivedSyncSourceHb = (syncSourcePingTime > 60);
 
-    return (receivedCentralHb && receivedSyncSourceHb);
+    // Wait for enough heartbeat's from the desired sync source so that our understanding of the
+    // ping time to that node is at least 'changeSyncSourceThresholdMillis' less than the ping time
+    // to our current sync source.
+    const centralSecondaryPingTime = replSetGetStatus.members[1].pingMs;
+    const exceedsChangeSyncSourceThreshold = (syncSourcePingTime - centralSecondaryPingTime > 5);
+
+    return (receivedCentralHb && receivedSyncSourceHb && exceedsChangeSyncSourceThreshold);
 });
 
 const replSetGetStatus = assert.commandWorked(testNode.adminCommand({replSetGetStatus: 1}));
@@ -117,4 +130,3 @@ assert.eq(numSyncSourceChanges + 1,
           serverStatus.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode);
 
 rst.stopSet();
-})();

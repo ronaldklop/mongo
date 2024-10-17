@@ -6,10 +6,9 @@
  * This test relies on the DBHash checker to run at the end to ensure that the primaries and
  * secondaries have the same data. For that reason it's important that this test not drop
  * intermediate collections.
- *
- * @tags: [requires_fcv_47]
  */
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 const rst = new ReplSetTest({name: "v2_delta_oplog_entries", nodes: 2});
 
 rst.startSet();
@@ -345,4 +344,3 @@ testUpdateReplicates({
 // corruption.
 
 rst.stopSet();
-})();

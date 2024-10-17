@@ -27,26 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/exec/document_value/document.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/serialization_context.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString viewNss("testdb.testview");
-const NamespaceString backingNss("testdb.testcoll");
+const NamespaceString viewNss = NamespaceString::createNamespaceString_forTest("testdb.testview");
+const NamespaceString backingNss =
+    NamespaceString::createNamespaceString_forTest("testdb.testcoll");
 const std::vector<BSONObj> emptyPipeline;
 const BSONObj kDefaultCursorOptionDocument = BSON(aggregation_request_helper::kBatchSizeField
                                                   << aggregation_request_helper::kDefaultBatchSize);
@@ -79,7 +93,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithNonemptyPipelineAppendsToViewPipel
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest{viewNss, {}};
+    AggregateCommandRequest aggRequest{viewNss, std::vector<mongo::BSONObj>()};
     aggRequest.setExplain(ExplainOptions::Verbosity::kExecStats);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -89,7 +103,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesExplain) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestWithCursorAndExplainOnlyPreservesExplain) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest{viewNss, {}};
+    AggregateCommandRequest aggRequest{viewNss, std::vector<mongo::BSONObj>()};
     SimpleCursorOptions cursor;
     cursor.setBatchSize(10);
     aggRequest.setCursor(cursor);
@@ -105,7 +119,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithCursorAndExplainOnlyPreservesExpla
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesBypassDocumentValidation) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
     aggRequest.setBypassDocumentValidation(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -114,7 +128,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesBypassDocumentValidation) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesAllowDiskUse) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
     aggRequest.setAllowDiskUse(true);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -123,7 +137,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesAllowDiskUse) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesHint) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
     aggRequest.setHint(BSON("a" << 1));
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -132,7 +146,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesHint) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadPreference) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
     aggRequest.setUnwrappedReadPref(BSON("$readPreference"
                                          << "nearest"));
 
@@ -144,19 +158,18 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadPreference) {
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesReadConcern) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
-    aggRequest.setReadConcern(BSON("level"
-                                   << "linearizable"));
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
+    aggRequest.setReadConcern(repl::ReadConcernArgs::kLinearizable);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_BSONOBJ_EQ(result.getReadConcern().value_or(BSONObj()),
+    ASSERT_BSONOBJ_EQ(result.getReadConcern().value_or(repl::ReadConcernArgs()).toBSONInner(),
                       BSON("level"
                            << "linearizable"));
 }
 
 TEST(ResolvedViewTest, ExpandingAggRequestPreservesMaxTimeMS) {
     const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
     aggRequest.setMaxTimeMS(100u);
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
@@ -171,12 +184,47 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
     ASSERT_BSONOBJ_EQ(resolvedView.getDefaultCollation(),
                       BSON("locale"
                            << "fr_CA"));
-    AggregateCommandRequest aggRequest(viewNss, {});
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
 
     auto result = resolvedView.asExpandedViewAggregation(aggRequest);
     ASSERT_BSONOBJ_EQ(result.getCollation().value_or(BSONObj()),
                       BSON("locale"
                            << "fr_CA"));
+}
+
+TEST(ResolvedViewTest, EnsureSerializationContextCopy) {
+    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
+
+    AggregateCommandRequest requestOnViewDefault{viewNss, emptyPipeline};
+
+    auto resultDefault = resolvedView.asExpandedViewAggregation(requestOnViewDefault);
+    ASSERT_TRUE(resultDefault.getSerializationContext() ==
+                SerializationContext::stateCommandRequest());
+
+    SerializationContext scCommand = SerializationContext::stateCommandRequest();
+    scCommand.setPrefixState(true);
+    AggregateCommandRequest requestOnViewCommand{viewNss, emptyPipeline, scCommand};
+
+    auto resultCommand = resolvedView.asExpandedViewAggregation(requestOnViewCommand);
+    ASSERT_EQ(resultCommand.getSerializationContext().getSource(),
+              SerializationContext::Source::Command);
+    ASSERT_EQ(resultCommand.getSerializationContext().getCallerType(),
+              SerializationContext::CallerType::Request);
+    ASSERT_EQ(resultCommand.getSerializationContext().getPrefix(),
+              SerializationContext::Prefix::IncludePrefix);
+}
+
+TEST(ResolvedViewTest, ExpandingAggRequestPreservesIncludeQueryStatsMetrics) {
+    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
+
+    aggRequest.setIncludeQueryStatsMetrics(false);
+    auto result = resolvedView.asExpandedViewAggregation(aggRequest);
+    ASSERT_FALSE(result.getIncludeQueryStatsMetrics());
+
+    aggRequest.setIncludeQueryStatsMetrics(true);
+    result = resolvedView.asExpandedViewAggregation(aggRequest);
+    ASSERT_TRUE(result.getIncludeQueryStatsMetrics());
 }
 
 TEST(ResolvedViewTest, FromBSONFailsIfMissingResolvedView) {
@@ -200,25 +248,26 @@ TEST(ResolvedViewTest, FromBSONFailsOnInvalidViewNsType) {
 }
 
 TEST(ResolvedViewTest, FromBSONFailsIfMissingPipeline) {
-    BSONObj badCmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns()));
+    BSONObj badCmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns_forTest()));
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40251);
 }
 
 TEST(ResolvedViewTest, FromBSONFailsOnInvalidPipelineType) {
     BSONObj badCmdResponse =
-        BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << 7));
+        BSON("resolvedView" << BSON("ns" << backingNss.ns_forTest() << "pipeline" << 7));
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40251);
 }
 
 TEST(ResolvedViewTest, FromBSONFailsOnInvalidCollationType) {
-    BSONObj badCmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
-                                                              << BSONArray() << "collation" << 1));
+    BSONObj badCmdResponse =
+        BSON("resolvedView" << BSON("ns" << backingNss.ns_forTest() << "pipeline" << BSONArray()
+                                         << "collation" << 1));
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40639);
 }
 
 TEST(ResolvedViewTest, FromBSONSuccessfullyParsesEmptyBSONArrayIntoEmptyVector) {
     BSONObj cmdResponse =
-        BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
+        BSON("resolvedView" << BSON("ns" << backingNss.ns_forTest() << "pipeline" << BSONArray()));
     const ResolvedView result = ResolvedView::fromBSON(cmdResponse);
     ASSERT_EQ(result.getNamespace(), backingNss);
     ASSERT(std::equal(emptyPipeline.begin(),
@@ -228,7 +277,7 @@ TEST(ResolvedViewTest, FromBSONSuccessfullyParsesEmptyBSONArrayIntoEmptyVector) 
 }
 
 TEST(ResolvedViewTest, FromBSONSuccessfullyParsesCollation) {
-    BSONObj cmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
+    BSONObj cmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns_forTest() << "pipeline"
                                                            << BSONArray() << "collation"
                                                            << BSON("locale"
                                                                    << "fil")));
@@ -267,7 +316,8 @@ TEST(ResolvedViewTest, IsResolvedViewErrorResponseDetectsKickbackErrorCodeSucces
     BSONObj errorResponse =
         BSON("ok" << 0 << "code" << ErrorCodes::CommandOnShardedViewNotSupportedOnMongod << "errmsg"
                   << "This view is sharded and cannot be run on mongod"
-                  << "resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
+                  << "resolvedView"
+                  << BSON("ns" << backingNss.ns_forTest() << "pipeline" << BSONArray()));
     auto status = getStatusFromCommandResult(errorResponse);
     ASSERT_EQ(status, ErrorCodes::CommandOnShardedViewNotSupportedOnMongod);
     ASSERT(status.extraInfo<ResolvedView>());

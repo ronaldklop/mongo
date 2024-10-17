@@ -27,332 +27,283 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/s/resharding/resharding_oplog_applier.h"
-
-#include <fmt/format.h>
-
-#include "mongo/base/simple_string_data_comparator.h"
-#include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/repl/oplog_applier_utils.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
-#include "mongo/db/s/resharding/resharding_metrics.h"
-#include "mongo/db/s/resharding_util.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/s/resharding/resharding_future_util.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier.h"
+#include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/timer.h"
 #include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 
-using namespace fmt::literals;
-
 namespace {
-
-ServiceContext::UniqueClient makeKillableClient(ServiceContext* serviceContext, StringData name) {
-    auto client = serviceContext->makeClient(name.toString());
-    stdx::lock_guard<Client> lk(*client);
-    client->setSystemOperationKillableByStepdown(lk);
-    return client;
+MONGO_FAIL_POINT_DEFINE(reshardingApplyOplogBatchTwice);
 }
-
-ServiceContext::UniqueOperationContext makeInterruptibleOperationContext() {
-    auto opCtx = cc().makeOperationContext();
-    opCtx->setAlwaysInterruptAtStepDownOrUp();
-    return opCtx;
-}
-
-}  // anonymous namespace
 
 ReshardingOplogApplier::ReshardingOplogApplier(
     std::unique_ptr<Env> env,
+    std::size_t oplogBatchTaskCount,
     ReshardingSourceId sourceId,
-    NamespaceString oplogNs,
-    NamespaceString nsBeingResharded,
-    UUID collUUIDBeingResharded,
+    NamespaceString oplogBufferNss,
+    NamespaceString outputNss,
     std::vector<NamespaceString> allStashNss,
     size_t myStashIdx,
-    Timestamp reshardingCloneFinishedTs,
+    ChunkManager sourceChunkMgr,
     std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIterator,
-    const ChunkManager& sourceChunkMgr,
-    std::shared_ptr<executor::TaskExecutor> executor,
-    ThreadPool* writerPool)
+    bool isCapped)
     : _env(std::move(env)),
       _sourceId(std::move(sourceId)),
-      _oplogNs(std::move(oplogNs)),
-      _nsBeingResharded(std::move(nsBeingResharded)),
-      _uuidBeingResharded(std::move(collUUIDBeingResharded)),
-      _outputNs(constructTemporaryReshardingNss(_nsBeingResharded.db(), _uuidBeingResharded)),
-      _reshardingCloneFinishedTs(std::move(reshardingCloneFinishedTs)),
-      _batchPreparer{CollatorInterface::cloneCollator(sourceChunkMgr.getDefaultCollator())},
-      _sessionApplication{},
-      _applicationRules(ReshardingOplogApplicationRules(
-          _outputNs, std::move(allStashNss), myStashIdx, _sourceId.getShardId(), sourceChunkMgr)),
-      _executor(std::move(executor)),
-      _writerPool(writerPool),
+      _batchPreparer{oplogBatchTaskCount,
+                     CollatorInterface::cloneCollator(sourceChunkMgr.getDefaultCollator()),
+                     isCapped},
+      _crudApplication{std::move(outputNss),
+                       std::move(allStashNss),
+                       myStashIdx,
+                       _sourceId.getShardId(),
+                       std::move(sourceChunkMgr),
+                       _env->applierMetrics(),
+                       isCapped},
+      _sessionApplication{std::move(oplogBufferNss)},
+      _batchApplier{_crudApplication, _sessionApplication},
       _oplogIter(std::move(oplogIterator)) {}
 
-ExecutorFuture<void> ReshardingOplogApplier::applyUntilCloneFinishedTs(
-    CancellationToken cancelToken) {
-    invariant(_stage == ReshardingOplogApplier::Stage::kStarted);
+SemiFuture<void> ReshardingOplogApplier::_applyBatch(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
+    Timer latencyTimer;
+    auto crudWriterVectors = _batchPreparer.makeCrudOpWriterVectors(
+        _currentBatchToApply, _currentDerivedOpsForCrudWriters);
 
-    // It is safe to capture `this` because PrimaryOnlyService and RecipientStateMachine
-    // collectively guarantee that the ReshardingOplogApplier instances will outlive `_executor` and
-    // `_writerPool`.
-    return ExecutorFuture(_executor)
-        .then([this, cancelToken] { return _scheduleNextBatch(cancelToken); })
-        .onError([this](Status status) { return _onError(status); });
-}
+    CancellationSource errorSource(cancelToken);
 
-ExecutorFuture<void> ReshardingOplogApplier::applyUntilDone(CancellationToken cancelToken) {
-    invariant(_stage == ReshardingOplogApplier::Stage::kReachedCloningTS);
+    std::vector<SharedSemiFuture<void>> batchApplierFutures;
+    // Use `2 * crudWriterVectors.size()` because sessionWriterVectors.size() is very likely equal
+    // to crudWriterVectors.size(). Calling ReshardingOplogBatchApplier::applyBatch<false>() first
+    // though allows CRUD application to be concurrent with preparing the writer vectors for session
+    // application in addition to being concurrent with session application itself.
+    batchApplierFutures.reserve(2 * crudWriterVectors.size());
 
-    // It is safe to capture `this` because PrimaryOnlyService and RecipientStateMachine
-    // collectively guarantee that the ReshardingOplogApplier instances will outlive `_executor` and
-    // `_writerPool`.
-    return ExecutorFuture(_executor)
-        .then([this, cancelToken] { return _scheduleNextBatch(cancelToken); })
-        .onError([this](Status status) { return _onError(status); });
-}
-
-ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch(CancellationToken cancelToken) {
-    return ExecutorFuture(_executor)
-        .then([this, cancelToken] {
-            auto batchClient = makeKillableClient(_service(), kClientName);
-            AlternativeClientRegion acr(batchClient);
-
-            return _oplogIter->getNextBatch(_executor, cancelToken);
-        })
-        .then([this](OplogBatch batch) {
-            LOGV2_DEBUG(5391002, 3, "Starting batch", "batchSize"_attr = batch.size());
-            _currentBatchToApply = std::move(batch);
-
-            auto applyBatchClient = makeKillableClient(_service(), kClientName);
-            AlternativeClientRegion acr(applyBatchClient);
-            auto applyBatchOpCtx = makeInterruptibleOperationContext();
-
-            return _applyBatch(applyBatchOpCtx.get(), false /* isForSessionApplication */);
-        })
-        .then([this] {
-            auto applyBatchClient = makeKillableClient(_service(), kClientName);
-            AlternativeClientRegion acr(applyBatchClient);
-            auto applyBatchOpCtx = makeInterruptibleOperationContext();
-
-            return _applyBatch(applyBatchOpCtx.get(), true /* isForSessionApplication */);
-        })
-        .then([this] {
-            _env->metrics()->onOplogEntriesApplied(_currentBatchToApply.size());
-
-            if (_currentBatchToApply.empty()) {
-                // It is possible that there are no more oplog entries from the last point we
-                // resumed from.
-                if (_stage == ReshardingOplogApplier::Stage::kStarted) {
-                    _stage = ReshardingOplogApplier::Stage::kReachedCloningTS;
-                } else if (_stage == ReshardingOplogApplier::Stage::kReachedCloningTS) {
-                    _stage = ReshardingOplogApplier::Stage::kFinished;
-                }
-                return false;
-            }
-
-            auto lastApplied = _currentBatchToApply.back();
-
-            auto scheduleBatchClient = makeKillableClient(_service(), kClientName);
-            AlternativeClientRegion acr(scheduleBatchClient);
-            auto opCtx = makeInterruptibleOperationContext();
-
-            auto lastAppliedTs = _clearAppliedOpsAndStoreProgress(opCtx.get());
-
-            if (_stage == ReshardingOplogApplier::Stage::kStarted &&
-                lastAppliedTs >= _reshardingCloneFinishedTs) {
-                _stage = ReshardingOplogApplier::Stage::kReachedCloningTS;
-                // TODO: SERVER-51741 preemptively schedule next batch
-                return false;
-            }
-
-            return true;
-        })
-        .then([this, cancelToken](bool moreToApply) {
-            if (!moreToApply) {
-                return ExecutorFuture(_executor);
-            }
-
-            if (cancelToken.isCanceled()) {
-                return ExecutorFuture<void>(
-                    _executor,
-                    Status{ErrorCodes::CallbackCanceled,
-                           "Resharding oplog applier aborting due to abort or stepdown"});
-            }
-            return _scheduleNextBatch(cancelToken);
-        });
-}
-
-Future<void> ReshardingOplogApplier::_applyBatch(OperationContext* opCtx,
-                                                 bool isForSessionApplication) {
-    if (isForSessionApplication) {
-        _currentWriterVectors = _batchPreparer.makeSessionOpWriterVectors(_currentBatchToApply);
-    } else {
-        _currentWriterVectors =
-            _batchPreparer.makeCrudOpWriterVectors(_currentBatchToApply, _currentDerivedOps);
-    }
-
-    auto pf = makePromiseFuture<void>();
-
-    {
-        stdx::lock_guard lock(_mutex);
-        _currentApplyBatchPromise = std::move(pf.promise);
-        _remainingWritersToWait = _currentWriterVectors.size();
-        _currentBatchConsolidatedStatus = Status::OK();
-    }
-
-    for (auto&& writer : _currentWriterVectors) {
-        if (writer.empty()) {
-            _onWriterVectorDone(Status::OK());
-            continue;
-        }
-
-        _writerPool->schedule([this, &writer](auto scheduleStatus) {
-            if (!scheduleStatus.isOK()) {
-                _onWriterVectorDone(scheduleStatus);
-            } else {
-                _onWriterVectorDone(_applyOplogBatchPerWorker(&writer));
-            }
-        });
-    }
-
-    return std::move(pf.future);
-}
-
-Status ReshardingOplogApplier::_applyOplogBatchPerWorker(
-    std::vector<const repl::OplogEntry*>* ops) {
-    auto opCtx = makeInterruptibleOperationContext();
-
-    for (const auto& op : *ops) {
-        try {
-            auto status = _applyOplogEntry(opCtx.get(), *op);
-
-            if (!status.isOK()) {
-                return status;
-            }
-        } catch (const DBException& ex) {
-            return ex.toStatus();
+    for (auto&& writer : crudWriterVectors) {
+        if (!writer.empty()) {
+            batchApplierFutures.emplace_back(
+                _batchApplier
+                    .applyBatch<false>(std::move(writer), executor, errorSource.token(), factory)
+                    .share());
         }
     }
 
-    return Status::OK();
-}
+    auto sessionWriterVectors = _batchPreparer.makeSessionOpWriterVectors(
+        _currentBatchToApply, _currentDerivedOpsForSessionWriters);
+    batchApplierFutures.reserve(crudWriterVectors.size() + sessionWriterVectors.size());
 
-Status ReshardingOplogApplier::_applyOplogEntry(OperationContext* opCtx,
-                                                const repl::OplogEntry& op) {
-    // Unlike normal secondary replication, we want the write to generate it's own oplog entry.
-    invariant(opCtx->writesAreReplicated());
-
-    if (op.isForReshardingSessionApplication()) {
-        auto hitPreparedTxn = _sessionApplication.tryApplyOperation(opCtx, op);
-
-        if (hitPreparedTxn) {
-            hitPreparedTxn->get(opCtx);
-            uassert(5538400,
-                    str::stream() << "Hit prepared transaction twice while applying oplog entry: "
-                                  << redact(op.toBSONForLogging()),
-                    !_sessionApplication.tryApplyOperation(opCtx, op));
+    for (auto&& writer : sessionWriterVectors) {
+        if (!writer.empty()) {
+            batchApplierFutures.emplace_back(
+                _batchApplier
+                    .applyBatch<true>(std::move(writer), executor, errorSource.token(), factory)
+                    .share());
         }
-
-        return Status::OK();
     }
 
-    invariant(op.isCrudOpType());
-    return _applicationRules.applyOperation(opCtx, op);
-}
-
-Status ReshardingOplogApplier::_onError(Status status) {
-    _stage = ReshardingOplogApplier::Stage::kErrorOccurred;
-    return status;
-}
-
-void ReshardingOplogApplier::_onWriterVectorDone(Status status) {
-    auto finalStatus = ([this, &status] {
-        boost::optional<Status> statusToReturn;
-
-        stdx::lock_guard lock(_mutex);
-        invariant(_remainingWritersToWait > 0);
-        _remainingWritersToWait--;
-
-        if (!status.isOK()) {
+    return resharding::cancelWhenAnyErrorThenQuiesce(batchApplierFutures, executor, errorSource)
+        .onError([](Status status) {
             LOGV2_ERROR(
                 5012004, "Failed to apply operation in resharding", "error"_attr = redact(status));
-            _currentBatchConsolidatedStatus = std::move(status);
-        }
+            return status;
+        })
+        .onCompletion([this, latencyTimer](Status status) {
+            _env->applierMetrics()->onOplogLocalBatchApplied(
+                duration_cast<Milliseconds>(latencyTimer.elapsed()));
 
-        if (_remainingWritersToWait == 0) {
-            statusToReturn = _currentBatchConsolidatedStatus;
-        }
+            return status;
+        })
+        .semi();
+}
 
-        return statusToReturn;
-    })();
+SemiFuture<void> ReshardingOplogApplier::run(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
+    struct ChainContext {
+        std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIter;
+        Timer fetchTimer;
+    };
 
-    // Note: We ready _currentApplyBatchPromise without holding the mutex so the
-    // ReshardingOplogApplier is safe to destruct immediately after a batch has been applied.
-    if (finalStatus) {
-        if (finalStatus->isOK()) {
-            _currentApplyBatchPromise.emplaceValue();
-        } else {
-            _currentApplyBatchPromise.setError(*finalStatus);
-        }
-    }
+    auto chainCtx = std::make_shared<ChainContext>();
+    chainCtx->oplogIter = std::move(_oplogIter);
+
+    return AsyncTry([this, chainCtx, executor, cancelToken, factory] {
+               chainCtx->fetchTimer.reset();
+               return chainCtx->oplogIter->getNextBatch(executor, cancelToken, factory)
+                   .thenRunOn(executor)
+                   .then([this, chainCtx, executor, cancelToken, factory](OplogBatch batch) {
+                       LOGV2_DEBUG(5391002, 3, "Starting batch", "batchSize"_attr = batch.size());
+
+                       _env->applierMetrics()->onBatchRetrievedDuringOplogApplying(
+                           duration_cast<Milliseconds>(chainCtx->fetchTimer.elapsed()));
+
+                       _currentBatchToApply = std::move(batch);
+                       return _applyBatch(executor, cancelToken, factory);
+                   })
+                   .then([this, executor, cancelToken, factory] {
+                       if (MONGO_unlikely(reshardingApplyOplogBatchTwice.shouldFail())) {
+                           LOGV2(5687600,
+                                 "reshardingApplyOplogBatchTwice failpoint enabled, applying batch "
+                                 "a second time",
+                                 "batchSize"_attr = _currentBatchToApply.size());
+                           _currentDerivedOpsForCrudWriters.clear();
+                           _currentDerivedOpsForSessionWriters.clear();
+                           return _applyBatch(executor, cancelToken, factory);
+                       }
+                       return SemiFuture<void>();
+                   })
+                   .then([this, factory] {
+                       if (_currentBatchToApply.empty()) {
+                           // Increment the number of entries applied by 1 in order to account for
+                           // the final oplog entry that the iterator never returns because it's a
+                           // known no-op oplog entry.
+                           _env->applierMetrics()->onOplogEntriesApplied(1);
+
+                           return false;
+                       }
+
+                       auto opCtx = factory.makeOperationContext(&cc());
+                       _clearAppliedOpsAndStoreProgress(opCtx.get());
+                       return true;
+                   });
+           })
+        .until([](const StatusWith<bool>& swMoreToApply) {
+            return !swMoreToApply.isOK() || !swMoreToApply.getValue();
+        })
+        .on(executor, cancelToken)
+        .ignoreValue()
+        .thenRunOn(std::move(cleanupExecutor))
+        // It is unsafe to capture `this` once the task is running on the cleanupExecutor because
+        // RecipientStateMachine, along with its ReshardingOplogApplier member, may have already
+        // been destructed.
+        .onCompletion([chainCtx](Status status) {
+            if (chainCtx->oplogIter) {
+                // Use a separate Client to make a better effort of calling dispose() even when the
+                // CancellationToken has been canceled.
+                auto client = cc().getServiceContext()
+                                  ->getService(ClusterRole::ShardServer)
+                                  ->makeClient("ReshardingOplogApplierCleanupClient");
+
+                // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+                {
+                    stdx::lock_guard<Client> lk(*client.get());
+                    client.get()->setSystemOperationUnkillableByStepdown(lk);
+                }
+
+                AlternativeClientRegion acr(client);
+                auto opCtx = cc().makeOperationContext();
+
+                chainCtx->oplogIter->dispose(opCtx.get());
+                chainCtx->oplogIter.reset();
+            }
+
+            return status;
+        })
+        .semi();
 }
 
 boost::optional<ReshardingOplogApplierProgress> ReshardingOplogApplier::checkStoredProgress(
     OperationContext* opCtx, const ReshardingSourceId& id) {
     DBDirectClient client(opCtx);
     auto doc = client.findOne(
-        NamespaceString::kReshardingApplierProgressNamespace.ns(),
+        NamespaceString::kReshardingApplierProgressNamespace,
         BSON(ReshardingOplogApplierProgress::kOplogSourceIdFieldName << id.toBSON()));
 
     if (doc.isEmpty()) {
         return boost::none;
     }
 
-    IDLParserErrorContext ctx("ReshardingOplogApplierProgress");
+    IDLParserContext ctx("ReshardingOplogApplierProgress");
     return ReshardingOplogApplierProgress::parse(ctx, doc);
 }
 
-Timestamp ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress(OperationContext* opCtx) {
+void ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress(OperationContext* opCtx) {
     const auto& lastOplog = _currentBatchToApply.back();
 
-    auto oplogId =
-        ReshardingDonorOplogId::parse(IDLParserErrorContext("ReshardingOplogApplierStoreProgress"),
-                                      lastOplog.get_id()->getDocument().toBson());
-
-    // TODO: take multi statement transactions into account.
-
-    auto lastAppliedTs = lastOplog.getTimestamp();
+    auto oplogId = ReshardingDonorOplogId::parse(
+        IDLParserContext{"ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress"},
+        lastOplog.get_id()->getDocument().toBson());
 
     PersistentTaskStore<ReshardingOplogApplierProgress> store(
         NamespaceString::kReshardingApplierProgressNamespace);
+
+    BSONObjBuilder builder;
+    builder.append("$set",
+                   BSON(ReshardingOplogApplierProgress::kProgressFieldName << oplogId.toBSON()));
+    builder.append("$inc",
+                   BSON(ReshardingOplogApplierProgress::kNumEntriesAppliedFieldName
+                        << static_cast<long long>(_currentBatchToApply.size())));
+
+    builder.append("$set",
+                   BSON(ReshardingOplogApplierProgress::kInsertsAppliedFieldName
+                        << _env->applierMetrics()->getInsertsApplied()));
+    builder.append("$set",
+                   BSON(ReshardingOplogApplierProgress::kUpdatesAppliedFieldName
+                        << _env->applierMetrics()->getUpdatesApplied()));
+    builder.append("$set",
+                   BSON(ReshardingOplogApplierProgress::kDeletesAppliedFieldName
+                        << _env->applierMetrics()->getDeletesApplied()));
+    builder.append("$set",
+                   BSON(ReshardingOplogApplierProgress::kWritesToStashCollectionsFieldName
+                        << _env->applierMetrics()->getWritesToStashCollections()));
+
     store.upsert(
         opCtx,
-        QUERY(ReshardingOplogApplierProgress::kOplogSourceIdFieldName << _sourceId.toBSON()),
-        BSON("$set" << BSON(ReshardingOplogApplierProgress::kProgressFieldName
-                            << oplogId.toBSON())));
+        BSON(ReshardingOplogApplierProgress::kOplogSourceIdFieldName << _sourceId.toBSON()),
+        builder.obj(),
+        WriteConcerns::kLocalWriteConcern);
+
+    _env->applierMetrics()->onOplogEntriesApplied(_currentBatchToApply.size());
 
     _currentBatchToApply.clear();
-    _currentDerivedOps.clear();
-
-    return lastAppliedTs;
+    _currentDerivedOpsForCrudWriters.clear();
+    _currentDerivedOpsForSessionWriters.clear();
 }
 
 NamespaceString ReshardingOplogApplier::ensureStashCollectionExists(
@@ -360,7 +311,7 @@ NamespaceString ReshardingOplogApplier::ensureStashCollectionExists(
     const UUID& existingUUID,
     const ShardId& donorShardId,
     const CollectionOptions& options) {
-    auto nss = getLocalConflictStashNamespace(existingUUID, donorShardId);
+    auto nss = resharding::getLocalConflictStashNamespace(existingUUID, donorShardId);
 
     resharding::data_copy::ensureCollectionExists(opCtx, nss, options);
     return nss;

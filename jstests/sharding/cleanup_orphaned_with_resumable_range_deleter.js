@@ -8,9 +8,8 @@
  *    once all orphans have been deleted.
  */
 
-(function() {
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -19,8 +18,8 @@ const ns = dbName + "." + collName;
 var st = new ShardingTest({shards: 2});
 
 jsTest.log("Shard and split a collection");
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 1}}));
@@ -75,4 +74,3 @@ assert.eq(0, st.shard0.getDB(dbName).getCollection(collName).count());
 assert.eq(null, res.stoppedAtKey);
 
 st.stop();
-})();

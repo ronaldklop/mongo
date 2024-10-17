@@ -1,8 +1,7 @@
 // ensure removing a chained node does not break reporting of replication progress (SERVER-15849)
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {syncFrom} from "jstests/replsets/rslib.js";
 
 var numNodes = 5;
 var host = getHostName();
@@ -23,6 +22,11 @@ replTest.initiate({
 });
 replTest.awaitNodesAgreeOnPrimary(replTest.kDefaultTimeoutMS, nodes, nodes[0]);
 var primary = replTest.getPrimary();
+// The default WC is majority and stopServerReplication could prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 replTest.awaitReplication();
 
 // When setting up chaining on slow machines, we do not want slow writes or delayed heartbeats
@@ -70,4 +74,3 @@ options.writeConcern.w = 4;
 assert.commandWorked(primary.getDB(name).foo.insert({x: 2}, options));
 
 replTest.stopSet();
-}());

@@ -27,26 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/commands/internal_rename_if_options_and_indexes_match_gen.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/commands/internal_rename_if_options_and_indexes_match_gen.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
-bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead lock(opCtx, nss);
-    return opCtx->writesAreReplicated() &&
-        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
-}
-
-}  // namespace
+MONGO_FAIL_POINT_DEFINE(blockBeforeInternalRenameAndBeforeTakingDDLLocks);
 
 /**
  * Rename a collection while checking collection option and indexes.
@@ -62,29 +75,67 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             auto thisRequest = request();
-            auto toNss = thisRequest.getTo();
+            const auto& fromNss = thisRequest.getFrom();
+            const auto& toNss = thisRequest.getTo();
+            const auto& originalIndexes = thisRequest.getIndexes();
+            const auto indexList =
+                std::list<BSONObj>(originalIndexes.begin(), originalIndexes.end());
+            const auto& collectionOptions = thisRequest.getCollectionOptions();
 
-            uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << "cannot rename to sharded collection '" << toNss << "'",
-                    !isCollectionSharded(opCtx, toNss));
+            if (MONGO_unlikely(blockBeforeInternalRenameAndBeforeTakingDDLLocks.shouldFail())) {
+                blockBeforeInternalRenameAndBeforeTakingDDLLocks.pauseWhileSet();
+            }
 
-            auto originalIndexes = thisRequest.getIndexes();
-            auto indexList = std::list<BSONObj>(originalIndexes.begin(), originalIndexes.end());
-            RenameCollectionOptions options;
-            options.dropTarget = true;
-            options.stayTemp = false;
-            doLocalRenameIfOptionsAndIndexesHaveNotChanged(opCtx,
-                                                           thisRequest.getFrom(),
-                                                           toNss,
-                                                           options,
-                                                           std::move(indexList),
-                                                           thisRequest.getCollectionOptions());
+            if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+                // No need to acquire additional locks in a non-sharded environment
+                _internalRun(opCtx, fromNss, toNss, indexList, collectionOptions);
+            } else {
+                // Sharded environment. Run the _shardsvrRenameCollection command, which will use
+                // the RenameCollectionCoordinator.
+                RenameCollectionRequest renameCollectionRequest(toNss);
+                renameCollectionRequest.setDropTarget(true);
+                renameCollectionRequest.setExpectedIndexes(originalIndexes);
+                renameCollectionRequest.setExpectedCollectionOptions(collectionOptions);
+                // TODO: SERVER-81975 (PM-1931) remove this once we enable support for $out to
+                // sharded collections.
+                renameCollectionRequest.setTargetMustNotBeSharded(true);
+
+                ShardsvrRenameCollection shardsvrRenameCollectionRequest(fromNss);
+                shardsvrRenameCollectionRequest.setRenameCollectionRequest(renameCollectionRequest);
+
+                // _shardsvrRenameCollecion requires majority write concern.
+                generic_argument_util::setMajorityWriteConcern(shardsvrRenameCollectionRequest);
+
+                DBDirectClient client(opCtx);
+                BSONObj cmdResult;
+                client.runCommand(
+                    fromNss.dbName(), shardsvrRenameCollectionRequest.toBSON(), cmdResult);
+                uassertStatusOK(getStatusFromCommandResult(cmdResult));
+            }
         }
 
     private:
+        static void _internalRun(OperationContext* opCtx,
+                                 const NamespaceString& fromNss,
+                                 const NamespaceString& toNss,
+                                 const std::list<BSONObj>& indexList,
+                                 const BSONObj& collectionOptions) {
+            RenameCollectionOptions options;
+            options.dropTarget = true;
+            options.stayTemp = false;
+            options.originalIndexes = indexList;
+            options.originalCollectionOptions = collectionOptions;
+            doLocalRenameIfOptionsAndIndexesHaveNotChanged(opCtx, fromNss, toNss, options);
+        }
+
         NamespaceString ns() const override {
             return request().getFrom();
         }
+
+        const DatabaseName& db() const override {
+            return request().getDbName();
+        }
+
         bool supportsWriteConcern() const override {
             return true;
         }
@@ -94,22 +145,27 @@ public:
             auto from = thisRequest.getFrom();
             auto to = thisRequest.getTo();
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to rename " << from,
+                    str::stream() << "Unauthorized to rename " << from.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(from),
                                                            ActionType::renameCollection));
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to drop " << to,
+                    str::stream() << "Unauthorized to drop " << to.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(to),
                                                            ActionType::dropCollection));
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to insert into " << to,
+                    str::stream() << "Unauthorized to insert into " << to.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(to),
                                                            ActionType::insert));
         }
     };
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command to rename and check collection options";
@@ -122,6 +178,8 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
+};
+MONGO_REGISTER_COMMAND(InternalRenameIfOptionsAndIndexesMatchCmd).forShard();
 
-} internalRenameIfOptionsAndIndexesMatchCmd;
+}  // namespace
 }  // namespace mongo

@@ -28,10 +28,28 @@
  */
 #include "mongo/client/sdam/topology_manager.h"
 
-#include <boost/optional/optional_io.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/sdam/sdam_test_base.h"
-#include "mongo/unittest/death_test.h"
+#include "mongo/client/sdam/server_description.h"
+#include "mongo/client/sdam/topology_description.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo {
@@ -60,7 +78,7 @@ protected:
     static inline const auto kBsonTopologyVersionHigh =
         okBuilder().append("topologyVersion", TopologyVersion(OID::max(), 1).toBSON()).obj();
     static inline const auto kBsonRsPrimary = okBuilder()
-                                                  .append("ismaster", true)
+                                                  .append("isWritablePrimary", true)
                                                   .append("setName", kSetName)
                                                   .append("minWireVersion", 2)
                                                   .append("maxWireVersion", 10)
@@ -108,7 +126,7 @@ TEST_F(TopologyManagerTestFixture,
        ShouldUpdateServerDescriptionsTopologyDescriptionPtrWhenTopologyDescriptionIsInstalled) {
     auto checkServerTopologyDescriptionMatches = [](TopologyDescriptionPtr topologyDescription) {
         auto rawTopologyDescPtr = topologyDescription.get();
-        for (auto server : topologyDescription->getServers()) {
+        for (const auto& server : topologyDescription->getServers()) {
             auto rawServerTopologyDescPtr = (*server->getTopologyDescription()).get();
             ASSERT(server->getTopologyDescription());
             ASSERT(rawServerTopologyDescPtr == rawTopologyDescPtr);

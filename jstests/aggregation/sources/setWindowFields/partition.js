@@ -8,17 +8,8 @@
  *   do_not_wrap_aggregations_in_facets,
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');  // For resultsEq.
-const getParam = db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1});
-jsTestLog(getParam);
-const featureEnabled = assert.commandWorked(getParam).featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
+import {resultsEq} from "jstests/aggregation/extras/utils.js";
+import {getSingleNodeExplain} from "jstests/libs/query/analyze_plan.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -41,16 +32,16 @@ assert.commandFailedWithCode(coll.runCommand({
 // Test that a constant expression for 'partitionBy' is equivalent to no partitioning.
 const constantPartitionExprs = [null, "constant", {$add: [1, 2]}];
 constantPartitionExprs.forEach(function(partitionExpr) {
-    const result = coll.explain().aggregate([
+    const result = assert.commandWorked(coll.explain().aggregate([
         // prevent stages from being absorbed into the .find() layer
         {$_internalInhibitOptimization: {}},
         {$setWindowFields: {partitionBy: partitionExpr, output: {}}},
-    ]);
-    assert.commandWorked(result);
-    assert(Array.isArray(result.stages), result);
-    assert(result.stages[0].$cursor, result);
-    assert(result.stages[1].$_internalInhibitOptimization, result);
-    assert.eq({$_internalSetWindowFields: {output: {}}}, result.stages[2]);
+    ]));
+    const explain = getSingleNodeExplain(result);
+    assert(Array.isArray(explain.stages), explain);
+    assert(explain.stages[0].$cursor, explain);
+    assert(explain.stages[1].$_internalInhibitOptimization, explain);
+    assert.eq({$_internalSetWindowFields: {output: {}}}, explain.stages[2], explain);
 });
 
 coll.drop();
@@ -95,4 +86,3 @@ assert(resultsEq(res.toArray(), [
     {int_field: 0, count: 1},
     {other_field: 0, count: 1}
 ]));
-})();

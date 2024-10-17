@@ -1,6 +1,5 @@
 /**
- * Demonstrate that durable history can be used across a restart. Also assert that any
- * collection/index minimum visible timestamps are set to legal values. The rough test outline:
+ * Demonstrate that durable history can be used across a restart. The rough test outline:
  *
  * 1) Create a collection `existsAtOldestTs`. This collection and its `_id` index should be readable
  *    across a restart.
@@ -9,10 +8,13 @@
  *    restart. This is a conservative behavior that is perfectly reasonable to later relax.
  * 4) Create a collection `dneAtOldestTs`. This collection should not be readable across a restart.
  *
- * @tags: [requires_fcv_49, requires_majority_read_concern, requires_persistence]
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ * ]
  */
-(function() {
-"use strict";
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 let replTest = new ReplSetTest({
     name: "use_history_after_restart",
@@ -116,7 +118,10 @@ assert.eq(2, result["cursor"]["firstBatch"].length);
 result = primary.getDB("test").runCommand(
     {find: "dneAtOldestTs", readConcern: {level: "snapshot", atClusterTime: oldestTimestamp}});
 jsTestLog({"SnapshotUnavailable on dneAtOldestTs": result});
-assert.commandFailedWithCode(result, ErrorCodes.SnapshotUnavailable);
+
+// The collection does not exist at this time so find will return an empty result set.
+assert.commandWorked(result);
+assert.eq(0, result["cursor"]["firstBatch"].length);
 
 // Querying `dneAtOldestTs` at the stable timestamp should succeed with a correct result.
 result = primary.getDB("test").runCommand(
@@ -125,4 +130,3 @@ jsTestLog({"Available dneAtOldestTs result": result});
 assert.eq(1, result["cursor"]["firstBatch"].length);
 
 replTest.stopSet();
-})();

@@ -27,29 +27,28 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
+#include <wiredtiger.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
 using std::string;
-
-WiredTigerServerStatusSection::WiredTigerServerStatusSection(WiredTigerKVEngine* engine)
-    : ServerStatusSection(kWiredTigerEngineName), _engine(engine) {}
 
 bool WiredTigerServerStatusSection::includeByDefault() const {
     return true;
@@ -57,43 +56,20 @@ bool WiredTigerServerStatusSection::includeByDefault() const {
 
 BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
                                                        const BSONElement& configElement) const {
-    Lock::GlobalLock lk(
-        opCtx, LockMode::MODE_IS, Date_t::now(), Lock::InterruptBehavior::kLeaveUnlocked);
-    if (!lk.isLocked()) {
-        LOGV2_DEBUG(3088800, 2, "Failed to retrieve wiredTiger statistics");
-        return BSONObj();
-    }
-
-    // The session does not open a transaction here as one is not needed and opening one would
-    // mean that execution could become blocked when a new transaction cannot be allocated
-    // immediately.
-    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
-    invariant(session);
-
-    WT_SESSION* s = session->getSession();
-    invariant(s);
-    const string uri = "statistics:";
-
-    // Filter out unrelevant statistic fields.
-    std::vector<std::string> fieldsToIgnore = {"LSM"};
+    WiredTigerKVEngine* engine = checked_cast<WiredTigerKVEngine*>(
+        opCtx->getServiceContext()->getStorageEngine()->getEngine());
 
     BSONObjBuilder bob;
-    Status status =
-        WiredTigerUtil::exportTableToBSON(s, uri, "statistics=(fast)", &bob, fieldsToIgnore);
-    if (!status.isOK()) {
-        bob.append("error", "unable to retrieve statistics");
-        bob.append("code", static_cast<int>(status.code()));
-        bob.append("reason", status.reason());
+    if (!WiredTigerUtil::collectConnectionStatistics(engine, bob)) {
+        LOGV2_DEBUG(7003148, 2, "WiredTiger is not ready to collect statistics.");
     }
 
-    WiredTigerKVEngine::appendGlobalStats(bob);
-
-    WiredTigerUtil::appendSnapshotWindowSettings(_engine, session, &bob);
+    WiredTigerUtil::appendSnapshotWindowSettings(engine, &bob);
 
     {
         BSONObjBuilder subsection(bob.subobjStart("oplog"));
         subsection.append("visibility timestamp",
-                          Timestamp(_engine->getOplogManager()->getOplogReadTimestamp()));
+                          Timestamp(engine->getOplogManager()->getOplogReadTimestamp()));
     }
 
     return bob.obj();

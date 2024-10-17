@@ -15,12 +15,16 @@
 // chunk is empty.
 //
 
-load('./jstests/libs/chunk_manipulation_util.js');
+import {
+    migrateStepNames,
+    moveChunkParallel,
+    pauseMigrateAtStep,
+    unpauseMigrateAtStep,
+    waitForMigrateStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-"use strict";
-
-var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
+var staticMongod = MongoRunner.runMongod({});
 
 /**
  * Start up new sharded cluster, stop balancer that would interfere in manual chunk management.
@@ -41,8 +45,7 @@ var mongos = st.s0, admin = mongos.getDB('admin'), dbName = "testDB", ns = dbNam
 // Donor:     [0, 20) [20, 40)
 // Recipient:
 jsTest.log('Enabling sharding of the collection and pre-splitting into two chunks....');
-assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(admin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: ns, key: {a: 1}}));
 assert.commandWorked(admin.runCommand({split: ns, middle: {a: 20}}));
 
@@ -140,4 +143,3 @@ assert.eq(1, recipientCollUpdatedNum, "Update failed on recipient shard during m
 jsTest.log('DONE!');
 MongoRunner.stopMongod(staticMongod);
 st.stop();
-})();

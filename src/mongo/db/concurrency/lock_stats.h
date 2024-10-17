@@ -29,7 +29,11 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
@@ -52,6 +56,10 @@ struct CounterOps {
 
     static void set(int64_t& counter, int64_t value) {
         counter = value;
+    }
+
+    static void set(int64_t& counter, const AtomicWord<long long>& value) {
+        counter = value.load();
     }
 
     static void set(AtomicWord<long long>& counter, int64_t value) {
@@ -81,6 +89,13 @@ struct CounterOps {
 template <typename CounterType>
 struct LockStatCounters {
     template <typename OtherType>
+    void set(const LockStatCounters<OtherType>& other) {
+        CounterOps::set(numAcquisitions, other.numAcquisitions);
+        CounterOps::set(numWaits, other.numWaits);
+        CounterOps::set(combinedWaitTimeMicros, other.combinedWaitTimeMicros);
+    }
+
+    template <typename OtherType>
     void append(const LockStatCounters<OtherType>& other) {
         CounterOps::add(numAcquisitions, other.numAcquisitions);
         CounterOps::add(numWaits, other.numWaits);
@@ -101,11 +116,12 @@ struct LockStatCounters {
     }
 
     // The lock statistics we track.
-    CounterType numAcquisitions;
-    CounterType numWaits;
-    CounterType combinedWaitTimeMicros;
+    CounterType numAcquisitions{0};
+    CounterType numWaits{0};
+    CounterType combinedWaitTimeMicros{0};
 };
 
+const ResourceId resourceIdRsOplog(RESOURCE_COLLECTION, NamespaceString::kRsOplogNamespace);
 
 /**
  * Templatized lock statistics management class, which can be specialized with atomic integers
@@ -119,10 +135,21 @@ public:
     // Declare the type for the lock counters bundle
     typedef LockStatCounters<CounterType> LockStatCountersType;
 
-    /**
-     * Initializes the locking statistics with zeroes (calls reset).
-     */
-    LockStats();
+    LockStats() = default;
+    LockStats(const LockStats<CounterType>& other) = default;
+
+    template <typename OtherType>
+    explicit LockStats(const LockStats<OtherType>& other) {
+        set(other);
+    }
+
+    LockStats<CounterType>& operator=(const LockStats<CounterType>& other) = default;
+
+    template <typename OtherType>
+    LockStats<CounterType>& operator=(const LockStats<OtherType>& other) {
+        set(other);
+        return *this;
+    }
 
     void recordAcquisition(ResourceId resId, LockMode mode) {
         CounterOps::add(get(resId, mode).numAcquisitions, 1);
@@ -137,18 +164,59 @@ public:
     }
 
     LockStatCountersType& get(ResourceId resId, LockMode mode) {
-        if (resId == resourceIdOplog) {
+        if (resId == resourceIdRsOplog) {
             return _oplogStats.modeStats[mode];
+        }
+
+        if (resId.getType() == RESOURCE_GLOBAL) {
+            return _resourceGlobalStats[resId.getHashId()].modeStats[mode];
         }
 
         return _stats[resId.getType()].modeStats[mode];
     }
 
     template <typename OtherType>
+    void set(const LockStats<OtherType>& other) {
+        typedef LockStatCounters<OtherType> OtherLockStatCountersType;
+
+        // Set global lock stats.
+        for (uint8_t i = 0; i < static_cast<uint8_t>(ResourceGlobalId::kNumIds); ++i) {
+            for (uint8_t mode = 0; mode < LockModesCount; ++mode) {
+                _resourceGlobalStats[i].modeStats[mode].set(
+                    other._resourceGlobalStats[i].modeStats[mode]);
+            }
+        }
+
+        // Set all non-global, non-oplog lock stats.
+        for (int i = 0; i < ResourceTypesCount; i++) {
+            for (int mode = 0; mode < LockModesCount; mode++) {
+                const OtherLockStatCountersType& otherStats = other._stats[i].modeStats[mode];
+                LockStatCountersType& thisStats = _stats[i].modeStats[mode];
+                thisStats.set(otherStats);
+            }
+        }
+
+        // Set the oplog stats
+        for (int mode = 0; mode < LockModesCount; mode++) {
+            const OtherLockStatCountersType& otherStats = other._oplogStats.modeStats[mode];
+            LockStatCountersType& thisStats = _oplogStats.modeStats[mode];
+            thisStats.set(otherStats);
+        }
+    }
+
+    template <typename OtherType>
     void append(const LockStats<OtherType>& other) {
         typedef LockStatCounters<OtherType> OtherLockStatCountersType;
 
-        // Append all lock stats
+        // Append global lock stats.
+        for (uint8_t i = 0; i < static_cast<uint8_t>(ResourceGlobalId::kNumIds); ++i) {
+            for (uint8_t mode = 0; mode < LockModesCount; ++mode) {
+                _resourceGlobalStats[i].modeStats[mode].append(
+                    other._resourceGlobalStats[i].modeStats[mode]);
+            }
+        }
+
+        // Append all non-global, non-oplog lock stats.
         for (int i = 0; i < ResourceTypesCount; i++) {
             for (int mode = 0; mode < LockModesCount; mode++) {
                 const OtherLockStatCountersType& otherStats = other._stats[i].modeStats[mode];
@@ -169,6 +237,13 @@ public:
     void subtract(const LockStats<OtherType>& other) {
         typedef LockStatCounters<OtherType> OtherLockStatCountersType;
 
+        for (uint8_t i = 0; i < static_cast<uint8_t>(ResourceGlobalId::kNumIds); ++i) {
+            for (uint8_t mode = 0; mode < LockModesCount; ++mode) {
+                _resourceGlobalStats[i].modeStats[mode].subtract(
+                    other._resourceGlobalStats[i].modeStats[mode]);
+            }
+        }
+
         for (int i = 0; i < ResourceTypesCount; i++) {
             for (int mode = 0; mode < LockModesCount; mode++) {
                 const OtherLockStatCountersType& otherStats = other._stats[i].modeStats[mode];
@@ -186,6 +261,7 @@ public:
 
     void report(BSONObjBuilder* builder) const;
     void reset();
+    int64_t getCumulativeWaitTimeMicros() const;
 
 private:
     // Necessary for the append call, which accepts argument of type different than our
@@ -205,9 +281,12 @@ private:
                  const char* resourceTypeName,
                  const PerModeLockStatCounters& stat) const;
 
+    int64_t _getWaitTime(const PerModeLockStatCounters& stat) const;
 
-    // Split the lock stats per resource type. Special-case the oplog so we can collect more
-    // detailed stats for it.
+    // For the global resource, split the lock stats per ID since each one should be reported
+    // separately. For the remaining resources, split the lock stats per resource type. Special-case
+    // the oplog so we can collect more detailed stats for it.
+    PerModeLockStatCounters _resourceGlobalStats[static_cast<uint8_t>(ResourceGlobalId::kNumIds)];
     PerModeLockStatCounters _stats[ResourceTypesCount];
     PerModeLockStatCounters _oplogStats;
 };

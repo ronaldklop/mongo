@@ -27,10 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
 #include "mongo/db/exec/sbe/stages/makeobj.h"
+#include "mongo/db/exec/sbe/stages/project.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo::sbe {
 class MkObjStageTest : public PlanStageTestFixture {
@@ -50,8 +71,8 @@ public:
         be += 4;
         const char* end = be + obj.objsize();
         while (*be != 0) {
-            auto sv = bson::fieldNameView(be);
-            auto [tag, val] = bson::convertFrom(false, be, end, sv.size());
+            auto sv = bson::fieldNameAndLength(be);
+            auto [tag, val] = bson::convertFrom<false>(be, end, sv.size());
             be = bson::advance(be, sv.size());
 
             objView->push_back(sv, tag, val);
@@ -151,14 +172,14 @@ public:
         auto objOutSlotId = generateSlotId();
         auto slotVec = makeSV(generateSlotId(), generateSlotId());
 
-        value::SlotMap<std::unique_ptr<EExpression>> slotMap;
-        slotMap[slotVec[0]] = makeE<EConstant>("one");
-        slotMap[slotVec[1]] = makeE<EConstant>("two");
+        SlotExprPairVector slotExprVec;
+        slotExprVec.emplace_back(slotVec[0], makeE<EConstant>("one"));
+        slotExprVec.emplace_back(slotVec[1], makeE<EConstant>("two"));
 
-        auto makeStageFn = [objOutSlotId, &slotVec, &slotMap](
+        auto makeStageFn = [objOutSlotId, &slotVec, &slotExprVec](
                                value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
             auto project =
-                makeS<ProjectStage>(std::move(scanStage), std::move(slotMap), kEmptyPlanNodeId);
+                makeS<ProjectStage>(std::move(scanStage), std::move(slotExprVec), kEmptyPlanNodeId);
 
             auto mkobj = makeS<MkObjStageType>(std::move(project),
                                                objOutSlotId,
@@ -202,14 +223,14 @@ public:
         auto objOutSlotId = generateSlotId();
         auto slotVec = makeSV(generateSlotId(), generateSlotId());
 
-        value::SlotMap<std::unique_ptr<EExpression>> slotMap;
-        slotMap[slotVec[0]] = makeE<EConstant>("one");
-        slotMap[slotVec[1]] = makeE<EConstant>("two");
+        SlotExprPairVector slotExprVec;
+        slotExprVec.emplace_back(slotVec[0], makeE<EConstant>("one"));
+        slotExprVec.emplace_back(slotVec[1], makeE<EConstant>("two"));
 
-        auto makeStageFn = [objOutSlotId, &slotVec, &slotMap](
+        auto makeStageFn = [objOutSlotId, &slotVec, &slotExprVec](
                                value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
             auto project =
-                makeS<ProjectStage>(std::move(scanStage), std::move(slotMap), kEmptyPlanNodeId);
+                makeS<ProjectStage>(std::move(scanStage), std::move(slotExprVec), kEmptyPlanNodeId);
 
             auto mkobj = makeS<MkObjStageType>(std::move(project),
                                                objOutSlotId,
@@ -248,13 +269,11 @@ public:
                                                         << "one"
                                                         << "c" << 2 << "b"
                                                         << "two")
-                                                <<
-
-                                                BSON("a"
-                                                     << "one"
-                                                     << "b"
-                                                     << "two"
-                                                     << "c" << 3)
+                                                << BSON("a"
+                                                        << "one"
+                                                        << "b"
+                                                        << "two"
+                                                        << "c" << 3)
                                                 << BSON("a"
                                                         << "one"
                                                         << "c" << 2 << "b"

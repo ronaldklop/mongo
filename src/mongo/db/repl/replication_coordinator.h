@@ -29,28 +29,57 @@
 
 #pragma once
 
-#include "mongo/db/repl/replication_coordinator_fwd.h"
-
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_config.h"
 #include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_fwd.h"
 #include "mongo/db/repl/split_horizon.h"
+#include "mongo/db/repl/split_prepare_session_manager.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/idl/generic_argument_gen.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/rpc/topology_version_gen.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/interruptible.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
+
 class CommitQuorumOptions;
 class IndexDescriptor;
 class NamespaceString;
@@ -73,13 +102,17 @@ class ReplSetMetadata;
 namespace repl {
 
 class BackgroundSync;
+
 class HelloResponse;
 class OpTime;
 class OpTimeAndWallTime;
+
 class ReadConcernArgs;
 class ReplSetConfig;
+
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
+
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
 class UpdatePositionArgs;
@@ -109,7 +142,7 @@ public:
         StatusAndDuration(const Status& stat, Milliseconds ms) : status(stat), duration(ms) {}
     };
 
-    virtual ~ReplicationCoordinator();
+    ~ReplicationCoordinator() override;
 
     /**
      * Does any initial bookkeeping needed to start replication, and instructs the other
@@ -117,7 +150,7 @@ public:
      * initialization they need.
      */
     virtual void startup(OperationContext* opCtx,
-                         LastStorageEngineShutdownState lastStorageEngineShutdownState) = 0;
+                         StorageEngine::LastShutdownState lastShutdownState) = 0;
 
     /**
      * Start terminal shutdown.  This causes the topology coordinator to refuse to vote in any
@@ -149,39 +182,19 @@ public:
      * Does whatever cleanup is required to stop replication, including instructing the other
      * components of the replication system to shut down and stop any threads they are using,
      * blocking until all replication-related shutdown tasks are complete.
+     * The parameter `shutdownTimeElapsedBuilder` is for adding time elapsed of tasks done
+     * in this function into one single builder that records the time elapsed during shutdown.
      */
-    virtual void shutdown(OperationContext* opCtx) = 0;
-
-    /**
-     * Performs some bookkeeping to make sure that it's a clean shutdown (i.e. dataset is
-     * consistent with top of the oplog).
-     * This should be called after calling shutdown() and should make sure that that are no
-     * active readers while executing this method as this does perform timestamped storage
-     * writes at lastAppliedTimestamp.
-     */
-    virtual void markAsCleanShutdownIfPossible(OperationContext* opCtx) = 0;
+    virtual void shutdown(OperationContext* opCtx, BSONObjBuilder* shutdownTimeElapsedBuilder) = 0;
 
     /**
      * Returns a reference to the parsed command line arguments that are related to replication.
      */
     virtual const ReplSettings& getSettings() const = 0;
 
-    enum Mode { modeNone = 0, modeReplSet };
-
-    /**
-     * Returns a value indicating whether this node was configured at start-up to run standalone or
-     * as a member of a replica set.
-     */
-    virtual Mode getReplicationMode() const = 0;
-
-    /**
-     * Returns true if this node is configured to be a member of a replica set.
-     */
-    virtual bool isReplEnabled() const = 0;
-
     /**
      * Returns the current replica set state of this node (PRIMARY, SECONDARY, STARTUP, etc).
-     * It is invalid to call this unless getReplicationMode() == modeReplSet.
+     * It is invalid to call this unless getSettings().isReplSet() returns true.
      */
     virtual MemberState getMemberState() const = 0;
 
@@ -195,13 +208,16 @@ public:
      * Returns OK if member state is 'state'.
      * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the state change.
      * Returns ErrorCodes::BadValue if timeout is negative.
+     * Throws if interrupted (pass Interruptible::notInterruptible() if interruption is not desired.
      */
-    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) = 0;
+    virtual Status waitForMemberState(Interruptible* interruptible,
+                                      MemberState expectedState,
+                                      Milliseconds timeout) = 0;
 
     /**
      * Returns true if this node is in state PRIMARY or SECONDARY.
      *
-     * It is invalid to call this unless getReplicationMode() == modeReplSet.
+     * It is invalid to call this unless getSettings().isReplSet() returns true.
      *
      * This method may be optimized to reduce synchronization overhead compared to
      * reading the current member state with getMemberState().
@@ -230,7 +246,7 @@ public:
      * ErrorCodes::ExceededTimeLimit if the opCtx->getMaxTimeMicrosRemaining is reached before
      *     the data has been sufficiently replicated
      * ErrorCodes::NotWritablePrimary if the node is not a writable primary
-     * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
+     * ErrorCodes::UnknownReplWriteConcern if the writeConcern.w contains a write concern
      *     mode that is not known
      * ErrorCodes::ShutdownInProgress if we are mid-shutdown
      * ErrorCodes::Interrupted if the operation was killed with killop()
@@ -274,13 +290,15 @@ public:
      * NOTE: This function can only be meaningfully called while the caller holds the
      * ReplicationStateTransitionLock in some mode other than MODE_NONE.
      */
-    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) = 0;
+    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx,
+                                            const DatabaseName& dbName) = 0;
 
     /**
      * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL, the
      * return value may be inaccurate by the time the function returns.
      */
-    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) = 0;
+    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
+                                                   const DatabaseName& dbName) = 0;
 
     /**
      * Returns true if it is valid for this node to accept writes on the given namespace.
@@ -327,6 +345,9 @@ public:
     /**
      * Returns Status::OK() if it is valid for this node to serve reads on the given collection
      * and an errorcode indicating why the node cannot if it cannot.
+     *
+     * Should not be called if namespace is locked is a view. The user should instead check if we
+     * can serve reads for the backing collection.
      */
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
@@ -350,53 +371,56 @@ public:
                                              const NamespaceString& ns) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime applied to this node. Also updates our
-     * internal tracking of the wall clock time corresponding to that operation.
-     *
-     * The new value of "opTime" must be no less than any prior value passed to this method, and
-     * it is the caller's job to properly synchronize this behavior.  The exception to this rule
-     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
-     * "opTime" is reset based on the contents of the oplog, and may go backwards due to
-     * rollback. Additionally, the optime given MUST represent a consistent database state.
+     * Updates our internal tracking of the last OpTime that an oplog entry is written into memory
+     * on this node if the supplied optime is later than the current lastWritten OpTime.
      */
-    virtual void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+    virtual void setMyLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime durable to this node. Also updates our
-     * internal tracking of the wall clock time corresponding to that operation.
-     *
-     * The new value of "opTime" must be no less than any prior value passed to this method, and
-     * it is the caller's job to properly synchronize this behavior.  The exception to this rule
-     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
-     * "opTime" is reset based on the contents of the oplog, and may go backwards due to
-     * rollback.
-     */
-    virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
-
-    /**
-     * Updates our internal tracking of the last OpTime applied to this node, but only
-     * if the supplied optime is later than the current last OpTime known to the replication
+     * Updates our internal tracking of the last OpTime applied to this node, but only if the
+     * supplied optime is later than the current lastApplied OpTime known to the replication
      * coordinator.
      *
-     * This function is used by logOp() on a primary, since the ops in the oplog do not
-     * necessarily commit in sequential order. It is also used when we finish oplog batch
-     * application on secondaries, to avoid any potential race conditions around setting the
-     * applied optime from more than one thread.
+     * This function is only used on secondary and the caller needs to make sure the input opTime is
+     * not greater than the current lastWritten timestamp.
+     *
+     * Since the last applied op time and wall time might not be visible (i.e. there may be
+     * "oplog holes" from oplog entries with earlier timestamps which commit after this one)
+     * this method does not notify oplog waiters.  Callers which know the new lastApplied is at
+     * a no-holes point should call signalOplogWaiters after calling this method.
      */
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime durable to this node, but only
-     * if the supplied optime is later than the current last OpTime known to the replication
+     * Updates our internal tracking of the last OpTime durable to this node, but only if the
+     * supplied optime is later than the current lastDurable OpTime known to the replication
      * coordinator. Also updates the wall clock time corresponding to that operation.
      *
-     * This function is used by logOp() on a primary, since the ops in the oplog do not
-     * necessarily commit in sequential order.
+     * This function is used by onDurable() hook on secondary, while primary should use
+     * setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward() instead. The caller needs to make
+     * sure the input opTime is not greater than the current lastWritten timestamp.
      */
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime) = 0;
-    // virtual void setMyLastDurableOpTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+
+    /**
+     * Update lastApplied and lastWritten under the same lock guard. This is used by the oplog
+     * onCommit() hook on the primary.
+     */
+    virtual void setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+
+    /**
+     * Update lastDurable and lastWritten under the same lock guard. This should only be used on
+     * primary due to an edge case that the onCommit() hook is stuck at somewhere and lastWritten
+     * has not been updated yet. On secondary, we always write oplog into in-memory collection first
+     * before journal flush, which means that lastWritten should already be updated, so we should
+     * use setMyLastDurableOpTimeAndWallTimeForward() instead.
+     */
+    virtual void setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
      * Same as above, but used during places we need to zero our last optime.
@@ -409,6 +433,22 @@ public:
     virtual void setMyHeartbeatMessage(const std::string& msg) = 0;
 
     /**
+     * Returns the last optime recorded by setMyLastWrittenOpTimeAndWallTimeForward.
+     */
+    virtual OpTime getMyLastWrittenOpTime() const = 0;
+
+    /*
+     * Returns the same as getMyLastWrittenOpTime() and additionally returns the wall clock time
+     * corresponding to that OpTime.
+     *
+     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
+     * state. The lastWrittenOpTime during ROLLBACK might be temporarily pointing to an oplog entry
+     * in the divergent branch of history which would become invalid after the rollback finishes.
+     */
+    virtual OpTimeAndWallTime getMyLastWrittenOpTimeAndWallTime(
+        bool rollbackSafe = false) const = 0;
+
+    /**
      * Returns the last optime recorded by setMyLastAppliedOpTime.
      */
     virtual OpTime getMyLastAppliedOpTime() const = 0;
@@ -416,13 +456,8 @@ public:
     /*
      * Returns the same as getMyLastAppliedOpTime() and additionally returns the wall clock time
      * corresponding to that OpTime.
-     *
-     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
-     * state. The lastAppliedOpTime during ROLLBACK might be temporarily pointing to an oplog entry
-     * in the divergent branch of history which would become invalid after the rollback finishes.
      */
-    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(
-        bool rollbackSafe = false) const = 0;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const = 0;
 
     /**
      * Returns the last optime recorded by setMyLastDurableOpTime.
@@ -458,6 +493,9 @@ public:
      */
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& settings,
+                                               boost::optional<Date_t> deadline) = 0;
+    virtual Status waitUntilOpTimeWrittenUntil(OperationContext* opCtx,
+                                               LogicalTime clusterTime,
                                                boost::optional<Date_t> deadline) = 0;
 
     /**
@@ -523,74 +561,103 @@ public:
      * Step-up
      * =======
      * On stepup, repl coord enters catch-up mode. It's the same as the secondary mode from
-     * the perspective of producer and applier, so there's nothing to do with them.
-     * When a node enters drain mode, producer state = Stopped, applier state = Draining.
+     * the perspective of producer and writer/applier, so there's nothing to do with them.
      *
-     * If the applier state is Draining, it will signal repl coord when there's nothing to apply.
-     * The applier goes into Stopped state at the same time.
+     * When entering drain mode, producer state = Stopped, writer state = Draining, applier
+     * state = Running.
+     *
+     * Once writer is done writing everything, applier state = Draining. Applier will later
+     * signal repl coord when there's nothing to apply. After that both writer and applier
+     * go to the Stopped state.
      *
      * The states go like the following:
-     * - secondary and during catchup mode
-     * (producer: Running, applier: Running)
+     *
+     * - Secondary and during catchup mode:
+     * (producer: Running, writer: Running, applier: Running)
      *      |
-     *      | finish catch-up, enter drain mode
+     *      | finishes catch-up, writer enters drain mode
      *      V
-     * - drain mode
-     * (producer: Stopped, applier: Draining)
+     * - Writer drain mode:
+     * (producer: Stopped, writer: Draining, applier: Running)
      *      |
-     *      | applier signals drain is complete
+     *      | writer signals drain complete, applier enters drain mode
+     *      V
+     * - Applier drain mode:
+     * (producer: Stopped, writer: Draining, applier: Draining)
+     *      |
+     *      | applier signals drain complete
      *      V
      * - primary is in writable mode
-     * (producer: Stopped, applier: Stopped)
+     * (producer: Stopped, writer: Stopped, applier: Stopped)
      *
      *
      * Step-down
      * =========
      * The state transitions become:
-     * - primary is in writable mode
-     * (producer: Stopped, applier: Stopped)
+     *
+     * - Primary is in writable mode:
+     * (producer: Stopped, writer: Stopped, applier: Stopped)
      *      |
-     *      | step down
+     *      | steps down
      *      V
-     * - secondary mode, starting bgsync
-     * (producer: Starting, applier: Running)
+     * - Secondary mode, starting bgsync:
+     * (producer: Starting, writer: Running, applier: Running)
      *      |
      *      | bgsync runs start()
      *      V
-     * - secondary mode, normal
-     * (producer: Running, applier: Running)
+     * - Secondary mode, normal:
+     * (producer: Running, Writer: Running, applier: Running)
      *
      * When a node steps down during draining mode, it's OK to change from (producer: Stopped,
-     * applier: Draining) to (producer: Starting, applier: Running).
+     * writer: Draining, applier: Running/Draining) to (producer: Starting, writer: Running,
+     * applier: Running).
      *
      * When a node steps down during catchup mode, the states remain the same (producer: Running,
-     * applier: Running).
+     * writer: Running, applier: Running).
      */
-    enum class ApplierState { Running, Draining, Stopped };
+    enum class OplogSyncState {
+        Running,
+        WriterDraining,
+        ApplierDraining,
+        Stopped,
+    };
 
     /**
-     * In normal cases: Running -> Draining -> Stopped -> Running.
-     * Draining -> Running is also possible if a node steps down during drain mode.
+     * In normal cases: Running -> WriterDraining -> ApplierDraining -> Stopped -> Running.
+     * WriterDraining/ApplierDraining -> Running is also possible if the node steps down
+     * during drain mode.
      *
-     * Only the applier can make the transition from Draining to Stopped by calling
-     * signalDrainComplete().
+     * Only the applier can make the transition from ApplierDraining to Stopped by calling
+     * signalApplierDrainComplete().
      */
-    virtual ApplierState getApplierState() = 0;
+    virtual OplogSyncState getOplogSyncState() = 0;
+
+    /**
+     * Signals that a previously requested pause and drain of the writer buffer
+     * has completed.
+     *
+     * This is an interface that allows the writer to notify the applier buffer
+     * to start draining.
+     */
+    virtual void signalWriterDrainComplete(OperationContext* opCtx,
+                                           long long termWhenExhausted) = 0;
 
     /**
      * Signals that a previously requested pause and drain of the applier buffer
      * has completed.
      *
-     * This is an interface that allows the applier to reenable writes after
-     * a successful election triggers the draining of the applier buffer.
+     * This is an interface that allows the applier to reenable writes after a
+     * successful election triggers the draining of the applier buffer.
      *
-     * The applier signals drain complete when the buffer is empty and it's in Draining
+     * The applier signals drain complete when its buffer is empty and it is in Draining
      * state. We need to make sure the applier checks both conditions in the same term.
      * Otherwise, it's possible that the applier confirms the empty buffer, but the node
-     * steps down and steps up so quickly that the applier signals drain complete in the wrong
-     * term.
+     * steps down and steps up so quickly that the applier signals drain complete in the
+     * wrong term.
      */
-    virtual void signalDrainComplete(OperationContext* opCtx, long long termWhenBufferIsEmpty) = 0;
+    virtual void signalApplierDrainComplete(OperationContext* opCtx,
+                                            long long termWhenExhausted) noexcept = 0;
+
 
     /**
      * Signals the sync source feedback thread to wake up and send a handshake and
@@ -610,7 +677,8 @@ public:
      * Handles an incoming replSetGetStatus command. Adds BSON to 'result'. If kInitialSync is
      * requested but initial sync is not running, kBasic will be used.
      */
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result,
+    virtual Status processReplSetGetStatus(OperationContext* opCtx,
+                                           BSONObjBuilder* result,
                                            ReplSetGetStatusResponseStyle responseStyle) = 0;
 
     /**
@@ -621,8 +689,93 @@ public:
 
     /**
      * Returns a copy of the current ReplSetConfig.
+     *
+     * To avoid unnecessarily copying the ReplSetConfig through this method, please use the
+     * getConfig* methods below if you are only accessing a specific field of the ReplSetConfig,
+     * i.e. replCoord->getConfigNumMembers() instead of replCoord->getConfig().getNumMembers(). See
+     * SERVER-47828.
      */
     virtual ReplSetConfig getConfig() const = 0;
+
+    /**
+     * Returns the current ReplSetConfig's connection string.
+     */
+    virtual ConnectionString getConfigConnectionString() const = 0;
+
+    /**
+     * Returns the current ReplSetConfig's election timeout period.
+     */
+    virtual Milliseconds getConfigElectionTimeoutPeriod() const = 0;
+
+    /**
+     * Returns the current ReplSetConfig's voting members.
+     */
+    virtual std::vector<MemberConfig> getConfigVotingMembers() const = 0;
+
+    /**
+     * Returns how many voting members there are for the current ReplSetConfig.
+     */
+    virtual size_t getNumConfigVotingMembers() const = 0;
+
+    /**
+     * Returns the current ReplSetConfig's term.
+     */
+    virtual std::int64_t getConfigTerm() const = 0;
+
+    /**
+     * Returns the current ReplSetConfig's version.
+     */
+    virtual std::int64_t getConfigVersion() const = 0;
+
+    /**
+     * Returns the (version, term) pair of the current ReplSetConfig.
+     */
+    virtual ConfigVersionAndTerm getConfigVersionAndTerm() const = 0;
+
+    /**
+     * Returns the number of members in the current ReplSetConfig.
+     */
+    virtual int getConfigNumMembers() const = 0;
+
+    /**
+     * Returns the amount of time to wait for a response to heartbeats sent to other
+     * nodes in the current ReplSetConfig.
+     */
+    virtual Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const = 0;
+
+    /**
+     * Returns the BSON of the current ReplSetConfig.
+     */
+    virtual BSONObj getConfigBSON() const = 0;
+
+    /**
+     * Validates the given WriteConcernOptions on the current ReplSetConfig.
+     */
+    virtual Status validateWriteConcern(const WriteConcernOptions& writeConcern) const = 0;
+
+    /**
+     * Returns a copy of the MemberConfig corresponding to the member with the given
+     * HostAndPort in the current ReplSetConfig, or boost::none if there is no member with that
+     * address.
+     *
+     * This is deprecated because the previous version of this method returned a pointer to an
+     * internal structure that could change at any time, and getting member information is
+     * inherently racy; member configuration can change at any time.
+     */
+    virtual boost::optional<MemberConfig> findConfigMemberByHostAndPort_deprecated(
+        const HostAndPort& hap) const = 0;
+
+    /**
+     * Returns whether all members of the current ReplSetConfig set have hostname localhost.
+     */
+    virtual bool isConfigLocalHostAllowed() const = 0;
+
+    /**
+     * Returns the interval between the time the last heartbeat from a node was received
+     * successfully, or the time when we gave up retrying, and when the next heartbeat should be
+     * sent to a target, for the current ReplSetConfig.
+     */
+    virtual Milliseconds getConfigHeartbeatInterval() const = 0;
 
     /**
      * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
@@ -667,9 +820,12 @@ public:
     /**
      * Toggles maintenanceMode to the value expressed by 'activate'
      * return Status::OK if the change worked, NotSecondary if it failed because we are
-     * PRIMARY, and OperationFailed if we are not currently in maintenance mode
+     * PRIMARY, and OperationFailed if we are not currently in maintenance mode.
+     *
+     * Takes the ReplicationStateTransitionLock (RSTL) in X mode, since the state can potentially
+     * change to and from RECOVERING.
      */
-    virtual Status setMaintenanceMode(bool activate) = 0;
+    virtual Status setMaintenanceMode(OperationContext* opCtx, bool activate) = 0;
 
     /**
      * Retrieves the current count of maintenanceMode and returns 'true' if greater than 0.
@@ -739,10 +895,12 @@ public:
 
     /**
      * Waits until the following two conditions are satisfied:
-     *  (1) The current config has propagated to a majority of nodes.
+     *  (1) The current config with config term 'term' has propagated to a majority of nodes.
      *  (2) Any operations committed in the previous config are committed in the current config.
      */
-    virtual Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) = 0;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx,
+                                         bool waitForOplogCommitment,
+                                         long long term) = 0;
 
     /*
      * Handles an incoming replSetInitiate command. If "configObj" is empty, generates a default
@@ -828,7 +986,7 @@ public:
      * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
      * on what has been requested.
      */
-    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+    virtual void prepareReplMetadata(const GenericArguments& genericArgs,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
@@ -878,8 +1036,9 @@ public:
 
     /**
      * Appends diagnostics about the replication subsystem.
+     * Places it under a subobject called `leafName`.
      */
-    virtual void appendDiagnosticBSON(BSONObjBuilder* bob) = 0;
+    virtual void appendDiagnosticBSON(BSONObjBuilder* bob, StringData leafName) = 0;
 
     /**
      * Appends connection information to the provided BSONObjBuilder.
@@ -891,6 +1050,12 @@ public:
      * setting the 'wMajorityWriteAvailabilityDate' election candidate metric.
      */
     virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) = 0;
+
+    /**
+     * Waits until the "new primary" no-op entry written in this node's latest step-up attempt has
+     * been majority committed.
+     */
+    virtual Status waitForPrimaryMajorityReadsAvailable(OperationContext* opCtx) const = 0;
 
     /**
      * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
@@ -925,11 +1090,6 @@ public:
     virtual void incrementNumCatchUpOpsIfCatchingUp(long numOps) = 0;
 
     /**
-     * Signals that drop pending collections have been removed from storage.
-     */
-    virtual void signalDropPendingCollectionsRemovedFromStorage() = 0;
-
-    /**
      * Returns true if logOp() should not append an entry to the oplog for this operation.
      */
     bool isOplogDisabledFor(OperationContext* opCtx, const NamespaceString& nss) const;
@@ -941,7 +1101,6 @@ public:
      */
     static bool isOplogDisabledForNS(const NamespaceString& nss);
 
-
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
      * recovery point was not stable, returns "none".
@@ -952,12 +1111,6 @@ public:
      * Returns true if the current replica set config has at least one arbiter.
      */
     virtual bool setContainsArbiter() const = 0;
-
-    /**
-     * Returns true if the current replica set config has at least one member with 'newlyAdded'
-     * field set to true.
-     */
-    virtual bool replSetContainsNewlyAddedMembers() const = 0;
 
     /**
      * Instructs the ReplicationCoordinator to recalculate the stable timestamp and advance it for
@@ -991,9 +1144,9 @@ public:
      * internal operations occurs (i.e. step up, step down, or rollback). Also logs the metrics.
      */
     virtual void updateAndLogStateTransitionMetrics(
-        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
-        const size_t numOpsKilled,
-        const size_t numOpsRunning) const = 0;
+        ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        size_t numOpsKilled,
+        size_t numOpsRunning) const = 0;
 
     /**
      * Increment the server TopologyVersion and fulfill the promise of any currently waiting
@@ -1052,14 +1205,14 @@ public:
     using OnRemoteCmdCompleteFn = std::function<void(executor::TaskExecutor::CallbackHandle)>;
     /**
      * Runs the given command 'cmdObj' on primary and waits till the response for that command is
-     * received. If the node is primary, then the command will be executed using DBDirectClient to
-     * avoid tcp network calls. Otherwise, the node will execute the remote command using the repl
-     * task executor (AsyncDBClient).
+     * received. The node will execute the remote command using the repl task executor
+     * (AsyncDBClient), even if it is primary itself.
+     *
      * - 'OnRemoteCmdScheduled' will be called once the remote command is scheduled.
      * - 'OnRemoteCmdComplete' will be called once the response for the remote command is received.
      */
     virtual BSONObj runCmdOnPrimaryAndAwaitResponse(OperationContext* opCtx,
-                                                    const std::string& dbName,
+                                                    const DatabaseName& dbName,
                                                     const BSONObj& cmdObj,
                                                     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                                     OnRemoteCmdCompleteFn onRemoteCmdComplete) = 0;
@@ -1068,6 +1221,87 @@ public:
      * A testing only function that cancels and reschedules replication heartbeats immediately.
      */
     virtual void restartScheduledHeartbeats_forTest() = 0;
+
+    /**
+     * Records if the cluster-wide write concern is set during sharding initialization.
+     *
+     * This function will assert if the shard can't talk to config server.
+     */
+    virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) = 0;
+
+    /**
+     * Interface used to synchronize changes to custom write concern tags in the config and
+     * custom default write concern settings.
+     *
+     * Use [reserve|release]DefaultWriteConcernChanges when making changes to the current
+     * default read/write concern.
+     * Use [reserve|release]ConfigWriteConcernTagChanges when executing a reconfig that
+     * could potentially change read/write concern tags.
+     */
+    class WriteConcernTagChanges {
+    public:
+        WriteConcernTagChanges() = default;
+        virtual ~WriteConcernTagChanges() = default;
+        virtual bool reserveDefaultWriteConcernChange() = 0;
+        virtual void releaseDefaultWriteConcernChange() = 0;
+
+        virtual bool reserveConfigWriteConcernTagChange() = 0;
+        virtual void releaseConfigWriteConcernTagChange() = 0;
+    };
+
+    virtual WriteConcernTagChanges* getWriteConcernTagChanges() = 0;
+
+    /**
+     * Returns a SplitPrepareSessionManager that manages the sessions for split
+     * prepared transactions.
+     */
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() = 0;
+
+    /**
+     * Returns true if we are running retryable write or retryable internal multi-document
+     * transaction.
+     */
+    virtual bool isRetryableWrite(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the in-memory initialSyncId from last initial sync. boost::none will be returned if
+     * there is no initial sync.
+     */
+    virtual boost::optional<UUID> getInitialSyncId(OperationContext* opCtx) = 0;
+
+    /**
+     * Called when a consistent (to a point-in-time) copy of data is available. That's:
+     *   - After replSetInitiate
+     *   - After initial sync completes (for both logical and file-copy based initial sync)
+     *   - After rollback to stable timestamp
+     *   - After storage startup from a stable checkpoint
+     *   - After replication recovery from an unstable checkpoint
+     */
+    virtual void setConsistentDataAvailable(OperationContext* opCtx,
+                                            bool isDataMajorityCommitted) = 0;
+
+    /**
+     * Returns whether data writes are applied against a consistent copy of the data. This should
+     * start to return true after setConsistentDataAvailable is called.
+     */
+    virtual bool isDataConsistent() const = 0;
+
+    /*
+     * Clear this node's sync source.
+     */
+    virtual void clearSyncSource() = 0;
+
+    /**
+     * Returns true if the node undergoes initial sync or rollback.
+     */
+    bool isInInitialSyncOrRollback() const;
+
+    /**
+     * Returns whether the provided client last committed opTime is older than our view of
+     * last committed. If so, we should attempt to advance the client view of the commit point
+     * using an empty oplog batch rather than waiting on new data to return.
+     */
+    bool shouldUseEmptyOplogBatchToPropagateCommitPoint(OpTime clientOpTime) const;
 
 protected:
     ReplicationCoordinator();

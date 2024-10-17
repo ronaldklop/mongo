@@ -27,13 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/s/request_types/update_zone_key_range_request_type.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/bson/bson_field.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/write_concern_options.h"
+#include "mongo/s/request_types/update_zone_key_range_request_type.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -58,7 +65,8 @@ StatusWith<UpdateZoneKeyRangeRequest> UpdateZoneKeyRangeRequest::parseFromConfig
 }
 
 void UpdateZoneKeyRangeRequest::appendAsConfigCommand(BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append(kConfigsvrUpdateZoneKeyRange, _ns.ns());
+    cmdBuilder->append(kConfigsvrUpdateZoneKeyRange,
+                       NamespaceStringUtil::serialize(_ns, SerializationContext::stateDefault()));
     _range.append(cmdBuilder);
 
     if (_isRemove) {
@@ -78,7 +86,8 @@ StatusWith<UpdateZoneKeyRangeRequest> UpdateZoneKeyRangeRequest::_parseFromComma
         return parseNamespaceStatus;
     }
 
-    NamespaceString ns(rawNS);
+    const auto ns =
+        NamespaceStringUtil::deserialize(boost::none, rawNS, SerializationContext::stateDefault());
 
     if (!ns.isValid()) {
         return {ErrorCodes::InvalidNamespace,

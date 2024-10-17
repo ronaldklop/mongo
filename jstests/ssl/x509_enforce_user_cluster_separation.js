@@ -1,5 +1,6 @@
 // Check if this build supports the authenticationMechanisms startup parameter.
-load("jstests/libs/logv2_helpers.js");
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const SERVER_CERT = "jstests/libs/server.pem";
 const SERVER_SAN_CERT = "jstests/libs/server_SAN.pem";
@@ -78,9 +79,9 @@ function initUser(conn, user) {
 }
 
 const x509_options = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
 };
 
 const mongodOptions =
@@ -99,8 +100,9 @@ function runMongodTest(desc, func) {
 
 function runMongodFailTest(desc, options) {
     print(desc);
-    const mongo = MongoRunner.runMongod(Object.merge(mongodOptions, options));
-    assert(!mongo, "MongoD started successfully with bad options");
+    assert.throws(() => MongoRunner.runMongod(Object.merge(mongodOptions, options)),
+                  [],
+                  "MongoD started successfully with bad options");
 }
 
 function runMongosTest(desc, func) {

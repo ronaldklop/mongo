@@ -3,8 +3,7 @@
  * that both entries include a UUID for the "system.views" collection.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "view_catalog_oplog_entries";
 const collName = "test_coll";
@@ -45,4 +44,3 @@ assert(modViewOplogEntry[0].hasOwnProperty("ui"),
 assert.eq(viewCatalogUUID, modViewOplogEntry[0].ui);
 
 replTest.stopSet();
-}());

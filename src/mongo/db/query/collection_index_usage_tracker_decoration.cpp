@@ -27,30 +27,49 @@
  *    it in the license file.
  */
 
+
+#include <utility>
+
+#include "mongo/db/aggregated_index_usage_tracker.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/decorable.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
-
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/service_context.h"
 
 namespace mongo {
 
 namespace {
 
 const auto getCollectionIndexUsageTrackerDecoration =
-    SharedCollectionDecorations::declareDecoration<CollectionIndexUsageTrackerDecoration>();
+    Collection::declareDecoration<CollectionIndexUsageTrackerDecoration>();
 
 }  // namespace
 
-CollectionIndexUsageTracker& CollectionIndexUsageTrackerDecoration::get(
-    SharedCollectionDecorations* decorations) {
-    return getCollectionIndexUsageTrackerDecoration(decorations)._indexUsageTracker;
+const CollectionIndexUsageTracker& CollectionIndexUsageTrackerDecoration::get(
+    const Collection* collection) {
+    return *getCollectionIndexUsageTrackerDecoration(collection)._indexUsageTracker;
+}
+CollectionIndexUsageTracker& CollectionIndexUsageTrackerDecoration::write(Collection* collection) {
+    auto& decoration = getCollectionIndexUsageTrackerDecoration(collection);
+
+    // Make copy of existing CollectionIndexUsageTracker and store it in our writable Collection
+    // instance.
+    decoration._indexUsageTracker = new CollectionIndexUsageTracker(*decoration._indexUsageTracker);
+
+    return *decoration._indexUsageTracker;
 }
 
-CollectionIndexUsageTrackerDecoration::CollectionIndexUsageTrackerDecoration()
-    : _indexUsageTracker(getGlobalServiceContext()->getPreciseClockSource()) {}
+CollectionIndexUsageTrackerDecoration::CollectionIndexUsageTrackerDecoration() {
+    // This can get instantiated in unittests that doesn't set a global service context.
+    if (!hasGlobalServiceContext())
+        return;
+
+    _indexUsageTracker =
+        new CollectionIndexUsageTracker(AggregatedIndexUsageTracker::get(getGlobalServiceContext()),
+                                        getGlobalServiceContext()->getPreciseClockSource());
+}
 
 }  // namespace mongo

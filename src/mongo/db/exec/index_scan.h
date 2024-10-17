@@ -29,14 +29,33 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/recordid_deduplicator.h"
 #include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
@@ -48,19 +67,23 @@ struct IndexScanParams {
                     std::string indexName,
                     BSONObj keyPattern,
                     MultikeyPaths multikeyPaths,
-                    bool multikey)
+                    bool multikey,
+                    bool lowPriority = false)
         : indexDescriptor(descriptor),
           name(std::move(indexName)),
           keyPattern(std::move(keyPattern)),
           multikeyPaths(std::move(multikeyPaths)),
-          isMultiKey(multikey) {}
+          isMultiKey(multikey),
+          lowPriority(lowPriority) {}
 
-    IndexScanParams(OperationContext* opCtx, const IndexDescriptor* descriptor)
+    IndexScanParams(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    const IndexDescriptor* descriptor)
         : IndexScanParams(descriptor,
                           descriptor->indexName(),
                           descriptor->keyPattern(),
-                          descriptor->getEntry()->getMultikeyPaths(opCtx),
-                          descriptor->getEntry()->isMultikey()) {}
+                          descriptor->getEntry()->getMultikeyPaths(opCtx, collection),
+                          descriptor->getEntry()->isMultikey(opCtx, collection)) {}
 
     const IndexDescriptor* indexDescriptor;
 
@@ -80,6 +103,8 @@ struct IndexScanParams {
 
     // Do we want to add the key as metadata?
     bool addKeyMetadata{false};
+
+    bool lowPriority = false;
 };
 
 /**
@@ -109,7 +134,7 @@ public:
     };
 
     IndexScan(ExpressionContext* expCtx,
-              const CollectionPtr& collection,
+              VariantCollectionPtrOrAcquisition collection,
               IndexScanParams params,
               WorkingSet* workingSet,
               const MatchExpression* filter);
@@ -125,9 +150,23 @@ public:
 
     std::unique_ptr<PlanStageStats> getStats() final;
 
-    const SpecificStats* getSpecificStats() const final;
+    const IndexScanStats* getSpecificStats() const final {
+        return &_specificStats;
+    }
 
     static const char* kStageType;
+
+    const BSONObj& getKeyPattern() const {
+        return _keyPattern;
+    }
+
+    bool isForward() const {
+        return _forward;
+    }
+
+    const IndexBounds& getBounds() const {
+        return _bounds;
+    }
 
 protected:
     void doSaveStateRequiresIndex() final;
@@ -167,7 +206,9 @@ private:
     // Keeps track of what work we need to do next.
     ScanState _scanState = ScanState::INITIALIZING;
 
-    // Could our index have duplicates?  If so, we use _returned to dedup.
+    // TODO SERVER-88337: keep only of deduplicator here.
+    // Could our index have duplicates?  If so, we use _recordIdDeduplicator or _returned to dedup.
+    std::unique_ptr<RecordIdDeduplicator> _recordIdDeduplicator;
     stdx::unordered_set<RecordId, RecordId::Hasher> _returned;
 
     //
@@ -199,6 +240,9 @@ private:
     bool _startKeyInclusive;
     // Is the end key included in the range?
     bool _endKeyInclusive;
+
+    bool _lowPriority;
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> _priority;
 };
 
 }  // namespace mongo

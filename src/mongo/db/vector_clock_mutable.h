@@ -29,7 +29,13 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -92,11 +98,11 @@ public:
      * Ensures that the values of the vector clock are at least equal to those from the last
      * successfully persisted ones.
      */
-    virtual SharedSemiFuture<void> recover() = 0;
+    virtual VectorClock::VectorTime recoverDirect(OperationContext* opCtx) = 0;
 
 protected:
     VectorClockMutable();
-    virtual ~VectorClockMutable();
+    ~VectorClockMutable() override;
 
     /**
      * Called by sub-classes in order to actually tick a Component time, once they have determined

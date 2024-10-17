@@ -5,18 +5,23 @@
 // hello fails on the arbiter once it's removed, which blocks all checks.
 TestData.skipCheckDBHashes = true;
 
-(function() {
-'use strict';
-
-load('jstests/replsets/rslib.js');
+import {reconnect} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
 replTest.initiate();
 
+const primary = replTest.getPrimary();
+// This test performs a reconfig that will change the implicit default write concern
+// from {w: "majority"} to {w: 1}. In order for this reconfig to succeed, we must first
+// set the cluster-wide write concern.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: "majority"}, writeConcern: {w: "majority"}}));
+
 jsTestLog('Start arbiter');
 const arbiterConn = replTest.add();
-const admin = replTest.getPrimary().getDB('admin');
+const admin = primary.getDB('admin');
 const conf = replTest.getReplSetConfigFromNode();
 conf.members.push({_id: 2, host: arbiterConn.host, arbiterOnly: true});
 conf.version++;
@@ -50,4 +55,3 @@ assert.soonNoExcept(
     1000 /* intervalMS */);
 
 replTest.stopSet();
-})();

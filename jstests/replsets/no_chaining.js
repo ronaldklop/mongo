@@ -1,4 +1,5 @@
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {syncFrom} from "jstests/replsets/rslib.js";
 
 function myprint(x) {
     print("chaining output: " + x);
@@ -18,6 +19,11 @@ replTest.initiate({
 });
 
 var primary = replTest.getPrimary();
+// The default WC is majority and stopServerReplication could prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 replTest.awaitReplication();
 
 var breakNetwork = function() {

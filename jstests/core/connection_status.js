@@ -1,17 +1,27 @@
+// Tests the connectionStatus command
+//
 // @tags: [
+//   # The test runs commands that are not allowed with security token: ConnectionStatus,
+//   # connectionStatus, createUser, logout.
+//   not_allowed_with_signed_security_token,
 //   assumes_superuser_permissions,
 //   assumes_write_concern_unchanged,
 //   creates_and_authenticates_user,
 //   requires_auth,
 //   requires_non_retryable_commands,
+//   # This test uses db._authOrThrow which does not use runCommand (required by the
+//   # simulate_atlas_proxy.js override).
+//   tenant_migration_incompatible,
 // ]
 
-// Tests the connectionStatus command
-(function() {
-"use strict";
-var dbName = 'connection_status';
-var myDB = db.getSiblingDB(dbName);
+const kAdminDbName = 'admin';
+const kTestDbName = 'connection_status';
+
+const myDB = db.getSiblingDB(kTestDbName);
+
 myDB.dropAllUsers();
+db.logout();  // logout from the current db - anecodtally "test_autocomplete" - to avoid double
+// authn errors
 
 /**
  * Test that the output of connectionStatus makes sense.
@@ -21,6 +31,18 @@ function validateConnectionStatus(expectedUser, expectedRole, showPrivileges) {
         myDB.runCommand({"connectionStatus": 1, "showPrivileges": showPrivileges});
     assert.commandWorked(connectionStatus);
     var authInfo = connectionStatus.authInfo;
+
+    // Test that UUID is properly returned.
+    // This UUID is from the runCommand connection, not the user, so it cannot be asserted against
+    // the userId.
+    const uuid = connectionStatus.uuid;
+    assert(uuid, "UUID returned from runCommand is falsy: " + tojson(uuid));
+
+    const parsedUUID = JSON.parse(JSON.stringify(uuid));
+    assert.eq(NumberInt(parsedUUID["$type"]),
+              4,
+              "UUID field should be a BinDataUUID, got: " + tojson(uuid));
+    assert(parsedUUID["$binary"], "Missing payload for UUID type: " + tojson(uuid));
 
     // Test that authenticated users are properly returned.
     var users = authInfo.authenticatedUsers;
@@ -73,9 +95,10 @@ function validateConnectionStatus(expectedUser, expectedRole, showPrivileges) {
 }
 
 function test(userName) {
-    var user = {user: userName, db: dbName};
-    var role = {role: "root", db: "admin"};
+    const user = {user: userName, db: kTestDbName};
+    const role = {role: "root", db: kAdminDbName};
     myDB.createUser({user: userName, pwd: "weak password", roles: [role]});
+
     myDB.auth(userName, "weak password");
 
     // Validate with and without showPrivileges
@@ -89,4 +112,3 @@ function test(userName) {
 
 test("someone");
 test("someone else");
-})();

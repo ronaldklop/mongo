@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
-
-#include "mongo/bson/util/bson_check.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -177,13 +176,7 @@ void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kSenderHostFieldName, _hasSender ? _senderHost.toString() : "");
     builder->appendNumber(kSenderIdFieldName, _senderId);
     builder->appendNumber(kTermFieldName, _term);
-
-    // TODO SERVER-49382: Remove this FCV check when 5.0 becomes last-lts.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-            ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
-        builder->append(kPrimaryIdFieldName, _primaryId);
-    }
+    builder->append(kPrimaryIdFieldName, _primaryId);
 }
 
 }  // namespace repl

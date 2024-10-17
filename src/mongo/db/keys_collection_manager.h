@@ -29,16 +29,23 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_cache.h"
 #include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/keys_collection_manager_gen.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/duration.h"
@@ -68,6 +75,8 @@ Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
  */
 class KeysCollectionManager {
 public:
+    static const unsigned kReadConcernMajorityNotAvailableYetMaxTries;
+    static const Milliseconds kRefreshIntervalIfErrored;
     static const std::string kKeyManagerPurposeString;
 
     KeysCollectionManager(std::string purpose,
@@ -92,9 +101,20 @@ public:
                                                         const LogicalTime& forThisTime);
 
     /**
-     * Request this manager to perform a refresh.
+     * Request this manager perform a refresh.
+     * Additionally blocks until either:
+     * 1. The refresh completes
+     * 2. The dealdine of opCtx expires
+     * 3. kDefaultRefreshWaitTime elapses
+     * In the later two cases, an exception is thrown.
      */
     void refreshNow(OperationContext* opCtx);
+
+    /**
+     * Requests this manager perform a refresh, but does not block on the refresh completing.
+     * Returns immediately after the refresh request is enqueued.
+     */
+    void requestRefreshAsync(OperationContext* opCtx);
 
     /**
      * Starts a background thread that will constantly update the internal cache of keys.
@@ -139,16 +159,25 @@ private:
 
         /**
          * Preemptively inform the monitoring thread it needs to perform a refresh. Returns an
-         * object
-         * that gets notified after the current round of refresh is over. Note that being notified
-         * can
-         * mean either of these things:
+         * object that gets notified after the current round of refresh is over. Note that being
+         * notified can mean any of these things:
          *
          * 1. An error occurred and refresh was not performed.
          * 2. No error occurred but no new key was found.
          * 3. No error occurred and new keys were found.
          */
+        std::shared_ptr<Notification<void>> requestRefreshAsync(OperationContext* opCtx);
+
+        /**
+         * Tells the monitoring thread to refresh, as the above function does.
+         * Additionally blocks until either:
+         * 1. The refresh completes
+         * 2. The dealdine of opCtx expires
+         * 3. kDefaultRefreshWaitTime elapses
+         * In the later two cases, an exception is thrown.
+         */
         void refreshNow(OperationContext* opCtx);
+
 
         /**
          * Sets the refresh function to use.
@@ -192,7 +221,7 @@ private:
         AtomicWord<bool> _hasSeenKeys{false};
 
         // protects all the member variables below.
-        mutable Mutex _mutex = MONGO_MAKE_LATCH("PeriodicRunner::_mutex");
+        mutable stdx::mutex _mutex;
         std::shared_ptr<Notification<void>> _refreshRequest;
         stdx::condition_variable _refreshNeededCV;
 

@@ -33,9 +33,16 @@ global:
 
 types:
     CommitQuorum:
-        bson_serialization_type: any
-        description: "CommitQuorumOptions defines the required quorum for the index builds to 
-                      commit."
+        # Union of string and safeInt.
+        bson_serialization_type:
+            - long
+            - int
+            - decimal
+            - double
+            - string
+        description: "CommitQuorumOptions defines the replica set membership required to be ready
+                      for commit in order for the primary to proceed to commit an index build."
         cpp_type: "mongo::CommitQuorumOptions"
         serializer: "mongo::CommitQuorumOptions::appendToBuilder"
         deserializer: "mongo::CommitQuorumOptions::deserializerForIDL"
+        is_view: false

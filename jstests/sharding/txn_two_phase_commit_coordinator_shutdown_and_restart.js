@@ -15,11 +15,8 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 // these validation checks.
 TestData.skipCheckDBHashes = true;
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/write_concern_util.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const rs0_opts = {
     nodes: [{}, {}]
@@ -34,8 +31,7 @@ const st =
 // Create a sharded collection:
 // shard0: [-inf, 0)
 // shard1: [0, inf)
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.name);
+assert.commandWorked(st.s0.adminCommand({enableSharding: 'test', primaryShard: st.shard0.name}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: 'test.user', middle: {x: 0}}));
 assert.commandWorked(
@@ -54,7 +50,6 @@ const lsid = {
     id: UUID()
 };
 let txnNumber = 0;
-const participantList = [{shardId: st.shard0.shardName}, {shardId: st.shard1.shardName}];
 
 // Build the following command as a string since we need to persist the lsid and the txnNumber
 // into the scope of the parallel shell.
@@ -108,7 +103,7 @@ let failPoint = configureFailPoint(coordinatorPrimaryConn, "hangBeforeWritingDec
 
 // Run commit through mongos in a parallel shell. This should timeout since we have set the
 // failpoint.
-runCommitThroughMongosInParallelShellExpectTimeOut();
+const commit = runCommitThroughMongosInParallelShellExpectTimeOut();
 failPoint.wait();
 
 jsTest.log("Stopping coordinator shard");
@@ -155,5 +150,6 @@ assert.commandWorked(st.s.adminCommand({
     autocommit: false
 }));
 
+// TODO: SERVER-59686
+commit({checkExitSuccess: false});
 st.stop();
-})();

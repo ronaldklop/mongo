@@ -29,7 +29,12 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+
 #include "mongo/base/status.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/functional.h"
 
 namespace mongo {
@@ -134,7 +139,7 @@ public:
         invariant(_exec, kNoExecutorStr);
     }
 
-    virtual ~GuaranteedExecutor() = default;
+    ~GuaranteedExecutor() override = default;
 
     /**
      * Return a wrapped task that is enforced to run once and only once.
@@ -175,7 +180,7 @@ public:
         // Fallback invariants via GuaranteedExecutor's constructor.
     }
 
-    virtual ~GuaranteedExecutorWithFallback() = default;
+    ~GuaranteedExecutorWithFallback() override = default;
 
     void schedule(Task func) override {
         _preferred->schedule([func = std::move(func), fallback = _fallback](Status status) mutable {

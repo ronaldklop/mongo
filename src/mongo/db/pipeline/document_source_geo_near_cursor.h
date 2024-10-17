@@ -30,7 +30,11 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <list>
 #include <memory>
 
@@ -41,6 +45,7 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
@@ -60,7 +65,7 @@ public:
      * nonnegative.
      */
     static boost::intrusive_ptr<DocumentSourceGeoNearCursor> create(
-        const CollectionPtr&,
+        const MultipleCollectionAccessor&,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
         const boost::intrusive_ptr<ExpressionContext>&,
         FieldPath distanceField,
@@ -70,19 +75,19 @@ public:
     const char* getSourceName() const final;
 
 private:
-    DocumentSourceGeoNearCursor(const CollectionPtr&,
+    DocumentSourceGeoNearCursor(const MultipleCollectionAccessor&,
                                 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
                                 const boost::intrusive_ptr<ExpressionContext>&,
                                 FieldPath distanceField,
                                 boost::optional<FieldPath> locationField,
                                 double distanceMultiplier);
 
-    ~DocumentSourceGeoNearCursor() = default;
+    ~DocumentSourceGeoNearCursor() override = default;
 
     /**
      * Transforms 'obj' into a Document, calculating the distance.
      */
-    Document transformDoc(Document&& obj) const override final;
+    Document transformDoc(Document&& obj) const final;
 
     // The output field in which to store the computed distance.
     FieldPath _distanceField;

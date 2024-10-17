@@ -27,25 +27,48 @@
  *    it in the license file.
  */
 
+#include <cstddef>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/json.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace {
 using std::string;
 using std::unique_ptr;
-using std::vector;
 
 using namespace mongo;
 
 using projection_ast::Projection;
 
-const NamespaceString kTestNss = NamespaceString("db.projection_test");
+const NamespaceString kTestNss =
+    NamespaceString::createNamespaceString_forTest("db.projection_test");
 
 /**
  * Helper for creating projections.
@@ -61,7 +84,7 @@ projection_ast::Projection createProjection(const BSONObj& query,
     ASSERT_OK(statusWithMatcher.getStatus());
     std::unique_ptr<MatchExpression> queryMatchExpr = std::move(statusWithMatcher.getValue());
     projection_ast::Projection res =
-        projection_ast::parse(expCtx, projObj, queryMatchExpr.get(), query, policies);
+        projection_ast::parseAndAnalyze(expCtx, projObj, queryMatchExpr.get(), query, policies);
 
     return res;
 }
@@ -88,13 +111,14 @@ void assertInvalidFindProjection(const char* queryStr, const char* projStr, size
     StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatcher.getStatus());
     std::unique_ptr<MatchExpression> queryMatchExpr = std::move(statusWithMatcher.getValue());
-    ASSERT_THROWS_CODE(projection_ast::parse(expCtx,
-                                             projObj,
-                                             queryMatchExpr.get(),
-                                             query,
-                                             ProjectionPolicies::findProjectionPolicies()),
-                       DBException,
-                       errCode);
+    ASSERT_THROWS_CODE(
+        projection_ast::parseAndAnalyze(expCtx,
+                                        projObj,
+                                        queryMatchExpr.get(),
+                                        query,
+                                        ProjectionPolicies::findProjectionPolicies()),
+        DBException,
+        errCode);
 }
 
 TEST(QueryProjectionTest, MakeEmptyProjection) {
@@ -116,8 +140,9 @@ TEST(QueryProjectionTest, MakeSingleFieldInclusion) {
     ASSERT_FALSE(proj.requiresDocument());
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQUALS(fields.size(), 2U);
-    ASSERT_EQUALS(fields[0], "_id");
-    ASSERT_EQUALS(fields[1], "a");
+    auto fieldsIt = fields.begin();
+    ASSERT_EQUALS(*fieldsIt++, "_id");
+    ASSERT_EQUALS(*fieldsIt++, "a");
 }
 
 TEST(QueryProjectionTest, MakeSingleFieldInclusionNoId) {
@@ -125,7 +150,7 @@ TEST(QueryProjectionTest, MakeSingleFieldInclusionNoId) {
     ASSERT_FALSE(proj.requiresDocument());
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQUALS(fields.size(), 1U);
-    ASSERT_EQUALS(fields[0], "a");
+    ASSERT_EQUALS(*fields.begin(), "a");
 }
 
 TEST(QueryProjectionTest, MakeSingleFieldId) {
@@ -133,7 +158,7 @@ TEST(QueryProjectionTest, MakeSingleFieldId) {
     ASSERT_FALSE(proj.requiresDocument());
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQUALS(fields.size(), 1U);
-    ASSERT_EQUALS(fields[0], "_id");
+    ASSERT_EQUALS(*fields.begin(), "_id");
 }
 
 TEST(QueryProjectionTest, MakeSingleFieldNoIdBoolean) {
@@ -141,7 +166,7 @@ TEST(QueryProjectionTest, MakeSingleFieldNoIdBoolean) {
     ASSERT_FALSE(proj.requiresDocument());
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQUALS(fields.size(), 1U);
-    ASSERT_EQUALS(fields[0], "a");
+    ASSERT_EQUALS(*fields.begin(), "a");
 }
 
 TEST(QueryProjectionTest, MakeSingleFieldFalseIdBoolean) {
@@ -149,7 +174,7 @@ TEST(QueryProjectionTest, MakeSingleFieldFalseIdBoolean) {
     ASSERT_FALSE(proj.requiresDocument());
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQUALS(fields.size(), 1U);
-    ASSERT_EQUALS(fields[0], "a");
+    ASSERT_EQUALS(*fields.begin(), "a");
 }
 
 //
@@ -177,7 +202,7 @@ TEST(QueryProjectionTest, InvalidElemMatchGeoNearProjection) {
     assertInvalidFindProjection(
         "{}",
         "{a: {$elemMatch: {$nearSphere: {$geometry: {type: 'Point', coordinates: [0, 0]}}}}}",
-        ErrorCodes::BadValue);
+        5626500);
 }
 
 TEST(QueryProjectionTest, InvalidElemMatchExprProjection) {
@@ -213,14 +238,14 @@ TEST(QueryProjectionTest, InvalidPositionalProjectionDefaultPathMatchExpression)
     ASSERT_EQ(nullptr, queryMatchExpr->path().rawData());
 
     BSONObj projObj = fromjson("{'a.$': 1}");
-    ASSERT_THROWS(projection_ast::parse(
+    ASSERT_THROWS(projection_ast::parseAndAnalyze(
                       expCtx, projObj, queryMatchExpr.get(), BSONObj(), ProjectionPolicies{}),
                   DBException);
 
     // Projecting onto empty field should fail.
     BSONObj emptyFieldProjObj = fromjson("{'.$': 1}");
     ASSERT_THROWS(
-        projection_ast::parse(
+        projection_ast::parseAndAnalyze(
             expCtx, emptyFieldProjObj, queryMatchExpr.get(), BSONObj(), ProjectionPolicies{}),
         DBException);
 }
@@ -503,7 +528,7 @@ TEST(QueryProjectionTest, ProjectionWithExpressionIsNotSimple) {
 
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQ(fields.size(), 1);
-    ASSERT_EQ(fields[0], "_id");
+    ASSERT_EQ(*fields.begin(), "_id");
 }
 
 TEST(QueryProjectionTest, ProjectionWithTopLevelExpressionConstantDoesNotRequireField) {
@@ -512,8 +537,9 @@ TEST(QueryProjectionTest, ProjectionWithTopLevelExpressionConstantDoesNotRequire
 
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQ(fields.size(), 2);
-    ASSERT_EQ(fields[0], "_id");
-    ASSERT_EQ(fields[1], "b");
+    auto fieldsIt = fields.begin();
+    ASSERT_EQ(*fieldsIt++, "_id");
+    ASSERT_EQ(*fieldsIt++, "b");
 }
 
 TEST(QueryProjectionTest, ProjectionWithROOTNeedsWholeDocument) {
@@ -529,8 +555,9 @@ TEST(QueryProjectionTest, ProjectionWithFieldPathExpressionDoesNotNeedWholeDocum
 
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQ(fields.size(), 2);
-    ASSERT_EQ(fields[0], "b");
-    ASSERT_EQ(fields[1], "c");
+    auto fieldsIt = fields.begin();
+    ASSERT_EQ(*fieldsIt++, "b");
+    ASSERT_EQ(*fieldsIt++, "c");
 }
 
 TEST(QueryProjectionTest, AssignmentToDottedPathRequiresFirstComponent) {
@@ -540,7 +567,7 @@ TEST(QueryProjectionTest, AssignmentToDottedPathRequiresFirstComponent) {
 
     const auto& fields = proj.getRequiredFields();
     ASSERT_EQ(fields.size(), 1);
-    ASSERT_EQ(fields[0], "a");
+    ASSERT_EQ(*fields.begin(), "a");
 }
 
 }  // namespace

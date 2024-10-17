@@ -27,20 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/dbtests/mock/mock_remote_db_server.h"
-
+#include <absl/container/node_hash_map.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
-#include <tuple>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/projection_parser.h"
-#include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/rpc/metadata.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/reply_interface.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -60,7 +69,7 @@ MockRemoteDBServer::CircularBSONIterator::CircularBSONIterator(
 }
 
 StatusWith<BSONObj> MockRemoteDBServer::CircularBSONIterator::next() {
-    verify(_iter != _replyObjs.end());
+    MONGO_verify(_iter != _replyObjs.end());
 
     StatusWith<BSONObj> reply = _iter->isOK() ? StatusWith(_iter->getValue().copy()) : *_iter;
     ++_iter;
@@ -79,7 +88,7 @@ MockRemoteDBServer::MockRemoteDBServer(const string& hostAndPort)
       _cmdCount(0),
       _queryCount(0),
       _instanceID(0) {
-    insert(IdentityNS, BSON(HostField(hostAndPort)), 0);
+    insert(IdentityNS, BSON(HostField(hostAndPort)));
     setCommandReply("dbStats", BSON(HostField(hostAndPort)));
 }
 
@@ -124,15 +133,16 @@ void MockRemoteDBServer::setCommandReply(const string& cmdName,
     _cmdMap[cmdName].reset(new CircularBSONIterator(replySequence));
 }
 
-void MockRemoteDBServer::insert(const string& ns, BSONObj obj, int flags) {
+void MockRemoteDBServer::insert(const NamespaceString& nss, BSONObj obj) {
     scoped_spinlock sLock(_lock);
 
-    vector<BSONObj>& mockCollection = _dataMgr[ns];
+    vector<BSONObj>& mockCollection = _dataMgr[nss.toString_forTest()];
     mockCollection.push_back(obj.copy());
 }
 
-void MockRemoteDBServer::remove(const string& ns, Query query, int flags) {
+void MockRemoteDBServer::remove(const NamespaceString& nss, const BSONObj&) {
     scoped_spinlock sLock(_lock);
+    auto ns = nss.toString_forTest();
     if (_dataMgr.count(ns) == 0) {
         return;
     }
@@ -140,9 +150,9 @@ void MockRemoteDBServer::remove(const string& ns, Query query, int flags) {
     _dataMgr.erase(ns);
 }
 
-void MockRemoteDBServer::assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid) {
+void MockRemoteDBServer::assignCollectionUuid(StringData ns, const mongo::UUID& uuid) {
     scoped_spinlock sLock(_lock);
-    _uuidToNs[uuid] = ns;
+    _uuidToNs[uuid] = ns.toString();
 }
 
 rpc::UniqueReply MockRemoteDBServer::runCommand(InstanceID id, const OpMsgRequest& request) {
@@ -181,7 +191,7 @@ std::unique_ptr<projection_executor::ProjectionExecutor>
 MockRemoteDBServer::createProjectionExecutor(const BSONObj& projectionSpec) {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     ProjectionPolicies defaultPolicies;
-    auto projection = projection_ast::parse(expCtx, projectionSpec, defaultPolicies);
+    auto projection = projection_ast::parseAndAnalyze(expCtx, projectionSpec, defaultPolicies);
     return projection_executor::buildProjectionExecutor(
         expCtx, &projection, defaultPolicies, projection_executor::kDefaultBuilderParams);
 }
@@ -195,15 +205,9 @@ BSONObj MockRemoteDBServer::project(projection_executor::ProjectionExecutor* pro
     return projectedDoc.toBson().getOwned();
 }
 
-mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
-                                           const NamespaceStringOrUUID& nsOrUuid,
-                                           mongo::Query query,
-                                           int nToReturn,
-                                           int nToSkip,
-                                           const BSONObj* fieldsToReturn,
-                                           int queryOptions,
-                                           int batchSize,
-                                           boost::optional<BSONObj> readConcernObj) {
+mongo::BSONArray MockRemoteDBServer::findImpl(InstanceID id,
+                                              const NamespaceStringOrUUID& nsOrUuid,
+                                              BSONObj projection) {
     checkIfUp(id);
 
     if (_delayMilliSec > 0) {
@@ -213,13 +217,13 @@ mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
     checkIfUp(id);
 
     std::unique_ptr<projection_executor::ProjectionExecutor> projectionExecutor;
-    if (fieldsToReturn) {
-        projectionExecutor = createProjectionExecutor(*fieldsToReturn);
+    if (!projection.isEmpty()) {
+        projectionExecutor = createProjectionExecutor(projection);
     }
     scoped_spinlock sLock(_lock);
     _queryCount++;
 
-    auto ns = nsOrUuid.uuid() ? _uuidToNs[*nsOrUuid.uuid()] : nsOrUuid.nss()->ns();
+    auto ns = nsOrUuid.isUUID() ? _uuidToNs[nsOrUuid.uuid()] : nsOrUuid.nss().toString_forTest();
     const vector<BSONObj>& coll = _dataMgr[ns];
     BSONArrayBuilder result;
     for (vector<BSONObj>::const_iterator iter = coll.begin(); iter != coll.end(); ++iter) {
@@ -227,6 +231,11 @@ mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
     }
 
     return BSONArray(result.obj());
+}
+
+mongo::BSONArray MockRemoteDBServer::find(MockRemoteDBServer::InstanceID id,
+                                          const FindCommandRequest& findRequest) {
+    return findImpl(id, findRequest.getNamespaceOrUUID(), findRequest.getProjection());
 }
 
 mongo::ConnectionString::ConnectionType MockRemoteDBServer::type() const {

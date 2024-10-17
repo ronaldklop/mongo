@@ -4,17 +4,21 @@
  * @tags: [uses_transactions, uses_multi_shard_transaction, multiversion_incompatible]
  */
 
-(function() {
-'use strict';
-
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    flushRoutersAndRefreshShardMetadata,
+    getCoordinatorFailpoints
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-// The test should not depend on a particular timeout, but shorter timeout makes it faster.
-TestData.transactionLifetimeLimitSeconds = 5;
+// Lower the transaction timeout for participants, since this test exercises the case where the
+// coordinator hangs before writing the participant list and then checks that the transaction is
+// eventually aborted on the coordinator, and the coordinator will only abort on reaching the
+// transaction timeout.
+TestData.transactionLifetimeLimitSeconds = 30;
 
 let lsid = {id: UUID()};
 let txnNumber = 0;
@@ -50,8 +54,8 @@ const setUp = function() {
     // shard0: [-inf, 0)
     // shard1: [0, 10)
     // shard2: [10, +inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: participant0.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: participant0.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -141,5 +145,4 @@ testCommitProtocol({
 });
 
 st.stop();
-})();
 })();

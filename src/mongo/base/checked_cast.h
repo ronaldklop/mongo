@@ -34,9 +34,7 @@
 
 #include "mongo/util/debug_util.h"
 
-#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
-#include "mongo/util/invariant.h"
-#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 

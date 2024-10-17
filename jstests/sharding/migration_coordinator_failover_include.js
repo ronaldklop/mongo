@@ -1,7 +1,8 @@
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
 
-function getNewNs(dbName) {
+export function getNewNs(dbName) {
     if (typeof getNewNs.counter == 'undefined') {
         getNewNs.counter = 0;
     }
@@ -10,11 +11,11 @@ function getNewNs(dbName) {
     return [collName, dbName + "." + collName];
 }
 
-function runMoveChunkMakeDonorStepDownAfterFailpoint(st,
-                                                     dbName,
-                                                     failpointName,
-                                                     shouldMakeMigrationFailToCommitOnConfig,
-                                                     expectAbortDecisionWithCode) {
+export function runMoveChunkMakeDonorStepDownAfterFailpoint(st,
+                                                            dbName,
+                                                            failpointName,
+                                                            shouldMakeMigrationFailToCommitOnConfig,
+                                                            expectAbortDecisionWithCode) {
     const [collName, ns] = getNewNs(dbName);
     jsTest.log("Running migration, making donor step down after failpoint " + failpointName +
                "; shouldMakeMigrationFailToCommitOnConfig is " +
@@ -38,9 +39,12 @@ function runMoveChunkMakeDonorStepDownAfterFailpoint(st,
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
     if (shouldMakeMigrationFailToCommitOnConfig) {
-        // Turn on a failpoint to make the migration commit fail on the config server.
-        assert.commandWorked(st.configRS.getPrimary().adminCommand(
-            {configureFailPoint: "migrationCommitVersionError", mode: "alwaysOn"}));
+        // Turn on a failpoint to make the migration commit fail on the config server. Set failpoint
+        // on each node in case configsvr is also acting as the donor in this test.
+        st.configRS.nodes.forEach(node => {
+            assert.commandWorked(node.adminCommand(
+                {configureFailPoint: "migrationCommitVersionError", mode: "alwaysOn"}));
+        });
     }
 
     jsTest.log("Run the moveChunk asynchronously and wait for " + failpointName + " to be hit.");
@@ -52,16 +56,21 @@ function runMoveChunkMakeDonorStepDownAfterFailpoint(st,
                     db.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShardName}),
                     expectAbortDecisionWithCode);
             } else {
-                assert.commandWorked(
-                    db.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShardName}));
+                assert.soonRetryOnAcceptableErrors(() => {
+                    assert.commandWorked(
+                        db.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShardName}));
+                    return true;
+                }, ErrorCodes.FailedToSatisfyReadPreference);
             }
         }, ns, st.shard1.shardName, expectAbortDecisionWithCode), st.s.port);
     failpointHandle.wait();
 
-    jsTest.log("Make the donor primary step down.");
-    assert.commandWorked(
-        st.rs0.getPrimary().adminCommand({replSetStepDown: 10 /* stepDownSecs */, force: true}));
+    jsTest.log("Make the donor primary step down and an election occur");
+    const donorPrimary = st.rs0.getPrimary();
+    st.rs0.freeze(donorPrimary);
     failpointHandle.off();
+    st.rs0.unfreeze(donorPrimary);
+    st.rs0.waitForPrimary();
 
     jsTest.log("Allow the moveChunk to finish.");
     awaitResult();
@@ -96,7 +105,9 @@ function runMoveChunkMakeDonorStepDownAfterFailpoint(st,
 
     if (shouldMakeMigrationFailToCommitOnConfig) {
         // Turn off the failpoint on the config server before returning.
-        assert.commandWorked(st.configRS.getPrimary().adminCommand(
-            {configureFailPoint: "migrationCommitVersionError", mode: "off"}));
+        st.configRS.nodes.forEach(node => {
+            assert.commandWorked(node.adminCommand(
+                {configureFailPoint: "migrationCommitVersionError", mode: "off"}));
+        });
     }
 }

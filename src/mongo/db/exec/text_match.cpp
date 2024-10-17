@@ -30,18 +30,17 @@
 #include "mongo/db/exec/text_match.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
-#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/util/str.h"
+#include "mongo/db/storage/snapshot.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 const char* TextMatchStage::kStageType = "TEXT_MATCH";
 

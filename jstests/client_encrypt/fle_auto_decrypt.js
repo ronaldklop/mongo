@@ -1,11 +1,6 @@
 // Test to ensure that the client community shell auto decrypts an encrypted field
 // stored in the database if it has the correct credentials.
-
-load("jstests/client_encrypt/lib/mock_kms.js");
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-"use strict";
+import {CA_CERT, SERVER_CERT} from "jstests/ssl/libs/ssl_helpers.js";
 
 const x509_options = {
     sslMode: "requireSSL",
@@ -72,4 +67,3 @@ const clientSideFLEOptionsBypassAutoEncrypt = {
 test(conn, clientSideFLEOptionsBypassAutoEncrypt, keyId);
 
 MongoRunner.stopMongod(conn);
-}());

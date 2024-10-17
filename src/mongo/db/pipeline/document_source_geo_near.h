@@ -29,8 +29,30 @@
 
 #pragma once
 
+#include <list>
+#include <memory>
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -49,15 +71,36 @@ public:
         return DocumentSourceGeoNear::kStageName.rawData();
     }
 
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kGeoNear;
+    }
+
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kFirst,
-                HostTypeRequirement::kAnyShard,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kNotAllowed,
-                TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed,
-                UnionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kCustom,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        // TODO SERVER-35581: Once distanceField is made optional, this stage will be considered a
+        // selection stage if distanceField is also not set (same as includeLocs).
+        if (!includeLocs) {
+            constraints.noFieldModifications = true;
+        }
+        return constraints;
+    }
+
+    void validatePipelinePosition(bool alreadyOptimized,
+                                  Pipeline::SourceContainer::const_iterator pos,
+                                  const Pipeline::SourceContainer& container) const final {
+        // This stage must be in the first position in the pipeline after optimization.
+        uassert(40603,
+                str::stream() << getSourceName()
+                              << " was not the first stage in the pipeline after optimization. Is "
+                                 "optimization disabled or inhibited?",
+                !alreadyOptimized || pos == container.cbegin());
     }
 
     /**
@@ -68,7 +111,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    boost::intrusive_ptr<DocumentSource> optimize() final;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
@@ -112,6 +157,13 @@ public:
     }
 
     /**
+     * Set the field over which to apply the "near" predicate.
+     */
+    void setKeyField(const FieldPath& newPath) {
+        keyFieldPath = newPath;
+    }
+
+    /**
      * A scaling factor to apply to the distance, if specified by the user.
      */
     boost::optional<double> getDistanceMultiplier() const {
@@ -119,6 +171,8 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     /**
      * Returns true if the $geoNear specification requires the geoNear point metadata.
@@ -129,30 +183,44 @@ public:
      * Converts this $geoNear aggregation stage into an equivalent $near or $nearSphere query on
      * 'nearFieldName'.
      */
-    BSONObj asNearQuery(StringData nearFieldName) const;
+    BSONObj asNearQuery(StringData nearFieldName);
 
     /**
      * In a sharded cluster, this becomes a merge sort by distance, from nearest to furthest.
      */
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
+protected:
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
+
 private:
     explicit DocumentSourceGeoNear(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /**
+     * If this stage immediately follows an $_internalUnpackBucket, split it up into several stages
+     * including an explicit $sort.
+     *
+     * Does nothing if not immediately following an $_internalUnpackBucket.
+     */
+    Pipeline::SourceContainer::iterator splitForTimeseries(Pipeline::SourceContainer::iterator itr,
+                                                           Pipeline::SourceContainer* container);
+
+
+    /**
      * Parses the fields in the object 'options', throwing if an error occurs.
      */
-    void parseOptions(BSONObj options);
+    void parseOptions(BSONObj options, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
     // These fields describe the command to run.
-    // 'coords' and 'distanceField' are required; the rest are optional.
-    BSONObj coords;  // "near" option, but near is a reserved keyword on windows
-    bool coordsIsArray;
+    // 'near' and 'distanceField' are required; the rest are optional.
+    boost::intrusive_ptr<Expression> _nearGeometry;
+
     std::unique_ptr<FieldPath> distanceField;  // Using unique_ptr because FieldPath can't be empty
     BSONObj query;
     bool spherical;
-    boost::optional<double> maxDistance;
-    boost::optional<double> minDistance;
+    boost::intrusive_ptr<Expression> maxDistance;
+    boost::intrusive_ptr<Expression> minDistance;
     boost::optional<double> distanceMultiplier;
     boost::optional<FieldPath> includeLocs;
     boost::optional<FieldPath> keyFieldPath;

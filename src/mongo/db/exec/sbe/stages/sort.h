@@ -29,28 +29,66 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/sorter/sorter_stats.h"
 
 namespace mongo {
 template <typename Key, typename Value>
 class SortIteratorInterface;
+
 template <typename Key, typename Value>
 class Sorter;
 }  // namespace mongo
 
 namespace mongo::sbe {
+/**
+ * Sorts the incoming data from the 'input' tree. The keys on which we are sorting are given by the
+ * order-by slots, 'obs'.  The ascending/descending sort direction associated with each of these
+ * order-by slots is given by 'dirs'. The 'obs' and 'dirs' vectors must be the same length. The
+ * 'vals' slot vector indicates the values that should associated with the sort keys.
+ *
+ * Together, a set of values for 'obs' and 'vals' consistute one of the rows being sorted. These
+ * rows are materialized at runtime. The given 'memoryLimit' contrains the amount of materialized
+ * data that can be held in memory. If this limit is exceeded, and 'allowDiskUse' is false, then
+ * this stage throws a query-fatal exception. If 'allowDiskUse' is true, then this stage will spill
+ * materialized rows to disk.
+ *
+ * If 'limit' is not std::numeric_limits<size_t>::max(), then this is a top-k sort that should only
+ * return the number of rows given by the limit.
+ *
+ * This stage is a binding reflector, meaning that only the 'obs' and 'vals' slots are visible to
+ * nodes higher in the tree.
+ *
+ * Debug string representation:
+ *
+ *   sort [<order-by slots>] [asc/desc, ...] [<value slots>] limit? childStage
+ */
 class SortStage final : public PlanStage {
 public:
     SortStage(std::unique_ptr<PlanStage> input,
               value::SlotVector obs,
               std::vector<value::SortDirection> dirs,
               value::SlotVector vals,
-              size_t limit,
+              std::unique_ptr<EExpression> limit,
               size_t memoryLimit,
               bool allowDiskUse,
-              PlanNodeId planNodeId);
+              PlanYieldPolicy* yieldPolicy,
+              PlanNodeId planNodeId,
+              bool participateInTrialRunTracking = true);
 
-    ~SortStage();
+    ~SortStage() override;
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -63,35 +101,74 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
-
-protected:
-    void doDetachFromTrialRunTracker() override;
-    void doAttachToTrialRunTracker(TrialRunTracker* tracker) override;
+    size_t estimateCompileTimeSize() const final;
 
 private:
-    void makeSorter();
+    class SortIface {
+    public:
+        virtual ~SortIface() {}
+        virtual void prepare(CompileCtx& ctx) = 0;
+        virtual value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) = 0;
+        virtual void open(bool reOpen) = 0;
+        virtual PlanState getNext() = 0;
+        virtual void close() = 0;
+    };
 
-    using SorterIterator = SortIteratorInterface<value::MaterializedRow, value::MaterializedRow>;
-    using SorterData = std::pair<value::MaterializedRow, value::MaterializedRow>;
+    template <typename KeyRow, typename ValueRow>
+    class SortImpl : public SortIface {
+    public:
+        SortImpl(SortStage& stage);
+        ~SortImpl() override;
 
+        void prepare(CompileCtx& ctx) final;
+        value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
+        void open(bool reOpen) final;
+        PlanState getNext() final;
+        void close() final;
+
+    private:
+        int64_t runLimitCode();
+        void makeSorter();
+
+        using SorterIterator = SortIteratorInterface<KeyRow, ValueRow>;
+        using SorterData = std::pair<KeyRow, ValueRow>;
+
+        SortStage& _stage;
+
+        std::vector<value::SlotAccessor*> _inKeyAccessors;
+        std::vector<value::SlotAccessor*> _inValueAccessors;
+
+        value::SlotMap<std::unique_ptr<value::SlotAccessor>> _outAccessors;
+
+        std::unique_ptr<SorterIterator> _mergeIt;
+        SorterData _mergeData;
+        SorterData* _mergeDataIt{&_mergeData};
+        std::unique_ptr<Sorter<KeyRow, ValueRow>> _sorter;
+
+        std::unique_ptr<vm::CodeFragment> _limitCode;
+    };
+
+private:
+    template <typename KeyType, typename ValueType>
+    std::unique_ptr<SortIface> makeStageImplInternal();
+    template <typename KeyType>
+    std::unique_ptr<SortIface> makeStageImplInternal(size_t valueSize);
+    std::unique_ptr<SortIface> makeStageImplInternal(size_t keySize, size_t valueSize);
+
+    std::unique_ptr<SortIface> makeStageImpl();
+
+private:
     const value::SlotVector _obs;
     const std::vector<value::SortDirection> _dirs;
     const value::SlotVector _vals;
     const bool _allowDiskUse;
+
+    std::unique_ptr<SorterFileStats> _sorterFileStats;
+
+    std::unique_ptr<SortIface> _stageImpl;
+
+    std::unique_ptr<EExpression> _limitExpr;
+
     SortStats _specificStats;
-
-    std::vector<value::SlotAccessor*> _inKeyAccessors;
-    std::vector<value::SlotAccessor*> _inValueAccessors;
-
-    value::SlotMap<std::unique_ptr<value::SlotAccessor>> _outAccessors;
-
-    std::unique_ptr<SorterIterator> _mergeIt;
-    SorterData _mergeData;
-    SorterData* _mergeDataIt{&_mergeData};
-    std::unique_ptr<Sorter<value::MaterializedRow, value::MaterializedRow>> _sorter;
-
-    // If provided, used during a trial run to accumulate certain execution stats. Once the trial
-    // run is complete, this pointer is reset to nullptr.
-    TrialRunTracker* _tracker{nullptr};
 };
 }  // namespace mongo::sbe

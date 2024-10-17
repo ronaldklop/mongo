@@ -1,11 +1,8 @@
 /**
  * This test simulates initial sync workflows which are performed by the Atlas automation agent.
- * @tags: [live_record_incompatible]
  */
-(function() {
-"use strict";
-
-load('jstests/replsets/rslib.js');  // waitForState.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {disconnectSecondaries, reconnectSecondaries, waitForState} from "jstests/replsets/rslib.js";
 
 const testName = TestData.testName;
 // Set up a standard 3-node replica set.  Note the two secondaries are priority 0; this is
@@ -140,4 +137,3 @@ jsTestLog("Test replacing a node with initial sync with two secondaries unreacha
 testReplaceWithInitialSync(2);
 
 rst.stopSet();
-})();

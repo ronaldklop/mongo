@@ -27,24 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <cstdint>
 
-#include "mongo/db/exec/trial_period_utils.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/trial_period_utils.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_knob_configuration.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo::trial_period {
-size_t getTrialPeriodMaxWorks(OperationContext* opCtx, const CollectionPtr& collection) {
-    // Run each plan some number of times. This number is at least as great as
-    // 'internalQueryPlanEvaluationWorks', but may be larger for big collections.
-    size_t numWorks = internalQueryPlanEvaluationWorks.load();
+size_t getTrialPeriodMaxWorks(OperationContext* opCtx,
+                              const CollectionPtr& collection,
+                              int maxWorksParam,
+                              double collFraction) {
+    size_t numWorks = static_cast<size_t>(maxWorksParam);
     if (collection) {
-        // For large collections, the number of works is set to be this fraction of the collection
-        // size.
-        double fraction = internalQueryPlanEvaluationCollFraction;
-
-        numWorks = std::max(static_cast<size_t>(internalQueryPlanEvaluationWorks.load()),
-                            static_cast<size_t>(fraction * collection->numRecords(opCtx)));
+        numWorks =
+            std::max(numWorks, static_cast<size_t>(collFraction * collection->numRecords(opCtx)));
     }
 
     return numWorks;
@@ -53,11 +57,9 @@ size_t getTrialPeriodMaxWorks(OperationContext* opCtx, const CollectionPtr& coll
 size_t getTrialPeriodNumToReturn(const CanonicalQuery& query) {
     // Determine the number of results which we will produce during the plan ranking phase before
     // stopping.
-    size_t numResults = static_cast<size_t>(internalQueryPlanEvaluationMaxResults.load());
-    if (query.getFindCommandRequest().getNtoreturn()) {
-        numResults = std::min(static_cast<size_t>(*query.getFindCommandRequest().getNtoreturn()),
-                              numResults);
-    } else if (query.getFindCommandRequest().getLimit()) {
+    size_t numResults =
+        query.getExpCtx()->getQueryKnobConfiguration().getPlanEvaluationMaxResultsForOp();
+    if (query.getFindCommandRequest().getLimit()) {
         numResults =
             std::min(static_cast<size_t>(*query.getFindCommandRequest().getLimit()), numResults);
     }

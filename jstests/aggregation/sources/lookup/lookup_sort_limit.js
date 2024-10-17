@@ -1,14 +1,7 @@
 /**
  * Test that a $lookup correctly optimizes a foreign pipeline containing a $sort and a $limit. This
  * test is designed to reproduce SERVER-36715.
- *
- * @tags: [assumes_unsharded_collection]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For getAggPlanStages().
-
 const testDB = db.getSiblingDB("lookup_sort_limit");
 testDB.dropDatabase();
 
@@ -48,4 +41,3 @@ res = localColl
               .toArray();
 
 assert.eq({_id: 0, result: [{_id: 9, foreignField: 9}]}, res[0]);
-}());

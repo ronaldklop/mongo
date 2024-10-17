@@ -27,15 +27,20 @@
  *    it in the license file.
  */
 
+
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/client.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/speculative_majority_read_info.h"
-#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace repl {

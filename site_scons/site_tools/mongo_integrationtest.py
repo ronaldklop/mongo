@@ -19,13 +19,12 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
-
 """
 Pseudo-builders for building and registering integration tests.
 """
-from SCons.Script import Action
 
 from site_scons.mongo import insort_wrapper
+
 
 def exists(env):
     return True
@@ -58,7 +57,7 @@ def build_cpp_integration_test(env, target, source, **kwargs):
     # mongo_test_execution.py for details on undecidability) because
     # we don't correctly express the dependency on the server
     # components required to run them.
-    kwargs['UNDECIDABLE_TEST'] = True
+    kwargs["UNDECIDABLE_TEST"] = True
 
     result = env.Program(target, source, **kwargs)
     env.RegisterTest("$INTEGRATION_TEST_LIST", result[0])

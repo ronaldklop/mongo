@@ -1,7 +1,6 @@
 // Tests various cases of dropping and recreating collections in the same namespace with multiple
 // mongoses
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 3, mongos: 3, causallyConsistent: true});
 
@@ -23,8 +22,8 @@ var shards = [st.shard0, st.shard1, st.shard2];
 
 jsTest.log("Enabling sharding for the first time...");
 
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
+assert.commandWorked(
+    admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
 var bulk = insertMongos.getCollection(coll + "").initializeUnorderedBulkOp();
@@ -44,7 +43,6 @@ st.configRS.awaitLastOpCommitted();
 
 jsTest.log("Re-enabling sharding with a different key...");
 
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
 assert.commandWorked(coll.createIndex({notId: 1}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {notId: 1}}));
 
@@ -76,4 +74,3 @@ assert.eq(100, staleMongos.getCollection(coll + "").find({test: "c"}).itcount())
 assert.eq(0, staleMongos.getCollection(coll + "").find({test: {$in: ["a", "b"]}}).itcount());
 
 st.stop();
-})();

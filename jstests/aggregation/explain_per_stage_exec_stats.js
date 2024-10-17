@@ -2,12 +2,18 @@
  * Tests that aggregation stages report the number of documents returned (nReturned) and
  * execution time (executionTimeMillisEstimate) when explain is run with verbosities
  * "executionStats" and "allPlansExecution".
+ *
+ *  @tags: [
+ *      # The response to `$changeStream` will contain a db name different from the one requested.
+ *      # This expected behavior is incompatible with the prefix matching check between the request
+ *      # and reply used by simulate_atlas_proxy and simulate_mongoq overrides.
+ *      simulate_atlas_proxy_incompatible,
+ *      simulate_mongoq_incompatible,
+ *  ]
  */
-(function() {
-"use strict";
 
-load("jstests/libs/analyze_plan.js");     // For getAggPlanStages().
-load("jstests/libs/fixture_helpers.js");  // For isReplSet().
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
 
 const coll = db.explain_per_stage_exec_stats;
 coll.drop();
@@ -157,4 +163,3 @@ assert.eq(numberOfDocsReturnedByMatchStage(coll.explain("executionStats").aggreg
     };
     checkResults(result, assertOutputBytesSize);
 })();
-}());

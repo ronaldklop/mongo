@@ -30,14 +30,11 @@
 #include "mongo/db/exec/queued_data_stage.h"
 
 #include <memory>
-
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
+#include <vector>
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 const char* QueuedDataStage::kStageType = "QUEUED_DATA";
 

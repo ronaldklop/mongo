@@ -2,18 +2,13 @@
  * Test the creation of views with various options.
  *
  * @tags: [
- *   # applyOps is not available on mongos.
- *   assumes_against_mongod_not_mongos,
  *   assumes_superuser_permissions,
- *   # applyOps is not retryable.
- *   requires_non_retryable_commands,
+ *   # TODO SERVER-73967: Remove this tag.
+ *   does_not_support_stepdowns,
+ *   references_foreign_collection,
  * ]
  */
-(function() {
-"use strict";
-
-// For arrayEq.
-load("jstests/aggregation/extras/utils.js");
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 const viewsDBName = "views_creation";
 
@@ -26,13 +21,22 @@ assert.eq(0, collNames.length, tojson(collNames));
 // You cannot create a view that starts with 'system.'.
 assert.commandFailedWithCode(viewsDB.runCommand({create: "system.special", viewOn: "collection"}),
                              ErrorCodes.InvalidNamespace,
-                             "Created an illegal view named 'system.views'");
+                             "Created an illegal view named 'system.special'");
 
 // Collections that start with 'system.' that are not special to MongoDB fail with a different
 // error code.
 assert.commandFailedWithCode(viewsDB.runCommand({create: "system.foo", viewOn: "collection"}),
                              ErrorCodes.InvalidNamespace,
                              "Created an illegal view named 'system.foo'");
+
+// Attempting to create a view on a database's views collection namespace is specially handled
+// because it can deadlock.
+const errRes =
+    assert.commandFailedWithCode(viewsDB.runCommand({create: "system.views", viewOn: "collection"}),
+                                 ErrorCodes.InvalidNamespace,
+                                 "Created an illegal view named <db>.system.views");
+assert(errRes.errmsg.indexOf("Cannot create a view called") > -1,
+       "Unexpected errmsg: " + tojson(errRes));
 
 // Create a collection for test purposes.
 assert.commandWorked(viewsDB.runCommand({create: "collection"}));
@@ -104,23 +108,52 @@ assert.commandFailedWithCode(viewsDB.runCommand({
 }),
                              40600);
 
-// These test that, when an existing view in system.views is invalid because of a $out in the
-// pipeline, the database errors on creation of a new view.
-assert.commandWorked(viewsDB.adminCommand({
-    applyOps: [{
-        op: "i",
-        ns: viewsDBName + ".system.views",
-        o: {
-            _id: viewsDBName + ".invalidView",
-            viewOn: "collection",
-            pipeline: [{$project: {_id: false}}, {$out: "notExistingCollection"}]
-        }
-    }]
-}));
-assert.commandFailedWithCode(
-    viewsDB.runCommand({create: "viewWithBadViewCatalog", viewOn: "collection", pipeline: []}),
-    ErrorCodes.OptionNotSupportedOnView);
-assert.commandWorked(viewsDB.adminCommand({
-    applyOps: [{op: "d", ns: viewsDBName + ".system.views", o: {_id: viewsDBName + ".invalidView"}}]
-}));
-}());
+// Test that creating a view which already exists with identical options reports success.
+let repeatedCmd = {
+    create: "existingViewTest",
+    viewOn: "collection",
+    pipeline: [{$match: {x: 1}}],
+    collation: {locale: "uk"},
+};
+assert.commandWorked(viewsDB.runCommand(repeatedCmd));
+assert.commandWorked(viewsDB.runCommand(repeatedCmd));
+
+// Test that creating a view with the same name as an existing view but different options fails.
+
+// Different collation.
+assert.commandFailedWithCode(viewsDB.runCommand({
+    create: "existingViewTest",
+    viewOn: "collection",
+    pipeline: [{$match: {x: 1}}],
+    collation: {locale: "fr"},
+}),
+                             ErrorCodes.NamespaceExists);
+
+// Different pipeline.
+assert.commandFailedWithCode(viewsDB.runCommand({
+    create: "existingViewTest",
+    viewOn: "collection",
+    pipeline: [{$match: {x: 2}}],
+    collation: {locale: "uk"},
+}),
+                             ErrorCodes.NamespaceExists);
+// viewOn collection is different.
+assert.commandFailedWithCode(viewsDB.runCommand({
+    create: "existingViewTest",
+    viewOn: "collection1",
+    pipeline: [{$match: {x: 1}}],
+    collation: {locale: "uk"},
+}),
+                             ErrorCodes.NamespaceExists);
+
+// Test that creating a view when there is already a collection with the same name fails.
+assert.commandFailedWithCode(viewsDB.runCommand({create: "collection", viewOn: "collection"}),
+                             ErrorCodes.NamespaceExists);
+
+// Test that creating a collection when there is already a view with the same name fails.
+assert.commandFailedWithCode(viewsDB.runCommand({create: "existingViewTest"}),
+                             ErrorCodes.NamespaceExists);
+
+// Ensure we accept a view with a name of greater than 64 characters (the maximum dbname length).
+assert.commandWorked(viewsDB.createView(
+    "longNamedView", "Queries_IdentityView_UnindexedLargeInMatching0_BackingCollection", []));

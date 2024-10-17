@@ -1,28 +1,39 @@
 # -*- mode: python; -*-
 
-Import('env')
+Import("env")
 
 env = env.Clone()
 
-env.Library(
-    target='bson_extract',
+env.Program(
+    target="bson_corpus_gen",
     source=[
-        'bson_extract.cpp',
+        "bson_corpus_gen.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        "$BUILD_DIR/mongo/base",
     ],
 )
 
 env.CppUnitTest(
-    target='bson_util_test',
+    target="bson_util_test",
     source=[
-        'bson_check_test.cpp',
-        'bson_extract_test.cpp',
-        'builder_test.cpp',
+        "bson_check_test.cpp",
+        "bson_extract_test.cpp",
+        "builder_test.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'bson_extract',
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/util/safe_num",
+        "bson_extract",
+    ],
+)
+
+env.Benchmark(
+    target="bufbuilder_bm",
+    source=[
+        "bufbuilder_bm.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
     ],
 )

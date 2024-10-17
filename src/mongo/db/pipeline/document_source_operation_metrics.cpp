@@ -27,15 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <map>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_operation_metrics.h"
-
-#include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/stats/operation_resource_consumption_gen.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
-#include "mongo/util/net/socket_utils.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -44,7 +49,7 @@ using boost::intrusive_ptr;
 REGISTER_DOCUMENT_SOURCE(operationMetrics,
                          DocumentSourceOperationMetrics::LiteParsed::parse,
                          DocumentSourceOperationMetrics::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
+                         AllowedWithApiStrict::kNeverInVersion1);
 
 const char* DocumentSourceOperationMetrics::getSourceName() const {
     return kStageName.rawData();
@@ -53,6 +58,7 @@ const char* DocumentSourceOperationMetrics::getSourceName() const {
 namespace {
 static constexpr StringData kClearMetrics = "clearMetrics"_sd;
 static constexpr StringData kDatabaseName = "db"_sd;
+static constexpr StringData kLocalTimeFieldName = "localTime"_sd;
 }  // namespace
 
 DocumentSource::GetNextResult DocumentSourceOperationMetrics::doGetNext() {
@@ -63,9 +69,11 @@ DocumentSource::GetNextResult DocumentSourceOperationMetrics::doGetNext() {
             }
             return ResourceConsumption::get(pExpCtx->opCtx).getDbMetrics();
         }();
+        auto localTime = jsTime();  // fetch current time to include in all metrics documents
         for (auto& [dbName, metrics] : dbMetrics) {
             BSONObjBuilder builder;
             builder.append(kDatabaseName, dbName);
+            builder.appendDate(kLocalTimeFieldName, localTime);
             metrics.toBson(&builder);
             _operationMetrics.push_back(builder.obj());
         }
@@ -74,7 +82,7 @@ DocumentSource::GetNextResult DocumentSourceOperationMetrics::doGetNext() {
     }
 
     if (_operationMetricsIter != _operationMetrics.end()) {
-        auto doc = Document(std::move(*_operationMetricsIter));
+        auto doc = Document(*_operationMetricsIter);
         _operationMetricsIter++;
         return doc;
     }
@@ -86,13 +94,13 @@ intrusive_ptr<DocumentSource> DocumentSourceOperationMetrics::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
     if (!ResourceConsumption::isMetricsAggregationEnabled()) {
         uasserted(ErrorCodes::CommandNotSupported,
-                  "The aggregateOperationResourceConsumption server parameter is not set");
+                  "The aggregateOperationResourceConsumptionMetrics server parameter is not set");
     }
 
     const NamespaceString& nss = pExpCtx->ns;
     uassert(ErrorCodes::InvalidNamespace,
             "$operationMetrics must be run against the 'admin' database with {aggregate: 1}",
-            nss.db() == NamespaceString::kAdminDb && nss.isCollectionlessAggregateNS());
+            nss.isAdminDB() && nss.isCollectionlessAggregateNS());
 
     uassert(ErrorCodes::BadValue,
             "The $operationMetrics stage specification must be an object",
@@ -110,8 +118,7 @@ intrusive_ptr<DocumentSource> DocumentSourceOperationMetrics::createFromBson(
     return new DocumentSourceOperationMetrics(pExpCtx, clearMetrics);
 }
 
-Value DocumentSourceOperationMetrics::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceOperationMetrics::serialize(const SerializationOptions& opts) const {
     return Value(DOC(getSourceName() << Document()));
 }
 }  // namespace mongo

@@ -30,7 +30,9 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 
+#include "mongo/util/cancellation.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
@@ -62,7 +64,7 @@ class Baton : public Waitable,
               public OutOfLineExecutor,
               public std::enable_shared_from_this<Baton> {
 public:
-    virtual ~Baton() = default;
+    ~Baton() override = default;
 
     /**
      * Detaches a baton from an associated opCtx.
@@ -100,10 +102,7 @@ public:
         return nullptr;
     }
 
-    /**
-     * Marks the baton to wake up on client socket disconnect
-     */
-    virtual void markKillOnClientDisconnect() noexcept = 0;
+    virtual Future<void> waitUntil(Date_t expiration, const CancellationToken& token) = 0;
 
     /**
      * Holder for a SubBaton, detaches on destruction

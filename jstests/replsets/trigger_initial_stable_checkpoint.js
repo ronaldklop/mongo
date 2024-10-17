@@ -4,7 +4,8 @@
  * We don't support unclean shutdowns with restarts into a last-lts binary.
  * @tags: [requires_persistence, multiversion_incompatible]
  */
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
@@ -30,4 +31,3 @@ jsTestLog("Waiting for the node to restart and become primary again.");
 rst.getPrimary();
 
 rst.stopSet();
-}());

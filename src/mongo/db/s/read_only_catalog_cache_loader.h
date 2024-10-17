@@ -29,7 +29,14 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -41,19 +48,13 @@ namespace mongo {
 class ReadOnlyCatalogCacheLoader final : public CatalogCacheLoader {
 public:
     ReadOnlyCatalogCacheLoader() = default;
-    ~ReadOnlyCatalogCacheLoader();
+    ~ReadOnlyCatalogCacheLoader() override;
 
-    void initializeReplicaSetRole(bool isPrimary) override {}
-    void onStepDown() override {}
-    void onStepUp() override {}
     void shutDown() override;
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override {}
-    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
-    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
 
     SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
                                                           ChunkVersion version) override;
-    SemiFuture<DatabaseType> getDatabase(StringData dbName) override;
+    SemiFuture<DatabaseType> getDatabase(const DatabaseName& dbName) override;
 
 private:
     ConfigServerCatalogCacheLoader _configServerLoader;

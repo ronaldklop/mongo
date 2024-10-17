@@ -5,8 +5,12 @@
 //   - Inserts 10k documents and ensures they're evenly distributed
 //   - Verifies a $where query can be killed on multiple DBs
 //   - Tests fsync and fsync+lock permissions on sharded db
-(function() {
-'use strict';
+// @tags: [
+//   expects_explicit_underscore_id_index,
+//   requires_scripting
+// ]
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({shards: 2, mongos: 1});
 var dbForTest = s.getDB("test");
@@ -16,8 +20,7 @@ dbForTest.foo.drop();
 var numDocs = 10000;
 
 // shard test.foo and add a split point
-s.adminCommand({enablesharding: "test"});
-s.ensurePrimaryShard('test', s.shard1.shardName);
+s.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName});
 s.adminCommand({shardcollection: "test.foo", key: {_id: 1}});
 s.adminCommand({split: "test.foo", middle: {_id: numDocs / 2}});
 
@@ -147,9 +150,4 @@ assert(x.code == 13, "fsync on non-admin succeeded, but should have failed: " + 
 x = dbForTest._adminCommand("fsync");
 assert(x.ok == 1, "fsync failed: " + tojson(x));
 
-// test fsync+lock on admin db
-x = dbForTest._adminCommand({"fsync": 1, lock: true});
-assert(!x.ok, "lock should fail: " + tojson(x));
-
 s.stop();
-})();

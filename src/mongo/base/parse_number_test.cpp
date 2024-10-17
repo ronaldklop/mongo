@@ -27,18 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
 #include <cmath>
-#include <cstdint>
+#include <fmt/format.h>
+#include <iterator>
 #include <limits>
-#include <type_traits>
+#include <memory>
+#include <string>
 #include <typeinfo>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/str.h"  // for str::stream()!
 
 #define ASSERT_PARSES_WITH_PARSER(type, input_string, parser, expected_value) \
@@ -476,7 +479,7 @@ PARSE_TEST(DoubleNormalParse) {
     ASSERT_PARSES(NumberType, "12e-8", 12e-8);
     ASSERT_PARSES(NumberType, "-485.381e-8", -485.381e-8);
 
-#if !(defined(_WIN32) || defined(__sun))
+#if !defined(_WIN32)
     // Parse hexadecimal representations of a double.  Hex literals not supported by MSVC, and
     // not parseable by the Windows SDK libc or the Solaris libc in the mode we build.
     // See SERVER-14131.
@@ -532,7 +535,7 @@ TEST(Double, TestParsingNormal) {
     ASSERT_PARSES(double, "12e-8", 12e-8);
     ASSERT_PARSES(double, "-485.381e-8", -485.381e-8);
 
-#if !(defined(_WIN32) || defined(__sun))
+#if !defined(_WIN32)
     // Parse hexadecimal representations of a double.  Hex literals not supported by MSVC, and
     // not parseable by the Windows SDK libc or the Solaris libc in the mode we build.
     // See SERVER-14131.

@@ -3,18 +3,14 @@
  * flags.
  *
  * @tags: [
- *     uses_api_parameters,
- *     requires_fcv_49,
- *     assumes_unsharded_collection,
- *     do_not_wrap_aggregations_in_facets,
- *     assumes_read_preference_unchanged,
- *     assumes_read_concern_unchanged,
- *     assumes_against_mongod_not_mongos
+ *   assumes_against_mongod_not_mongos,
+ *   assumes_read_concern_unchanged,
+ *   assumes_read_preference_unchanged,
+ *   assumes_unsharded_collection,
+ *   do_not_wrap_aggregations_in_facets,
+ *   uses_api_parameters,
  * ]
  */
-(function() {
-"use strict";
-
 const dbName = jsTestName();
 const testDB = db.getSiblingDB(dbName);
 testDB.dropDatabase();
@@ -44,11 +40,11 @@ let result = curDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
     writeConcern: {w: "majority"},
+    readConcern: {},
     apiVersion: "1",
     apiStrict: true
 });
@@ -65,7 +61,6 @@ result = testDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
@@ -86,7 +81,6 @@ result = testDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
@@ -128,6 +122,7 @@ result = curDB.runCommand({
     pipeline: [{$project: {_id: 0}}],
     cursor: {},
     writeConcern: {w: "majority"},
+    readConcern: {},
     apiVersion: "1",
     apiStrict: true
 });
@@ -143,4 +138,28 @@ result = testDB.runCommand({
     apiStrict: true
 });
 assert.commandWorked(result);
+
+// Tests that time-series collection can be queried (invoking $_internalUnpackBucket stage)
+// from an external client with 'apiStrict'.
+(function testInternalUnpackBucketAllowance() {
+    const collName = 'timeseriesColl';
+    const timeField = 'tm';
+    assert.commandWorked(testDB.createCollection(collName, {timeseries: {timeField: timeField}}));
+    const coll = testDB[collName];
+    assert.commandWorked(coll.insert({[timeField]: ISODate('2021-01-01')}));
+    assert.commandWorked(testDB.runCommand({
+        find: collName,
+        apiVersion: "1",
+        apiStrict: true,
+    }));
+    assert.commandWorked(testDB.runCommand({
+        aggregate: collName,
+        pipeline: [{$match: {}}],
+        cursor: {},
+        apiVersion: "1",
+        apiStrict: true,
+    }));
+    const plans = [coll.find().explain(), coll.explain().aggregate([{$match: {}}])];
+    assert(plans.every(
+        plan => plan.stages.map(x => Object.keys(x)[0]).includes("$_internalUnpackBucket")));
 })();

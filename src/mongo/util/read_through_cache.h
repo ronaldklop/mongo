@@ -30,14 +30,34 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <tuple>
+#include <utility>
+#include <vector>
 
-#include "mongo/bson/oid.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/invalidating_lru_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
@@ -49,7 +69,7 @@ class ReadThroughCacheBase {
     ReadThroughCacheBase& operator=(const ReadThroughCacheBase&) = delete;
 
 protected:
-    ReadThroughCacheBase(Mutex& mutex, ServiceContext* service, ThreadPoolInterface& threadPool);
+    ReadThroughCacheBase(Service* service, ThreadPoolInterface& threadPool);
 
     virtual ~ReadThroughCacheBase();
 
@@ -80,32 +100,37 @@ protected:
 
     Date_t _now();
 
-    // Service context under which this cache has been instantiated (used for access to service-wide
+    // Service under which this cache has been instantiated (used for access to service-wide
     // functionality, such as client/operation context creation)
-    ServiceContext* const _serviceContext;
+    Service* const _service;
 
+private:
     // Thread pool to be used for invoking the blocking 'lookup' calls
     ThreadPoolInterface& _threadPool;
 
-    // Used to protect the shared state in the child ReadThroughCache template below. Has a lock
-    // level of 3, meaning that while held, it is only allowed to take '_cancelTokenMutex' below and
-    // the Client lock.
-    Mutex& _mutex;
-
-    // Used to protect calls to 'tryCancel' above. Has a lock level of 2, meaning what while held,
-    // it is only allowed to take the Client lock.
-    Mutex _cancelTokenMutex = MONGO_MAKE_LATCH("ReadThroughCacheBase::_cancelTokenMutex");
+    // Used to protect calls to 'tryCancel' above and is shared across all emitted CancelTokens.
+    // Semantically, each CancelToken's interruption is independent from all the others so they
+    // could have their own mutexes, but in the interest of not creating a mutex for each async task
+    // spawned, we share the mutex here.
+    //
+    // Has a lock level of 2, meaning what while held, any code is only allowed to take the Client
+    // lock.
+    stdx::mutex _cancelTokensMutex;
 };
 
-template <typename Result, typename Key, typename Value, typename Time>
+template <typename Result, typename Key, typename Value, typename Time, typename... LookupArgs>
 struct ReadThroughCacheLookup {
-    using Fn = unique_function<Result(
-        OperationContext*, const Key&, const Value& cachedValue, const Time& timeInStore)>;
+    using Fn = unique_function<Result(OperationContext*,
+                                      const Key&,
+                                      const Value& cachedValue,
+                                      const Time& timeInStore,
+                                      const LookupArgs... lookupArgs)>;
 };
 
-template <typename Result, typename Key, typename Value>
-struct ReadThroughCacheLookup<Result, Key, Value, CacheNotCausallyConsistent> {
-    using Fn = unique_function<Result(OperationContext*, const Key&, const Value& cachedValue)>;
+template <typename Result, typename Key, typename Value, typename... LookupArgs>
+struct ReadThroughCacheLookup<Result, Key, Value, CacheNotCausallyConsistent, LookupArgs...> {
+    using Fn = unique_function<Result(
+        OperationContext*, const Key&, const Value& cachedValue, const LookupArgs... lookupArgs)>;
 };
 
 /**
@@ -114,8 +139,16 @@ struct ReadThroughCacheLookup<Result, Key, Value, CacheNotCausallyConsistent> {
  *
  * Causal consistency is provided by requiring the backing store to asociate every Value it returns
  * with a logical timestamp of type Time.
+ *
+ * Lookup functions to the backing store can be supplied with additional arguments as specified in
+ * LookupArgs. These additional arguments are expected to be supplied to all calls to `acquire()`
+ * for the cache. The signature of the backing `LookupFn` is also expected to correspond with these
+ * `LookupArgs`.
  */
-template <typename Key, typename Value, typename Time = CacheNotCausallyConsistent>
+template <typename Key,
+          typename Value,
+          typename Time = CacheNotCausallyConsistent,
+          typename... LookupArgs>
 class ReadThroughCache : public ReadThroughCacheBase {
     /**
      * Data structure wrapping and expanding on the values stored in the cache.
@@ -227,7 +260,8 @@ public:
         Time t;
     };
 
-    using LookupFn = typename ReadThroughCacheLookup<LookupResult, Key, ValueHandle, Time>::Fn;
+    using LookupFn =
+        typename ReadThroughCacheLookup<LookupResult, Key, ValueHandle, Time, LookupArgs...>::Fn;
 
     // Exposed publicly so it can be unit-tested indepedently of the usages in this class. Must not
     // be used independently.
@@ -238,7 +272,8 @@ public:
      * set ValueHandle (its operator bool will be true). Otherwise, either causes the blocking
      * 'LookupFn' to be asynchronously invoked to fetch 'key' from the backing store or joins an
      * already scheduled invocation) and returns a future which will be signaled when the lookup
-     * completes.
+     * completes. The blocking 'LookupFn' will be invoked with the arguments supplied in
+     * 'lookupArgs.'
      *
      * If the lookup is successful and 'key' is found in the store, it will be cached (so subsequent
      * lookups won't have to re-fetch it) and the future will be set. If 'key' is not found in the
@@ -250,11 +285,11 @@ public:
      *  The returned value may be invalid by the time the caller gets to access it, if 'invalidate'
      *  is called for 'key'.
      */
-    TEMPLATE(typename KeyType)
-    REQUIRES(IsComparable<KeyType>&& std::is_constructible_v<Key, KeyType>)
-    SharedSemiFuture<ValueHandle> acquireAsync(
-        const KeyType& key,
-        CacheCausalConsistency causalConsistency = CacheCausalConsistency::kLatestCached) {
+    template <typename KeyType>
+    requires(IsComparable<KeyType>&& std::is_constructible_v<Key, KeyType>)
+        SharedSemiFuture<ValueHandle> acquireAsync(const KeyType& key,
+                                                   CacheCausalConsistency causalConsistency,
+                                                   LookupArgs&&... lookupArgs) {
 
         // Fast path
         if (auto cachedValue = _cache.get(key, causalConsistency))
@@ -274,8 +309,11 @@ public:
         auto [cachedValue, timeInStore] = _cache.getCachedValueAndTimeInStore(key);
         auto [it, emplaced] = _inProgressLookups.emplace(
             key,
-            std::make_unique<InProgressLookup>(
-                *this, Key(key), ValueHandle(std::move(cachedValue)), std::move(timeInStore)));
+            std::make_unique<InProgressLookup>(*this,
+                                               Key(key),
+                                               ValueHandle(std::move(cachedValue)),
+                                               std::move(timeInStore),
+                                               std::forward<LookupArgs>(lookupArgs)...));
         invariant(emplaced);
         auto& inProgressLookup = *it->second;
         auto sharedFutureToReturn = inProgressLookup.addWaiter(ul);
@@ -288,31 +326,74 @@ public:
         return sharedFutureToReturn;
     }
 
+    template <typename KeyType>
+    requires(IsComparable<KeyType>&& std::is_constructible_v<Key, KeyType>)
+        SharedSemiFuture<ValueHandle> acquireAsync(const KeyType& key, LookupArgs&&... lookupArgs) {
+        return acquireAsync(
+            key, CacheCausalConsistency::kLatestCached, std::forward<LookupArgs>(lookupArgs)...);
+    }
+
     /**
      * A blocking variant of 'acquireAsync' above - refer to it for more details.
      *
      * NOTES:
      *  This is a potentially blocking method.
      */
-    TEMPLATE(typename KeyType)
-    REQUIRES(IsComparable<KeyType>)
-    ValueHandle acquire(
-        OperationContext* opCtx,
-        const KeyType& key,
-        CacheCausalConsistency causalConsistency = CacheCausalConsistency::kLatestCached) {
-        return acquireAsync(key, causalConsistency).get(opCtx);
+    template <typename KeyType>
+    requires IsComparable<KeyType> ValueHandle acquire(OperationContext* opCtx,
+                                                       const KeyType& key,
+                                                       CacheCausalConsistency causalConsistency,
+                                                       LookupArgs&&... lookupArgs) {
+        return acquireAsync(key, causalConsistency, std::forward<LookupArgs>(lookupArgs)...)
+            .get(opCtx);
+    }
+
+    template <typename KeyType>
+    requires IsComparable<KeyType> ValueHandle acquire(OperationContext* opCtx,
+                                                       const KeyType& key,
+                                                       LookupArgs&&... lookupArgs) {
+        return acquire(opCtx,
+                       key,
+                       CacheCausalConsistency::kLatestCached,
+                       std::forward<LookupArgs>(lookupArgs)...);
     }
 
     /**
      * Acquires the latest value from the cache, or an empty ValueHandle if the key is not present
      * in the cache.
      *
-     * Doesn't attempt to lookup, and so doesn't block.
+     * Doesn't attempt to lookup, and so doesn't block, but this means it will ignore any
+     * in-progress keys or keys whose time in store is newer than what is currently cached.
      */
-    TEMPLATE(typename KeyType)
-    REQUIRES(IsComparable<KeyType>)
-    ValueHandle peekLatestCached(const KeyType& key) {
+    template <typename KeyType>
+    requires IsComparable<KeyType> ValueHandle peekLatestCached(const KeyType& key) {
         return {_cache.get(key, CacheCausalConsistency::kLatestCached)};
+    }
+
+    /**
+     * Returns a vector of the latest values from the cache which satisfy the predicate.
+     *
+     * Doesn't attempt to lookup, and so doesn't block, but this means it will ignore any
+     * in-progress keys or keys whose time in store is newer than what is currently cached.
+     */
+    template <typename Pred>
+    std::vector<ValueHandle> peekLatestCachedIf(const Pred& pred) {
+        auto invalidatingCacheValues = [&] {
+            stdx::lock_guard lg(_mutex);
+            return _cache.getLatestCachedIf(
+                [&](const Key& key, const StoredValue* value) { return pred(key, value->value); });
+        }();
+
+        std::vector<ValueHandle> valueHandles;
+        valueHandles.reserve(invalidatingCacheValues.size());
+        std::transform(invalidatingCacheValues.begin(),
+                       invalidatingCacheValues.end(),
+                       std::back_inserter(valueHandles),
+                       [](auto& invalidatingCacheValue) {
+                           return ValueHandle(std::move(invalidatingCacheValue));
+                       });
+
+        return valueHandles;
     }
 
     /**
@@ -321,21 +402,21 @@ public:
      * The 'time' parameter is mandatory for causally-consistent caches, but not needed otherwise
      * (since the time never changes).
      */
-    void insertOrAssign(const Key& key, Value&& newValue, Date_t updateWallClockTime) {
-        stdx::lock_guard lg(_mutex);
-        if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
-            it->second->invalidateAndCancelCurrentLookupRound(lg);
-        _cache.insertOrAssign(key, {std::move(newValue), updateWallClockTime});
+    void insertOrAssign(const Key& key, Value&& value, Date_t updateWallClockTime) {
+        MONGO_STATIC_ASSERT_MSG(
+            !isCausallyConsistent<Time>,
+            "Time must be passed to insertOrAssign on causally consistent caches");
+        insertOrAssign(key, std::move(value), updateWallClockTime, Time());
     }
 
     void insertOrAssign(const Key& key,
-                        Value&& newValue,
+                        Value&& value,
                         Date_t updateWallClockTime,
                         const Time& time) {
         stdx::lock_guard lg(_mutex);
         if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
             it->second->invalidateAndCancelCurrentLookupRound(lg);
-        _cache.insertOrAssign(key, {std::move(newValue), updateWallClockTime}, time);
+        _cache.insertOrAssign(key, {std::move(value), updateWallClockTime}, time);
     }
 
     /**
@@ -345,21 +426,21 @@ public:
      * The 'time' parameter is mandatory for causally-consistent caches, but not needed otherwise
      * (since the time never changes).
      */
-    ValueHandle insertOrAssignAndGet(const Key& key, Value&& newValue, Date_t updateWallClockTime) {
-        stdx::lock_guard lg(_mutex);
-        if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
-            it->second->invalidateAndCancelCurrentLookupRound(lg);
-        return _cache.insertOrAssignAndGet(key, {std::move(newValue), updateWallClockTime});
+    ValueHandle insertOrAssignAndGet(const Key& key, Value&& value, Date_t updateWallClockTime) {
+        MONGO_STATIC_ASSERT_MSG(
+            !isCausallyConsistent<Time>,
+            "Time must be passed to insertOrAssign on causally consistent caches");
+        return insertOrAssignAndGet(key, std::move(value), updateWallClockTime, Time());
     }
 
     ValueHandle insertOrAssignAndGet(const Key& key,
-                                     Value&& newValue,
+                                     Value&& value,
                                      Date_t updateWallClockTime,
                                      const Time& time) {
         stdx::lock_guard lg(_mutex);
         if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
             it->second->invalidateAndCancelCurrentLookupRound(lg);
-        return _cache.insertOrAssignAndGet(key, {std::move(newValue), updateWallClockTime}, time);
+        return _cache.insertOrAssignAndGet(key, {std::move(value), updateWallClockTime}, time);
     }
 
     /**
@@ -371,11 +452,11 @@ public:
      * guarantee that if 'advanceTimeInStore' is called with a 'newTime', a subsequent call to
      * 'LookupFn' for 'key' must return at least 'newTime' or later.
      *
-     * Returns true if the passed 'newTimeInStore' is grater than the time of the currently cached
+     * Returns true if the passed 'newTimeInStore' is greater than the time of the currently cached
      * value or if no value is cached for 'key'.
      */
-    TEMPLATE(typename KeyType)
-    REQUIRES(IsComparable<KeyType>)
+    template <typename KeyType>
+    requires IsComparable<KeyType>
     bool advanceTimeInStore(const KeyType& key, const Time& newTime) {
         stdx::lock_guard lg(_mutex);
         if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
@@ -384,18 +465,19 @@ public:
     }
 
     /**
-     * The invalidate methods below guarantee the following:
+     * The invalidate+ methods below guarantee the following:
      *  - All affected keys already in the cache (or returned to callers) will be invalidated and
      *    removed from the cache
      *  - All affected keys, which are in the process of being loaded (i.e., acquireAsync has not
      *    yet completed) will be internally interrupted and rescheduled again, as if 'acquireAsync'
      *    was called *after* the call to invalidate
      *
-     * In essence, the invalidate calls serve as a "barrier" for the affected keys.
+     * In essence, the invalidate+ calls serve as an externally induced "barrier" for the affected
+     * keys.
      */
-    TEMPLATE(typename KeyType)
-    REQUIRES(IsComparable<KeyType>)
-    void invalidate(const KeyType& key) {
+    template <typename KeyType>
+    requires IsComparable<KeyType>
+    void invalidateKey(const KeyType& key) {
         stdx::lock_guard lg(_mutex);
         if (auto it = _inProgressLookups.find(key); it != _inProgressLookups.end())
             it->second->invalidateAndCancelCurrentLookupRound(lg);
@@ -403,30 +485,39 @@ public:
     }
 
     /**
-     * Invalidates all cached entries and in progress lookups with keys that matches the preidcate.
+     * Invalidates only the entries whose key is matched by the predicate.
      */
     template <typename Pred>
-    void invalidateKeyIf(const Pred& predicate) {
+    void invalidateKeyIf(const Pred& pred) {
         stdx::lock_guard lg(_mutex);
         for (auto& entry : _inProgressLookups) {
-            if (predicate(entry.first))
+            if (pred(entry.first))
                 entry.second->invalidateAndCancelCurrentLookupRound(lg);
         }
-        _cache.invalidateIf([&](const Key& key, const StoredValue*) { return predicate(key); });
+        _cache.invalidateIf([&](const Key& key, const StoredValue*) { return pred(key); });
     }
 
     /**
-     * Invalidates all cached entries with stored values that matches the preidcate.
+     * Invalidates all entries.
      */
-    template <typename Pred>
-    void invalidateCachedValueIf(const Pred& predicate) {
-        stdx::lock_guard lg(_mutex);
-        _cache.invalidateIf(
-            [&](const Key&, const StoredValue* value) { return predicate(value->value); });
-    }
-
     void invalidateAll() {
         invalidateKeyIf([](const Key&) { return true; });
+    }
+
+    /**
+     * The method below guarantees only that the affected key/value(s) already in the cache (or
+     * returned to callers) will be invalidated and removed from the cache. However, any affected
+     * keys, which are in the process of being loaded (i.e., acquireAsync has not yet completed)
+     * will not be interrupted and will eventually end-up on the cache.
+     *
+     * Because the behaviour described above does not provide any guarantees about the in-progress
+     * lookups, it should be considered as "best-effort".
+     */
+    template <typename Pred>
+    void invalidateLatestCachedValueIf_IgnoreInProgress(const Pred& pred) {
+        stdx::lock_guard lg(_mutex);
+        _cache.invalidateIf(
+            [&](const Key& key, const StoredValue* value) { return pred(key, value->value); });
     }
 
     /**
@@ -454,16 +545,17 @@ public:
      * invocation of `lookup`. Specifically, several concurrent invocations of `acquire` for the
      * same key may group together for a single `lookup`.
      */
-    ReadThroughCache(Mutex& mutex,
-                     ServiceContext* service,
+    ReadThroughCache(stdx::mutex& mutex,
+                     Service* service,
                      ThreadPoolInterface& threadPool,
                      LookupFn lookupFn,
                      int cacheSize)
-        : ReadThroughCacheBase(mutex, service, threadPool),
+        : ReadThroughCacheBase(service, threadPool),
+          _mutex(mutex),
           _lookupFn(std::move(lookupFn)),
           _cache(cacheSize) {}
 
-    ~ReadThroughCache() {
+    ~ReadThroughCache() override {
         invariant(_inProgressLookups.empty());
     }
 
@@ -474,10 +566,10 @@ private:
                                                      LruKeyComparator<Key>>;
 
     /**
-     * This method implements an asynchronous "while (!valid)" loop over 'key', which must be on the
-     * in-progress map.
+     * This method implements an asynchronous "while (!valid)" loop over the in-progress lookup
+     * object for 'key', which must have been previously placed on the in-progress map.
      */
-    Future<LookupResult> _doLookupWhileNotValid(Key key, StatusWith<LookupResult> sw) {
+    Future<LookupResult> _doLookupWhileNotValid(Key key, StatusWith<LookupResult> sw) noexcept {
         stdx::unique_lock ul(_mutex);
         auto it = _inProgressLookups.find(key);
         invariant(it != _inProgressLookups.end());
@@ -490,11 +582,17 @@ private:
                                        false);
 
             // There was a concurrent call to 'invalidate', so start all over
-            if (!inProgressLookup.valid(ul))
+            if (!inProgressLookup.valid(ul)) {
+                LOGV2_DEBUG(9280200,
+                            2,
+                            "Invalidate call happened during in-progress lookup. A reattempt will "
+                            "be made.");
+
                 return std::make_tuple(
                     std::vector<std::unique_ptr<SharedPromise<ValueHandle>>>{},
                     StatusWith<ValueHandle>(Status(ErrorCodes::Error(461541), "")),
                     true);
+            }
 
             // Lookup resulted in an error, which is not cancellation
             if (!sw.isOK())
@@ -506,7 +604,14 @@ private:
             // 'invalidate'. Place the value on the cache and return the necessary promises to
             // signal (those which are waiting for time < time at the store).
             auto& result = sw.getValue();
-            auto promisesToSet = inProgressLookup.getPromisesLessThanTime(ul, result.t);
+            const auto timeOfOldestPromise = inProgressLookup.getTimeOldestPromise(ul);
+            auto promisesToSet = inProgressLookup.getPromisesLessThanOrEqualToTime(ul, result.t);
+            tassert(6493100,
+                    str::stream() << "Time monotonicity violation: lookup time "
+                                  << result.t.toString()
+                                  << " which is less than the earliest expected timeInStore "
+                                  << timeOfOldestPromise.toString() << ".",
+                    !promisesToSet.empty());
 
             auto valueHandleToSet = [&] {
                 if (result.v) {
@@ -540,10 +645,11 @@ private:
             auto p(std::move(promisesToSet.back()));
             promisesToSet.pop_back();
 
-            if (promisesToSet.empty())
+            if (promisesToSet.empty()) {
                 p->setFrom(std::move(result));
-            else
-                p->setFrom(result);
+                break;
+            }
+            p->setFrom(result);
         }
 
         return mustDoAnotherLoop
@@ -554,7 +660,13 @@ private:
             : Future<LookupResult>::makeReady(Status(ErrorCodes::Error(461542), ""));
     }
 
-    // Blocking function which will be invoked to retrieve entries from the backing store
+    // Used to protect the shared below. Has a lock level of 3, meaning that while held, any code is
+    // only allowed to take '_cancelTokensMutex' (which in turn is allowed to be followed by the
+    // Client lock).
+    stdx::mutex& _mutex;
+
+    // Blocking function which will be invoked to retrieve entries from the backing store. It will
+    // be supplied with the arguments specified by the LookupArgs parameter pack.
     const LookupFn _lookupFn;
 
     // Contains all the currently cached keys. This structure is self-synchronising and doesn't
@@ -579,8 +691,8 @@ private:
  * the invalidation logic as described in the comments of 'ReadThroughCache::invalidate'.
  *
  * It is intended to be used in conjunction with the 'ReadThroughCache', which operates on it under
- * its '_mutex' and ensures there is always at most a single active instance at a time active for
- * each 'key'.
+ * its '_mutex' and ensures there is always at most one active instance at a time active for each
+ * 'key'.
  *
  * The methods of this class are not thread-safe, unless indicated in the comments.
  *
@@ -598,35 +710,48 @@ private:
  *      inProgress.signalWaiters(result);
  * }
  */
-template <typename Key, typename Value, typename Time>
-class ReadThroughCache<Key, Value, Time>::InProgressLookup {
+template <typename Key, typename Value, typename Time, typename... LookupArgs>
+class ReadThroughCache<Key, Value, Time, LookupArgs...>::InProgressLookup {
 public:
-    InProgressLookup(ReadThroughCache& cache, Key key, ValueHandle cachedValue, Time minTimeInStore)
+    InProgressLookup(ReadThroughCache& cache,
+                     Key key,
+                     ValueHandle cachedValue,
+                     Time minTimeInStore,
+                     LookupArgs&&... lookupArgs)
         : _cache(cache),
           _key(std::move(key)),
           _cachedValue(std::move(cachedValue)),
-          _minTimeInStore(std::move(minTimeInStore)) {}
+          _minTimeInStore(std::move(minTimeInStore)),
+          _lookupArgs(std::forward<LookupArgs>(lookupArgs)...) {}
 
     Future<LookupResult> asyncLookupRound() {
         auto [promise, future] = makePromiseFuture<LookupResult>();
 
         stdx::lock_guard lg(_cache._mutex);
         _valid = true;
-        _cancelToken.emplace(_cache._asyncWork([ this, promise = std::move(promise) ](
-            OperationContext * opCtx, const Status& status) mutable noexcept {
-            promise.setWith([&] {
-                uassertStatusOK(status);
-                if constexpr (std::is_same_v<Time, CacheNotCausallyConsistent>) {
-                    return _cache._lookupFn(opCtx, _key, _cachedValue);
-                } else {
-                    auto minTimeInStore = [&] {
-                        stdx::lock_guard lg(_cache._mutex);
-                        return _minTimeInStore;
-                    }();
-                    return _cache._lookupFn(opCtx, _key, _cachedValue, minTimeInStore);
-                }
-            });
-        }));
+        _cancelToken.emplace(_cache._asyncWork(
+            [this, promise = std::move(promise)](
+                OperationContext* opCtx, const Status& cancelStatusAtTaskBegin) mutable noexcept {
+                promise.setWith([&] {
+                    uassertStatusOK(cancelStatusAtTaskBegin);
+
+                    if constexpr (std::is_same_v<Time, CacheNotCausallyConsistent>) {
+                        return std::apply(_cache._lookupFn,
+                                          std::tuple_cat(std::make_tuple(opCtx, _key, _cachedValue),
+                                                         _lookupArgs));
+                    } else {
+                        auto minTimeInStore = [&] {
+                            stdx::lock_guard lg(_cache._mutex);
+                            return _minTimeInStore;
+                        }();
+                        return std::apply(
+                            _cache._lookupFn,
+                            std::tuple_cat(
+                                std::make_tuple(opCtx, _key, _cachedValue, minTimeInStore),
+                                _lookupArgs));
+                    }
+                });
+            }));
 
         return std::move(future);
     }
@@ -654,8 +779,18 @@ public:
         return ret;
     }
 
-    std::vector<std::unique_ptr<SharedPromise<ValueHandle>>> getPromisesLessThanTime(WithLock,
-                                                                                     Time time) {
+    /**
+     * Returns the time associated to the oldest promise. This function will invariant if there are
+     * no promises.
+     */
+    Time getTimeOldestPromise(WithLock) const {
+        invariant(_valid);
+        invariant(!_outstanding.empty());
+        return _outstanding.begin()->first;
+    }
+
+    std::vector<std::unique_ptr<SharedPromise<ValueHandle>>> getPromisesLessThanOrEqualToTime(
+        WithLock, Time time) {
         invariant(_valid);
         std::vector<std::unique_ptr<SharedPromise<ValueHandle>>> ret;
         for (auto it = _outstanding.begin(); it != _outstanding.end();) {
@@ -690,14 +825,20 @@ private:
 
     const Key _key;
 
+    // The validity status must start as false so that the first round ignores the error code with
+    // which it would have completed and will loop around
     bool _valid{false};
     boost::optional<CancelToken> _cancelToken;
 
     ValueHandle _cachedValue;
     Time _minTimeInStore;
 
+    std::tuple<LookupArgs...> _lookupArgs;
+
     using TimeAndPromiseMap = std::map<Time, std::unique_ptr<SharedPromise<ValueHandle>>>;
     TimeAndPromiseMap _outstanding;
 };
 
 }  // namespace mongo
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

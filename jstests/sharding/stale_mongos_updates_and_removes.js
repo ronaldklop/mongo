@@ -14,11 +14,17 @@
  * This test is labeled resource intensive because its total io_write is 31MB compared to a median
  * of 5MB across all sharding tests in wiredTiger.
  *
- * @tags: [resource_intensive]
+ * @tags: [
+ *   resource_intensive,
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    WriteWithoutShardKeyTestUtil
+} from "jstests/sharding/updateOne_without_shard_key/libs/write_without_shard_key_test_util.js";
 
 // Create a new sharded collection with numDocs documents, with two docs sharing each shard key
 // (used for testing *multi* removes to a *specific* shard key).
@@ -126,26 +132,16 @@ function checkAllRemoveQueries(makeMongosStaleFunc) {
         }
     }
 
-    function checkRemoveIsInvalid(query, multiOption, makeMongosStaleFunc) {
-        makeMongosStaleFunc();
-        const res = staleMongos.getCollection(collNS).remove(query, multiOption);
-        assert.writeError(res);
-    }
-
-    // Not possible because single remove requires equality match on shard key.
-    checkRemoveIsInvalid(emptyQuery, single, makeMongosStaleFunc);
+    doRemove(emptyQuery, single, makeMongosStaleFunc);
     doRemove(emptyQuery, multi, makeMongosStaleFunc);
 
     doRemove(pointQuery, single, makeMongosStaleFunc);
     doRemove(pointQuery, multi, makeMongosStaleFunc);
 
-    // Not possible because can't do range query on a single remove.
-    checkRemoveIsInvalid(rangeQuery, single, makeMongosStaleFunc);
+    doRemove(rangeQuery, single, makeMongosStaleFunc);
     doRemove(rangeQuery, multi, makeMongosStaleFunc);
 
-    // Not possible because single remove must contain _id or shard key at top level
-    // (not within $or).
-    checkRemoveIsInvalid(multiPointQuery, single, makeMongosStaleFunc);
+    doRemove(multiPointQuery, single, makeMongosStaleFunc);
     doRemove(multiPointQuery, multi, makeMongosStaleFunc);
 }
 
@@ -179,7 +175,13 @@ function checkAllUpdateQueries(makeMongosStaleFunc) {
     function assertUpdateIsValidIfAllChunksOnSingleShard(
         query, update, multiOption, makeMongosStaleFunc) {
         if (makeMongosStaleFunc == makeStaleMongosTargetOneShardWhenChunksAreOnMultipleShards) {
-            assertUpdateIsInvalid(query, update, multiOption, makeMongosStaleFunc);
+            // Sharded updateOnes that do not directly target a shard can now use the two phase
+            // write protocol to execute.
+            if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(st.s)) {
+                doUpdate(query, update, multiOption, makeMongosStaleFunc);
+            } else {
+                assertUpdateIsInvalid(query, update, multiOption, makeMongosStaleFunc);
+            }
         } else {
             doUpdate(query, update, multiOption, makeMongosStaleFunc);
         }
@@ -236,10 +238,9 @@ const numShardKeys = 10;
 const numDocs = numShardKeys * 2;
 const splitPoint = numShardKeys / 2;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: collNS, key: {x: 1}}));
-
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 const freshMongos = st.s0;
 const staleMongos = st.s1;
@@ -268,4 +269,3 @@ checkAllUpdateQueries(makeStaleMongosTargetMultipleShardsWhenAllChunksAreOnOneSh
 checkAllUpdateQueries(makeStaleMongosTargetOneShardWhenChunksAreOnMultipleShards);
 
 st.stop();
-})();

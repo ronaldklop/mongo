@@ -33,15 +33,21 @@
 
 #include "mongo/db/exec/queued_data_stage.h"
 
-#include <boost/optional.hpp>
+#include <cstddef>
 #include <memory>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/tree_walker.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 using namespace mongo;
 
@@ -49,12 +55,11 @@ namespace {
 
 using std::unique_ptr;
 
-const static NamespaceString kNss("db.dummy");
+const static NamespaceString kNss = NamespaceString::createNamespaceString_forTest("db.dummy");
 
 class QueuedDataStageTest : public ServiceContextMongoDTest {
 public:
-    QueuedDataStageTest() {
-        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+    QueuedDataStageTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {
         _opCtx = makeOperationContext();
     }
 
@@ -112,7 +117,7 @@ TEST_F(QueuedDataStageTest, ValidateStats) {
     ASSERT_EQUALS(stats->yields, 1U);
 
     // unyields
-    mock->restoreState({});
+    mock->restoreState({nullptr});
     ASSERT_EQUALS(stats->unyields, 1U);
 
 

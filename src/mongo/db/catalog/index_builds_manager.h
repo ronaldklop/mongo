@@ -29,17 +29,33 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/rebuild_indexes.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl_index_build_state.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/resumable_index_builds_gen.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -60,6 +76,8 @@ class IndexBuildsManager {
     IndexBuildsManager& operator=(const IndexBuildsManager&) = delete;
 
 public:
+    using RetrySkippedRecordMode = MultiIndexBlock::RetrySkippedRecordMode;
+
     /**
      * Indicates whether or not to ignore indexing constraints.
      */
@@ -72,6 +90,8 @@ public:
         SetupOptions();
         IndexConstraints indexConstraints = IndexConstraints::kEnforce;
         IndexBuildProtocol protocol = IndexBuildProtocol::kSinglePhase;
+        IndexBuildMethod method = IndexBuildMethod::kHybrid;
+        bool forRecovery = false;
     };
 
     IndexBuildsManager() = default;
@@ -90,9 +110,10 @@ public:
                            const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
 
     /**
-     * Unregisters the builder associated with the given buildUUID from the _builders map.
+     * Unregisters the builder associated with the given buildUUID from the _builders map, causing
+     * the index build in-memory state to be destroyed.
      */
-    void unregisterIndexBuild(const UUID& buildUUID);
+    void tearDownAndUnregisterIndexBuild(const UUID& buildUUID);
 
     /**
      * Runs the scanning/insertion phase of the index build..
@@ -100,7 +121,7 @@ public:
     Status startBuildingIndex(OperationContext* opCtx,
                               const CollectionPtr& collection,
                               const UUID& buildUUID,
-                              boost::optional<RecordId> resumeAfterRecordId = boost::none);
+                              const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
 
     Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
                                                 const CollectionPtr& collection,
@@ -128,12 +149,14 @@ public:
                                  IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
-     * Retries the key generation and insertion of records that were skipped during the scanning
-     * phase due to error suppression.
+     * By default, retries the key generation and insertion of records that were skipped during the
+     * scanning phase due to error suppression.
      */
-    Status retrySkippedRecords(OperationContext* opCtx,
-                               const UUID& buildUUID,
-                               const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const UUID& buildUUID,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
      * Runs the index constraint violation checking phase of the index build..
@@ -186,6 +209,12 @@ public:
     bool isBackgroundBuilding(const UUID& buildUUID);
 
     /**
+     * Provides passthrough access to MultiIndexBlock for index build info.
+     * Does nothing if build UUID does not refer to an active index build.
+     */
+    void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
+
+    /**
      * Checks via invariant that the manager has no index builds presently.
      */
     void verifyNoIndexBuilds_forTestOnly();
@@ -202,21 +231,11 @@ private:
     StatusWith<MultiIndexBlock*> _getBuilder(const UUID& buildUUID);
 
     // Protects the map data structures below.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsManager::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Map of index builders by build UUID. Allows access to the builders so that actions can be
     // taken on and information passed to and from index builds.
     std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
-
-    /**
-     * Deletes record containing duplicate keys and insert it into a local lost and found collection
-     * titled "local.lost_and_found.<original collection UUID>". Returns the size of the
-     * record removed.
-     */
-    StatusWith<int> _moveRecordToLostAndFound(OperationContext* opCtx,
-                                              const NamespaceString& ns,
-                                              const NamespaceString& lostAndFoundNss,
-                                              RecordId dupRecord);
 };
 
 }  // namespace mongo

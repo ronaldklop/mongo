@@ -30,10 +30,16 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
+#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 
@@ -92,16 +98,21 @@ enum WireVersion {
     // Supports features available from 4.9 and onwards.
     WIRE_VERSION_49 = 12,
 
-    // Set this to the highest value in this enum - it will be the default maxWireVersion for
-    // the WireSpec values.
-    LATEST_WIRE_VERSION = WIRE_VERSION_49,
+    // Supports features available from 5.0 and onwards.
+    WIRE_VERSION_50 = 13,
+
+    // Supports features available from 5.1 and onwards.
+    WIRE_VERSION_51 = 14,
+
+    // Calculate the latest wire version using the number of releases since 4.0.
+    LATEST_WIRE_VERSION = REPLICA_SET_TRANSACTIONS + multiversion::kSince_4_0,
 
     // Set this to LATEST_WIRE_VERSION - 1.
     LAST_CONT_WIRE_VERSION = LATEST_WIRE_VERSION - 1,
 
-    // Set this to the wire version of the previous LTS version. We expect to update this after
-    // each LTS release.
-    LAST_LTS_WIRE_VERSION = RESUMABLE_INITIAL_SYNC,
+    // Calculate the last LTS wire version using the latest wire version minus the number of
+    // releases since last LTS.
+    LAST_LTS_WIRE_VERSION = LATEST_WIRE_VERSION - multiversion::kSinceLastLTS,
 };
 
 /**
@@ -119,6 +130,8 @@ struct WireVersionInfo {
 
 class WireSpec {
 public:
+    static WireSpec& getWireSpec(ServiceContext* sc);
+
     struct Specification {
         // incomingExternalClient.minWireVersion - Minimum version that the server accepts on
         // incoming requests from external clients. We should bump this whenever we don't want to
@@ -153,7 +166,7 @@ public:
 
         // outgoing.maxWireVersion - Latest version allowed on remote nodes when the server sends
         // requests.
-        WireVersionInfo outgoing = {RELEASE_2_4_AND_BEFORE, LATEST_WIRE_VERSION};
+        WireVersionInfo outgoing = {SUPPORTS_OP_MSG, LATEST_WIRE_VERSION};
 
         // Set to true if the client is internal to the cluster---this is a mongod or mongos
         // connecting to another mongod.
@@ -175,15 +188,14 @@ public:
     };
 
 public:
-    static WireSpec& instance();
-
     /**
      * Appends the min and max versions in 'wireVersionInfo' to 'builder' in the format expected for
-     * reporting information about the internal client.
+     * reporting information about the internal client, if the WireSpec represents the internal
+     * client.
      *
-     * Intended for use as part of performing the isMaster handshake with a remote node. When an
-     * internal clients make a connection to another node in the cluster, it includes internal
-     * client information as a parameter to the isMaster command. This parameter has the following
+     * Intended for use as part of performing the isMaster/hello handshake with a remote node. When
+     * an internal clients make a connection to another node in the cluster, it includes internal
+     * client information as a parameter to the hello command. This parameter has the following
      * format:
      *
      *    internalClient: {
@@ -193,25 +205,40 @@ public:
      *
      * This information can be used to ensure correctness during upgrade in mixed version clusters.
      */
-    static void appendInternalClientWireVersion(WireVersionInfo wireVersionInfo,
-                                                BSONObjBuilder* builder);
+    void appendInternalClientWireVersionIfNeeded(BSONObjBuilder* builder);
 
     void initialize(Specification spec);
 
     void reset(Specification spec);
 
-    // Calling `get()` on uninitialized instances of `WireSpec` is prohibited.
-    std::shared_ptr<const Specification> get() const;
+    // Calling `get()` on uninitialized instances of `WireSpec` is an invariant failure.
+    std::shared_ptr<const Specification> get();
 
+    // Do not call this, it requires the caller to hold the lock on _spec.
     bool isInitialized() const {
         return _spec ? true : false;
     }
 
 private:
-    // Ensures concurrent accesses to `get()` and `reset()` are thread-safe.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("WireSpec::_mutex");
+    // Ensures concurrent accesses to `get()`, `appendInternalClientWireVersionIfNeeded()`, and
+    // `reset()` are thread-safe.
+    mutable stdx::mutex _mutex;
 
     std::shared_ptr<const Specification> _spec;
 };
 
+namespace wire_version {
+
+/**
+ * Validates client and server wire version. The server's wire version is returned from
+ * hello/isMaster, and the client is from WireSpec.instance().
+ */
+Status validateWireVersion(WireVersionInfo client, WireVersionInfo server);
+
+/**
+ * Determines the min/max wire version of a remote server from a hello/isMaster command reply.
+ */
+StatusWith<WireVersionInfo> parseWireVersionFromHelloReply(const BSONObj& helloReply);
+
+}  // namespace wire_version
 }  // namespace mongo

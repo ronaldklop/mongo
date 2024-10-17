@@ -27,18 +27,25 @@
  *    it in the license file.
  */
 
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <mutex>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
+#include "mongo/db/s/resharding/resharding_coordinator_observer.h"
+#include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/assert_util.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
-#include "mongo/db/s/resharding/resharding_coordinator_observer.h"
-
-#include <fmt/format.h>
-
-#include "mongo/db/s/resharding/coordinator_document_gen.h"
-#include "mongo/db/s/resharding_util.h"
-#include "mongo/db/service_context.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 namespace {
@@ -61,11 +68,16 @@ const std::vector<RecipientShardEntry>& getParticipants(
 
 /**
  * Returns true if all participants are in a state greater than or equal to the expectedState.
+ * Returns false if the participants list is empty.
  */
 template <class TState, class TParticipant>
 bool allParticipantsInStateGTE(WithLock lk,
                                TState expectedState,
                                const std::vector<TParticipant>& participants) {
+    if (participants.size() == 0) {
+        return false;
+    }
+
     for (const auto& shard : participants) {
         if (shard.getMutableState().getState() < expectedState) {
             return false;
@@ -103,7 +115,7 @@ bool stateTransistionsComplete(WithLock lk,
 template <class TParticipant>
 Status getStatusFromAbortReasonWithShardInfo(const TParticipant& participant,
                                              StringData participantType) {
-    return getStatusFromAbortReason(participant.getMutableState())
+    return resharding::getStatusFromAbortReason(participant.getMutableState())
         .withContext("{} shard {} reached an unrecoverable error"_format(
             participantType, participant.getId().toString()));
 }
@@ -119,7 +131,7 @@ boost::optional<Status> getAbortReasonIfExists(
     if (updatedStateDoc.getAbortReason()) {
         // Note: the absence of context specifying which shard the abortReason originates from
         // implies the abortReason originates from the coordinator.
-        return getStatusFromAbortReason(updatedStateDoc);
+        return resharding::getStatusFromAbortReason(updatedStateDoc);
     }
 
     for (const auto& donorShard : updatedStateDoc.getDonorShards()) {
@@ -136,63 +148,32 @@ boost::optional<Status> getAbortReasonIfExists(
 
     return boost::none;
 }
-
-template <class TState, class TParticipant>
-bool allParticipantsDoneWithAbortReason(WithLock lk,
-                                        TState expectedState,
-                                        const std::vector<TParticipant>& participants) {
-    for (const auto& shard : participants) {
-        if (!(shard.getMutableState().getState() == expectedState &&
-              shard.getMutableState().getAbortReason().is_initialized())) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
- * Fulfills allParticipantsDoneAbortingSp if all participants have reported to the coordinator that
- * they have finished aborting locally.
- */
-void checkAllParticipantsAborted(WithLock lk,
-                                 SharedPromise<void>& allParticipantsDoneAbortingSp,
-                                 const ReshardingCoordinatorDocument& updatedStateDoc) {
-    if (allParticipantsDoneAbortingSp.getFuture().isReady()) {
-        return;
-    }
-
-    bool allDonorsAborted = allParticipantsDoneWithAbortReason(
-        lk, DonorStateEnum::kDone, updatedStateDoc.getDonorShards());
-    bool allRecipientsAborted = allParticipantsDoneWithAbortReason(
-        lk, RecipientStateEnum::kDone, updatedStateDoc.getRecipientShards());
-
-    if (allDonorsAborted && allRecipientsAborted) {
-        allParticipantsDoneAbortingSp.emplaceValue();
-    }
-}
-
 }  // namespace
 
 ReshardingCoordinatorObserver::ReshardingCoordinatorObserver() = default;
 
 ReshardingCoordinatorObserver::~ReshardingCoordinatorObserver() {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    // Rarely, when there is a short period of time between stepdown and stepup, the
+    // ReshardingCoordinator::run() method is not called causing the invariants below
+    // to fire. If this method hasn't been called, we skip the checks.
+    if (!_reshardingCoordinatorRunCalled) {
+        return;
+    }
     invariant(_allDonorsReportedMinFetchTimestamp.getFuture().isReady());
     invariant(_allRecipientsFinishedCloning.getFuture().isReady());
-    invariant(_allRecipientsFinishedApplying.getFuture().isReady());
     invariant(_allRecipientsReportedStrictConsistencyTimestamp.getFuture().isReady());
-    invariant(_allRecipientsRenamedCollection.getFuture().isReady());
-    invariant(_allDonorsDroppedOriginalCollection.getFuture().isReady());
+    invariant(_allRecipientsDone.getFuture().isReady());
+    invariant(_allDonorsDone.getFuture().isReady());
 }
 
 void ReshardingCoordinatorObserver::onReshardingParticipantTransition(
     const ReshardingCoordinatorDocument& updatedStateDoc) {
-    stdx::lock_guard<Latch> lk(_mutex);
-
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (auto abortReason = getAbortReasonIfExists(updatedStateDoc)) {
-        _onAbortOrStepdown(lk, abortReason.get());
-        checkAllParticipantsAborted(lk, _allParticipantsDoneAborting, updatedStateDoc);
-        return;
+        _onAbortOrStepdown(lk, abortReason.value());
+        // Don't exit early since the coordinator waits for all participants to report state 'done'.
     }
 
     if (!stateTransistionsComplete(lk,
@@ -208,13 +189,6 @@ void ReshardingCoordinatorObserver::onReshardingParticipantTransition(
     }
 
     if (!stateTransistionsComplete(lk,
-                                   _allRecipientsFinishedApplying,
-                                   RecipientStateEnum::kSteadyState,
-                                   updatedStateDoc)) {
-        return;
-    }
-
-    if (!stateTransistionsComplete(lk,
                                    _allRecipientsReportedStrictConsistencyTimestamp,
                                    RecipientStateEnum::kStrictConsistency,
                                    updatedStateDoc)) {
@@ -222,12 +196,11 @@ void ReshardingCoordinatorObserver::onReshardingParticipantTransition(
     }
 
     if (!stateTransistionsComplete(
-            lk, _allRecipientsRenamedCollection, RecipientStateEnum::kDone, updatedStateDoc)) {
+            lk, _allRecipientsDone, RecipientStateEnum::kDone, updatedStateDoc)) {
         return;
     }
 
-    if (!stateTransistionsComplete(
-            lk, _allDonorsDroppedOriginalCollection, DonorStateEnum::kDone, updatedStateDoc)) {
+    if (!stateTransistionsComplete(lk, _allDonorsDone, DonorStateEnum::kDone, updatedStateDoc)) {
         return;
     }
 }
@@ -243,40 +216,49 @@ ReshardingCoordinatorObserver::awaitAllRecipientsFinishedCloning() {
 }
 
 SharedSemiFuture<ReshardingCoordinatorDocument>
-ReshardingCoordinatorObserver::awaitAllRecipientsFinishedApplying() {
-    return _allRecipientsFinishedApplying.getFuture();
-}
-
-SharedSemiFuture<ReshardingCoordinatorDocument>
 ReshardingCoordinatorObserver::awaitAllRecipientsInStrictConsistency() {
     return _allRecipientsReportedStrictConsistencyTimestamp.getFuture();
 }
 
 SharedSemiFuture<ReshardingCoordinatorDocument>
-ReshardingCoordinatorObserver::awaitAllDonorsDroppedOriginalCollection() {
-    return _allDonorsDroppedOriginalCollection.getFuture();
+ReshardingCoordinatorObserver::awaitAllDonorsDone() {
+    return _allDonorsDone.getFuture();
 }
 
 SharedSemiFuture<ReshardingCoordinatorDocument>
-ReshardingCoordinatorObserver::awaitAllRecipientsRenamedCollection() {
-    return _allRecipientsRenamedCollection.getFuture();
-}
-
-SharedSemiFuture<void> ReshardingCoordinatorObserver::awaitAllParticipantsDoneAborting() {
-    return _allParticipantsDoneAborting.getFuture();
+ReshardingCoordinatorObserver::awaitAllRecipientsDone() {
+    return _allRecipientsDone.getFuture();
 }
 
 void ReshardingCoordinatorObserver::interrupt(Status status) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _onAbortOrStepdown(lk, status);
 
-    if (!_allParticipantsDoneAborting.getFuture().isReady()) {
-        _allParticipantsDoneAborting.setError(status);
+    if (!_allRecipientsDone.getFuture().isReady()) {
+        _allRecipientsDone.setError(status);
+    }
+
+    if (!_allDonorsDone.getFuture().isReady()) {
+        _allDonorsDone.setError(status);
     }
 }
 
+void ReshardingCoordinatorObserver::fulfillPromisesBeforePersistingStateDoc() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(!_allDonorsReportedMinFetchTimestamp.getFuture().isReady());
+    invariant(!_allRecipientsFinishedCloning.getFuture().isReady());
+    invariant(!_allRecipientsReportedStrictConsistencyTimestamp.getFuture().isReady());
+    invariant(!_allRecipientsDone.getFuture().isReady());
+    invariant(!_allDonorsDone.getFuture().isReady());
+    _allDonorsReportedMinFetchTimestamp.emplaceValue();
+    _allRecipientsFinishedCloning.emplaceValue();
+    _allRecipientsReportedStrictConsistencyTimestamp.emplaceValue();
+    _allRecipientsDone.emplaceValue();
+    _allDonorsDone.emplaceValue();
+}
+
 void ReshardingCoordinatorObserver::onCriticalSectionTimeout() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (!_allRecipientsReportedStrictConsistencyTimestamp.getFuture().isReady()) {
         _allRecipientsReportedStrictConsistencyTimestamp.setError(
             Status{ErrorCodes::ReshardingCriticalSectionTimeout,
@@ -293,20 +275,8 @@ void ReshardingCoordinatorObserver::_onAbortOrStepdown(WithLock, Status status) 
         _allRecipientsFinishedCloning.setError(status);
     }
 
-    if (!_allRecipientsFinishedApplying.getFuture().isReady()) {
-        _allRecipientsFinishedApplying.setError(status);
-    }
-
     if (!_allRecipientsReportedStrictConsistencyTimestamp.getFuture().isReady()) {
         _allRecipientsReportedStrictConsistencyTimestamp.setError(status);
-    }
-
-    if (!_allRecipientsRenamedCollection.getFuture().isReady()) {
-        _allRecipientsRenamedCollection.setError(status);
-    }
-
-    if (!_allDonorsDroppedOriginalCollection.getFuture().isReady()) {
-        _allDonorsDroppedOriginalCollection.setError(status);
     }
 }
 

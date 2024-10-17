@@ -6,12 +6,10 @@
  *  - via heartbeats:
  *      these nodes should include null lastApplied and lastDurable optimes in heartbeat responses
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {checkWriteConcernTimedOut} from "jstests/libs/write_concern_util.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 const testName = jsTestName();
 const rst = new ReplSetTest({name: testName, nodes: [{}, {rsConfig: {priority: 0}}]});
@@ -20,6 +18,10 @@ rst.initiate();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB("test");
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 assert.commandWorked(primaryDb.test.insert({"starting": "doc"}, {writeConcern: {w: 2}}));
 
 jsTestLog("Adding a new node to the replica set");
@@ -58,7 +60,9 @@ assert.commandWorked(secondary.adminCommand({
 
 jsTestLog("Inserting some docs on the primary to advance its lastApplied");
 
-assert.commandWorked(primaryDb.test.insert([{a: 1}, {b: 2}, {c: 3}, {d: 4}, {e: 5}]));
+// We insert these one at a time to avoid batching of inserts.
+[{a: 1}, {b: 2}, {c: 3}, {d: 4}, {e: 5}].forEach(
+    doc => assert.commandWorked(primaryDb.test.insert([doc])));
 
 jsTestLog("Resuming initial sync");
 
@@ -113,11 +117,11 @@ assert.neq(nullWallTime, secondaryOpTimes.optimeDurableDate, () => tojson(second
 // ...the primary thinks they're still null as they were null in the heartbeat responses.
 const primaryStatusRes = assert.commandWorked(primary.adminCommand({replSetGetStatus: 1}));
 const secondaryOpTimesAsSeenByPrimary = primaryStatusRes.members[2];
-assert.docEq(secondaryOpTimesAsSeenByPrimary.optime,
-             nullOpTime,
+assert.docEq(nullOpTime,
+             secondaryOpTimesAsSeenByPrimary.optime,
              () => tojson(secondaryOpTimesAsSeenByPrimary));
-assert.docEq(secondaryOpTimesAsSeenByPrimary.optimeDurable,
-             nullOpTime,
+assert.docEq(nullOpTime,
+             secondaryOpTimesAsSeenByPrimary.optimeDurable,
              () => tojson(secondaryOpTimesAsSeenByPrimary));
 assert.eq(nullWallTime,
           secondaryOpTimesAsSeenByPrimary.optimeDate,
@@ -144,4 +148,3 @@ assert.commandWorked(
 
 rst.restart(1);
 rst.stopSet();
-})();

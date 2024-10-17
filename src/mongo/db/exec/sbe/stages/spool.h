@@ -29,8 +29,29 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo::sbe {
 /**
@@ -45,13 +66,19 @@ namespace mongo::sbe {
  * This producer spool can be connected with multiple consumer spools via a shared 'SpoolBuffer'.
  * This stage will be responsible for populating the buffer, while consumers will read from the
  * buffer once its populated, each using its own read pointer.
+ *
+ * Debug string representation:
+ *
+ *   espool spoolId [<vals>] childStage
  */
 class SpoolEagerProducerStage final : public PlanStage {
 public:
     SpoolEagerProducerStage(std::unique_ptr<PlanStage> input,
                             SpoolId spoolId,
                             value::SlotVector vals,
-                            PlanNodeId planNodeId);
+                            PlanYieldPolicy* yieldPolicy,
+                            PlanNodeId planNodeId,
+                            bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -64,6 +91,7 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
 
 private:
     std::shared_ptr<SpoolBuffer> _buffer{nullptr};
@@ -92,6 +120,10 @@ private:
  * This spool can be parameterized with an optional predicate which can be used to filter the input
  * and store only portion of input data into the buffer. Filtered out input data is passed through
  * without being stored into the buffer.
+ *
+ * Debug string representation:
+ *
+ *   lspool spoolId [<vals>] { predicate }? childStage
  */
 class SpoolLazyProducerStage final : public PlanStage {
 public:
@@ -99,7 +131,8 @@ public:
                            SpoolId spoolId,
                            value::SlotVector vals,
                            std::unique_ptr<EExpression> predicate,
-                           PlanNodeId planNodeId);
+                           PlanNodeId planNodeId,
+                           bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -112,6 +145,13 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    void doSaveState(bool relinquishCursor) final;
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
 
 private:
     std::shared_ptr<SpoolBuffer> _buffer{nullptr};
@@ -119,7 +159,7 @@ private:
 
     const value::SlotVector _vals;
     std::vector<value::SlotAccessor*> _inAccessors;
-    value::SlotMap<value::ViewOfValueAccessor> _outAccessors;
+    value::SlotMap<value::OwnedValueAccessor> _outAccessors;
 
     std::unique_ptr<EExpression> _predicate;
     std::unique_ptr<vm::CodeFragment> _predicateCode;
@@ -142,20 +182,33 @@ private:
  * example, the lazy spool can add values [1,2,3], then the stack consumer spool will read and
  * delete 3, then another two values can be added to the buffer [1,2,4,5], then the consumer spool
  * will read and delete 5, and so on.
+ *
+ * Debug string representations:
+ *
+ *   cspool spoolId [<vals>]
+ *   sspool spoolId [<vals>]
  */
 template <bool IsStack>
 class SpoolConsumerStage final : public PlanStage {
 public:
-    SpoolConsumerStage(SpoolId spoolId, value::SlotVector vals, PlanNodeId planNodeId)
-        : PlanStage{IsStack ? "sspool"_sd : "cspool"_sd, planNodeId},
+    SpoolConsumerStage(SpoolId spoolId,
+                       value::SlotVector vals,
+                       PlanYieldPolicy* yieldPolicy,
+                       PlanNodeId planNodeId,
+                       bool participateInTrialRunTracking = true)
+        : PlanStage{IsStack ? "sspool"_sd : "cspool"_sd,
+                    yieldPolicy,
+                    planNodeId,
+                    participateInTrialRunTracking},
           _spoolId{spoolId},
           _vals{std::move(vals)} {}
 
-    std::unique_ptr<PlanStage> clone() const {
-        return std::make_unique<SpoolConsumerStage<IsStack>>(_spoolId, _vals, _commonStats.nodeId);
+    std::unique_ptr<PlanStage> clone() const override {
+        return std::make_unique<SpoolConsumerStage<IsStack>>(
+            _spoolId, _vals, _yieldPolicy, _commonStats.nodeId, participateInTrialRunTracking());
     }
 
-    void prepare(CompileCtx& ctx) {
+    void prepare(CompileCtx& ctx) override {
         if (!_buffer) {
             _buffer = ctx.getSpoolBuffer(_spoolId);
         }
@@ -172,7 +225,7 @@ public:
         }
     }
 
-    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) override {
         if (auto it = _outAccessors.find(slot); it != _outAccessors.end()) {
             return &it->second;
         }
@@ -180,15 +233,16 @@ public:
         return ctx.getAccessor(slot);
     }
 
-    void open(bool reOpen) {
+    void open(bool reOpen) override {
         auto optTimer(getOptTimer(_opCtx));
 
         _commonStats.opens++;
         _bufferIt = _buffer->size();
     }
 
-    PlanState getNext() {
+    PlanState getNext() override {
         auto optTimer(getOptTimer(_opCtx));
+        checkForInterruptAndYield(_opCtx);
 
         if constexpr (IsStack) {
             if (_bufferIt != _buffer->size()) {
@@ -214,30 +268,30 @@ public:
         return trackPlanState(PlanState::ADVANCED);
     }
 
-    void close() {
+    void close() override {
         auto optTimer(getOptTimer(_opCtx));
 
-        _commonStats.closes++;
+        trackClose();
     }
 
-    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const {
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const override {
         auto ret = std::make_unique<PlanStageStats>(_commonStats);
 
         if (includeDebugInfo) {
             BSONObjBuilder bob;
             bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
-            bob.append("outputSlots", _vals);
+            bob.append("outputSlots", _vals.begin(), _vals.end());
             ret->debugInfo = bob.obj();
         }
 
         return ret;
     }
 
-    const SpecificStats* getSpecificStats() const {
+    const SpecificStats* getSpecificStats() const override {
         return nullptr;
     }
 
-    std::vector<DebugPrinter::Block> debugPrint() const {
+    std::vector<DebugPrinter::Block> debugPrint() const override {
         auto ret = PlanStage::debugPrint();
 
         DebugPrinter::addSpoolIdentifier(ret, _spoolId);
@@ -253,6 +307,12 @@ public:
         ret.emplace_back("`]");
 
         return ret;
+    }
+
+    size_t estimateCompileTimeSize() const override {
+        size_t size = sizeof(*this);
+        size += size_estimator::estimate(_vals);
+        return size;
     }
 
 private:

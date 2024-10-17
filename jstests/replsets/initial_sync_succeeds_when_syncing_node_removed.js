@@ -3,16 +3,15 @@
  * This behavior is desired because transient DNS failures can cause the node to falsely believe
  * that it is removed.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = TestData.testName;
 const rst = new ReplSetTest({name: testName, nodes: [{}]});
-const nodes = rst.startSet();
+rst.startSet();
 rst.initiate();
 
 const primary = rst.getPrimary();
@@ -108,4 +107,3 @@ assert.commandWorked(primary.adminCommand({replSetReconfig: config, force: 1}));
 rst.waitForState(initialSyncNode, ReplSetTest.State.SECONDARY);
 
 rst.stopSet();
-})();

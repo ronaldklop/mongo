@@ -27,12 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/unittest/thread_assertion_monitor.h"
 
+#include <memory>
+#include <ostream>
+
+#include "mongo/base/string_data.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/framework.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo::unittest {
 namespace {
@@ -44,7 +51,9 @@ TEST(ThreadAssertionMonitor, Trivial) {
 
 TEST(ThreadAssertionMonitor, ControllerInStdxThread) {
     ThreadAssertionMonitor monitor;
-    stdx::thread{[&] { monitor.notifyDone(); }}.join();
+    stdx::thread{[&] {
+        monitor.notifyDone();
+    }}.join();
 }
 
 TEST(ThreadAssertionMonitor, OnlyControllerInSpawn) {

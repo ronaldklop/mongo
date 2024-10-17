@@ -42,8 +42,6 @@
 
 #define MONGO_COMPILER_NORETURN __declspec(noreturn)
 
-#define MONGO_COMPILER_VARIABLE_UNUSED
-
 #define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __declspec(align(ALIGNMENT))
 
 #define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __declspec(align(ALIGNMENT))
@@ -72,3 +70,23 @@
 #define MONGO_COMPILER_ALWAYS_INLINE __forceinline
 
 #define MONGO_COMPILER_UNREACHABLE __assume(false)
+
+#define MONGO_COMPILER_RETURNS_NONNULL
+
+#define MONGO_COMPILER_MALLOC __declspec(restrict)
+
+#define MONGO_COMPILER_ALLOC_SIZE(varindex)
+
+#define MONGO_COMPILER_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+
+#define MONGO_COMPILER_USED
+
+#define MONGO_GSL_POINTER
+
+// Introduced in Visual Studio 2022 17.7
+// See: https://learn.microsoft.com/en-us/cpp/code-quality/c26815?view=msvc-170
+#if _MSC_VER >= 1937
+#define MONGO_COMPILER_LIFETIME_BOUND [[msvc::lifetimebound]]
+#else
+#define MONGO_COMPILER_LIFETIME_BOUND
+#endif

@@ -27,10 +27,12 @@
  *    it in the license file.
  */
 
-#include "engine.h"
+#include <string>
+
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
-void ScriptEngine::setup(bool disableLoadStored) {
+void ScriptEngine::setup(ExecutionEnvironment environment) {
     // noop
 }
 

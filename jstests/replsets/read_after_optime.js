@@ -1,8 +1,6 @@
 // Test read after opTime functionality with maxTimeMS.
-load("jstests/libs/logv2_helpers.js");
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -37,14 +35,9 @@ var runTest = function(testDB, primaryConn) {
     runTimeoutTest();
     testDB.setLogLevel(0, 'command');
 
-    var msg = 'Command on database ' + testDB.getName() +
-        ' timed out waiting for read concern to be satisfied. Command:';
-
-    if (isJsonLog(testDB.getMongo())) {
-        msg =
-            new RegExp(`Command timed out waiting for read concern to be satisfied.*"attr":{"db":"${
-                testDB.getName()}",*`);
-    }
+    const msg =
+        new RegExp(`Command timed out waiting for read concern to be satisfied.*"attr":{"db":"${
+            testDB.getName()}",*`);
 
     checkLog.containsWithCount(testDB.getMongo(), msg, 1);
     // Clear the log to not fill up the ramlog
@@ -89,4 +82,3 @@ jsTest.log("test2");
 runTest(replTest.getSecondary().getDB('test2'), primary);
 
 replTest.stopSet();
-})();

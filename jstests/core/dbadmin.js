@@ -5,9 +5,6 @@
 //    does_not_support_stepdowns,
 // ]
 
-(function() {
-'use strict';
-
 var t = db.dbadmin;
 t.save({x: 1});
 t.save({x: 1});
@@ -31,10 +28,9 @@ if (localTimeSkew >= 50) {
 assert.lt(localTimeSkew, 60 * 60 * 1000 /* one minute */, "hello.localTime");
 
 var before = db.runCommand("serverStatus");
-print(before.uptimeEstimate);
-sleep(5000);
+print(before.uptimeMillis);
+sleep(100);
 
 var after = db.runCommand("serverStatus");
-print(after.uptimeEstimate);
-assert.gte(after.uptimeEstimate, before.uptimeEstimate, "uptime estimate should be non-decreasing");
-})();
+print(after.uptimeMillis);
+assert.gte(after.uptimeMillis, before.uptimeMillis, "uptime estimate should be non-decreasing");

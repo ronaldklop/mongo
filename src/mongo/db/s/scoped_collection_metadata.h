@@ -35,7 +35,7 @@ namespace mongo {
 
 /**
  * Contains the parts of the sharding state for a particular collection, which do not change due to
- * chunk move, split and merge. The implementation is allowed to be tighly coupled with the
+ * chunk move, split and merge. The implementation is allowed to be tightly coupled with the
  * CollectionShardingState from which it was derived and because of this it must not be accessed
  * outside of a collection lock.
  */
@@ -53,12 +53,12 @@ public:
 
     ScopedCollectionDescription(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
 
-    bool isSharded() const {
-        return _impl->get().isSharded();
+    bool hasRoutingTable() const {
+        return _impl->get().hasRoutingTable();
     }
 
-    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const {
-        return _impl->get().disallowWritesForResharding(currentCollectionUUID);
+    bool isSharded() const {
+        return _impl->get().isSharded();
     }
 
     bool isValidKey(const BSONObj& key) const {
@@ -73,8 +73,13 @@ public:
         _impl->get().throwIfReshardingInProgress(nss);
     }
 
+    // Same as getShardKeyPattern().toBSON()
     const BSONObj& getKeyPattern() const {
         return _impl->get().getKeyPattern();
+    }
+
+    const ShardKeyPattern& getShardKeyPattern() const {
+        return _impl->get().getShardKeyPattern();
     }
 
     const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
@@ -97,8 +102,20 @@ public:
         return _impl->get().uuidMatches(uuid);
     }
 
+    const UUID& getUUID() const {
+        return _impl->get().getUUID();
+    }
+
     const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
         return _impl->get().getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        return _impl->get().getTimeseriesFields();
+    }
+
+    bool isUniqueShardKey() const {
+        return _impl->get().isUniqueShardKey();
     }
 
 protected:
@@ -120,6 +137,10 @@ public:
     bool keyBelongsToMe(const BSONObj& key) const {
         return _impl->get().keyBelongsToMe(key);
     }
+
+    bool isRangeEntirelyOwned(const BSONObj& min,
+                              const BSONObj& max,
+                              bool includeMaxBound = true) const;
 };
 
 }  // namespace mongo

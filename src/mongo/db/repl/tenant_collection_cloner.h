@@ -29,14 +29,33 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/base_cloner.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/db/repl/tenant_base_cloner.h"
 #include "mongo/db/repl/tenant_migration_shared_data.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -44,13 +63,13 @@ namespace repl {
 class TenantCollectionCloner : public TenantBaseCloner {
 public:
     struct Stats {
-        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
+        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopyAtStartOfClone"_sd;
         static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
 
         std::string ns;
         Date_t start;
         Date_t end;
-        size_t documentToCopy{0};
+        size_t documentsToCopyAtStartOfClone{0};
         size_t documentsCopied{0};
         size_t indexes{0};
         size_t insertedBatches{0};
@@ -65,14 +84,6 @@ public:
         void append(BSONObjBuilder* builder) const;
     };
 
-    /**
-     * Type of function to schedule storage interface tasks with the executor.
-     *
-     * Used for testing only.
-     */
-    using ScheduleDbWorkFn = unique_function<StatusWith<executor::TaskExecutor::CallbackHandle>(
-        executor::TaskExecutor::CallbackFn)>;
-
     TenantCollectionCloner(const NamespaceString& ns,
                            const CollectionOptions& collectionOptions,
                            TenantMigrationSharedData* sharedData,
@@ -82,7 +93,7 @@ public:
                            ThreadPool* dbPool,
                            StringData tenantId);
 
-    virtual ~TenantCollectionCloner() = default;
+    ~TenantCollectionCloner() override = default;
 
     Stats getStats() const;
 
@@ -92,7 +103,7 @@ public:
         return _sourceNss;
     }
     UUID getSourceUuid() const {
-        return *_sourceDbAndUuid.uuid();
+        return _sourceDbAndUuid.uuid();
     }
     const std::string& getTenantId() const {
         return _tenantId;
@@ -106,15 +117,6 @@ public:
      */
     void setBatchSize_forTest(int batchSize) {
         _collectionClonerBatchSize = batchSize;
-    }
-
-    /**
-     * Overrides how executor schedules database work.
-     *
-     * For testing only.
-     */
-    void setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWorkFn) {
-        _scheduleDbWorkFn = std::move(scheduleDbWorkFn);
     }
 
     Timestamp getOperationTime_forTest();
@@ -209,25 +211,20 @@ private:
     AfterStageBehavior queryStage();
 
     /**
-     * Put all results from a query batch into a buffer to be inserted, and schedule
-     * it to be inserted.
+     * Put all results from a query batch into a buffer to be inserted, and schedule it to be
+     * inserted.
      */
-    void handleNextBatch(DBClientCursorBatchIterator& iter);
+    void handleNextBatch(DBClientCursor& cursor);
 
     /**
      * Called whenever there is a new batch of documents ready from the DBClientConnection.
      */
-    void insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd);
+    void insertDocuments(std::vector<BSONObj> docsToInsert);
 
     /**
      * Sends a query command to the source.
      */
     void runQuery();
-
-    /**
-     * Waits for any database work to finish or fail.
-     */
-    void waitForDatabaseWorkToComplete();
 
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -247,25 +244,20 @@ private:
     // The size of the batches of documents returned in collection cloning.
     int _collectionClonerBatchSize;  // (R)
 
-    TenantCollectionClonerStage _countStage;                          // (R)
-    TenantCollectionClonerStage _checkIfDonorCollectionIsEmptyStage;  // (R)
-    TenantCollectionClonerStage _listIndexesStage;                    // (R)
-    TenantCollectionClonerStage _createCollectionStage;               // (R)
-    TenantCollectionClonerQueryStage _queryStage;                     // (R)
+    TenantCollectionClonerStage _countStage;                               // (R)
+    TenantCollectionClonerQueryStage _checkIfDonorCollectionIsEmptyStage;  // (R)
+    TenantCollectionClonerStage _listIndexesStage;                         // (R)
+    TenantCollectionClonerStage _createCollectionStage;                    // (R)
+    TenantCollectionClonerQueryStage _queryStage;                          // (R)
 
     ProgressMeter _progressMeter;           // (X) progress meter for this instance.
     std::vector<BSONObj> _readyIndexSpecs;  // (X) Except for _id_
     BSONObj _idIndexSpec;                   // (X)
 
     BSONObj _lastDocId;  // (X)
-    // Function for scheduling database work using the executor.
-    ScheduleDbWorkFn _scheduleDbWorkFn;  // (R)
     // Documents read from source to insert.
     std::vector<BSONObj> _documentsToInsert;  // (M)
     Stats _stats;                             // (M)
-    // We put _dbWorkTaskRunner after anything the database threads depend on to ensure it is
-    // only destroyed after those threads exit.
-    TaskRunner _dbWorkTaskRunner;  // (R)
 
     // The database name prefix of the tenant associated with this migration.
     std::string _tenantId;  // (R)

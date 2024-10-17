@@ -27,14 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/vector_clock_metadata_hook.h"
-
 #include <memory>
 
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/operation_time_tracker.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/db/vector_clock_gen.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -48,12 +58,11 @@ VectorClockMetadataHook::VectorClockMetadataHook(ServiceContext* service) : _ser
 
 Status VectorClockMetadataHook::writeRequestMetadata(OperationContext* opCtx,
                                                      BSONObjBuilder* metadataBob) {
-    VectorClock::get(_service)->gossipOut(opCtx, metadataBob, transport::Session::kInternalClient);
+    VectorClock::get(_service)->gossipOut(opCtx, metadataBob, true /* forceInternal */);
     return Status::OK();
 }
 
 Status VectorClockMetadataHook::readReplyMetadata(OperationContext* opCtx,
-                                                  StringData replySource,
                                                   const BSONObj& metadataObj) {
     if (!VectorClock::get(_service)->isEnabled()) {
         return Status::OK();
@@ -70,8 +79,12 @@ Status VectorClockMetadataHook::readReplyMetadata(OperationContext* opCtx,
         }
     }
 
-    VectorClock::get(_service)->gossipIn(
-        opCtx, metadataObj, false /* couldBeUnauthorized */, transport::Session::kInternalClient);
+    auto receivedComponents = GossipedVectorClockComponents::parse(
+        IDLParserContext("VectorClockComponents"), metadataObj);
+    VectorClock::get(_service)->gossipIn(opCtx,
+                                         receivedComponents,
+                                         false /* couldBeUnauthorized */,
+                                         true /* defaultIsInternalClient */);
     return Status::OK();
 }
 

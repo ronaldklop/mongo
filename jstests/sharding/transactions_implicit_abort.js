@@ -2,26 +2,24 @@
 // error.
 //
 // @tags: [requires_sharding, uses_transactions, uses_multi_shard_transaction]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    assertNoSuchTransactionOnAllShards
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + '.' + collName;
 
-const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+const st = new ShardingTest({shards: 2, mongos: 1});
 
 // Set up a sharded collection with one chunk on each shard.
-
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: -1}, {writeConcern: {w: "majority"}}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 1}, {writeConcern: {w: "majority"}}));
-
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
@@ -60,4 +58,3 @@ assertNoSuchTransactionOnAllShards(st, session.getSessionId(), session.getTxnNum
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 st.stop();
-})();

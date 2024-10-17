@@ -3,6 +3,8 @@
  * SERVER-13055.
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({name: 'prohibit_w0', nodes: 1});
 var nodes = replTest.nodeList();
 var conns = replTest.startSet();
@@ -18,11 +20,7 @@ function testReconfig(gleDefaults) {
     conf.version++;
 
     var response = admin.runCommand({replSetReconfig: conf});
-    // TODO (SERVER-48065): When 5.0 becomes last-lts, remove
-    // ErrorCodes.NewReplicaSetConfigurationIncompatible.
-    assert.commandFailedWithCode(
-        response,
-        [ErrorCodes.InvalidReplicaSetConfig, ErrorCodes.NewReplicaSetConfigurationIncompatible]);
+    assert.commandFailedWithCode(response, ErrorCodes.InvalidReplicaSetConfig);
 }
 
 /*

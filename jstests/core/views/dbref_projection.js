@@ -2,13 +2,7 @@
  * Test projecting DBRef fields ($ref, $id, $db) in views.
  *
  * Legacy find() queries do not support views, so must use the find() command.
- * @tags: [
- *   requires_find_command,
- * ]
  */
-(function() {
-"use strict";
-
 const viewsDB = db.getSiblingDB("views_dbref_projection");
 assert.commandWorked(viewsDB.dropDatabase());
 
@@ -28,4 +22,3 @@ function checkViewAndBaseCollection(projection, expectedResult) {
 checkViewAndBaseCollection({"link.$ref": 1}, [{_id: 0, link: {$ref: "otherColl"}}]);
 checkViewAndBaseCollection({"link.$db": 1}, [{_id: 0, link: {$db: viewsDB.getName()}}]);
 checkViewAndBaseCollection({"link.$id": 1}, [{_id: 0, link: {$id: "someId"}}]);
-}());

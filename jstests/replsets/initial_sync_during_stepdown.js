@@ -1,11 +1,10 @@
 /**
  * Test that stepdown during collection cloning and oplog fetching does not interrupt initial sync.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
-load("jstests/libs/fail_point_util.js");
+import {waitForCurOpByFailPoint} from "jstests/libs/curop_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "initialSyncDuringStepDown";
 const dbName = testName;
@@ -27,6 +26,10 @@ var secondaryColl = secondaryDB[collName];
 var dbNss = primaryDB.getName();
 var collNss = primaryColl.getFullName();
 
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 function setupTest({
     failPoint,
     nss: nss = '',
@@ -42,11 +45,7 @@ function setupTest({
     rst.stop(secondary);
 
     jsTestLog("Enabling failpoint '" + failPoint + "' on primary (sync source).");
-    assert.commandWorked(primary.adminCommand({
-        configureFailPoint: failPoint,
-        data: {nss: nss + nssSuffix, shouldCheckForInterrupt: true, shouldNotdropLock: true},
-        mode: "alwaysOn"
-    }));
+    configureFailPoint(primary, failPoint, {nss: nss + nssSuffix, shouldCheckForInterrupt: true});
 
     jsTestLog("Starting secondary.");
     secondaryStartupParams['numInitialSyncAttempts'] = 1;
@@ -75,7 +74,7 @@ function finishTest(
     checkLog.contains(primary, "Starting to kill user operations");
 
     jsTestLog("Allowing initial sync to continue.");
-    assert.commandWorked(primaryAdmin.adminCommand({configureFailPoint: failPoint, mode: 'off'}));
+    configureFailPoint(primaryAdmin, failPoint, {}, "off");
 
     jsTestLog("Waiting for initial sync to complete.");
     rst.waitForState(secondary, ReplSetTest.State.SECONDARY);
@@ -158,16 +157,13 @@ assert.commandWorked(primaryColl.insert([{_id: 3}, {_id: 4}]));
 
 // Insert is successful. So, enable fail point "waitWithPinnedCursorDuringGetMoreBatch"
 // such that it doesn't drop locks when getmore cmd waits inside the fail point block.
-assert.commandWorked(primary.adminCommand({
-    configureFailPoint: "waitWithPinnedCursorDuringGetMoreBatch",
-    data: {nss: oplogNss, shouldCheckForInterrupt: true, shouldNotdropLock: true},
-    mode: "alwaysOn"
-}));
+configureFailPoint(primary,
+                   "waitWithPinnedCursorDuringGetMoreBatch",
+                   {nss: oplogNss, shouldCheckForInterrupt: true});
 
 // Now, disable fail point "waitAfterPinningCursorBeforeGetMoreBatch" to allow getmore to
 // continue and hang on "waitWithPinnedCursorDuringGetMoreBatch" fail point.
-assert.commandWorked(primary.adminCommand(
-    {configureFailPoint: "waitAfterPinningCursorBeforeGetMoreBatch", mode: "off"}));
+configureFailPoint(primary, "waitAfterPinningCursorBeforeGetMoreBatch", {}, "off");
 
 // Disable fail point on secondary to allow initial sync to continue.
 assert.commandWorked(
@@ -180,4 +176,3 @@ finishTest({
 });
 
 rst.stopSet();
-})();

@@ -1,10 +1,10 @@
 // db.js
-
 var DB;
 
 (function() {
 
 var _defaultWriteConcern = {w: 'majority', wtimeout: 10 * 60 * 1000};
+const kWireVersionSupportingScramSha256Fallback = 15;
 
 if (DB === undefined) {
     DB = function(mongo, name) {
@@ -36,8 +36,19 @@ DB.prototype.getName = function() {
     return this._name;
 };
 
-DB.prototype.stats = function(scale) {
-    return this.runCommand({dbstats: 1, scale: scale});
+/**
+ * Gets DB level statistics. opt can be a number representing the scale for backwards compatibility
+ * or a document with options passed along to the dbstats command.
+ */
+DB.prototype.stats = function(opt) {
+    var cmd = {dbstats: 1};
+
+    if (opt === undefined)
+        return this.runCommand(cmd);
+    if (typeof (opt) !== "object")
+        return this.runCommand(Object.extend(cmd, {scale: opt}));
+
+    return this.runCommand(Object.extend(cmd, opt));
 };
 
 DB.prototype.getCollection = function(name) {
@@ -54,26 +65,23 @@ DB.prototype.commandHelp = function(name) {
     return res.help;
 };
 
-// utility to attach readPreference if needed.
+// Utility to attach readPreference if needed.
 DB.prototype._attachReadPreferenceToCommand = function(cmdObj, readPref) {
     "use strict";
-    // if the user has not set a readpref, return the original cmdObj
+    // If the user has not set a read pref, return the original 'cmdObj'.
     if ((readPref === null) || typeof (readPref) !== "object") {
         return cmdObj;
     }
 
-    // if user specifies $readPreference manually, then don't change it
+    // If user specifies $readPreference manually, then don't change it.
     if (cmdObj.hasOwnProperty("$readPreference")) {
         return cmdObj;
     }
 
-    // copy object so we don't mutate the original
+    // Copy object so we don't mutate the original.
     var clonedCmdObj = Object.extend({}, cmdObj);
-    // The server selection spec mandates that the key is '$query', but
-    // the shell has historically used 'query'. The server accepts both,
-    // so we maintain the existing behavior
-    var cmdObjWithReadPref = {query: clonedCmdObj, $readPreference: readPref};
-    return cmdObjWithReadPref;
+    clonedCmdObj["$readPreference"] = readPref;
+    return clonedCmdObj;
 };
 
 /**
@@ -173,17 +181,11 @@ DB.prototype.runCommand = function(obj, extra, queryOptions) {
         // "error doing query: failed". Even though this message is arguably incorrect
         // for a command failing due to a connection failure, we preserve it for backwards
         // compatibility. See SERVER-18334 for details.
-        if (ex.message.indexOf("network error") >= 0) {
+        if (ex.hasOwnProperty("message") && ex.message.indexOf("network error") >= 0) {
             throw new Error("error doing query: failed: " + ex.message);
         }
         throw ex;
     }
-};
-
-DB.prototype.runCommandWithMetadata = function(commandArgs, metadata) {
-    const session = this.getSession();
-    return session._getSessionAwareClient().runCommandWithMetadata(
-        session, this._name, metadata, commandArgs);
 };
 
 DB.prototype._dbCommand = DB.prototype.runCommand;
@@ -196,6 +198,14 @@ DB.prototype.adminCommand = function(obj, extra) {
 };
 
 DB.prototype._adminCommand = DB.prototype.adminCommand;  // alias old name
+
+DB.prototype._helloOrLegacyHello = function(args) {
+    let cmd = this.getMongo().getApiParameters().version ? {hello: 1} : {isMaster: 1};
+    if (args) {
+        Object.assign(cmd, args);
+    }
+    return this.runCommand(cmd);
+};
 
 DB.prototype._runCommandWithoutApiStrict = function(command) {
     let commandWithoutApiStrict = Object.assign({}, command);
@@ -212,6 +222,10 @@ DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
     assert(cmdObj.aggregate !== undefined, "cmdObj must contain 'aggregate' field");
     assert(aggregateOptions === undefined || aggregateOptions instanceof Object,
            "'aggregateOptions' argument must be an object");
+
+    // Disallow explicit API parameters on the aggregate shell helper; callers should use runCommand
+    // directly if they want to test this.
+    assert.noAPIParams(aggregateOptions);
 
     // Make a copy of the initial command object, i.e. {aggregate: x, pipeline: [...]}.
     cmdObj = Object.extend({}, cmdObj);
@@ -248,23 +262,6 @@ DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
     }
 
     const res = this.runReadCommand(cmdObj);
-
-    if (!res.ok && (res.code == 17020 || res.errmsg == "unrecognized field \"cursor") &&
-        !("cursor" in aggregateOptions)) {
-        // If the command failed because cursors aren't supported and the user didn't explicitly
-        // request a cursor, try again without requesting a cursor.
-        delete cmdObj.cursor;
-
-        res = doAgg(cmdObj);
-
-        if ('result' in res && !("cursor" in res)) {
-            // convert old-style output to cursor-style output
-            res.cursor = {ns: '', id: NumberLong(0)};
-            res.cursor.firstBatch = res.result;
-            delete res.result;
-        }
-    }
-
     assert.commandWorked(res, "aggregate failed");
 
     if ("cursor" in res) {
@@ -455,12 +452,11 @@ DB.prototype.help = function() {
     print("\tdb.eval() - deprecated");
     print("\tdb.fsyncLock() flush data to disk and lock server for backups");
     print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
+    print("\tdb.checkMetadataConsistency() checks the consistency of the metadata in the db");
     print("\tdb.getCollection(cname) same as db['cname'] or db.cname");
     print("\tdb.getCollectionInfos([filter]) - returns a list that contains the names and options" +
           " of the db's collections");
     print("\tdb.getCollectionNames()");
-    print("\tdb.getLastError() - just returns the err msg string");
-    print("\tdb.getLastErrorObj() - return full status object");
     print("\tdb.getLogComponents()");
     print("\tdb.getMongo() get the server connection object");
     print("\tdb.getMongo().setSecondaryOk() allow queries on a replication secondary server");
@@ -619,9 +615,9 @@ DB.prototype.dbEval = DB.prototype.eval;
  */
 DB.prototype.groupeval = function(parmsObj) {
     var groupFunction = function() {
-        var parms = args[0];
-        var c = db[parms.ns].find(parms.cond || {});
-        var map = new Map();
+        var parms = args[0];  // eslint-disable-line
+        var c = globalThis.db[parms.ns].find(parms.cond || {});
+        var map = new BSONAwareMap();
         var pks = parms.key ? Object.keySet(parms.key) : null;
         var pkl = pks ? pks.length : 0;
         var key = {};
@@ -672,29 +668,6 @@ DB.prototype.forceError = function() {
     return this.runCommand({forceerror: 1});
 };
 
-DB.prototype.getLastError = function(w, wtimeout) {
-    var res = this.getLastErrorObj(w, wtimeout);
-    if (!res.ok)
-        throw _getErrorWithCode(ret, "getlasterror failed: " + tojson(res));
-    return res.err;
-};
-DB.prototype.getLastErrorObj = function(w, wtimeout, j) {
-    var cmd = {getlasterror: 1};
-    if (w) {
-        cmd.w = w;
-        if (wtimeout)
-            cmd.wtimeout = wtimeout;
-        if (j != null)
-            cmd.j = j;
-    }
-    var res = this.runCommand(cmd);
-
-    if (!res.ok)
-        throw _getErrorWithCode(res, "getlasterror failed: " + tojson(res));
-    return res;
-};
-DB.prototype.getLastErrorCmd = DB.prototype.getLastErrorObj;
-
 DB.prototype._getCollectionInfosCommand = function(
     filter, nameOnly = false, authorizedCollections = false, options = {}) {
     filter = filter || {};
@@ -716,7 +689,7 @@ DB.prototype._getCollectionInfosCommand = function(
 DB.prototype._getCollectionInfosFromPrivileges = function() {
     let ret = this.runCommand({connectionStatus: 1, showPrivileges: 1});
     if (!ret.ok) {
-        throw _getErrorWithCode(res, "Failed to acquire collection information from privileges");
+        throw _getErrorWithCode(ret, "Failed to acquire collection information from privileges");
     }
 
     // Parse apart collection information.
@@ -807,14 +780,24 @@ DB.prototype.hello = function() {
     return this.runCommand("hello");
 };
 
-var commandUnsupported = function(res) {
-    return (!res.ok &&
-            (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
-             res.code === 59 /* CommandNotFound */));
+DB.prototype.currentOp = function(arg) {
+    try {
+        const results = this.currentOpCursor(arg).toArray();
+        let res = {"inprog": results.length > 0 ? results : [], "ok": 1};
+        Object.defineProperty(res, "fsyncLock", {
+            get: function() {
+                throw Error(
+                    "fsyncLock is no longer included in the currentOp shell helper, run db.runCommand({currentOp: 1}) instead.");
+            }
+        });
+        return res;
+    } catch (e) {
+        return {"ok": 0, "code": e.code, "errmsg": "Error executing $currentOp: " + e.message};
+    }
 };
 
-DB.prototype.currentOp = function(arg) {
-    var q = {};
+DB.prototype.currentOpCursor = function(arg) {
+    let q = {};
     if (arg) {
         if (typeof (arg) == "object")
             Object.extend(q, arg);
@@ -822,40 +805,40 @@ DB.prototype.currentOp = function(arg) {
             q["$all"] = true;
     }
 
-    var commandObj = {"currentOp": 1};
-    Object.extend(commandObj, q);
-    var res = this.adminCommand(commandObj);
-    if (commandUnsupported(res)) {
-        // always send legacy currentOp with default (null) read preference (SERVER-17951)
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.inprog.findOne(q);
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
+    // Convert the incoming currentOp command into an equivalent aggregate command
+    // of the form {aggregate:1, pipeline: [{$currentOp: {idleConnections: $all, allUsers:
+    // !$ownOps, truncateOps: false}}, {$match: {<user-defined filter>}}], cursor:{}}.
+    let pipeline = [];
+
+    let currOpArgs = {};
+    let currOpStage = {"$currentOp": currOpArgs};
+    currOpArgs["allUsers"] = !q["$ownOps"];
+    currOpArgs["idleConnections"] = !!q["$all"];
+    currOpArgs["truncateOps"] = false;
+
+    pipeline.push(currOpStage);
+
+    let matchArgs = {};
+    let matchStage = {"$match": matchArgs};
+    for (const fieldname of Object.keys(q)) {
+        if (fieldname !== "$all" && fieldname !== "$ownOps" && fieldname !== "$truncateOps") {
+            matchArgs[fieldname] = q[fieldname];
         }
     }
-    return res;
+
+    pipeline.push(matchStage);
+
+    // The legacy db.currentOp() shell helper ignored any explicitly set read preference and used
+    // the default, with the ability to also run on secondaries. To preserve this behavior we will
+    // run the aggregate with read preference "primaryPreferred".
+    return this.getSiblingDB("admin").aggregate(pipeline,
+                                                {"$readPreference": {"mode": "primaryPreferred"}});
 };
-DB.prototype.currentOP = DB.prototype.currentOp;
 
 DB.prototype.killOp = function(op) {
     if (!op)
         throw Error("no opNum to kill specified");
-    var res = this.adminCommand({'killOp': 1, 'op': op});
-    if (commandUnsupported(res)) {
-        // fall back for old servers
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.killop.findOne({'op': op});
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
-        }
-    }
-    return res;
+    return this.adminCommand({'killOp': 1, 'op': op});
 };
 DB.prototype.killOP = DB.prototype.killOp;
 
@@ -935,11 +918,19 @@ DB.prototype.getReplicationInfo = function() {
 DB.prototype.printReplicationInfo = function() {
     var result = this.getReplicationInfo();
     if (result.errmsg) {
-        var isMaster = this.isMaster();
-        if (isMaster.arbiterOnly) {
+        let reply, isPrimary;
+        if (this.getMongo().getApiParameters().apiVersion) {
+            reply = this.hello();
+            isPrimary = reply.isWritablePrimary;
+        } else {
+            reply = this.isMaster();
+            isPrimary = reply.ismaster;
+        }
+
+        if (reply.arbiterOnly) {
             print("cannot provide replication status from an arbiter.");
             return;
-        } else if (!isMaster.ismaster) {
+        } else if (!isPrimary) {
             print("this is a secondary, printing secondary replication info.");
             this.printSecondaryReplicationInfo();
             return;
@@ -979,7 +970,7 @@ DB.prototype.printSecondaryReplicationInfo = function() {
     }
 
     function getPrimary(members) {
-        for (i in members) {
+        for (let i in members) {
             var row = members[i];
             if (row.state === 1) {
                 return row;
@@ -1023,14 +1014,14 @@ DB.prototype.printSecondaryReplicationInfo = function() {
         // no primary, find the most recent op among all members
         else {
             startOptimeDate = new Date(0, 0);
-            for (i in status.members) {
+            for (let i in status.members) {
                 if (status.members[i].optimeDate > startOptimeDate) {
                     startOptimeDate = status.members[i].optimeDate;
                 }
             }
         }
 
-        for (i in status.members) {
+        for (let i in status.members) {
             if (status.members[i].self && status.members[i].state === 5) {
                 print("source: " + status.members[i].name);
                 if (!status.initialSyncStatus) {
@@ -1048,35 +1039,11 @@ DB.prototype.printSecondaryReplicationInfo = function() {
     }
 };
 
+// Checking the server buildinfo requires the client to be authenticated
+// This is the deprecated version used by the jstest fuzzer, prefer using the getServerBuildInfo.
 DB.prototype.serverBuildInfo = function() {
-    return this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1});
-};
-
-// Used to trim entries from the metrics.commands that have never been executed
-getActiveCommands = function(tree) {
-    var result = {};
-    for (var i in tree) {
-        if (!tree.hasOwnProperty(i))
-            continue;
-        if (tree[i].hasOwnProperty("total")) {
-            if (tree[i].total > 0) {
-                result[i] = tree[i];
-            }
-            continue;
-        }
-        if (i == "<UNKNOWN>") {
-            if (tree[i] > 0) {
-                result[i] = tree[i];
-            }
-            continue;
-        }
-        // Handles nested commands
-        var subStatus = getActiveCommands(tree[i]);
-        if (Object.keys(subStatus).length > 0) {
-            result[i] = tree[i];
-        }
-    }
-    return result;
+    return assert.commandWorked(
+        this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1}));
 };
 
 DB.prototype.serverStatus = function(options) {
@@ -1084,12 +1051,8 @@ DB.prototype.serverStatus = function(options) {
     if (options) {
         Object.extend(cmd, options);
     }
-    var res = this._adminCommand(cmd);
-    // Only prune if we have a metrics tree with commands.
-    if (res.metrics && res.metrics.commands) {
-        res.metrics.commands = getActiveCommands(res.metrics.commands);
-    }
-    return res;
+
+    return this._adminCommand(cmd);
 };
 
 DB.prototype.hostInfo = function() {
@@ -1100,12 +1063,14 @@ DB.prototype.serverCmdLineOpts = function() {
     return this._adminCommand("getCmdLineOpts");
 };
 
+// Throws if client connection is not authenticated.
 DB.prototype.version = function() {
-    return this.serverBuildInfo().version;
+    return this.getServerBuildInfo().getVersion();
 };
 
+// Throws if client connection is not authenticated.
 DB.prototype.serverBits = function() {
-    return this.serverBuildInfo().bits;
+    return this.getServerBuildInfo().getBits();
 };
 
 DB.prototype.listCommands = function() {
@@ -1137,18 +1102,7 @@ DB.prototype.fsyncLock = function() {
 };
 
 DB.prototype.fsyncUnlock = function() {
-    var res = this.adminCommand({fsyncUnlock: 1});
-    if (commandUnsupported(res)) {
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.unlock.findOne();
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
-        }
-    }
-    return res;
+    return this.adminCommand({fsyncUnlock: 1});
 };
 
 DB.autocomplete = function(obj) {
@@ -1197,7 +1151,7 @@ DB.prototype.getQueryOptions = function() {
  */
 DB.prototype.loadServerScripts = function() {
     var global = Function('return this')();
-    this.system.js.find().forEach(function(u) {
+    this.getCollection('system.js').find().forEach(function(u) {
         if (u.value.constructor === Code) {
             global[u._id] = eval("(" + u.value.code + ")");
         } else {
@@ -1286,29 +1240,6 @@ function _hashPassword(username, password) {
     return hex_md5(username + ":mongo:" + password);
 }
 
-/**
- * Used for updating users in systems with V1 style user information
- * (ie MongoDB v2.4 and prior)
- */
-DB.prototype._updateUserV1 = function(name, updateObject, writeConcern) {
-    var setObj = {};
-    if (updateObject.pwd) {
-        setObj["pwd"] = _hashPassword(name, updateObject.pwd);
-    }
-    if (updateObject.extraData) {
-        setObj["extraData"] = updateObject.extraData;
-    }
-    if (updateObject.roles) {
-        setObj["roles"] = updateObject.roles;
-    }
-
-    this.system.users.update({user: name, userSource: null}, {$set: setObj});
-    var errObj = this.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
-    if (errObj.err) {
-        throw _getErrorWithCode(errObj, "Updating user failed: " + errObj.err);
-    }
-};
-
 DB.prototype.updateUser = function(name, updateObject, writeConcern) {
     var cmdObj = {updateUser: name};
     cmdObj = Object.extend(cmdObj, updateObject);
@@ -1317,11 +1248,6 @@ DB.prototype.updateUser = function(name, updateObject, writeConcern) {
 
     var res = this.runCommand(cmdObj);
     if (res.ok) {
-        return;
-    }
-
-    if (res.errmsg == "no such cmd: updateUser") {
-        this._updateUserV1(name, updateObject, cmdObj['writeConcern']);
         return;
     }
 
@@ -1358,31 +1284,7 @@ DB.prototype.dropUser = function(username, writeConcern) {
         return false;
     }
 
-    if (res.errmsg == "no such cmd: dropUsers") {
-        return this._removeUserV1(username, cmdObj['writeConcern']);
-    }
-
     throw _getErrorWithCode(res, res.errmsg);
-};
-
-/**
- * Used for removing users in systems with V1 style user information
- * (ie MongoDB v2.4 and prior)
- */
-DB.prototype._removeUserV1 = function(username, writeConcern) {
-    this.getCollection("system.users").remove({user: username});
-
-    var le = this.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
-
-    if (le.err) {
-        throw _getErrorWithCode(le, "Couldn't remove user: " + le.err);
-    }
-
-    if (le.n == 1) {
-        return true;
-    } else {
-        return false;
-    }
 };
 
 DB.prototype.dropAllUsers = function(writeConcern) {
@@ -1404,10 +1306,17 @@ DB.prototype.__pwHash = function(nonce, username, pass) {
 
 DB.prototype._defaultAuthenticationMechanism = null;
 
+function _fallbackToScramSha256(helloResult) {
+    return helloResult && isNumber(helloResult.maxWireVersion) &&
+        helloResult.maxWireVersion >= kWireVersionSupportingScramSha256Fallback;
+}
+
 DB.prototype._getDefaultAuthenticationMechanism = function(username, database) {
+    let result = null;
     if (username !== undefined) {
         const userid = database + "." + username;
-        const result = this.runCommand({isMaster: 1, saslSupportedMechs: userid});
+        result = this._helloOrLegacyHello({saslSupportedMechs: userid});
+
         if (result.ok && (result.saslSupportedMechs !== undefined)) {
             const mechs = result.saslSupportedMechs;
             if (!Array.isArray(mechs)) {
@@ -1429,14 +1338,18 @@ DB.prototype._getDefaultAuthenticationMechanism = function(username, database) {
         }
         // If isMaster doesn't support saslSupportedMechs,
         // or if we couldn't agree on a mechanism,
-        // then fallthrough to configured default or SCRAM-SHA-1.
+        // then fall through to a default mech, either
+        // configured or implicit based on the wire version
     }
 
     // Use the default auth mechanism if set on the command line.
-    if (this._defaultAuthenticationMechanism != null)
+    if (this._defaultAuthenticationMechanism != null) {
         return this._defaultAuthenticationMechanism;
+    }
 
-    return "SCRAM-SHA-1";
+    // for later wire versions, we prefer (or require) SCRAM-SHA-256
+    // if a fallback is required
+    return _fallbackToScramSha256(result) ? "SCRAM-SHA-256" : "SCRAM-SHA-1";
 };
 
 DB.prototype._defaultGssapiServiceName = null;
@@ -1476,8 +1389,8 @@ DB.prototype._authOrThrow = function() {
     params.db = this.getName();
     var good = this.getMongo().auth(params);
     if (good) {
-        // auth enabled, and should try to use isMaster and replSetGetStatus to build prompt
-        this.getMongo().authStatus = {authRequired: true, isMaster: true, replSetGetStatus: true};
+        // auth enabled, and should try to use hello and replSetGetStatus to build prompt
+        this.getMongo().authStatus = {authRequired: true, hello: true, replSetGetStatus: true};
     }
 
     return good;
@@ -1717,53 +1630,9 @@ DB.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
 
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
-    pipeline.unshift(changeStreamStage);
-    return this._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
-};
-
-DB.prototype.getFreeMonitoringStatus = function() {
-    'use strict';
-    return assert.commandWorked(this.adminCommand({getFreeMonitoringStatus: 1}));
-};
-
-DB.prototype.enableFreeMonitoring = function() {
-    'use strict';
-    const isMaster = this.isMaster();
-    if (isMaster.ismaster == false) {
-        print("ERROR: db.enableFreeMonitoring() may only be run on a primary");
-        return;
-    }
-
-    assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'enable'}));
-
-    const cmd = this.adminCommand({getFreeMonitoringStatus: 1});
-    if (!cmd.ok && (cmd.code == ErrorCode.Unauthorized)) {
-        // Edge case: It's technically possible that a user can change free-mon state,
-        // but is not allowed to inspect it.
-        print("Successfully initiated free monitoring, but unable to determine status " +
-              "as you lack the 'checkFreeMonitoringStatus' privilege.");
-        return;
-    }
-    assert.commandWorked(cmd);
-
-    if (cmd.state !== 'enabled') {
-        const url = this.adminCommand({'getParameter': 1, 'cloudFreeMonitoringEndpointURL': 1})
-                        .cloudFreeMonitoringEndpointURL;
-
-        print("Unable to get immediate response from the Cloud Monitoring service. We will" +
-              "continue to retry in the background. Please check your firewall " +
-              "settings to ensure that mongod can communicate with \"" + url + "\"");
-        return;
-    }
-
-    print(tojson(cmd));
-};
-
-DB.prototype.disableFreeMonitoring = function() {
-    'use strict';
-    assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'disable'}));
+    const [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+    return this._runAggregate({aggregate: 1, pipeline: [changeStreamStage, ...pipeline]},
+                              aggOptions);
 };
 
 // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the
@@ -1778,13 +1647,124 @@ DB.prototype.getSession = function() {
     return this._session;
 };
 })(Object.prototype.hasOwnProperty);
-}());
 
-DB.prototype._sbe = function(query) {
-    const res = this.runCommand({sbe: query});
-    if (!res.ok) {
-        throw _getErrorWithCode(res, "sbe failed: " + tojson(res));
+DB.prototype.createEncryptedCollection = function(name, opts) {
+    assert.neq(
+        opts, undefined, `createEncryptedCollection expected an opts object, it is undefined`);
+    assert(opts.hasOwnProperty("encryptedFields") && typeof opts.encryptedFields == "object",
+           `opts must contain an encryptedFields document'`);
+
+    const res = assert.commandWorked(this.createCollection(name, opts));
+
+    const cis = this.getCollectionInfos({"name": name});
+    assert.eq(cis.length, 1, `Expected to find one collection named '${name}'`);
+
+    const ci = cis[0];
+    assert(ci.hasOwnProperty("options"), `Expected collection '${name}' to have 'options'`);
+    const options = ci.options;
+    assert(options.hasOwnProperty("encryptedFields"),
+           `Expected collection '${name}' to have 'encryptedFields'`);
+    const ef = options.encryptedFields;
+
+    assert.commandWorked(this.getCollection(name).createIndex({__safeContent__: 1}));
+
+    assert.commandWorked(
+        this.createCollection(ef.escCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
+    assert.commandWorked(
+        this.createCollection(ef.eccCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
+    assert.commandWorked(
+        this.createCollection(ef.ecocCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
+
+    return res;
+};
+
+DB.prototype.dropEncryptedCollection = function(name) {
+    const ci = globalThis.db.getCollectionInfos({name: name})[0];
+    if (ci == undefined) {
+        throw `Encrypted Collection '${name}' not found`;
     }
 
+    const ef = ci.options.encryptedFields;
+    if (ef == undefined) {
+        throw `Encrypted Collection '${name}' not found`;
+    }
+
+    this.getCollection(ef.escCollection).drop();
+    this.getCollection(ef.eccCollection).drop();
+    this.getCollection(ef.ecocCollection).drop();
+    return this.getCollection(name).drop();
+};
+
+DB.prototype.checkMetadataConsistency = function(options = {}) {
+    assert(options instanceof Object,
+           `'options' parameter expected to be type object but found: ${typeof options}`);
+    const res = assert.commandWorked(
+        this.runCommand(Object.extend({checkMetadataConsistency: 1}, options)));
     return new DBCommandCursor(this, res);
+};
+
+DB.prototype.getDatabasePrimaryShardId = function() {
+    let x = this.getSiblingDB('config').databases.findOne({_id: this.getName()});
+    if (!x) {
+        throw Error(`Database '${this.getName()}' not found`);
+    }
+    return x.primary;
+};
+}());
+
+// Checking the server buildinfo requires the client to be authenticated
+DB.prototype.getServerBuildInfo = function() {
+    let BuildInfo = function(buildInfo) {
+        let _sanitizeMatch = function(flag) {
+            const sanitizeMatch =
+                /-fsanitize=([^\s]+) /.exec(buildInfo["buildEnvironment"]["ccflags"]);
+            if (flag && sanitizeMatch && RegExp(flag).exec(sanitizeMatch[1])) {
+                return true;
+            } else {
+                return false;
+            }
+        };
+
+        return {
+            rawData: function() {
+                return buildInfo;
+            },
+
+            getVersion: function() {
+                return buildInfo.version;
+            },
+
+            getBits: function() {
+                return buildInfo.bits;
+            },
+
+            isOptimizationsEnabled: function() {
+                const optimizationsMatch =
+                    /(\s|^)-O2(\s|$)/.exec(buildInfo["buildEnvironment"]["ccflags"]);
+                return Boolean(optimizationsMatch);
+            },
+
+            isAddressSanitizerActive: function() {
+                return _sanitizeMatch("address");
+            },
+
+            isLeakSanitizerActive: function() {
+                return _sanitizeMatch("leak");
+            },
+
+            isThreadSanitizerActive: function() {
+                return _sanitizeMatch("thread");
+            },
+
+            isUndefinedBehaviorSanitizerActive: function() {
+                return _sanitizeMatch("undefined");
+            },
+
+            isDebug: function() {
+                return buildInfo.debug;
+            }
+        };
+    };
+
+    return new BuildInfo(assert.commandWorked(this._runCommandWithoutApiStrict({buildinfo: 1})));
 };

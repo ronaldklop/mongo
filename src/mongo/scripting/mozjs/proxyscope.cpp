@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/proxyscope.h"
+#include <boost/none.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/proxyscope.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/functional.h"
-#include "mongo/util/quick_exit.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/interruptible.h"
 
 namespace mongo {
 namespace mozjs {
@@ -158,6 +162,29 @@ BSONObj MozJSProxyScope::getObject(const char* field) {
     return out;
 }
 
+OID MozJSProxyScope::getOID(const char* field) {
+    OID out;
+    run([&] { out = _implScope->getOID(field); });
+    return out;
+}
+
+void MozJSProxyScope::getBinData(const char* field,
+                                 std::function<void(const BSONBinData&)> withBinData) {
+    run([&] { _implScope->getBinData(field, std::move(withBinData)); });
+}
+
+Timestamp MozJSProxyScope::getTimestamp(const char* field) {
+    Timestamp out;
+    run([&] { out = _implScope->getTimestamp(field); });
+    return out;
+}
+
+JSRegEx MozJSProxyScope::getRegEx(const char* field) {
+    JSRegEx out;
+    run([&] { out = _implScope->getRegEx(field); });
+    return out;
+}
+
 void MozJSProxyScope::setNumber(const char* field, double val) {
     run([&] { _implScope->setNumber(field, val); });
 }
@@ -265,7 +292,9 @@ void MozJSProxyScope::run(Closure&& closure) {
 
 template <typename Closure>
 void MozJSProxyScope::runWithoutInterruptionExceptAtGlobalShutdown(Closure&& closure) {
-    auto toRun = [&] { run(std::forward<Closure>(closure)); };
+    auto toRun = [&] {
+        run(std::forward<Closure>(closure));
+    };
 
     if (_opCtx) {
         return _opCtx->runWithoutInterruptionExceptAtGlobalShutdown(toRun);
@@ -275,7 +304,7 @@ void MozJSProxyScope::runWithoutInterruptionExceptAtGlobalShutdown(Closure&& clo
 }
 
 void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     _function = std::move(f);
 
     invariant(_state == State::Idle);
@@ -287,7 +316,9 @@ void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
 
     Interruptible* interruptible = _opCtx ? _opCtx : Interruptible::notInterruptible();
 
-    auto pred = [&] { return _state == State::ImplResponse; };
+    auto pred = [&] {
+        return _state == State::ImplResponse;
+    };
 
     try {
         interruptible->waitForConditionOrInterrupt(_proxyCondvar, lk, pred);
@@ -312,7 +343,7 @@ void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
 
 void MozJSProxyScope::shutdownThread() {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         invariant(_state == State::Idle);
 
@@ -337,8 +368,9 @@ void MozJSProxyScope::shutdownThread() {
  *   break out of the loop and return.
  */
 void MozJSProxyScope::implThread(MozJSProxyScope* proxy) {
-    if (hasGlobalServiceContext())
-        Client::initThread("js");
+    if (hasGlobalServiceContext()) {
+        Client::initThread("js", getGlobalServiceContext()->getService());
+    }
 
     std::unique_ptr<MozJSImplScope> scope;
 
@@ -355,10 +387,10 @@ void MozJSProxyScope::implThread(MozJSProxyScope* proxy) {
     // This is mostly to silence coverity, so that it sees that the
     // ProxyScope doesn't hold a reference to the ImplScope after it
     // is deleted by the unique_ptr.
-    const auto unbindImplScope = makeGuard([&proxy] { proxy->_implScope = nullptr; });
+    const ScopeGuard unbindImplScope([&proxy] { proxy->_implScope = nullptr; });
 
     while (true) {
-        stdx::unique_lock<Latch> lk(proxy->_mutex);
+        stdx::unique_lock<stdx::mutex> lk(proxy->_mutex);
         {
             MONGO_IDLE_THREAD_BLOCK;
             proxy->_implCondvar.wait(lk, [proxy] {
@@ -371,7 +403,7 @@ void MozJSProxyScope::implThread(MozJSProxyScope* proxy) {
 
         try {
             lk.unlock();
-            const auto unlockGuard = makeGuard([&] { lk.lock(); });
+            const ScopeGuard unlockGuard([&] { lk.lock(); });
             proxy->_function();
         } catch (...) {
             proxy->_status = exceptionToStatus();

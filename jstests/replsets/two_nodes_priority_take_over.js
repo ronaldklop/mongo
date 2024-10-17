@@ -2,10 +2,8 @@
 // because of stepping down. In a two node replset, this rejection will prevent
 // smooth priority takeover.
 
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 var name = "two_nodes_priority_take_over";
 var rst = new ReplSetTest({name: name, nodes: 2});
@@ -49,4 +47,3 @@ var newTerm = res.term;
 assert.eq(newTerm, stableTerm + 1);
 
 rst.stopSet();
-})();

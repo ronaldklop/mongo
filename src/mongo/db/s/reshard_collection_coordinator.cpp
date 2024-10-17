@@ -27,61 +27,236 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/reshard_collection_coordinator.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/reshard_collection_gen.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_util.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 
 namespace mongo {
 
-ReshardCollectionCoordinator::ReshardCollectionCoordinator(
-    OperationContext* opCtx, const ShardsvrReshardCollection& reshardCollectionParams)
-    : ShardingDDLCoordinator_NORESILIENT(opCtx, reshardCollectionParams.getCommandParameter()),
-      _serviceContext(opCtx->getServiceContext()),
-      _request(reshardCollectionParams),
-      _nss(_request.getCommandParameter()) {}
+ReshardCollectionCoordinator::ReshardCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                                           const BSONObj& initialState)
+    : ReshardCollectionCoordinator(service, initialState, true /* persistCoordinatorDocument */) {}
 
-SemiFuture<void> ReshardCollectionCoordinator::runImpl(
-    std::shared_ptr<executor::TaskExecutor> executor) {
-    return ExecutorFuture<void>(executor, Status::OK())
-        .then([this, anchor = shared_from_this()]() {
-            ThreadClient tc("ReshardCollectionCoordinator", _serviceContext);
-            auto opCtxHolder = tc->makeOperationContext();
+ReshardCollectionCoordinator::ReshardCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                                           const BSONObj& initialState,
+                                                           bool persistCoordinatorDocument)
+    : RecoverableShardingDDLCoordinator(service, "ReshardCollectionCoordinator", initialState),
+      _request(_doc.getReshardCollectionRequest()) {}
+
+void ReshardCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
+    const auto otherDoc = ReshardCollectionCoordinatorDocument::parse(
+        IDLParserContext("ReshardCollectionCoordinatorDocument"), doc);
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Another reshard collection with different arguments is already running for the same "
+            "namespace",
+            SimpleBSONObjComparator::kInstance.evaluate(
+                _request.toBSON() == otherDoc.getReshardCollectionRequest().toBSON()));
+}
+
+void ReshardCollectionCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {
+    cmdInfoBuilder->appendElements(_request.toBSON());
+}
+
+ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token) noexcept {
+    return ExecutorFuture<void>(**executor)
+        .then(_buildPhaseHandler(Phase::kReshard, [this, anchor = shared_from_this()] {
+            auto opCtxHolder = cc().makeOperationContext();
             auto* opCtx = opCtxHolder.get();
-            _forwardableOpMetadata.setOn(opCtx);
+            getForwardableOpMetadata().setOn(opCtx);
 
-            ConfigsvrReshardCollection configsvrReshardCollection(_nss, _request.getKey());
-            configsvrReshardCollection.setDbName(_request.getDbName());
-            configsvrReshardCollection.setUnique(_request.getUnique());
-            configsvrReshardCollection.setCollation(_request.getCollation());
-            configsvrReshardCollection.set_presetReshardedChunks(
-                _request.get_presetReshardedChunks());
-            configsvrReshardCollection.setZones(_request.getZones());
-            configsvrReshardCollection.setNumInitialChunks(_request.getNumInitialChunks());
+            {
+                AutoGetCollection coll{opCtx,
+                                       nss(),
+                                       MODE_IS,
+                                       AutoGetCollection::Options{}
+                                           .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                                           .expectedUUID(_doc.getCollectionUUID())};
+            }
 
-            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            const auto cmOld = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getCollectionPlacementInfoWithRefresh(opCtx,
+                                                                                        nss()));
+
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "Collection '" << nss().toStringForErrorMsg()
+                                  << "' not found in cluster catalog",
+                    cmOld.hasRoutingTable());
+
+            StateDoc newDoc(_doc);
+            newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
+            newDoc.setOldCollectionUUID(cmOld.getUUID());
+            _updateStateDocument(opCtx, std::move(newDoc));
+
+            ConfigsvrReshardCollection configsvrReshardCollection(nss(), _doc.getKey());
+            configsvrReshardCollection.setDbName(nss().dbName());
+            configsvrReshardCollection.setUnique(_doc.getUnique());
+            configsvrReshardCollection.setCollation(_doc.getCollation());
+            configsvrReshardCollection.set_presetReshardedChunks(_doc.get_presetReshardedChunks());
+            configsvrReshardCollection.setZones(_doc.getZones());
+            configsvrReshardCollection.setNumInitialChunks(_doc.getNumInitialChunks());
+            configsvrReshardCollection.setRecipientOplogBatchTaskCount(
+                _doc.getRecipientOplogBatchTaskCount());
+
+            // TODO SERVER-92437 ensure this behavior is safe during FCV upgrade/downgrade
+            if (!resharding::gFeatureFlagReshardingRelaxedMode.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "Relaxed mode is not enabled, reject relaxed parameter",
+                        !_doc.getRelaxed().has_value());
+            }
+
+            if (!resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                uassert(
+                    ErrorCodes::InvalidOptions,
+                    "Resharding improvements is not enabled, reject shardDistribution parameter",
+                    !_doc.getShardDistribution().has_value());
+                uassert(
+                    ErrorCodes::InvalidOptions,
+                    "Resharding improvements is not enabled, reject forceRedistribution parameter",
+                    !_doc.getForceRedistribution().has_value());
+                uassert(ErrorCodes::InvalidOptions,
+                        "Resharding improvements is not enabled, reject reshardingUUID parameter",
+                        !_doc.getReshardingUUID().has_value());
+                uassert(ErrorCodes::InvalidOptions,
+                        "Resharding improvements is not enabled, reject feature flag "
+                        "moveCollection or unshardCollection",
+                        !resharding::gFeatureFlagMoveCollection.isEnabled(
+                            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                            !resharding::gFeatureFlagUnshardCollection.isEnabled(
+                                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+            }
+
+            if (!resharding::gFeatureFlagMoveCollection.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                !resharding::gFeatureFlagUnshardCollection.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "Feature flag move collection or unshard collection is not enabled, reject "
+                        "provenance",
+                        !_doc.getProvenance().has_value() ||
+                            _doc.getProvenance().get() == ProvenanceEnum::kReshardCollection);
+            }
+
+            configsvrReshardCollection.setRelaxed(_doc.getRelaxed());
+            configsvrReshardCollection.setShardDistribution(_doc.getShardDistribution());
+            configsvrReshardCollection.setForceRedistribution(_doc.getForceRedistribution());
+            configsvrReshardCollection.setReshardingUUID(_doc.getReshardingUUID());
+
+            resharding::validateImplicitlyCreateIndex(_doc.getImplicitlyCreateIndex(),
+                                                      _doc.getKey());
+            configsvrReshardCollection.setImplicitlyCreateIndex(_doc.getImplicitlyCreateIndex());
+
+            auto provenance = _doc.getProvenance();
+            if (resharding::isMoveCollection(provenance)) {
+                uassert(ErrorCodes::NamespaceNotFound,
+                        str::stream()
+                            << "MoveCollection can only be called on an unsharded collection.",
+                        !cmOld.isSharded());
+            } else if (provenance && provenance.get() == ProvenanceEnum::kUnshardCollection) {
+                // If the collection is already unsharded, this request should be a no-op. Check
+                // that the user didn't specify a "to" shard other than the shard the collection
+                // lives on - if it is different, return an error.
+                if (!cmOld.isSharded()) {
+                    if (_doc.getShardDistribution()) {
+                        std::set<ShardId> currentShards;
+                        cmOld.getAllShardIds(&currentShards);
+                        const auto toShard = _doc.getShardDistribution().get().front().getShard();
+                        uassert(ErrorCodes::NamespaceNotSharded,
+                                "Collection is already unsharded. Call moveCollection to move this "
+                                "collection to a different shard.",
+                                currentShards.find(toShard) != currentShards.end());
+                    }
+
+                    return;
+                }
+
+                // Pick the "to" shard if the client did not specify one.
+                if (!_doc.getShardDistribution()) {
+                    auto toShard = shardutil::selectLeastLoadedNonDrainingShard(opCtx);
+                    mongo::ShardKeyRange destinationRange(toShard);
+                    destinationRange.setMin(cluster::unsplittable::kUnsplittableCollectionMinKey);
+                    destinationRange.setMax(cluster::unsplittable::kUnsplittableCollectionMaxKey);
+                    std::vector<mongo::ShardKeyRange> distribution = {destinationRange};
+                    configsvrReshardCollection.setShardDistribution(distribution);
+                }
+            } else {
+                uassert(ErrorCodes::NamespaceNotSharded,
+                        "Collection has to be a sharded collection.",
+                        cmOld.isSharded());
+            }
+
+            configsvrReshardCollection.setProvenance(provenance);
+            generic_argument_util::setMajorityWriteConcern(configsvrReshardCollection,
+                                                           &opCtx->getWriteConcern());
+
+            const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
             const auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(configsvrReshardCollection.toBSON({}),
-                                                           opCtx->getWriteConcern()),
+                DatabaseName::kAdmin,
+                configsvrReshardCollection.toBSON(),
                 Shard::RetryPolicy::kIdempotent));
-            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
-        })
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            LOGV2_ERROR(5276001,
-                        "Error running reshard collection",
-                        "namespace"_attr = _nss,
-                        "error"_attr = redact(status));
-            return status;
-        })
-        .semi();
+            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(cmdResponse));
+        }));
 }
 
 }  // namespace mongo

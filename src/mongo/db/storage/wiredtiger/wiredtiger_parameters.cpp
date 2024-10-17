@@ -26,25 +26,76 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#include <algorithm>
+#include <cstddef>
+#include <fmt/format.h>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <wiredtiger.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::string;
 
 void WiredTigerEngineRuntimeConfigParameter::append(OperationContext* opCtx,
-                                                    BSONObjBuilder& b,
-                                                    const std::string& name) {
-    b << name << _data.first;
+                                                    BSONObjBuilder* b,
+                                                    StringData name,
+                                                    const boost::optional<TenantId>&) {
+    *b << name << StringData{*_data.first};
 }
 
-Status WiredTigerEngineRuntimeConfigParameter::setFromString(const std::string& str) {
+Status validateExtraDiagnostics(const std::vector<std::string>& value,
+                                const boost::optional<TenantId>& tenantId) {
+    try {
+        std::set<std::string> flagArr = {"all",
+                                         "concurrent_access",
+                                         "data_validation",
+                                         "invalid_op",
+                                         "out_of_order",
+                                         "panic",
+                                         "slow_operation",
+                                         "visibility"};
+        for (const auto& diagFlag : value) {
+            bool exists = std::find(flagArr.begin(), flagArr.end(), diagFlag) != flagArr.end();
+
+            if (!exists) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("'{}' is not a valid flag option", diagFlag));
+            }
+        }
+    } catch (...) {
+        return exceptionToStatus();
+    }
+
+    return Status::OK();
+}
+
+Status WiredTigerEngineRuntimeConfigParameter::setFromString(StringData str,
+                                                             const boost::optional<TenantId>&) {
     size_t pos = str.find('\0');
     if (pos != std::string::npos) {
         return Status(ErrorCodes::BadValue,
@@ -54,13 +105,10 @@ Status WiredTigerEngineRuntimeConfigParameter::setFromString(const std::string& 
                        << pos));
     }
 
-    LOGV2(22376,
-          "Reconfiguring WiredTiger storage engine with config string: \"{config}\"",
-          "Reconfiguring WiredTiger storage engine",
-          "config"_attr = str);
+    LOGV2(22376, "Reconfiguring WiredTiger storage engine", "config"_attr = str);
 
     invariant(_data.second);
-    int ret = _data.second->reconfigure(str.c_str());
+    int ret = _data.second->reconfigure(str.toString().c_str());
     if (ret != 0) {
         const char* errorStr = wiredtiger_strerror(ret);
         string result = (str::stream() << "WiredTiger reconfiguration failed with error code ("
@@ -73,8 +121,20 @@ Status WiredTigerEngineRuntimeConfigParameter::setFromString(const std::string& 
         return Status(ErrorCodes::BadValue, result);
     }
 
-    _data.first = str;
+    _data.first = str.toString();
     return Status::OK();
+}
+
+Status WiredTigerDirectoryForIndexesParameter::setFromString(StringData,
+                                                             const boost::optional<TenantId>&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter"};
+};
+void WiredTigerDirectoryForIndexesParameter::append(OperationContext* opCtx,
+                                                    BSONObjBuilder* builder,
+                                                    StringData name,
+                                                    const boost::optional<TenantId>&) {
+    builder->append(name, wiredTigerGlobalOptions.directoryForIndexes);
 }
 
 }  // namespace mongo

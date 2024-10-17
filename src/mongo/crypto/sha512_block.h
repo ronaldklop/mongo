@@ -29,8 +29,13 @@
 
 #pragma once
 
-#include "mongo/crypto/hash_block.h"
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 
+#include "mongo/base/data_range.h"
+#include "mongo/base/string_data.h"
+#include "mongo/crypto/hash_block.h"
 #include "mongo/util/make_array_type.h"
 
 namespace mongo {
@@ -45,12 +50,12 @@ struct SHA512BlockTraits {
 
     static HashType computeHash(std::initializer_list<ConstDataRange> input);
 
-    static void computeHash(std::initializer_list<ConstDataRange> input, HashType* const output);
+    static void computeHash(std::initializer_list<ConstDataRange> input, HashType* output);
 
     static void computeHmac(const uint8_t* key,
                             size_t keyLen,
                             std::initializer_list<ConstDataRange> input,
-                            HashType* const output);
+                            HashType* output);
 };
 
 using SHA512Block = HashBlock<SHA512BlockTraits>;

@@ -5,6 +5,8 @@
  * @tags: [multiversion_incompatible]
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var NewReplicaSetConfigurationIncompatible = 103;
 var InvalidReplicaSetConfig = 93;
 
@@ -39,7 +41,7 @@ TestData.skipCheckDBHashes = true;
  */
 (function reconfigArbiterZeroVotes() {
     var replTest = new ReplSetTest({nodes: 4});
-    replTest.startSet();
+    replTest.startSet({setParameter: {allowMultipleArbiters: true}});
     var config = replTest.getReplSetConfig();
     config.members[2].arbiterOnly = true;
     config.members[3].arbiterOnly = true;

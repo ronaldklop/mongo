@@ -27,14 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/update/document_diff_serialization.h"
-
+#include <boost/container/flat_map.hpp>
+#include <boost/container/static_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+// IWYU pragma: no_include "boost/move/algo/detail/set_difference.hpp"
+#include <boost/move/algo/move.hpp>
+#include <boost/none.hpp>
+#include <functional>
+#include <limits>
 #include <stack>
+#include <type_traits>
 
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
-#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace diff_tree {
@@ -51,20 +67,27 @@ void InternalNode::ApproxBSONSizeTracker::addEntry(size_t fieldSize, const Node*
         }
         case (NodeType::kUpdate): {
             if (const auto* elem =
-                    stdx::get_if<BSONElement>(&checked_cast<const UpdateNode*>(node)->elt)) {
+                    get_if<BSONElement>(&checked_cast<const UpdateNode*>(node)->elt)) {
                 _size += elem->valuesize();
             }
             break;
         }
         case (NodeType::kInsert): {
             if (const auto* elem =
-                    stdx::get_if<BSONElement>(&checked_cast<const InsertNode*>(node)->elt)) {
+                    get_if<BSONElement>(&checked_cast<const InsertNode*>(node)->elt)) {
                 _size += elem->valuesize();
             }
             break;
         }
         case (NodeType::kDelete): {
             _size += 1 /* boolean value */;
+            break;
+        }
+        case (NodeType::kBinary): {
+            if (const auto* elem =
+                    get_if<BSONElement>(&checked_cast<const BinaryNode*>(node)->elt)) {
+                _size += elem->valuesize();
+            }
             break;
         }
     }
@@ -77,7 +100,9 @@ Node* DocumentSubDiffNode::addChild(StringData fieldName, std::unique_ptr<Node> 
     sizeTracker.addEntry(fieldName.size(), nodePtr);
 
     auto result = children.insert({fieldName.toString(), std::move(node)});
-    invariant(result.second);
+    uassert(7693400,
+            str::stream() << "Document already has a field named '" << fieldName << "'",
+            result.second);
     StringData storedFieldName = result.first->first;
     switch (nodePtr->type()) {
         case (NodeType::kArray):
@@ -109,30 +134,37 @@ Node* DocumentSubDiffNode::addChild(StringData fieldName, std::unique_ptr<Node> 
             updates.push_back({storedFieldName, checked_cast<UpdateNode*>(nodePtr)});
             return nodePtr;
         }
+        case (NodeType::kBinary): {
+            if (binaries.empty()) {
+                sizeTracker.addSizeForWrapping();
+            }
+            binaries.push_back({storedFieldName, checked_cast<BinaryNode*>(nodePtr)});
+            return nodePtr;
+        }
     }
     MONGO_UNREACHABLE;
 }
 
 namespace {
-void appendElementToBuilder(stdx::variant<mutablebson::Element, BSONElement> elem,
+void appendElementToBuilder(std::variant<mutablebson::Element, BSONElement> elem,
                             StringData fieldName,
                             BSONObjBuilder* builder) {
-    stdx::visit(
-        visit_helper::Overloaded{
-            [&](const mutablebson::Element& element) {
-                if (element.hasValue()) {
-                    builder->appendAs(element.getValue(), fieldName);
-                } else if (element.getType() == BSONType::Object) {
-                    BSONObjBuilder subBuilder(builder->subobjStart(fieldName));
-                    element.writeChildrenTo(&subBuilder);
-                } else {
-                    invariant(element.getType() == BSONType::Array);
-                    BSONArrayBuilder subBuilder(builder->subarrayStart(fieldName));
-                    element.writeArrayTo(&subBuilder);
-                }
-            },
-            [&](BSONElement element) { builder->appendAs(element, fieldName); }},
-        elem);
+    visit(OverloadedVisitor{[&](const mutablebson::Element& element) {
+                                if (element.hasValue()) {
+                                    builder->appendAs(element.getValue(), fieldName);
+                                } else if (element.getType() == BSONType::Object) {
+                                    BSONObjBuilder subBuilder(builder->subobjStart(fieldName));
+                                    element.writeChildrenTo(&subBuilder);
+                                } else {
+                                    invariant(element.getType() == BSONType::Array);
+                                    BSONArrayBuilder subBuilder(builder->subarrayStart(fieldName));
+                                    element.writeArrayTo(&subBuilder);
+                                }
+                            },
+                            [&](BSONElement element) {
+                                builder->appendAs(element, fieldName);
+                            }},
+          elem);
 }
 
 // Construction of the $v:2 diff needs to handle the same number of levels of recursion as the
@@ -230,6 +262,25 @@ public:
             _insertBob = boost::none;
         }
 
+        const auto& binaries = _node.getBinaries();
+        for (; _binaryIdx < binaries.size(); ++_binaryIdx) {
+            if (!_binaryBob) {
+                _binaryBob.emplace(_bob.subobjStart(doc_diff::kBinarySectionFieldName));
+            }
+
+            auto&& [fieldName, child] = binaries[_binaryIdx];
+
+            invariant(child->type() == NodeType::kBinary);
+            appendElementToBuilder(
+                checked_cast<BinaryNode*>(child)->elt, fieldName, _binaryBob.get_ptr());
+        }
+
+        if (_binaryBob) {
+            // All binaries have been written so we destroy the binary builder now.
+            _binaryBob = boost::none;
+        }
+
+
         if (_subDiffIdx != _node.getSubDiffs().size()) {
             auto&& [fieldName, child] = _node.getSubDiffs()[_subDiffIdx];
 
@@ -256,9 +307,11 @@ private:
 
     // Keeps track of which insertion or subDiff is being serialized.
     size_t _insertIdx = 0;
+    size_t _binaryIdx = 0;
     size_t _subDiffIdx = 0;
 
     boost::optional<BSONObjBuilder> _insertBob;
+    boost::optional<BSONObjBuilder> _binaryBob;
 };
 
 // Stack frame used to maintain state while serializing ArrayNodes.
@@ -277,21 +330,46 @@ public:
             }
         }
 
+        // +1 for leading char. +1 to round up from digits10.
+        static constexpr size_t fieldNameSize = std::numeric_limits<std::uint64_t>::digits10 + 2;
+        char fieldNameStorage[fieldNameSize];
+
+        auto formatFieldName = [&](char pre, size_t idx) {
+            const char* fieldNameStorageEnd =
+                fmt::format_to(fieldNameStorage, FMT_STRING("{}{}"), pre, idx);
+            return StringData(fieldNameStorage, fieldNameStorageEnd - fieldNameStorage);
+        };
+
+        // Make sure that 'doc_diff::kUpdateSectionFieldName' is a single character.
+        static_assert(doc_diff::kUpdateSectionFieldName.size() == 1,
+                      "doc_diff::kUpdateSectionFieldName should be a single character.");
+
         for (; _childIt != _node.getChildren().end(); ++_childIt) {
             auto&& [idx, child] = *_childIt;
-            auto idxAsStr = std::to_string(idx);
 
             switch (child->type()) {
                 case (NodeType::kUpdate): {
                     const auto& valueNode = checked_cast<const UpdateNode&>(*child);
                     appendElementToBuilder(
-                        valueNode.elt, doc_diff::kUpdateSectionFieldName + idxAsStr, &_bob);
+                        valueNode.elt,
+                        formatFieldName(doc_diff::kUpdateSectionFieldName[0], idx),
+                        &_bob);
                     break;
                 }
                 case (NodeType::kInsert): {
                     const auto& valueNode = checked_cast<const InsertNode&>(*child);
                     appendElementToBuilder(
-                        valueNode.elt, doc_diff::kUpdateSectionFieldName + idxAsStr, &_bob);
+                        valueNode.elt,
+                        formatFieldName(doc_diff::kUpdateSectionFieldName[0], idx),
+                        &_bob);
+                    break;
+                }
+                case (NodeType::kBinary): {
+                    const auto& valueNode = checked_cast<const BinaryNode&>(*child);
+                    appendElementToBuilder(
+                        valueNode.elt,
+                        formatFieldName(doc_diff::kUpdateSectionFieldName[0], idx),
+                        &_bob);
                     break;
                 }
                 case (NodeType::kDocumentInsert): {
@@ -303,14 +381,14 @@ public:
                     ++_childIt;
                     return std::make_unique<DocumentInsertFrame>(
                         *checked_cast<DocumentInsertionNode*>(child.get()),
-                        BSONObjBuilder(
-                            _bob.subobjStart(doc_diff::kUpdateSectionFieldName + idxAsStr)));
+                        BSONObjBuilder(_bob.subobjStart(
+                            formatFieldName(doc_diff::kUpdateSectionFieldName[0], idx))));
                 }
                 case (NodeType::kDocumentSubDiff):
                 case (NodeType::kArray): {
                     InternalNode* subNode = checked_cast<InternalNode*>(child.get());
                     BSONObjBuilder childBuilder = _bob.subobjStart(
-                        std::string(1, doc_diff::kSubDiffSectionFieldPrefix) + idxAsStr);
+                        formatFieldName(doc_diff::kSubDiffSectionFieldPrefix, idx));
 
                     ++_childIt;
                     return makeSubNodeFrameHelper(subNode, std::move(childBuilder));
@@ -399,7 +477,7 @@ doc_diff::DiffType identifyType(const BSONObj& diff) {
     return DiffType::kDocument;
 }
 
-stdx::variant<DocumentDiffReader, ArrayDiffReader> getReader(const Diff& diff) {
+std::variant<DocumentDiffReader, ArrayDiffReader> getReader(const Diff& diff) {
     const auto type = identifyType(diff);
     if (type == DiffType::kArray) {
         return ArrayDiffReader(diff);
@@ -466,11 +544,10 @@ boost::optional<std::pair<size_t, ArrayDiffReader::ArrayModification>> ArrayDiff
                 str::stream() << "expected sub diff at index " << idx << " but got " << next,
                 next.type() == BSONType::Object);
 
-        auto modification =
-            stdx::visit(visit_helper::Overloaded{[](const auto& reader) -> ArrayModification {
-                            return {reader};
-                        }},
-                        getReader(next.embeddedObject()));
+        auto modification = visit(OverloadedVisitor{[](const auto& reader) -> ArrayModification {
+                                      return {reader};
+                                  }},
+                                  getReader(next.embeddedObject()));
         return {{idx, modification}};
     } else {
         uasserted(4770502,
@@ -492,11 +569,19 @@ DocumentDiffReader::DocumentDiffReader(const Diff& diff) : _diff(diff) {
     static_assert(kDeleteSectionFieldName.size() == 1);
     static_assert(kInsertSectionFieldName.size() == 1);
     static_assert(kUpdateSectionFieldName.size() == 1);
+    static_assert(kBinarySectionFieldName.size() == 1);
 
-    const std::map<char, Section> sections{{kDeleteSectionFieldName[0], Section{&_deletes, 1}},
-                                           {kUpdateSectionFieldName[0], Section{&_updates, 2}},
-                                           {kInsertSectionFieldName[0], Section{&_inserts, 3}},
-                                           {kSubDiffSectionFieldPrefix, Section{&_subDiffs, 4}}};
+    // Create a map only using stack memory for this temporary helper map. Make sure to update the
+    // size for the 'static_vector' if changes are made to the number of elements we hold.
+    const boost::container::flat_map<char,
+                                     Section,
+                                     std::less<char>,
+                                     boost::container::static_vector<std::pair<char, Section>, 5>>
+        sections{{kDeleteSectionFieldName[0], Section{&_deletes, 1}},
+                 {kUpdateSectionFieldName[0], Section{&_updates, 2}},
+                 {kInsertSectionFieldName[0], Section{&_inserts, 3}},
+                 {kBinarySectionFieldName[0], Section{&_binaries, 4}},
+                 {kSubDiffSectionFieldPrefix, Section{&_subDiffs, 5}}};
 
     char prev = 0;
     bool hasSubDiffSections = false;
@@ -554,7 +639,14 @@ boost::optional<BSONElement> DocumentDiffReader::nextInsert() {
     return _inserts->next();
 }
 
-boost::optional<std::pair<StringData, stdx::variant<DocumentDiffReader, ArrayDiffReader>>>
+boost::optional<BSONElement> DocumentDiffReader::nextBinary() {
+    if (!_binaries || !_binaries->more()) {
+        return {};
+    }
+    return _binaries->next();
+}
+
+boost::optional<std::pair<StringData, std::variant<DocumentDiffReader, ArrayDiffReader>>>
 DocumentDiffReader::nextSubDiff() {
     if (!_subDiffs || !_subDiffs->more()) {
         return {};

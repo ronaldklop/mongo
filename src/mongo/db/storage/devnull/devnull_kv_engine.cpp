@@ -27,15 +27,33 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/devnull/devnull_kv_engine.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
 #include <memory>
+#include <set>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/catalog/validate_results.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/damage_vector.h"
+#include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/devnull/ephemeral_catalog_record_store.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -44,39 +62,49 @@ public:
     boost::optional<Record> next() final {
         return {};
     }
+    boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) override {
+        return {};
+    }
     boost::optional<Record> seekExact(const RecordId& id) final {
         return {};
     }
-    boost::optional<Record> seekNear(const RecordId& id) final {
-        return {};
-    }
     void save() final {}
-    bool restore() final {
+    bool restore(bool tolerateCappedRepositioning = true) final {
         return true;
     }
     void detachFromOperationContext() final {}
     void reattachToOperationContext(OperationContext* opCtx) final {}
+    void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
 };
 
 class DevNullRecordStore : public RecordStore {
 public:
-    DevNullRecordStore(StringData ns, StringData identName, const CollectionOptions& options)
-        : RecordStore(ns, identName), _options(options) {
+    DevNullRecordStore(const NamespaceString& nss,
+                       boost::optional<UUID> uuid,
+                       StringData identName,
+                       const CollectionOptions& options,
+                       KeyFormat keyFormat)
+        : RecordStore(uuid, identName, options.capped),
+          _options(options),
+          _keyFormat(keyFormat),
+          _ns(nss) {
         _numInserts = 0;
         _dummy = BSON("_id" << 1);
     }
 
-    virtual const char* name() const {
+    const char* name() const override {
         return "devnull";
     }
 
-    virtual void setCappedCallback(CappedCallback*) {}
+    NamespaceString ns(OperationContext* opCtx) const override {
+        return _ns;
+    }
 
-    virtual long long dataSize(OperationContext* opCtx) const {
+    long long dataSize(OperationContext* opCtx) const override {
         return 0;
     }
 
-    virtual long long numRecords(OperationContext* opCtx) const {
+    long long numRecords(OperationContext* opCtx) const override {
         return 0;
     }
 
@@ -84,25 +112,25 @@ public:
         return _options.capped;
     }
 
-    virtual KeyFormat keyFormat() const {
-        return KeyFormat::Long;
+    KeyFormat keyFormat() const override {
+        return _keyFormat;
     }
 
-    virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = nullptr,
-                                int infoLevel = 0) const {
+    int64_t storageSize(OperationContext* opCtx,
+                        BSONObjBuilder* extraInfo = nullptr,
+                        int infoLevel = 0) const override {
         return 0;
     }
 
-    virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const {
+    bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const override {
         return false;
     }
 
-    virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
+    void doDeleteRecord(OperationContext* opCtx, const RecordId& dl) override {}
 
-    virtual Status insertRecords(OperationContext* opCtx,
-                                 std::vector<Record>* inOutRecords,
-                                 const std::vector<Timestamp>& timestamps) {
+    Status doInsertRecords(OperationContext* opCtx,
+                           std::vector<Record>* inOutRecords,
+                           const std::vector<Timestamp>& timestamps) override {
         _numInserts += inOutRecords->size();
         for (auto& record : *inOutRecords) {
             record.id = RecordId(6, 4);
@@ -110,53 +138,81 @@ public:
         return Status::OK();
     }
 
-    virtual Status updateRecord(OperationContext* opCtx,
-                                const RecordId& oldLocation,
-                                const char* data,
-                                int len) {
+    Status doUpdateRecord(OperationContext* opCtx,
+                          const RecordId& oldLocation,
+                          const char* data,
+                          int len) override {
         return Status::OK();
     }
 
-    virtual bool updateWithDamagesSupported() const {
+    bool updateWithDamagesSupported() const override {
         return false;
     }
 
-    virtual StatusWith<RecordData> updateWithDamages(OperationContext* opCtx,
-                                                     const RecordId& loc,
-                                                     const RecordData& oldRec,
-                                                     const char* damageSource,
-                                                     const mutablebson::DamageVector& damages) {
+    StatusWith<RecordData> doUpdateWithDamages(OperationContext* opCtx,
+                                               const RecordId& loc,
+                                               const RecordData& oldRec,
+                                               const char* damageSource,
+                                               const DamageVector& damages) override {
         MONGO_UNREACHABLE;
     }
 
+    void printRecordMetadata(OperationContext* opCtx,
+                             const RecordId& recordId,
+                             std::set<Timestamp>* recordTimestamps) const override {
+        MONGO_UNREACHABLE;
+    }
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final {
         return std::make_unique<EmptyRecordCursor>();
     }
 
-    virtual Status truncate(OperationContext* opCtx) {
+    Status doTruncate(OperationContext* opCtx) override {
         return Status::OK();
     }
 
-    virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {}
+    Status doRangeTruncate(OperationContext* opCtx,
+                           const RecordId& minRecordId,
+                           const RecordId& maxRecordId,
+                           int64_t hintDataSizeDiff,
+                           int64_t hintNumRecordsDiff) override {
+        return Status::OK();
+    }
 
-    virtual void appendCustomStats(OperationContext* opCtx,
-                                   BSONObjBuilder* result,
-                                   double scale) const {
+    void doCappedTruncateAfter(OperationContext* opCtx,
+                               const RecordId& end,
+                               bool inclusive,
+                               const AboutToDeleteRecordCallback& aboutToDelete) override {}
+
+    void appendNumericCustomStats(OperationContext* opCtx,
+                                  BSONObjBuilder* result,
+                                  double scale) const override {
         result->appendNumber("numInserts", _numInserts);
     }
 
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
+    void updateStatsAfterRepair(OperationContext* opCtx,
+                                long long numRecords,
+                                long long dataSize) override {}
 
-    virtual void updateStatsAfterRepair(OperationContext* opCtx,
-                                        long long numRecords,
-                                        long long dataSize) {}
+    RecordId getLargestKey(OperationContext* opCtx) const final {
+        return RecordId();
+    }
+
+    void reserveRecordIds(OperationContext* opCtx,
+                          std::vector<RecordId>* out,
+                          size_t nRecords) final {
+        for (size_t i = 0; i < nRecords; i++) {
+            out->push_back(RecordId(i));
+        }
+    };
 
 private:
     CollectionOptions _options;
+    KeyFormat _keyFormat;
     long long _numInserts;
     BSONObj _dummy;
+    NamespaceString _ns;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
@@ -166,7 +222,7 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual Status addKey(const KeyString::Value& keyString) {
+    Status addKey(const key_string::Value& keyString) override {
         return Status::OK();
     }
 };
@@ -174,80 +230,121 @@ public:
 class DevNullSortedDataInterface : public SortedDataInterface {
 public:
     DevNullSortedDataInterface(StringData identName)
-        : SortedDataInterface(
-              identName, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())) {}
+        : SortedDataInterface(identName,
+                              key_string::Version::kLatestVersion,
+                              Ordering::make(BSONObj()),
+                              KeyFormat::Long) {}
 
-    virtual ~DevNullSortedDataInterface() {}
+    ~DevNullSortedDataInterface() override {}
 
-    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
-                                                                        bool dupsAllowed) {
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                bool dupsAllowed) override {
         return {};
     }
 
-    virtual Status insert(OperationContext* opCtx,
-                          const KeyString::Value& keyString,
-                          bool dupsAllowed) {
+    Status insert(OperationContext* opCtx,
+                  const key_string::Value& keyString,
+                  bool dupsAllowed,
+                  IncludeDuplicateRecordId includeDuplicateRecordId) override {
         return Status::OK();
     }
 
-    virtual void unindex(OperationContext* opCtx,
-                         const KeyString::Value& keyString,
-                         bool dupsAllowed) {}
+    void unindex(OperationContext* opCtx,
+                 const key_string::Value& keyString,
+                 bool dupsAllowed) override {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
+    Status dupKeyCheck(OperationContext* opCtx, const key_string::Value& keyString) override {
         return Status::OK();
     }
 
-    virtual void fullValidate(OperationContext* opCtx,
-                              long long* numKeysOut,
-                              IndexValidateResults* fullResults) const {}
+    boost::optional<RecordId> findLoc(OperationContext* opCtx,
+                                      StringData keyString) const override {
+        return boost::none;
+    }
 
-    virtual bool appendCustomStats(OperationContext* opCtx,
-                                   BSONObjBuilder* output,
-                                   double scale) const {
+    IndexValidateResults validate(OperationContext* opCtx, bool full) const override {
+        return IndexValidateResults{};
+    }
+
+    bool appendCustomStats(OperationContext* opCtx,
+                           BSONObjBuilder* output,
+                           double scale) const override {
         return false;
     }
 
-    virtual long long getSpaceUsedBytes(OperationContext* opCtx) const {
+    long long getSpaceUsedBytes(OperationContext* opCtx) const override {
         return 0;
     }
 
-    virtual long long getFreeStorageBytes(OperationContext* opCtx) const {
+    long long getFreeStorageBytes(OperationContext* opCtx) const override {
         return 0;
     }
 
-    virtual bool isEmpty(OperationContext* opCtx) {
+    bool isEmpty(OperationContext* opCtx) override {
         return true;
     }
 
-    virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
-                                                                   bool isForward) const {
+    int64_t numEntries(OperationContext* opCtx) const override {
+        return 0;
+    }
+
+    void printIndexEntryMetadata(OperationContext* opCtx,
+                                 const key_string::Value& keyString) const override {}
+
+    std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
+                                                           bool isForward) const override {
         return {};
     }
 
-    virtual Status initAsEmpty(OperationContext* opCtx) {
+    Status initAsEmpty(OperationContext* opCtx) override {
         return Status::OK();
     }
 };
 
+DevNullKVEngine::DevNullKVEngine() : _engineDbPath(storageGlobalParams.dbpath) {
+    auto testFilePath = _engineDbPath / "testFile.txt";
+    _mockBackupBlocks.push_back(BackupBlock(/*opCtx=*/nullptr,
+                                            /*nss=*/boost::none,
+                                            /*uuid=*/boost::none,
+                                            /*filePath=*/testFilePath.string()));
+}
+
+DevNullKVEngine::~DevNullKVEngine() = default;
+
+RecoveryUnit* DevNullKVEngine::newRecoveryUnit() {
+    return new RecoveryUnitNoop();
+}
 
 std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* opCtx,
-                                                             StringData ns,
+                                                             const NamespaceString& nss,
                                                              StringData ident,
                                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return std::make_unique<EphemeralForTestRecordStore>(ns, ident, &_catalogInfo);
+        return std::make_unique<EphemeralForTestRecordStore>(
+            nss, options.uuid, ident, &_catalogInfo);
     }
-    return std::make_unique<DevNullRecordStore>(ns, ident, options);
+    return std::make_unique<DevNullRecordStore>(nss, options.uuid, ident, options, KeyFormat::Long);
+}
+
+std::unique_ptr<RecordStore> DevNullKVEngine::getTemporaryRecordStore(OperationContext* opCtx,
+                                                                      StringData ident,
+                                                                      KeyFormat keyFormat) {
+    return makeTemporaryRecordStore(opCtx, ident, keyFormat);
 }
 
 std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
-                                                                       StringData ident) {
-    return std::make_unique<DevNullRecordStore>("" /* ns */, ident, CollectionOptions());
+                                                                       StringData ident,
+                                                                       KeyFormat keyFormat) {
+    return std::make_unique<DevNullRecordStore>(NamespaceString::kEmpty /* ns */,
+                                                boost::none /* uuid */,
+                                                ident,
+                                                CollectionOptions(),
+                                                keyFormat);
 }
 
 std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
     OperationContext* opCtx,
+    const NamespaceString& nss,
     const CollectionOptions& collOptions,
     StringData ident,
     const IndexDescriptor* desc) {
@@ -259,21 +356,24 @@ namespace {
 class StreamingCursorImpl : public StorageEngine::StreamingCursor {
 public:
     StreamingCursorImpl() = delete;
-    StreamingCursorImpl(StorageEngine::BackupOptions options)
-        : StorageEngine::StreamingCursor(options) {
-        _backupBlocks = {{"filename.wt"}};
+    StreamingCursorImpl(StorageEngine::BackupOptions options, std::deque<BackupBlock> backupBlocks)
+        : StorageEngine::StreamingCursor(options), _backupBlocks(std::move(backupBlocks)) {
         _exhaustCursor = false;
     };
 
-    ~StreamingCursorImpl() = default;
+    ~StreamingCursorImpl() override = default;
 
     BSONObj getMetadataObject(UUID backupId) {
         return BSONObj();
     }
 
-    StatusWith<std::vector<StorageEngine::BackupBlock>> getNextBatch(const std::size_t batchSize) {
+    void setCatalogEntries(stdx::unordered_map<std::string, std::pair<NamespaceString, UUID>>
+                               identsToNsAndUUID) override {}
+
+    StatusWith<std::deque<BackupBlock>> getNextBatch(OperationContext* opCtx,
+                                                     const std::size_t batchSize) override {
         if (_exhaustCursor) {
-            std::vector<StorageEngine::BackupBlock> emptyVector;
+            std::deque<BackupBlock> emptyVector;
             return emptyVector;
         }
         _exhaustCursor = true;
@@ -281,7 +381,7 @@ public:
     }
 
 private:
-    std::vector<StorageEngine::BackupBlock> _backupBlocks;
+    std::deque<BackupBlock> _backupBlocks;
     bool _exhaustCursor;
 };
 
@@ -289,11 +389,12 @@ private:
 
 StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> DevNullKVEngine::beginNonBlockingBackup(
     OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
-    return std::make_unique<StreamingCursorImpl>(options);
+    return std::make_unique<StreamingCursorImpl>(options, _mockBackupBlocks);
 }
 
-StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {
-    std::vector<std::string> filesToCopy = {"journal/WiredTigerLog.999"};
+StatusWith<std::deque<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {
+    std::deque<std::string> filesToCopy = {
+        (_engineDbPath / "journal" / "WiredTigerLog.999").string()};
     return filesToCopy;
 }
 

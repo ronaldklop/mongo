@@ -27,16 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/split_horizon.h"
-
 #include <algorithm>
-#include <boost/optional.hpp>
+#include <boost/none.hpp>
+#include <cstddef>
 #include <iterator>
+#include <ostream>
+#include <vector>
 
-#include "mongo/stdx/utility.h"
-#include "mongo/unittest/unittest.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/repl/split_horizon.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 using namespace std::literals::string_literals;
 
@@ -110,7 +118,7 @@ TEST(SplitHorizonTesting, determineHorizon) {
         const auto& input = test.input;
 
         const std::string witness =
-            SplitHorizon(input.forwardMapping).determineHorizon(input.horizonParameters).toString();
+            SplitHorizon(input.forwardMapping).determineHorizon(input.horizonParameters);
         ASSERT_EQUALS(witness, expected);
     }
 
@@ -443,6 +451,12 @@ TEST(SplitHorizonTesting, BSONRoundTrip) {
     const Input tests[] = {
         {{{"horizon1", "horizon1.example.com:42"}}},
         {{{"horizon1", "horizon1.example.com:42"}, {"horizon2", "horizon2.example.com:42"}}},
+        {{{"horizon1", "horizon1.example.com:42"}, {"horizon2", "horizon2.example.com:42"}}},
+        {{{"q_horizon", "horizonq.example.com:42"},
+          {"b_horizon1", "horizonb.example.com:42"},
+          {"z_horizon1", "horizonz.example.com:42"},
+          {"horizon1", "horizon1.example.com:42"},
+          {"horizon2", "horizon2.example.com:42"}}},
     };
     for (const auto& input : tests) {
         const auto testNumber = &input - tests;
@@ -457,10 +471,19 @@ TEST(SplitHorizonTesting, BSONRoundTrip) {
 
         const SplitHorizon witness(HostAndPort(defaultHostAndPort), bson["horizons"].Obj());
 
+        const BSONObj witnessBson = [&] {
+            BSONObjBuilder outputBuilder;
+            witness.toBSON(outputBuilder);
+            return outputBuilder.obj();
+        }();
+
         ASSERT_TRUE(horizon.getForwardMappings() == witness.getForwardMappings())
             << "Test #" << testNumber << " Failed on bson round trip with forward map";
         ASSERT_TRUE(horizon.getReverseHostMappings() == witness.getReverseHostMappings())
             << "Test #" << testNumber << " Failed on bson round trip with reverse map";
+        ASSERT_EQ(0, bson.woCompare(witnessBson))
+            << "Test #" << testNumber << " Failed on bson round trip with toBSON. BSONObj " << bson
+            << " != " << witnessBson;
     }
 }
 }  // namespace

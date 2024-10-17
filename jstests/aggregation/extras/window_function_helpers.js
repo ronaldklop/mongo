@@ -1,8 +1,10 @@
-load("jstests/aggregation/extras/utils.js");  // arrayEq
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
+
 /**
  * Create a collection of tickers and prices.
  */
-function seedWithTickerData(coll, docsPerTicker) {
+export function seedWithTickerData(coll, docsPerTicker) {
     for (let i = 0; i < docsPerTicker; i++) {
         assert.commandWorked(
             coll.insert({_id: i, partIndex: i, ticker: "T1", price: (500 - i * 10)}));
@@ -12,13 +14,13 @@ function seedWithTickerData(coll, docsPerTicker) {
     }
 }
 
-function forEachPartitionCase(callback) {
+export function forEachPartitionCase(callback) {
     callback(null);
     callback("$ticker");
     callback({$toLower: "$ticker"});
 }
 
-const documentBounds = [
+export const documentBounds = [
     ["unbounded", 0],
     ["unbounded", -1],
     ["unbounded", 1],
@@ -37,7 +39,7 @@ const documentBounds = [
     [-2, 3],
 ];
 
-function forEachDocumentBoundsCombo(callback) {
+export function forEachDocumentBoundsCombo(callback) {
     documentBounds.forEach(function(bounds, index) {
         let boundsCombo = [bounds];
         for (let j = index + 1; j < documentBounds.length; j++) {
@@ -63,14 +65,23 @@ function forEachDocumentBoundsCombo(callback) {
  *
  * The skip/limit values are calculated from the given bounds and the current index.
  *
+ * 'accumSpec' is the specification of accumulator being tested and is an object of the form
+ * {accumulatorName: <accumulator arguments>}.
+ *
  * 'defaultValue' is used in cases when the skip/limit combination result in $group not getting any
  * documents. The most likely scenario is that the window has gone off the side of the partition.
  *
  * Note that this function assumes that the data in 'coll' has been seeded with the documents from
  * the seedWithTickerData() method above.
  */
-function computeAsGroup(
-    {coll, partitionKey, accum, bounds, indexInPartition, defaultValue = null}) {
+export function computeAsGroup({
+    coll,
+    partitionKey,
+    accumSpec,
+    bounds,
+    indexInPartition,
+    defaultValue = null,
+}) {
     const skip = calculateSkip(bounds[0], indexInPartition);
     const limit = calculateLimit(bounds[0], bounds[1], indexInPartition);
     if (skip < 0 || limit <= 0)
@@ -83,8 +94,7 @@ function computeAsGroup(
         prefixPipe = prefixPipe.concat([{$limit: limit}]);
 
     const result =
-        coll.aggregate(prefixPipe.concat([{$group: {_id: null, res: {[accum]: "$price"}}}]))
-            .toArray();
+        coll.aggregate(prefixPipe.concat([{$group: {_id: null, res: accumSpec}}])).toArray();
     // If the window is completely off the edge of the right side of the partition, return null.
     if (result.length == 0) {
         return defaultValue;
@@ -95,7 +105,7 @@ function computeAsGroup(
 /**
  * Helper to calculate the correct skip based on the lowerBound given.
  */
-function calculateSkip(lowerBound, indexInPartition) {
+export function calculateSkip(lowerBound, indexInPartition) {
     let skipValueToUse = 0;
     if (lowerBound === "current") {
         skipValueToUse = indexInPartition;
@@ -113,7 +123,7 @@ function calculateSkip(lowerBound, indexInPartition) {
 /**
  * Helper to calculate the correct limit based on the bounds given.
  */
-function calculateLimit(lowerBound, upperBound, indexInPartition) {
+export function calculateLimit(lowerBound, upperBound, indexInPartition) {
     let limitValueToUse = "unbounded";
     if (upperBound === "current") {
         if (lowerBound === "unbounded") {
@@ -150,39 +160,46 @@ function calculateLimit(lowerBound, upperBound, indexInPartition) {
     return limitValueToUse;
 }
 
-function assertResultsEqual(wfRes, index, groupRes, accum) {
+export function assertResultsEqual(wfRes, index, groupRes, accum) {
     // On DEBUG builds, the computed $group may be slightly different due to precision
     // loss when spilling to disk.
     // TODO SERVER-42616: Enable the exact check for $stdDevPop/Samp.
     if (accum == "$stdDevSamp" || accum == "$stdDevPop") {
-        // $group doesn't return NaN, returns 0 or null.
-        // TODO SERVER-55063: The stdDev functions should not return NaN.
-        if (isNaN(wfRes.res)) {
-            if (accum == "$stdDevPop") {
-                assert.eq(groupRes,
-                          0,
-                          "$stdDevPop window function returned NaN, but $group returned " +
-                              tojson(groupRes) + " at index " + index);
-            } else {
-                assert.eq(groupRes,
-                          null,
-                          "$stdDevSamp window function returned NaN, but $group returned " +
-                              tojson(groupRes) + " at index " + index);
-            }
-        } else {
-            assert.close(groupRes,
-                         wfRes.res,
-                         "Window function $stdDev result for index " + index + ": " + tojson(wfRes),
-                         10 /* 10 decimal places */);
-        }
+        assert.close(groupRes,
+                     wfRes.res,
+                     "Window function $stdDev result for index " + index + ": " + tojson(wfRes),
+                     10 /* 10 decimal places */);
     } else if (accum == "$addToSet") {
         // Order doesn't matter for $addToSet.
         assert(arrayEq(groupRes, wfRes.res),
-               "Window function $addToSet results for index " + index + ": " + tojson(wfRes));
+               "Window function $addToSet results for index " + index + ": " + tojson(wfRes) +
+                   "\nexpected:\n " + tojson(groupRes));
     } else
         assert.eq(groupRes,
                   wfRes.res,
                   "Window function result for index " + index + ": " + tojson(wfRes));
+}
+
+export function assertExplainResult(explainResult) {
+    const stages = getAggPlanStages(explainResult, "$_internalSetWindowFields");
+    for (let stage of stages) {
+        assert(stage.hasOwnProperty("$_internalSetWindowFields"), stage);
+
+        assert(stage.hasOwnProperty("maxFunctionMemoryUsageBytes"), stage);
+        const maxFunctionMemUsages = stage["maxFunctionMemoryUsageBytes"];
+        for (let field of Object.keys(maxFunctionMemUsages)) {
+            assert.gte(maxFunctionMemUsages[field],
+                       0,
+                       "invalid memory usage for '" + field + "': " + tojson(stage));
+        }
+        assert.gt(
+            stage["maxTotalMemoryUsageBytes"], 0, "Incorrect total mem usage: " + tojson(stage));
+        // No test should be using more than 1GB of memory. This is mostly a sanity check that
+        // integer underflow doesn't occur.
+        assert.lt(stage["maxTotalMemoryUsageBytes"],
+                  1 * 1024 * 1024 * 1024,
+                  "Incorrect total mem usage: " + tojson(stage));
+    }
 }
 
 /**
@@ -192,27 +209,22 @@ function assertResultsEqual(wfRes, index, groupRes, accum) {
  * Note that this function assumes that the documents in 'coll' were initialized using the
  * seedWithTickerData() method above.
  */
-function testAccumAgainstGroup(coll, accum, onNoResults = null, disableRemovable = false) {
+export function testAccumAgainstGroup(coll, accum, onNoResults = null, accumArgs = "$price") {
+    const accumSpec = {[accum]: accumArgs};
     forEachPartitionCase(function(partition) {
         documentBounds.forEach(function(bounds, index) {
-            if (disableRemovable && bounds[0] !== "unbounded") {
-                jsTestLog("Skipping testing accumulator " + accum + " against " +
-                          tojson(partition) + " partition and [" + bounds + "] bounds");
-                return;
-            }
-            jsTestLog("Testing accumulator " + accum + " against " + tojson(partition) +
+            jsTestLog("Testing accumulator " + tojson(accumSpec) + " against " + tojson(partition) +
                       " partition and [" + bounds + "] bounds");
-            const wfResults =
-                coll.aggregate([
-                        {
-                            $setWindowFields: {
-                                partitionBy: partition,
-                                sortBy: {_id: 1},
-                                output: {res: {[accum]: "$price", window: {documents: bounds}}}
-                            },
-                        },
-                    ])
-                    .toArray();
+
+            let outputSpec = {window: {documents: bounds}};
+            Object.assign(outputSpec, accumSpec);
+            const pipeline = [
+                {
+                    $setWindowFields:
+                        {partitionBy: partition, sortBy: {_id: 1}, output: {res: outputSpec}},
+                },
+            ];
+            const wfResults = coll.aggregate(pipeline, {allowDiskUse: true}).toArray();
             for (let index = 0; index < wfResults.length; index++) {
                 const wfRes = wfResults[index];
 
@@ -222,24 +234,29 @@ function testAccumAgainstGroup(coll, accum, onNoResults = null, disableRemovable
                     groupRes = computeAsGroup({
                         coll: coll,
                         partitionKey: {},
-                        accum: accum,
+                        accumSpec: accumSpec,
                         bounds: bounds,
                         indexInPartition: indexInPartition,
-                        defaultValue: onNoResults
+                        defaultValue: onNoResults,
                     });
                 } else {
                     groupRes = computeAsGroup({
                         coll: coll,
                         partitionKey: {ticker: wfRes.ticker},
-                        accum: accum,
+                        accumSpec: accumSpec,
                         bounds: bounds,
                         indexInPartition: indexInPartition,
-                        defaultValue: onNoResults
+                        defaultValue: onNoResults,
                     });
                 }
 
                 assertResultsEqual(wfRes, index, groupRes, accum);
             }
+
+            // Run the same pipeline with explain verbosity "executionStats" and verify that the
+            // reported metrics are sensible.
+            assertExplainResult(
+                coll.explain("executionStats").aggregate(pipeline, {allowDiskUse: true}));
 
             jsTestLog("Done");
         });
@@ -248,7 +265,7 @@ function testAccumAgainstGroup(coll, accum, onNoResults = null, disableRemovable
         // combinations of various window types in the same $setWindowFields stage. This is more of
         // a fuzz test so no need to check results.
         forEachDocumentBoundsCombo(function(arrayOfBounds) {
-            jsTestLog("Testing accumulator " + accum +
+            jsTestLog("Testing accumulator " + tojson(accumSpec) +
                       " against multiple bounds: " + tojson(arrayOfBounds));
             let baseSpec = {
                 partitionBy: partition,
@@ -256,15 +273,14 @@ function testAccumAgainstGroup(coll, accum, onNoResults = null, disableRemovable
             };
             let outputFields = {};
             arrayOfBounds.forEach(function(bounds, index) {
-                if (disableRemovable && bounds[0] !== "unbounded") {
-                    jsTestLog("Skipping testing accumulator " + accum + " against " +
-                              tojson(partition) + " partition and [" + tojson(bounds) + "] bounds");
-                    return;
-                }
-                outputFields["res" + index] = {[accum]: "$price", window: {documents: bounds}};
+                let outputSpec = {window: {documents: bounds}};
+                Object.assign(outputSpec, accumSpec);
+                outputFields["res" + index] = outputSpec;
             });
             let specWithOutput = Object.merge(baseSpec, {output: outputFields});
-            const wfResults = coll.aggregate([{$setWindowFields: specWithOutput}]).toArray();
+            const wfResults =
+                coll.aggregate([{$setWindowFields: specWithOutput}], {allowDiskUse: true})
+                    .toArray();
             assert.gt(wfResults.length, 0);
             jsTestLog("Done");
         });

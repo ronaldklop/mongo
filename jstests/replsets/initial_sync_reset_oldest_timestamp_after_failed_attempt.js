@@ -3,14 +3,15 @@
  * a failpoint that causes initial sync to fail partway through its first attempt and makes sure it
  * does not hit a WiredTiger assertion on the second attempt.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Set the number of initial sync attempts to 2 so that the test fails on unplanned failures.
 const replTest =
@@ -34,6 +35,11 @@ assert.commandWorked(testColl.insert({_id: 1}));
 const session = primary.startSession();
 const sessionDB = session.getDatabase(dbName);
 const sessionColl = sessionDB.getCollection(collName);
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 session.startTransaction();
 assert.commandWorked(sessionColl.insert({_id: 2}));
 
@@ -105,4 +111,3 @@ jsTestLog("Initial sync completed");
 assert.commandWorked(session.abortTransaction_forTesting());
 
 replTest.stopSet();
-})();

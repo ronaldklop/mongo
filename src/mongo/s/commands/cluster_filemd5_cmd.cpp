@@ -27,14 +27,49 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -55,7 +90,7 @@ public:
         return false;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
         std::string collectionName;
         if (const auto rootElt = cmdObj["root"]) {
             uassert(ErrorCodes::InvalidNamespace,
@@ -66,13 +101,19 @@ public:
         if (collectionName.empty())
             collectionName = "fs";
         collectionName += ".chunks";
-        return NamespaceString(dbname, collectionName).ns();
+        return NamespaceStringUtil::deserialize(dbName, collectionName);
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -80,25 +121,27 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        const auto cm =
+        const auto cri =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
         const auto callShardFn = [&](const BSONObj& cmdObj, const BSONObj& routingQuery) {
             auto shardResults =
                 scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                           nss.db(),
+                                                           nss.dbName(),
                                                            nss,
-                                                           cm,
+                                                           cri,
                                                            cmdObj,
                                                            ReadPreferenceSetting::get(opCtx),
                                                            Shard::RetryPolicy::kIdempotent,
                                                            routingQuery,
-                                                           CollationSpec::kSimpleSpec);
+                                                           CollationSpec::kSimpleSpec,
+                                                           boost::none /*letParameters*/,
+                                                           boost::none /*runtimeConstants*/);
             invariant(shardResults.size() == 1);
             const auto shardResponse = uassertStatusOK(std::move(shardResults[0].swResponse));
             uassertStatusOK(shardResponse.status);
@@ -112,6 +155,7 @@ public:
         // If the collection is not sharded, or is sharded only on the 'files_id' field, we only
         // need to target a single shard, because the files' chunks can only be contained in a
         // single sharded chunk
+        const auto& cm = cri.cm;
         if (!cm.isSharded() ||
             SimpleBSONObjComparator::kInstance.evaluate(cm.getShardKeyPattern().toBSON() ==
                                                         BSON("files_id" << 1))) {
@@ -160,7 +204,7 @@ public:
                 BSON("files_id" << cmdObj.firstElement() << "n" << numGridFSChunksProcessed));
 
             uassert(16246,
-                    str::stream() << "Shard for database " << nss.db()
+                    str::stream() << "Shard for database " << nss.dbName().toStringForErrorMsg()
                                   << " is too old to support GridFS sharded by {files_id:1, n:1}",
                     res.hasField("md5state"));
 
@@ -184,8 +228,8 @@ public:
 
         MONGO_UNREACHABLE;
     }
-
-} fileMD5Cmd;
+};
+MONGO_REGISTER_COMMAND(FileMD5Cmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

@@ -29,18 +29,35 @@
 
 #pragma once
 
-#include <third_party/murmurhash3/MurmurHash3.h>
-
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
-#include <fstream>
+#include <exception>
+#include <fstream>  // IWYU pragma: keep
+#include <functional>
+#include <iterator>
 #include <memory>
+#include <queue>
 #include <string>
+#include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/sorter/sorter_checksum_calculator.h"
 #include "mongo/db/sorter/sorter_gen.h"
+#include "mongo/db/sorter/sorter_stats.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 /**
  * This is the public API for the Sorter (both in-memory and external)
@@ -99,6 +116,7 @@ struct SortOptions {
 
     // When in-memory memory usage exceeds this value, we try to spill to disk. This is approximate.
     size_t maxMemoryUsageBytes;
+    static const size_t DefaultMaxMemoryUsageBytes = 64 * 1024 * 1024;
 
     // Whether we are allowed to spill to disk. If this is false and in-memory exceeds
     // maxMemoryUsageBytes, we will uassert.
@@ -108,13 +126,35 @@ struct SortOptions {
     // restarts, it must encrypt with a persistent key. This key is accessed using the database
     // name that the sorted collection lives in. If encryption is enabled and dbName is boost::none,
     // a temporary key is used.
-    boost::optional<std::string> dbName;
+    boost::optional<DatabaseName> dbName;
 
     // Directory into which we place a file when spilling to disk. Must be explicitly set if
     // extSortAllowed is true.
     std::string tempDir;
 
-    SortOptions() : limit(0), maxMemoryUsageBytes(64 * 1024 * 1024), extSortAllowed(false) {}
+    // If set, allows us to observe Sorter file handle usage.
+    SorterFileStats* sorterFileStats;
+
+    // If set, allows us to observe aggregate Sorter behaviors.
+    SorterTracker* sorterTracker;
+
+    // When set, this sorter will own a memory pool that callers should used to allocate memory for
+    // the keys we are sorting. If enabled, any values returned by memUsageForSorter() will be
+    // ignored.
+    bool useMemPool;
+
+    // If set to true and sorted data fits into memory, sorted data will be moved into iterator
+    // instead of copying.
+    bool moveSortedDataIntoIterator;
+
+    SortOptions()
+        : limit(0),
+          maxMemoryUsageBytes(DefaultMaxMemoryUsageBytes),
+          extSortAllowed(false),
+          sorterFileStats(nullptr),
+          sorterTracker(nullptr),
+          useMemPool(false),
+          moveSortedDataIntoIterator(false) {}
 
     // Fluent API to support expressions like SortOptions().Limit(1000).ExtSortAllowed(true)
 
@@ -138,8 +178,28 @@ struct SortOptions {
         return *this;
     }
 
-    SortOptions& DBName(std::string newDbName) {
+    SortOptions& DBName(DatabaseName newDbName) {
         dbName = std::move(newDbName);
+        return *this;
+    }
+
+    SortOptions& FileStats(SorterFileStats* newSorterFileStats) {
+        sorterFileStats = newSorterFileStats;
+        return *this;
+    }
+
+    SortOptions& Tracker(SorterTracker* newSorterTracker) {
+        sorterTracker = newSorterTracker;
+        return *this;
+    }
+
+    SortOptions& MoveSortedDataIntoIterator(bool newMoveSortedDataIntoIterator = true) {
+        moveSortedDataIntoIterator = newMoveSortedDataIntoIterator;
+        return *this;
+    }
+
+    SortOptions& UseMemoryPool(bool usePool) {
+        useMemPool = usePool;
         return *this;
     }
 };
@@ -162,6 +222,7 @@ public:
     NullValue getOwned() const {
         return {};
     }
+    void makeOwned() {}
 };
 
 /**
@@ -181,7 +242,22 @@ public:
     // Unowned objects are only valid until next call to any method
 
     virtual bool more() = 0;
+    /**
+     * Returns the new key-value pair.
+     */
     virtual std::pair<Key, Value> next() = 0;
+
+    /**
+     * The following two methods are used together. nextWithDeferredValue() returns the next key. It
+     * must be followed by a call to getDeferredValue(), to return the pending deferred value,
+     * before calling next() or nextWithDeferredValue() again. This is intended specifically to
+     * avoid allocating memory for the value if the caller eventually decides to abandon the
+     * iterator and never consume any more values from it.
+     */
+    virtual Key nextWithDeferredValue() = 0;
+    virtual Value getDeferredValue() = 0;
+
+    virtual const Key& current() = 0;
 
     virtual ~SortIteratorInterface() {}
 
@@ -205,6 +281,18 @@ protected:
     SortIteratorInterface() {}  // can only be constructed as a base
 };
 
+class SorterBase {
+public:
+    SorterBase(SorterTracker* sorterTracker = nullptr) : _stats(sorterTracker) {}
+
+    const SorterStats& stats() const {
+        return _stats;
+    }
+
+protected:
+    SorterStats _stats;
+};
+
 /**
  * This is the way to input data to the sorting framework.
  *
@@ -221,12 +309,13 @@ protected:
  * nextFileName() for example.
  */
 template <typename Key, typename Value>
-class Sorter {
+class Sorter : public SorterBase {
     Sorter(const Sorter&) = delete;
     Sorter& operator=(const Sorter&) = delete;
 
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     typedef SortIteratorInterface<Key, Value> Iterator;
     typedef std::pair<typename Key::SorterDeserializeSettings,
                       typename Value::SorterDeserializeSettings>
@@ -235,6 +324,65 @@ public:
     struct PersistedState {
         std::string fileName;
         std::vector<SorterRange> ranges;
+    };
+
+    /**
+     * Represents the file that a Sorter uses to spill to disk. Supports reading and writing
+     * (append-only).
+     */
+    class File {
+    public:
+        File(std::string path, SorterFileStats* stats = nullptr);
+
+        ~File();
+
+        const boost::filesystem::path& path() const {
+            return _path;
+        }
+
+        /**
+         * Signals that the on-disk file should not be cleaned up.
+         */
+        void keep() {
+            _keep = true;
+        };
+
+        /**
+         * Reads the requested data from the file. Cannot write more to the file once this has been
+         * called.
+         */
+        void read(std::streamoff offset, std::streamsize size, void* out);
+
+        /**
+         * Writes the given data to the end of the file. Cannot be called after reading.
+         */
+        void write(const char* data, std::streamsize size);
+
+        /**
+         * Returns the current offset of the end of the file. Cannot be called after reading.
+         */
+        std::streamoff currentOffset();
+
+    private:
+        void _open();
+
+        /**
+         * Ensures that the file is open and that _offset is set to the end of the file.
+         */
+        void _ensureOpenForWriting();
+
+        boost::filesystem::path _path;
+        std::fstream _file;
+
+        // The current offset of the end of the file if there may be unflushed data, or -1 if the
+        // file either has not yet been opened or has been flushed.
+        std::streamoff _offset = -1;
+
+        // Whether to keep the on-disk file even after this in-memory object has been destructed.
+        bool _keep = false;
+
+        // If set, this points to an external metrics holder for tracking file open/close activity.
+        SorterFileStats* _stats;
     };
 
     explicit Sorter(const SortOptions& opts);
@@ -251,59 +399,212 @@ public:
 
     template <typename Comparator>
     static Sorter* makeFromExistingRanges(const std::string& fileName,
-                                          const std::vector<SorterRange> ranges,
+                                          const std::vector<SorterRange>& ranges,
                                           const SortOptions& opts,
                                           const Comparator& comp,
                                           const Settings& settings = Settings());
 
     virtual void add(const Key&, const Value&) = 0;
-    virtual void emplace(Key&& k, Value&& v) {
-        add(k, v);
-    }
+    virtual void emplace(Key&&, ValueProducer) = 0;
+
     /**
      * Cannot add more data after calling done().
-     *
-     * The returned Iterator must not outlive the Sorter instance, which manages file clean up.
      */
     virtual Iterator* done() = 0;
 
+    /**
+     * Pauses loading and returns the iterator that can be used to get the current state. Clients of
+     * this class can call this method to pause loading and get the current state available in
+     * read-only mode for storing it to a persistent storage which is used by streaming query use
+     * cases. New documents cannot be added until resume is called. The iterator returned is
+     * reflecting current in memory state and is not guaranteed to be sorted.
+     */
+    virtual Iterator* pause() = 0;
+
+    /**
+     * Resumes loading and cleans up internal state created during pause().
+     */
+    virtual void resume() = 0;
+
     virtual ~Sorter() {}
-
-    size_t numSpills() const {
-        return _numSpills;
-    }
-
-    size_t numSorted() const {
-        return _numSorted;
-    }
-
-    uint64_t totalDataSizeSorted() const {
-        return _totalDataSizeSorted;
-    }
 
     PersistedState persistDataForShutdown();
 
+    SharedBufferFragmentBuilder& memPool() {
+        invariant(_memPool);
+        return _memPool.get();
+    }
+
 protected:
-    Sorter() {}  // can only be constructed as a base
-
     virtual void spill() = 0;
-
-    size_t _numSpills = 0;  // Keeps track of the number of times data was spilled to disk.
-    size_t _numSorted = 0;  // Keeps track of the number of keys sorted.
-    uint64_t _totalDataSizeSorted = 0;  // Keeps track of the total size of data sorted.
-
-    // Whether the files written by this Sorter should be kept on destruction.
-    bool _shouldKeepFilesOnDestruction = false;
 
     SortOptions _opts;
 
-    // Used by Sorter::persistDataForShutdown() to return the base file name of the data persisted
-    // by this Sorter.
-    std::string _fileName;
-
-    std::string _fileFullPath;
+    std::shared_ptr<File> _file;
 
     std::vector<std::shared_ptr<Iterator>> _iters;  // Data that has already been spilled.
+    size_t fileIteratorsMaxBytesSize =
+        1 * 1024 * 1024;  // Memory Iterators for spilled data area allowed to use.
+    size_t fileIteratorsMaxNum;
+
+    boost::optional<SharedBufferFragmentBuilder> _memPool;
+};
+
+
+template <typename Key, typename Value>
+class BoundedSorterInterface : public SorterBase {
+
+public:
+    BoundedSorterInterface(const SortOptions& opts) : SorterBase(opts.sorterTracker) {}
+
+    virtual ~BoundedSorterInterface() {}
+
+    // Feed one item of input to the sorter.
+    // Together, add() and done() represent the input stream.
+    virtual void add(Key key, Value value) = 0;
+
+    // Indicate that no more input will arrive.
+    // Together, add() and done() represent the input stream.
+    virtual void done() = 0;
+
+    // Prepare the sorter to receive a new stream of input.
+    //
+    // The new input stream is treated as unrelated to the old one: new elements are only compared
+    // against each other, not against any elements of the old input stream.
+    //
+    // However, any SortOptions::limit applies to the entire sorter, not to each input stream
+    // separately.
+    virtual void restart() = 0;
+
+    enum class State {
+        // An output document is not available yet, but this may change as more input arrives.
+        kWait,
+        // An output document is available now: you may call next() once.
+        kReady,
+        // All output has been returned.
+        kDone,
+    };
+    // Together, state() and next() represent the output stream.
+    // See BoundedSorter::State for the meaning of each case.
+    virtual State getState() const = 0;
+
+    // Remove and return one item of output.
+    // Only valid to call when getState() == kReady.
+    // Together, state() and next() represent the output stream.
+    virtual std::pair<Key, Value> next() = 0;
+
+    // Serialize the bound for explain output
+    virtual Document serializeBound(const SerializationOptions& opts) const = 0;
+
+    virtual size_t limit() const = 0;
+
+    // By default, uassert that the input meets our assumptions of being almost-sorted.
+    // But if _checkInput is false, don't do that check.
+    // The output will be in the wrong order but otherwise it should work.
+    virtual bool checkInput() const = 0;
+};
+
+/**
+ * Sorts data that is already "almost sorted", meaning we can put a bound on how out-of-order
+ * any two input elements are. For example, maybe we are sorting by {time: 1} and we know that no
+ * two documents are more than an hour out of order. This means as soon as we see {time: t}, we know
+ * that any document earlier than {time: t - 1h} is safe to return.
+ *
+ * Note what's bounded is the difference in sort-key values, not the number of inversions.
+ * This means we don't know how much space we'll need.
+ *
+ * This is not a subclass of Sorter because the interface is different: Sorter has a strict
+ * separation between reading input and returning results, while BoundedSorter can alternate
+ * between the two.
+ *
+ * Comparator does a 3-way comparison between two Keys: comp(x, y) < 0 iff x < y.
+ *
+ * BoundMaker takes a Key from the input, and computes a bound. The bound is a Key that is
+ * less-or-equal to all future Keys that will be seen in the input.
+ */
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+class BoundedSorter : public BoundedSorterInterface<Key, Value> {
+public:
+    // 'Comparator' is a 3-way comparison, but std::priority_queue wants a '<' comparison.
+    // But also, std::priority_queue is a max-heap, and we want a min-heap.
+    // And also, 'Comparator' compares Keys, but std::priority_queue calls its comparator
+    // on whole elements.
+    struct Greater {
+        // Prevent default construction.
+        explicit Greater(Comparator const* compare) : compare(compare) {}
+
+        bool operator()(const std::pair<Key, Value>& p1, const std::pair<Key, Value>& p2) const {
+            return (*compare)(p1.first, p2.first) > 0;
+        }
+        Comparator const* compare;
+    };
+
+    BoundedSorter(const SortOptions& opts,
+                  Comparator comp,
+                  BoundMaker makeBound,
+                  bool checkInput = true);
+
+    BoundedSorter(const BoundedSorter&) = delete;
+    BoundedSorter(BoundedSorter&&) = delete;
+    BoundedSorter& operator=(const BoundedSorter&) = delete;
+    BoundedSorter& operator=(BoundedSorter&&) = delete;
+
+    // Feed one item of input to the sorter.
+    // Together, add() and done() represent the input stream.
+    void add(Key key, Value value) override;
+
+    // Indicate that no more input will arrive.
+    // Together, add() and done() represent the input stream.
+    void done() override {
+        invariant(!_done);
+        _done = true;
+    }
+
+    void restart() override;
+
+    // Together, state() and next() represent the output stream.
+    // See BoundedSorter::State for the meaning of each case.
+    using State = typename BoundedSorterInterface<Key, Value>::State;
+    State getState() const override;
+
+    // Remove and return one item of output.
+    // Only valid to call when getState() == kReady.
+    // Together, state() and next() represent the output stream.
+    std::pair<Key, Value> next() override;
+
+    // Serialize the bound for explain output
+    Document serializeBound(const SerializationOptions& opts) const override {
+        return {makeBound.serialize(opts)};
+    };
+
+    size_t limit() const override {
+        return _opts.limit;
+    }
+
+    bool checkInput() const override {
+        return _checkInput;
+    }
+
+    const Comparator compare;
+    const BoundMaker makeBound;
+
+private:
+    using SpillIterator = SortIteratorInterface<Key, Value>;
+
+    void _spill();
+
+    bool _checkInput;
+
+    const SortOptions _opts;
+
+    using KV = std::pair<Key, Value>;
+    std::priority_queue<KV, std::vector<KV>, Greater> _heap;
+
+    std::shared_ptr<typename Sorter<Key, Value>::File> _file;
+    std::shared_ptr<SpillIterator> _spillIter;
+
+    boost::optional<Key> _min;
+    bool _done = false;
 };
 
 /**
@@ -322,14 +623,13 @@ public:
         Settings;
 
     explicit SortedFileWriter(const SortOptions& opts,
-                              const std::string& fileFullPath,
-                              const std::streampos fileStartOffset,
+                              std::shared_ptr<typename Sorter<Key, Value>::File> file,
                               const Settings& settings = Settings());
 
     void addAlreadySorted(const Key&, const Value&);
 
     /**
-     * Spills any data remaining in the buffer to disk and then closes the file to which data was
+     * Writes any data remaining in the buffer to disk and then closes the file to which data was
      * written.
      *
      * No more data can be added via addAlreadySorted() after calling done().
@@ -337,32 +637,39 @@ public:
     Iterator* done();
 
     /**
-     * Only call this after done() has been called to set the end offset.
+     * The SortedFileWriter organizes data into chunks, with a chunk getting written to the output
+     * file when it exceends a maximum chunks size. A SortedFilerWriter client can produce a short
+     * chunk by manually calling this function.
+     *
+     * If no new data has been added since the last chunk was written, this function is a no-op.
      */
-    std::streampos getFileEndOffset() {
-        invariant(!_file.is_open());
-        return _fileEndOffset;
-    }
+    void writeChunk();
+
+    static std::shared_ptr<Iterator> createFileIteratorForResume(
+        std::shared_ptr<typename Sorter<Key, Value>::File> file,
+        std::streamoff fileStartOffset,
+        std::streamoff fileEndOffset,
+        const Settings& settings,
+        const boost::optional<DatabaseName>& dbName,
+        size_t checksum,
+        SorterChecksumVersion checksumVersion);
 
 private:
-    void spill();
+    SorterChecksumVersion _getSorterChecksumVersion() const;
 
     const Settings _settings;
-    std::string _fileFullPath;
-    std::ofstream _file;
+    std::shared_ptr<typename Sorter<Key, Value>::File> _file;
     BufBuilder _buffer;
 
     // Keeps track of the hash of all data objects spilled to disk. Passed to the FileIterator
     // to ensure data has not been corrupted after reading from disk.
-    uint32_t _checksum = 0;
+    SorterChecksumCalculator _checksumCalculator;
 
-    // Tracks where in the file we started and finished writing the sorted data range so that the
-    // information can be given to the Iterator in done(), and to the user via getFileEndOffset()
-    // for the next SortedFileWriter instance using the same file.
-    std::streampos _fileStartOffset;
-    std::streampos _fileEndOffset;
+    // Tracks where in the file we started writing the sorted data range so that the information can
+    // be given to the Iterator in done().
+    std::streamoff _fileStartOffset;
 
-    boost::optional<std::string> _dbName;
+    SortOptions _opts;
 };
 }  // namespace mongo
 
@@ -392,7 +699,7 @@ private:
         const SortOptions& opts, const Comparator& comp, const Settings& settings);            \
     template ::mongo::Sorter<Key, Value>* ::mongo::Sorter<Key, Value>::makeFromExistingRanges< \
         Comparator>(const std::string& fileName,                                               \
-                    const std::vector<SorterRange> ranges,                                     \
+                    const std::vector<SorterRange>& ranges,                                    \
                     const SortOptions& opts,                                                   \
                     const Comparator& comp,                                                    \
                     const Settings& settings);

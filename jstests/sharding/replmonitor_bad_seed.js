@@ -16,14 +16,31 @@
  * the shard use an in-memory storage engine, since the shardIdentity document will be lost after
  * restart.
  *
- * @tags: [requires_persistence]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
-(function() {
-'use strict';
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
 
-var st = new ShardingTest({shards: 1, rs: {oplogSize: 10}});
-var replTest = st.rs0;
+var st, replTest;
+// We use a high election timeout to avoid unplanned elections, in particular while restarting the
+// set.
+if (TestData.configShard) {
+    // Use a second shard so we don't shut down the config server.
+    st = new ShardingTest({
+        shards: 2,
+        rs: {oplogSize: 10, settings: {electionTimeoutMillis: ReplSetTest.kForeverMillis}}
+    });
+    replTest = st.rs1;
+} else {
+    st = new ShardingTest({
+        shards: 1,
+        rs: {oplogSize: 10, settings: {electionTimeoutMillis: ReplSetTest.kForeverMillis}}
+    });
+    replTest = st.rs0;
+}
 
 assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
@@ -34,7 +51,7 @@ assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 
 // Don't clear the data directory so that the shardIdentity is not deleted.
 replTest.stopSet(undefined /* send default signal */, true /* don't clear data directory */);
 
-st.restartMongos(0);
+st.restartRouterNode(0);
 
 replTest.startSet({restart: true, noCleanData: true});
 replTest.awaitSecondaryNodes();
@@ -46,4 +63,3 @@ replTest.awaitNodesAgreeOnPrimary();
 assert.commandWorked(st.s0.getDB('test').user.insert({x: 1}));
 
 st.stop();
-})();

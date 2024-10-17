@@ -2,10 +2,8 @@
  * Test initial sync with views present.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/replsets/rslib.js");
 let testName = "initial_sync_views";
 let hostName = getHostName();
 
@@ -38,4 +36,3 @@ assert.eq(10, secondaryDB.coll.find().itcount());
 assert.eq(1, secondaryDB.view.find().itcount());
 
 replTest.stopSet();
-})();

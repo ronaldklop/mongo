@@ -30,27 +30,15 @@
 #pragma once
 
 #include "mongo/db/concurrency/lock_manager.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/transaction_resources.h"
 
 namespace mongo {
-
-class LockerForTests : public LockerImpl {
-public:
-    explicit LockerForTests(OperationContext* opCtx, LockMode globalLockMode) {
-        lockGlobal(opCtx, globalLockMode);
-    }
-
-    ~LockerForTests() {
-        unlockGlobal();
-    }
-};
-
 
 class TrackingLockGrantNotification : public LockGrantNotification {
 public:
     TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {}
 
-    virtual void notify(ResourceId resId, LockResult result) {
+    void notify(ResourceId resId, LockResult result) override {
         numNotifies++;
         lastResId = resId;
         lastResult = result;
@@ -62,7 +50,6 @@ public:
     ResourceId lastResId;
     LockResult lastResult;
 };
-
 
 struct LockRequestCombo : public LockRequest, TrackingLockGrantNotification {
 public:

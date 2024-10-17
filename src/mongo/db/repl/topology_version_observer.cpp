@@ -27,22 +27,39 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/topology_version_observer.h"
 
-#include "mongo/base/status_with.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <type_traits>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(topologyVersionObserverExpectsInterruption);
 MONGO_FAIL_POINT_DEFINE(topologyVersionObserverExpectsShutdown);
+MONGO_FAIL_POINT_DEFINE(topologyVersionObserverBeforeCheckingForShutdown);
+MONGO_FAIL_POINT_DEFINE(topologyVersionObserverShutdownShouldWait);
 
 void TopologyVersionObserver::init(ServiceContext* serviceContext,
                                    ReplicationCoordinator* replCoordinator) noexcept {
@@ -83,10 +100,11 @@ void TopologyVersionObserver::shutdown() noexcept {
 
         // If we are still running, attempt to kill any opCtx
         if (_workerOpCtx) {
-            stdx::lock_guard clientLk(*_workerOpCtx->getClient());
+            ClientLock clientLk(_workerOpCtx->getClient());
             _serviceContext->killOperation(clientLk, _workerOpCtx, ErrorCodes::ShutdownInProgress);
         }
 
+        topologyVersionObserverShutdownShouldWait.pauseWhileSet();
         _cv.wait(lk, [&] { return _state.load() != State::kRunning; });
 
         invariant(_state.load() == State::kShutdown);
@@ -111,7 +129,7 @@ std::shared_ptr<const HelloResponse> TopologyVersionObserver::getCached() noexce
 
     // Acquires the lock to avoid potential races with `_workerThreadBody()`.
     // Atomics cannot be used here as `shared_ptr` cannot be atomically updated.
-    stdx::lock_guard<Mutex> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _cache;
 }
 
@@ -126,7 +144,7 @@ void TopologyVersionObserver::_cacheHelloResponse(
     LOGV2_DEBUG(4794600, 3, "Waiting for a topology change");
 
     {
-        auto cacheGuard = makeGuard([&] {
+        ScopeGuard cacheGuard([&] {
             // If we're not dismissed, reset the _cache.
             stdx::lock_guard lk(_mutex);
             _cache.reset();
@@ -154,6 +172,12 @@ void TopologyVersionObserver::_cacheHelloResponse(
     // We could be a PeriodicRunner::Job someday. For now, OperationContext::sleepFor() will serve
     // the same purpose.
     opCtx->sleepFor(kDelayMS);
+} catch (const ExceptionFor<ErrorCodes::InterruptedDueToStorageChange>& e) {
+    LOGV2_DEBUG(5929701,
+                1,
+                "Caught an InterruptedDueToStorageChange exception, "
+                "but this thread can safely continue",
+                "error"_attr = e.toStatus());
 } catch (const DBException& e) {
     if (ErrorCodes::isShutdownError(e)) {
         // Rethrow if we've experienced shutdown.
@@ -165,7 +189,13 @@ void TopologyVersionObserver::_cacheHelloResponse(
 
 void TopologyVersionObserver::_workerThreadBody() noexcept try {
     invariant(_serviceContext);
-    ThreadClient tc(kTopologyVersionObserverName, _serviceContext);
+    ThreadClient tc(kTopologyVersionObserverName,
+                    _serviceContext->getService(ClusterRole::ShardServer));
+
+    // This thread may be interrupted by replication state changes and this is safe because
+    // _cacheHelloResponse is the only place where an opCtx is used and already has logic for
+    // handling exceptions. Any logic added to this thread that uses the opCtx must be able to
+    // handle interrupts.
 
     auto getTopologyVersion = [&]() -> boost::optional<TopologyVersion> {
         // Only the observer thread updates `_cache`, thus there is no need to hold the lock before
@@ -197,6 +227,7 @@ void TopologyVersionObserver::_workerThreadBody() noexcept try {
         {
             stdx::lock_guard lk(_mutex);
             invariant(_state.load() == State::kRunning);
+            invariant(_workerOpCtx == nullptr);
             _state.store(State::kShutdown);
 
             // Invalidate the cache as it is no longer updated
@@ -213,12 +244,17 @@ void TopologyVersionObserver::_workerThreadBody() noexcept try {
         topologyVersionObserverExpectsShutdown.pauseWhileSet();
     });
 
-    while (!_shouldShutdown.load()) {
+    while (true) {
         auto opCtxHandle = tc->makeOperationContext();
+        topologyVersionObserverBeforeCheckingForShutdown.pauseWhileSet();
 
         {
             // Set the _workerOpCtx to our newly formed opCtxHandle before we unlock.
             stdx::lock_guard lk(_mutex);
+            // Checking `_shouldShutdown` under the lock is necessary to ensure the shutdown
+            // method can interrupt the new operation.
+            if (_shouldShutdown.load())
+                break;
             _workerOpCtx = opCtxHandle.get();
         }
 

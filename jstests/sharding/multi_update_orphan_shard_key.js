@@ -1,21 +1,22 @@
 /**
  * Tests it isn't possible to update an orphan document's shard key. Only multi=true updates skip
  * shard versioning. They are therefore the only case which skips ownership filtering.
- * @tags: [requires_fcv_47]
+ *
+ *  @tags: [
+ *    requires_fcv_52
+ * ]
  */
-(function() {
-"use strict";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/libs/fail_point_util.js");
-
-const st = new ShardingTest({mongos: 1, config: 1, shards: 2, rs: {nodes: 1}});
+const st = new ShardingTest({mongos: 1, shards: 2, rs: {nodes: 1}});
 const dbName = "test";
 const collName = "update_orphan_shard_key";
 const collection = st.s.getDB(dbName).getCollection(collName);
 
 // Create a sharded collection with two chunks on shard0, split at the key {x: -1}.
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: collection.getFullName(), key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: collection.getFullName(), middle: {x: -1}}));
 
@@ -40,9 +41,8 @@ assert.eq(1, res.nModified, res);
 
 // Do a multi=true update that will target both shards but not update any documents on the shard
 // which owns the range [-1, MaxKey].
-res = assert.commandFailedWithCode(
-    collection.update({x: {$lte: 0}, y: {$exists: false}}, {$set: {x: -10, y: 2}}, {multi: true}),
-    31025);
+res = assert.commandWorked(
+    collection.update({x: {$lte: 0}, y: {$exists: false}}, {$set: {x: -10, y: 2}}, {multi: true}));
 assert.eq(0, res.nMatched, res);
 assert.eq(0, res.nModified, res);
 assert.eq(0, res.nUpserted, res);
@@ -57,4 +57,3 @@ assert.soon(() => {
 assert.doesNotThrow(() => collection.aggregate([{$out: "output"}]));
 
 st.stop();
-})();

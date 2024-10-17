@@ -29,16 +29,19 @@
 
 #pragma once
 
+#include <variant>
 
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/system_tick_source.h"
+#include "mongo/util/tick_source.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
-
-class ClockSource;
-
 /**
- * This class increments a counter by a rough estimate of the time elapsed since its
- * construction when it goes out of scope.
+ * The timer increments a counter by the time elapsed since its construction when it goes out of
+ * scope.
  */
 class ScopedTimer {
     ScopedTimer(const ScopedTimer&) = delete;
@@ -46,17 +49,44 @@ class ScopedTimer {
 
 public:
     ScopedTimer(ScopedTimer&& other) = default;
-    ScopedTimer(ClockSource* cs, long long* counter);
+
+    ScopedTimer(Nanoseconds* counter, TickSource* ts);
+    ScopedTimer(Nanoseconds* counter, ClockSource* cs);
 
     ~ScopedTimer();
 
 private:
-    ClockSource* const _clock;
     // Reference to the counter that we are incrementing with the elapsed time.
-    long long* _counter;
+    Nanoseconds* const _counter;
+    TickSource* _tickSource;
+    ClockSource* _clockSource;
 
-    // Time at which the timer was constructed.
-    const Date_t _start;
+    Date_t _startCS;
+    TickSource::Tick _startTS;
 };
 
+/**
+ * The timer appends the time elapsed since its construction to a BSON Object.
+ */
+class TimeElapsedBuilderScopedTimer {
+public:
+    explicit TimeElapsedBuilderScopedTimer(ClockSource* clockSource,
+                                           StringData description,
+                                           BSONObjBuilder* builder);
+    ~TimeElapsedBuilderScopedTimer();
+
+private:
+    ClockSource* _clockSource;
+    StringData _description;
+    Date_t _beginTime;
+    BSONObjBuilder* _builder;
+};
+
+/*
+ * This helper function only creates a TimeElapsedBuilderScopedTimer when a valid pointer to a
+ * builder is passed in. This is used when timing startup tasks, so that tasks that run during
+ * startup and outside of startup will only be timed when they are called during startup.
+ */
+boost::optional<TimeElapsedBuilderScopedTimer> createTimeElapsedBuilderScopedTimer(
+    ClockSource* clockSource, StringData description, BSONObjBuilder* builder);
 }  // namespace mongo

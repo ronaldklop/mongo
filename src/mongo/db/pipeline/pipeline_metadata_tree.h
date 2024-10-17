@@ -29,19 +29,30 @@
 
 #pragma once
 
-#include <algorithm>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <algorithm>
 #include <functional>
+#include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_facet.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 /**
  * A simple representation of an Aggregation Pipeline and functions for building it.
@@ -129,7 +140,7 @@ inline auto findStageContents(const NamespaceString& ns,
 namespace detail {
 template <typename T>
 std::pair<boost::optional<Stage<T>>, std::function<T(const T&)>> makeTreeWithOffTheEndStage(
-    std::map<NamespaceString, T>&& initialStageContents,
+    const std::map<NamespaceString, T>& initialStageContents,
     const Pipeline& pipeline,
     const std::function<T(const T&, const std::vector<T>&, const DocumentSource&)>& propagator);
 
@@ -145,18 +156,17 @@ std::pair<boost::optional<Stage<T>>, std::function<T(const T&)>> makeTreeWithOff
  */
 template <typename T>
 inline auto makeAdditionalChildren(
-    std::map<NamespaceString, T>&& initialStageContents,
+    const std::map<NamespaceString, T>& initialStageContents,
     const DocumentSource& source,
     const std::function<T(const T&, const std::vector<T>&, const DocumentSource&)>& propagator,
     const T& currentContentsToCopyForFacet) {
     std::vector<Stage<T>> children;
     std::vector<T> offTheEndContents;
+
     if (auto lookupSource = dynamic_cast<const DocumentSourceLookUp*>(&source);
         lookupSource && lookupSource->hasPipeline()) {
-        auto [child, offTheEndReshaper] =
-            makeTreeWithOffTheEndStage(std::move(initialStageContents),
-                                       lookupSource->getResolvedIntrospectionPipeline(),
-                                       propagator);
+        auto [child, offTheEndReshaper] = makeTreeWithOffTheEndStage(
+            initialStageContents, lookupSource->getResolvedIntrospectionPipeline(), propagator);
         offTheEndContents.push_back(offTheEndReshaper(child.get().contents));
         children.push_back(std::move(*child));
     }
@@ -166,10 +176,17 @@ inline auto makeAdditionalChildren(
                        std::back_inserter(children),
                        [&](const auto& fPipe) {
                            auto [child, offTheEndReshaper] = makeTreeWithOffTheEndStage(
-                               std::move(initialStageContents), *fPipe.pipeline, propagator);
+                               initialStageContents, *fPipe.pipeline, propagator);
                            offTheEndContents.push_back(offTheEndReshaper(child.get().contents));
                            return std::move(*child);
                        });
+    if (auto unionWithSource = dynamic_cast<const DocumentSourceUnionWith*>(&source);
+        unionWithSource && unionWithSource->hasNonEmptyPipeline()) {
+        auto [child, offTheEndReshaper] = makeTreeWithOffTheEndStage(
+            initialStageContents, unionWithSource->getPipeline(), propagator);
+        offTheEndContents.push_back(offTheEndReshaper(child.get().contents));
+        children.push_back(std::move(*child));
+    }
     return std::pair(std::move(children), std::move(offTheEndContents));
 }
 
@@ -183,7 +200,7 @@ inline auto makeAdditionalChildren(
  */
 template <typename T>
 inline auto makeStage(
-    std::map<NamespaceString, T>&& initialStageContents,
+    const std::map<NamespaceString, T>& initialStageContents,
     boost::optional<Stage<T>>&& previous,
     const std::function<T(const T&)>& reshapeContents,
     const DocumentSource& source,
@@ -192,7 +209,7 @@ inline auto makeStage(
                                : findStageContents(source.getContext()->ns, initialStageContents);
 
     auto [additionalChildren, offTheEndContents] =
-        makeAdditionalChildren(std::move(initialStageContents), source, propagator, contents);
+        makeAdditionalChildren(initialStageContents, source, propagator, contents);
 
     auto principalChild = previous ? std::make_unique<Stage<T>>(std::move(previous.get()))
                                    : std::unique_ptr<Stage<T>>();
@@ -208,12 +225,12 @@ inline auto makeStage(
 
 template <typename T>
 inline std::pair<boost::optional<Stage<T>>, std::function<T(const T&)>> makeTreeWithOffTheEndStage(
-    std::map<NamespaceString, T>&& initialStageContents,
+    const std::map<NamespaceString, T>& initialStageContents,
     const Pipeline& pipeline,
     const std::function<T(const T&, const std::vector<T>&, const DocumentSource&)>& propagator) {
     std::pair<boost::optional<Stage<T>>, std::function<T(const T&)>> stageAndReshapeContents;
     for (const auto& source : pipeline.getSources())
-        stageAndReshapeContents = makeStage(std::move(initialStageContents),
+        stageAndReshapeContents = makeStage(initialStageContents,
                                             std::move(stageAndReshapeContents.first),
                                             stageAndReshapeContents.second,
                                             *source,
@@ -242,6 +259,12 @@ inline void walk(Stage<T>* stage,
         }
     }
 
+    if (auto unionWithSource = dynamic_cast<DocumentSourceUnionWith*>(&***sourceIter);
+        unionWithSource && unionWithSource->hasNonEmptyPipeline()) {
+        auto iter = unionWithSource->getPipeline().getSources().begin();
+        walk(&stage->additionalChildren.front(), &iter, zipper);
+    }
+
     zipper(stage, &**(*sourceIter)++);
 }
 
@@ -256,7 +279,7 @@ inline void walk(Stage<T>* stage,
  *
  * The arguments to propagator will be actualized with the following:
  * 'T&' - In general, the contents from the previous stage, initial stages of the main pipeline and
- * $lookup pipelines recieve an element off the queue 'initialStageContents'. $facet receives a copy
+ * $lookup pipelines receive an element off the queue 'initialStageContents'. $facet receives a copy
  * of its parent's contents.
  * 'std::vector<T>&' - Completed contents from sub-pipelines. $facet's additional children and
  * expressive $lookup's final contents will be manifested in here. Note that these will be
@@ -269,7 +292,7 @@ inline void walk(Stage<T>* stage,
  */
 template <typename T>
 inline std::pair<boost::optional<Stage<T>>, T> makeTree(
-    std::map<NamespaceString, T>&& initialStageContents,
+    const std::map<NamespaceString, T>& initialStageContents,
     const Pipeline& pipeline,
     const std::function<T(const T&, const std::vector<T>&, const DocumentSource&)>& propagator) {
     // For empty pipelines, there's no Stage<T> to return and the output schema is the same as the
@@ -280,7 +303,7 @@ inline std::pair<boost::optional<Stage<T>>, T> makeTree(
     }
 
     auto&& [finalStage, reshaper] =
-        detail::makeTreeWithOffTheEndStage(std::move(initialStageContents), pipeline, propagator);
+        detail::makeTreeWithOffTheEndStage(initialStageContents, pipeline, propagator);
 
     return std::pair(std::move(*finalStage), reshaper(finalStage.get().contents));
 }

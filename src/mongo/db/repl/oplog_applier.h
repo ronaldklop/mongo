@@ -31,18 +31,24 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplog_batcher.h"
+#include "mongo/db/repl/oplog_applier_batcher.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
@@ -65,12 +71,31 @@ public:
     class Options {
     public:
         Options() = delete;
+
         explicit Options(OplogApplication::Mode inputMode)
             : mode(inputMode),
-              allowNamespaceNotFoundErrorsOnCrudOps(
-                  inputMode == OplogApplication::Mode::kInitialSync ||
-                  inputMode == OplogApplication::Mode::kRecovering),
-              skipWritesToOplog(inputMode == OplogApplication::Mode::kRecovering) {}
+              allowNamespaceNotFoundErrorsOnCrudOps(inputMode ==
+                                                        OplogApplication::Mode::kInitialSync ||
+                                                    OplogApplication::inRecovering(inputMode)),
+              skipWritesToOplog(
+                  (feature_flags::gReduceMajorityWriteLatency.isEnabled(
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                   inputMode == OplogApplication::Mode::kSecondary) ||
+                  OplogApplication::inRecovering(inputMode)) {}
+
+        Options(OplogApplication::Mode inputMode, bool skipWritesToOplog)
+            : mode(inputMode),
+              allowNamespaceNotFoundErrorsOnCrudOps(inputMode ==
+                                                        OplogApplication::Mode::kInitialSync ||
+                                                    OplogApplication::inRecovering(inputMode)),
+              skipWritesToOplog(skipWritesToOplog) {}
+
+        Options(OplogApplication::Mode mode,
+                bool allowNamespaceNotFoundErrorsOnCrudOps,
+                bool skipWritesToOplog)
+            : mode(mode),
+              allowNamespaceNotFoundErrorsOnCrudOps(allowNamespaceNotFoundErrorsOnCrudOps),
+              skipWritesToOplog(skipWritesToOplog) {}
 
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
@@ -85,11 +110,11 @@ public:
     class Observer;
 
     /**
-     * OplogBatcher is an implementation detail that should be abstracted from all levels above
-     * the OplogApplier. Parts of the system that need to modify BatchLimits can do so through the
-     * OplogApplier.
+     * OplogApplierBatcher is an implementation detail that should be abstracted from all levels
+     * above the OplogApplier. Parts of the system that need to modify BatchLimits can do so through
+     * the OplogApplier.
      */
-    using BatchLimits = OplogBatcher::BatchLimits;
+    using BatchLimits = OplogApplierBatcher::BatchLimits;
 
     /**
      * Constructs this OplogApplier with specific options.
@@ -104,7 +129,7 @@ public:
     virtual ~OplogApplier() = default;
 
     /**
-     * Returns this applier's buffer.
+     * Returns this applier's input buffer.
      */
     OplogBuffer* getBuffer() const;
 
@@ -116,19 +141,19 @@ public:
 
     /**
      * Starts the shutdown process for this OplogApplier.
-     * It is safe to call shutdown() multiplie times.
+     * It is safe to call shutdown() multiple times.
      */
     void shutdown();
 
     /**
-     * Returns true if we are shutting down.
+     * Returns true if this OplogApplier is shutting down.
      */
     bool inShutdown() const;
 
     /**
      * Blocks until enough space is available.
      */
-    void waitForSpace(OperationContext* opCtx, std::size_t size);
+    void waitForSpace(OperationContext* opCtx, const OplogBuffer::Cost& cost);
 
     /**
      * Pushes operations read into oplog buffer.
@@ -138,10 +163,12 @@ public:
      */
     void enqueue(OperationContext* opCtx,
                  std::vector<OplogEntry>::const_iterator begin,
-                 std::vector<OplogEntry>::const_iterator end);
+                 std::vector<OplogEntry>::const_iterator end,
+                 boost::optional<const OplogBuffer::Cost&> cost = boost::none);
     void enqueue(OperationContext* opCtx,
                  OplogBuffer::Batch::const_iterator begin,
-                 OplogBuffer::Batch::const_iterator end);
+                 OplogBuffer::Batch::const_iterator end,
+                 boost::optional<const OplogBuffer::Cost&> cost = boost::none);
     /**
      * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
      * using a set of threads to apply the operations.
@@ -149,20 +176,30 @@ public:
      * If the batch application is successful, returns the optime of the last op applied, which
      * should be the last op in the batch.
      * Returns ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary.
-     *
-     * To provide crash resilience, this function will advance the persistent value of 'minValid'
-     * to at least the last optime of the batch. If 'minValid' is already greater than or equal
-     * to the last optime of this batch, it will not be updated.
      */
     StatusWith<OpTime> applyOplogBatch(OperationContext* opCtx, std::vector<OplogEntry> ops);
 
     /**
-     * Calls the OplogBatcher's getNextApplierBatch.
+     * Calls the OplogApplierBatcher's getNextApplierBatch.
      */
-    StatusWith<std::vector<OplogEntry>> getNextApplierBatch(OperationContext* opCtx,
-                                                            const BatchLimits& batchLimits);
+    StatusWith<OplogApplierBatch> getNextApplierBatch(
+        OperationContext* opCtx,
+        const BatchLimits& batchLimits,
+        Milliseconds waitToFillBatch = Milliseconds(0));
 
     const Options& getOptions() const;
+
+    /**
+     * The minValid value is the earliest (minimum) OpTime that must be applied in order to
+     * consider the dataset consistent.
+     * Returns the _minValid OpTime.
+     */
+    const OpTime& getMinValid();
+
+    /**
+     * Sets the minValid OpTime to '_minValid'.
+     */
+    void setMinValid(const OpTime& minValid);
 
 private:
     /**
@@ -190,7 +227,7 @@ private:
     Observer* const _observer;
 
     // Protects member data of OplogApplier.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogApplier::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;
@@ -198,9 +235,12 @@ private:
     // Configures this OplogApplier.
     const Options _options;
 
+    // minValid Optime;
+    OpTime _minValid;
+
 protected:
     // Handles consuming oplog entries from the OplogBuffer for oplog application.
-    std::unique_ptr<OplogBatcher> _oplogBatcher;
+    std::unique_ptr<OplogApplierBatcher> _oplogBatcher;
 };
 
 /**
@@ -236,13 +276,13 @@ extern NoopOplogApplierObserver noopOplogApplierObserver;
 /**
  * Creates the default thread pool for writer tasks.
  */
-std::unique_ptr<ThreadPool> makeReplWriterPool();
-std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount);
+std::unique_ptr<ThreadPool> makeReplWorkerPool();
+std::unique_ptr<ThreadPool> makeReplWorkerPool(int threadCount);
 
 /**
  * Creates a thread pool suitable for writer tasks, with the specified name
  */
-std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount,
+std::unique_ptr<ThreadPool> makeReplWorkerPool(int threadCount,
                                                StringData name,
                                                bool isKillableByStepdown = false);
 

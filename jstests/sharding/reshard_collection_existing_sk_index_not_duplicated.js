@@ -3,15 +3,11 @@
 // a new index.
 //
 // @tags: [
-//   requires_fcv_49,
 //   uses_atclustertime,
 // ]
 //
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest();
 reshardingTest.setup();
@@ -67,4 +63,3 @@ for (let {ns, indexToCreateBeforeResharding} of testCases) {
 }
 
 reshardingTest.teardown();
-})();

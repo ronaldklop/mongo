@@ -29,17 +29,27 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <functional>
 #include <memory>
 
 #include "mongo/base/status.h"
-#include "mongo/config.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/baton.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/wire_version.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/connection_metrics.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/ssl_connection_context.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
@@ -57,6 +67,7 @@ enum ConnectSSLMode { kGlobalSSLMode, kEnableSSL, kDisableSSL };
 
 class Reactor;
 using ReactorHandle = std::shared_ptr<Reactor>;
+class SessionManager;
 
 /**
  * The TransportLayer moves Messages between transport::Endpoints and the database.
@@ -83,21 +94,21 @@ public:
 
     friend class Session;
 
-    explicit TransportLayer(const WireSpec& wireSpec) : _wireSpec(wireSpec) {}
-
+    TransportLayer() = default;
     virtual ~TransportLayer() = default;
 
-    virtual StatusWith<SessionHandle> connect(
+    virtual StatusWith<std::shared_ptr<Session>> connect(
         HostAndPort peer,
         ConnectSSLMode sslMode,
         Milliseconds timeout,
-        boost::optional<TransientSSLParams> transientSSLParams = boost::none) = 0;
+        const boost::optional<TransientSSLParams>& transientSSLParams = boost::none) = 0;
 
-    virtual Future<SessionHandle> asyncConnect(
+    virtual Future<std::shared_ptr<Session>> asyncConnect(
         HostAndPort peer,
         ConnectSSLMode sslMode,
         const ReactorHandle& reactor,
         Milliseconds timeout,
+        std::shared_ptr<ConnectionMetrics> connectionMetrics,
         std::shared_ptr<const SSLConnectionContext> transientSSLContext) = 0;
 
     /**
@@ -116,21 +127,43 @@ public:
     virtual void shutdown() = 0;
 
     /**
+     * Stop accepting new sessions.
+     */
+    virtual void stopAcceptingSessions() = 0;
+
+    /**
      * Optional method for subclasses to setup their state before being ready to accept
      * connections.
      */
     virtual Status setup() = 0;
 
+    /** Allows a `TransportLayer` to contribute to a serverStatus readout. */
+    virtual void appendStatsForServerStatus(BSONObjBuilder* bob) const {}
+
+    /** Allows a `TransportLayer` to contribute to a FTDC readout. */
+    virtual void appendStatsForFTDC(BSONObjBuilder& bob) const {}
+
+    virtual StringData getNameForLogging() const = 0;
+
     enum WhichReactor { kIngress, kEgress, kNewReactor };
     virtual ReactorHandle getReactor(WhichReactor which) = 0;
 
     virtual BatonHandle makeBaton(OperationContext* opCtx) const {
-        return opCtx->getServiceContext()->makeBaton(opCtx);
+        return {};
     }
 
-    std::shared_ptr<const WireSpec::Specification> getWireSpec() const {
-        return _wireSpec.get();
-    }
+    /**
+     * Return the session manager, if any, associated with this TransportLayer.
+     */
+    virtual SessionManager* getSessionManager() const = 0;
+
+    /**
+     * Returns a shared_ptr reference to the owned SessionManager.
+     * Callers are strongly discouraged from retaining a full shared_ptr
+     * reference which may cause the SessionManager to outlive its TransportLayer.
+     * Please convert to `std::weak_ptr` if a long term, non-owning reference is needed.
+     */
+    virtual std::shared_ptr<SessionManager> getSharedSessionManager() const = 0;
 
 #ifdef MONGO_CONFIG_SSL
     /** Rotate the in-use certificates for new connections. */
@@ -146,9 +179,6 @@ public:
     virtual StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
     createTransientSSLContext(const TransientSSLParams& transientSSLParams) = 0;
 #endif
-
-private:
-    const WireSpec& _wireSpec;
 };
 
 class ReactorTimer {
@@ -191,7 +221,7 @@ public:
     Reactor(const Reactor&) = delete;
     Reactor& operator=(const Reactor&) = delete;
 
-    virtual ~Reactor() = default;
+    ~Reactor() override = default;
 
     /*
      * Run the event loop of the reactor until stop() is called.
@@ -201,7 +231,7 @@ public:
     virtual void stop() = 0;
     virtual void drain() = 0;
 
-    virtual void schedule(Task task) = 0;
+    void schedule(Task task) override = 0;
     virtual void dispatch(Task task) = 0;
 
     virtual bool onReactorThread() const = 0;
@@ -212,6 +242,8 @@ public:
      */
     virtual std::unique_ptr<ReactorTimer> makeTimer() = 0;
     virtual Date_t now() = 0;
+
+    virtual void appendStats(BSONObjBuilder& bob) const = 0;
 
 protected:
     Reactor() = default;

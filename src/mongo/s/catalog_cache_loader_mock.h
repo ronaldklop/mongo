@@ -29,8 +29,26 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog_cache_loader.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -44,23 +62,14 @@ class CatalogCacheLoaderMock final : public CatalogCacheLoader {
 
 public:
     CatalogCacheLoaderMock() = default;
-    ~CatalogCacheLoaderMock() = default;
+    ~CatalogCacheLoaderMock() override = default;
 
-    /**
-     * These functions should never be called. They trigger invariants if called.
-     */
-    void initializeReplicaSetRole(bool isPrimary) override;
-    void onStepDown() override;
-    void onStepUp() override;
     void shutDown() override;
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
-    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
-    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
 
     SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
                                                           ChunkVersion version) override;
 
-    SemiFuture<DatabaseType> getDatabase(StringData dbName) override;
+    SemiFuture<DatabaseType> getDatabase(const DatabaseName& dbName) override;
 
     /**
      * Sets the mocked collection entry result that getChunksSince will use to construct its return

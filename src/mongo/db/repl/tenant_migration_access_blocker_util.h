@@ -29,22 +29,45 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/repl/tenant_migration_donor_access_blocker.h"
 #include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 namespace tenant_migration_access_blocker {
 
-std::shared_ptr<TenantMigrationDonorAccessBlocker> getTenantMigrationDonorAccessBlocker(
-    ServiceContext* const serviceContext, StringData tenantId);
+void assertOnUnsafeInitialSync(const UUID& migrationId);
 
-std::shared_ptr<TenantMigrationRecipientAccessBlocker> getTenantMigrationRecipientAccessBlocker(
-    ServiceContext* const serviceContext, StringData tenantId);
+/**
+ * Parse the tenantId from a database name, or return boost::none if there is no tenantId.
+ */
+boost::optional<std::string> parseTenantIdFromDB(const DatabaseName& dbName);
+
+/**
+ * Validates that the tenant that owns nss belongs to the migration identified by migrationId. The
+ * function throws ErrorCodes::InvalidTenant if there is no tenantId or if the tenant is not being
+ * migrated by the expected migration.
+ */
+void validateNssIsBeingMigrated(const boost::optional<TenantId>& tenantId,
+                                const NamespaceString& nss,
+                                const UUID& migrationId);
 
 /**
  * Returns a TenantMigrationDonorDocument constructed from the given bson doc and validate the
@@ -53,42 +76,62 @@ std::shared_ptr<TenantMigrationRecipientAccessBlocker> getTenantMigrationRecipie
 TenantMigrationDonorDocument parseDonorStateDocument(const BSONObj& doc);
 
 /**
- * If the operation has read concern "snapshot" or includes afterClusterTime, and the database is
- * in the read blocking state at the given atClusterTime or afterClusterTime or the selected read
- * timestamp, the promise will be set for the returned future when the migration is committed or
- * aborted. Note: for better performance, check if the future is immediately ready.
+ * Checks if a command is allowed to run based on the tenant migration states of this node as a
+ * donor or as a recipient. TenantMigrationCommitted is returned if the request needs to be
+ * re-routed to the new owner of the tenant. If the tenant is currently being migrated and the
+ * request needs to block, a future for when the request is unblocked is returned, and the promise
+ * will be set for the returned future when the migration is committed or aborted. Note: for better
+ * performance, check if the future is immediately ready.
  */
-SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx, StringData dbName);
+SemiFuture<void> checkIfCanRunCommandOrBlock(OperationContext* opCtx,
+                                             const DatabaseName& dbName,
+                                             StringData commandName);
 
 /**
  * If the operation has read concern "linearizable", throws TenantMigrationCommitted error if the
  * database has been migrated to a different replica set.
  */
-void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringData dbName);
+void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, const DatabaseName& dbName);
 
 /**
  * Throws TenantMigrationConflict if the database is being migrated and the migration is in the
  * blocking state. Throws TenantMigrationCommitted if it is in committed.
  */
-void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName);
+void checkIfCanWriteOrThrow(OperationContext* opCtx, const DatabaseName& dbName, Timestamp writeTs);
 
 /**
  * Returns TenantMigrationConflict if the database is being migrated (even if migration is not yet
  * in the blocking state). Returns TenantMigrationCommitted if it is in committed.
  */
-Status checkIfCanBuildIndex(OperationContext* opCtx, StringData dbName);
+Status checkIfCanBuildIndex(OperationContext* opCtx, const DatabaseName& dbName);
+
+/**
+ * Asserts if opening a new change stream should block.
+ */
+void assertCanOpenChangeStream(OperationContext* opCtx, const DatabaseName& dbName);
+
+/**
+ * Asserts if getMores for change streams should fail.
+ */
+void assertCanGetMoreChangeStream(OperationContext* opCtx, const DatabaseName& dbName);
+
+/**
+ * Returns true if there is either a donor or recipient access blocker for the given dbName.
+ */
+bool hasActiveTenantMigration(OperationContext* opCtx, const DatabaseName& dbName);
 
 /**
  * Scan config.tenantMigrationDonors and creates the necessary TenantMigrationAccessBlockers for
- * unfinished migrations.
+ * unfinished migrations. Must only be called in --serverless mode.
  */
 void recoverTenantMigrationAccessBlockers(OperationContext* opCtx);
 
 /**
  * Blocks until the migration commits or aborts, then returns TenantMigrationCommitted or
- * TenantMigrationAborted.
+ * TenantMigrationAborted, or a non-retryable error if the given status is
+ * NonRetryableTenantMigrationConflict.
  */
-void handleTenantMigrationConflict(OperationContext* opCtx, Status status);
+Status handleTenantMigrationConflict(OperationContext* opCtx, Status status);
 
 /**
  * Appends a no-op to the oplog.
@@ -101,6 +144,21 @@ void performNoopWrite(OperationContext* opCtx, StringData msg);
  * by tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers.
  */
 bool inRecoveryMode(OperationContext* opCtx);
+
+/*
+ * Returns true if a command should be excluded from access blocker filtering.
+ */
+bool shouldExclude(OperationContext* opCtx);
+
+/**
+ * Parse the 'TenantId' from the provided DatabaseName.
+ */
+boost::optional<TenantId> parseTenantIdFromDatabaseName(const DatabaseName& dbName);
+
+/**
+ * Retrieves the 'tenant id' from the provided DatabaseName.
+ */
+boost::optional<std::string> extractTenantFromDatabaseName(const DatabaseName& dbName);
 
 }  // namespace tenant_migration_access_blocker
 

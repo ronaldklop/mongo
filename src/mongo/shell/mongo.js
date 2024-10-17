@@ -23,10 +23,6 @@ if (!Mongo.prototype.update)
         throw Error("update not implemented");
     };
 
-if (typeof mongoInject == "function") {
-    mongoInject(Mongo.prototype);
-}
-
 Mongo.prototype.setSlaveOk = function(value) {
     print(
         "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
@@ -97,7 +93,14 @@ Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
     return function(driverSession, filter, nameOnly, authorizedDatabases) {
         'use strict';
 
-        let cmdObj = {listDatabases: 1};
+        const multitenancyRes = this.adminCommand({getParameter: 1, multitenancySupport: 1});
+        const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
+
+        // Calling listDatases is only valid if we have a security token in multitenancy mode.
+        // Otherwise we call listDatabasesForAllTenants which list db.name and db.tenantId
+        // separately. The result never has a tenant prefix.
+        let cmdObj = multitenancy && !this._securityToken ? {listDatabasesForAllTenants: 1}
+                                                          : {listDatabases: 1};
         if (filter !== undefined) {
             cmdObj.filter = filter;
         }
@@ -159,6 +162,14 @@ Mongo.prototype.adminCommand = function(cmd) {
     return this.getDB("admin").runCommand(cmd);
 };
 
+Mongo.prototype._setSecurityToken = function(token) {
+    this._securityToken = token;
+};
+
+Mongo.prototype.runCommand = function(dbname, cmd, options) {
+    return this._runCommandImpl(dbname, cmd, options, this._securityToken);
+};
+
 /**
  * Returns all log components and current verbosity values
  */
@@ -180,7 +191,7 @@ Mongo.prototype.getLogComponents = function(driverSession = this._getDefaultSess
  */
 Mongo.prototype.setLogLevel = function(
     logLevel, component, driverSession = this._getDefaultSession()) {
-    componentNames = [];
+    let componentNames = [];
     if (typeof component === "string") {
         componentNames = component.split(".");
     } else if (component !== undefined) {
@@ -233,27 +244,20 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  * @param mode {string} read preference mode to use. Pass null to disable read
  *     preference.
  * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
- * @param hedgeOptions {<Object>} optional. The hedge options of the form {enabled: <bool>}.
  */
-Mongo.prototype.setReadPref = function(mode, tagSet, hedgeOptions) {
-    if (this._readPrefMode === "primary") {
-        if ((typeof (tagSet) !== "undefined") && (Object.keys(tagSet).length > 0)) {
-            // we allow empty arrays/objects or no tagSet for compatibility reasons
-            throw Error("Cannot supply tagSet with readPref mode \"primary\"");
-        }
-        if ((typeof (hedgeOptions) === "object") && hedgeOptions.enabled) {
-            throw Error("Cannot enable hedging with readPref mode \"primary\"");
-        }
+Mongo.prototype.setReadPref = function(mode, tagSet) {
+    if (this._readPrefMode === "primary" && typeof tagSet !== "undefined" &&
+        Object.keys(tagSet).length > 0) {
+        // we allow empty arrays/objects or no tagSet for compatibility reasons
+        throw Error("Cannot supply tagSet with readPref mode \"primary\"");
     }
-
-    this._setReadPrefUnsafe(mode, tagSet, hedgeOptions);
+    this._setReadPrefUnsafe(mode, tagSet);
 };
 
 // Set readPref without validating. Exposed so we can test the server's readPref validation.
-Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet, hedgeOptions) {
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
     this._readPrefMode = mode;
     this._readPrefTagSet = tagSet;
-    this._readPrefHedgeOptions = hedgeOptions;
 };
 
 Mongo.prototype.getReadPrefMode = function() {
@@ -262,10 +266,6 @@ Mongo.prototype.getReadPrefMode = function() {
 
 Mongo.prototype.getReadPrefTagSet = function() {
     return this._readPrefTagSet;
-};
-
-Mongo.prototype.getReadPrefHedgeOptions = function() {
-    return this._readPrefHedgeOptions;
 };
 
 // Returns a readPreference object of the type expected by mongos.
@@ -284,13 +284,6 @@ Mongo.prototype.getReadPref = function() {
     const tagSet = this.getReadPrefTagSet();
     if (Array.isArray(tagSet)) {
         obj.tags = tagSet;
-    }
-
-    // Hedged Reads Spec: - if readPref mode is "primary" then the hegde.enabled MUST
-    // be false. Ensured by setReadPref.
-    const hedgeOptions = this.getReadPrefHedgeOptions();
-    if (typeof (hedgeOptions) === "object") {
-        obj.hedge = hedgeOptions;
     }
 
     return obj;
@@ -318,7 +311,7 @@ Mongo.prototype.getReadConcern = function() {
     return this._readConcernLevel;
 };
 
-connect = function(url, user, pass, apiParameters) {
+globalThis.connect = function(url, user, pass, apiParameters) {
     if (url instanceof MongoURI) {
         user = url.user;
         pass = url.password;
@@ -380,7 +373,7 @@ connect = function(url, user, pass, apiParameters) {
 
         if (dest) {
             print(`\n\n*** You have failed to connect to a ${dest}. Please ensure` +
-                  " that your IP whitelist allows connections from your network.\n\n");
+                  " that your IP allowlist allows connections from your network.\n\n");
         }
 
         throw e;
@@ -411,131 +404,15 @@ connect = function(url, user, pass, apiParameters) {
         if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
             chatty("WARNING: shell and server versions do not match");
         }
+    } catch (e) {
+        if (e.code == ErrorCodes.Unauthorized) {
+            chatty("WARNING: shell could not get the server version: " + e.message);
+        }
     } finally {
         TestData = originalTestData;
     }
 
     return db;
-};
-
-/**
- * deprecated, use writeMode below
- *
- */
-Mongo.prototype.useWriteCommands = function() {
-    return (this.writeMode() != "legacy");
-};
-
-Mongo.prototype.forceWriteMode = function(mode) {
-    this._writeMode = mode;
-};
-
-Mongo.prototype.hasWriteCommands = function() {
-    var hasWriteCommands = (this.getMinWireVersion() <= 2 && 2 <= this.getMaxWireVersion());
-    return hasWriteCommands;
-};
-
-Mongo.prototype.hasExplainCommand = function() {
-    var hasExplain = (this.getMinWireVersion() <= 3 && 3 <= this.getMaxWireVersion());
-    return hasExplain;
-};
-
-/**
- * {String} Returns the current mode set. Will be commands/legacy/compatibility
- *
- * Sends isMaster to determine if the connection is capable of using bulk write operations, and
- * caches the result.
- */
-
-Mongo.prototype.writeMode = function() {
-    if ('_writeMode' in this) {
-        return this._writeMode;
-    }
-
-    // get default from shell params
-    if (_writeMode)
-        this._writeMode = _writeMode();
-
-    // can't use "commands" mode unless server version is good.
-    if (this.hasWriteCommands()) {
-        // good with whatever is already set
-    } else if (this._writeMode == "commands") {
-        this._writeMode = "compatibility";
-    }
-
-    return this._writeMode;
-};
-
-/**
- * Returns true if the shell is configured to use find/getMore commands rather than the C++ client.
- *
- * Currently, the C++ client will always use OP_QUERY find and OP_GET_MORE.
- */
-Mongo.prototype.useReadCommands = function() {
-    return (this.readMode() === "commands");
-};
-
-/**
- * For testing, forces the shell to use the readMode specified in 'mode'. Must be either "commands"
- * (use the find/getMore commands), "legacy" (use legacy OP_QUERY/OP_GET_MORE wire protocol reads),
- * or "compatibility" (auto-detect mode based on wire version).
- */
-Mongo.prototype.forceReadMode = function(mode) {
-    if (mode !== "commands" && mode !== "compatibility" && mode !== "legacy") {
-        throw new Error("Mode must be one of {commands, compatibility, legacy}, but got: " + mode);
-    }
-
-    this._readMode = mode;
-};
-
-/**
- * Get the readMode string (either "commands" for find/getMore commands, "legacy" for OP_QUERY find
- * and OP_GET_MORE, or "compatibility" for detecting based on wire version).
- */
-Mongo.prototype.readMode = function() {
-    // Get the readMode from the shell params if we don't have one yet.
-    if (typeof _readMode === "function" && !this.hasOwnProperty("_readMode")) {
-        this._readMode = _readMode();
-    }
-
-    if (this.hasOwnProperty("_readMode") && this._readMode !== "compatibility") {
-        // We already have determined our read mode. Just return it.
-        return this._readMode;
-    } else {
-        // We're in compatibility mode. Determine whether the server supports the find/getMore
-        // commands. If it does, use commands mode. If not, degrade to legacy mode.
-        try {
-            var hasReadCommands = (this.getMinWireVersion() <= 4 && 4 <= this.getMaxWireVersion());
-            if (hasReadCommands) {
-                this._readMode = "commands";
-            } else {
-                this._readMode = "legacy";
-            }
-        } catch (e) {
-            // We failed trying to determine whether the remote node supports the find/getMore
-            // commands. In this case, we keep _readMode as "compatibility" and the shell should
-            // issue legacy reads. Next time around we will issue another isMaster to try to
-            // determine the readMode decisively.
-        }
-    }
-
-    return this._readMode;
-};
-
-/**
- * Run a function while forcing a certain readMode, and then return the readMode to its original
- * setting afterwards. Passes this connection to the given function, and returns the function's
- * result.
- */
-Mongo.prototype._runWithForcedReadMode = function(forcedReadMode, fn) {
-    let origReadMode = this.readMode();
-    this.forceReadMode(forcedReadMode);
-    try {
-        var res = fn(this);
-    } finally {
-        this.forceReadMode(origReadMode);
-    }
-    return res;
 };
 
 //
@@ -697,6 +574,31 @@ Mongo.prototype._extractChangeStreamOptions = function(options) {
         delete options.allChangesForCluster;
     }
 
+    if (options.hasOwnProperty("allowToRunOnConfigDB")) {
+        changeStreamOptions.allowToRunOnConfigDB = options.allowToRunOnConfigDB;
+        delete options.allowToRunOnConfigDB;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnSystemNS")) {
+        changeStreamOptions.allowToRunOnSystemNS = options.allowToRunOnSystemNS;
+        delete options.allowToRunOnSystemNS;
+    }
+
+    if (options.hasOwnProperty("showExpandedEvents")) {
+        changeStreamOptions.showExpandedEvents = options.showExpandedEvents;
+        delete options.showExpandedEvents;
+    }
+
+    if (options.hasOwnProperty("showSystemEvents")) {
+        changeStreamOptions.showSystemEvents = options.showSystemEvents;
+        delete options.showSystemEvents;
+    }
+
+    if (options.hasOwnProperty("showRawUpdateDescription")) {
+        changeStreamOptions.showRawUpdateDescription = options.showRawUpdateDescription;
+        delete options.showRawUpdateDescription;
+    }
+
     return [{$changeStream: changeStreamOptions}, options];
 };
 
@@ -704,9 +606,8 @@ Mongo.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
 
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
+    const [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
     changeStreamStage.$changeStream.allChangesForCluster = true;
-    pipeline.unshift(changeStreamStage);
-    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
+    return this.getDB("admin")._runAggregate(
+        {aggregate: 1, pipeline: [changeStreamStage, ...pipeline]}, aggOptions);
 };

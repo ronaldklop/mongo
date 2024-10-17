@@ -4,16 +4,15 @@
  * be routed to a secondary in the replica set, whereas the latter must be routed to the primary.
  *
  * @tags: [
+ *  # The test runs commands that are not allowed with security token: getCmdLineOpts.
+ *  not_allowed_with_signed_security_token,
  *  assumes_read_preference_unchanged,
  *  requires_collstats,
  *  requires_capped,
  * ]
  */
 
-load('jstests/aggregation/extras/utils.js');
-
-(function() {
-'use strict';
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 // Check that smallArray is entirely contained by largeArray
 // returns false if a member of smallArray is not in largeArray
@@ -65,9 +64,11 @@ assert.eq(serverStatus.pid, latestStartUpLog.pid, "pid doesn't match that from s
 
 // Test buildinfo
 var buildinfo = db.runCommand("buildinfo");
-delete buildinfo.ok;             // Delete extra meta info not in startup_log
-delete buildinfo.operationTime;  // Delete extra meta info not in startup_log
-delete buildinfo.$clusterTime;   // Delete extra meta info not in startup_log
+delete buildinfo.ok;                   // Delete extra meta info not in startup_log
+delete buildinfo.operationTime;        // Delete extra meta info not in startup_log
+delete buildinfo.$clusterTime;         // Delete extra meta info not in startup_log
+delete buildinfo.lastCommittedOpTime;  // Delete extra meta info not in startup_log (only returned
+// by shardsvrs)
 var hello = db._adminCommand("hello");
 
 // Test buildinfo has the expected keys
@@ -110,4 +111,3 @@ assert((jsEngine == "none") || jsEngine.startsWith("mozjs"));
 assert.eq(hello.maxBsonObjectSize,
           latestStartUpLog.buildinfo.maxBsonObjectSize,
           "maxBsonObjectSize doesn't match one from hello");
-})();

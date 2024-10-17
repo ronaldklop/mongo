@@ -1,10 +1,8 @@
-/**
- * Tests that maxTimeMS is respected even in an inner $unionWith pipeline.
- */
-
-(function() {
-"use strict";
-
+// Tests that maxTimeMS is respected even in an inner $unionWith pipeline.
+//
+// @tags: [
+//   requires_scripting,
+// ]
 const testDB = db.getSiblingDB(jsTestName());
 const collA = testDB.A;
 collA.drop();
@@ -34,4 +32,3 @@ assert.commandFailedWithCode(testDB.runCommand({
     maxTimeMS: 3 * 1000
 }),
                              ErrorCodes.MaxTimeMSExpired);
-})();

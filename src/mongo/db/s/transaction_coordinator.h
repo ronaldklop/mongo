@@ -29,10 +29,31 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/transaction_coordinator_document_gen.h"
+#include "mongo/db/s/transaction_coordinator_futures_util.h"
+#include "mongo/db/s/transaction_coordinator_structures.h"
 #include "mongo/db/s/transaction_coordinator_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -40,13 +61,13 @@ class TransactionCoordinatorMetricsObserver;
 
 /**
  * State machine, which implements the two-phase commit protocol for a specific transaction,
- * identified by lsid + txnNumber.
+ * identified by lsid + txnNumber + txnRetryCounter.
  *
- * The lifetime of a coordinator starts with a construction and ends with the `onCompletion()`
- * future getting signaled. It is illegal to destroy a coordinator without waiting for
- * `onCompletion()`.
+ * The lifetime of a coordinator starts with a construction, followed by calling `start()` to
+ * kick off asynchronous operations, and finally ends with the `onCompletion()` future getting
+ * signaled.
  */
-class TransactionCoordinator {
+class TransactionCoordinator : public std::enable_shared_from_this<TransactionCoordinator> {
     TransactionCoordinator(const TransactionCoordinator&) = delete;
     TransactionCoordinator& operator=(const TransactionCoordinator&) = delete;
 
@@ -60,12 +81,15 @@ public:
         kWaitingForVotes,
         kWritingDecision,
         kWaitingForDecisionAcks,
+        kWritingEndOfTransaction,
         kDeletingCoordinatorDoc,
+
+        kLastStep = kDeletingCoordinatorDoc
     };
 
     /**
-     * Instantiates a new TransactioncCoordinator for the specified lsid + txnNumber pair and gives
-     * it a 'scheduler' to use for any asynchronous tasks it spawns.
+     * Instantiates a new TransactionCoordinator for the specified lsid + txnNumber +
+     * txnRetryCounter and gives it a 'scheduler' to use for any asynchronous tasks it spawns.
      *
      * If the 'coordinateCommitDeadline' parameter is specified, a timed task will be scheduled to
      * cause the coordinator to be put in a cancelled state, if runCommit is not eventually
@@ -73,11 +97,26 @@ public:
      */
     TransactionCoordinator(OperationContext* operationContext,
                            const LogicalSessionId& lsid,
-                           TxnNumber txnNumber,
+                           const TxnNumberAndRetryCounter& txnNumberAndRetryCounter,
                            std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
-                           Date_t deadline);
+                           Date_t deadline,
+                           const CancellationToken& cancelToken);
 
     ~TransactionCoordinator();
+
+    /*
+     * After constructing a TransactionCoordinator, calling start() begins its asynchronous
+     * operations.
+     */
+    void start(OperationContext* operationContext);
+
+    /*
+     * After waiting on the onCompletion() future, users of TransactionCoordinator must call
+     * shutdown() to ensure its lifecycle ends cleanly. In particular, the 'scheduler' must be
+     * destroyed before its parent scheduler, and calling shutdown() allows the caller to do so
+     * at an appropriate time.
+     */
+    void shutdown();
 
     /**
      * The first time this is called, it asynchronously begins the two-phase commit process for the
@@ -99,11 +138,17 @@ public:
     SharedSemiFuture<txn::CommitDecision> getDecision() const;
 
     /**
+     * Gets a Future that will contain the decision that the coordinator reaches. Note that this
+     * will never be signaled unless runCommit has been called.
+     */
+    SharedSemiFuture<txn::CommitDecision> onDecisionAcknowledged() const;
+
+    /**
      * Returns a future which can be listened on for when all the asynchronous activity spawned by
      * this coordinator has completed. It will always eventually be set and once set it is safe to
      * dispose of the TransactionCoordinator object.
      */
-    SharedSemiFuture<txn::CommitDecision> onCompletion();
+    SharedSemiFuture<void> onCompletion() const;
 
     /**
      * If runCommit has not yet been called, this will transition this coordinator object to
@@ -115,6 +160,10 @@ public:
      */
     void cancelIfCommitNotYetStarted();
 
+    TxnRetryCounter getTxnRetryCounterForTest() const {
+        return *_txnNumberAndRetryCounter.getTxnRetryCounter();
+    }
+
     /**
      * Returns the TransactionCoordinatorMetricsObserver for this TransactionCoordinator.
      */
@@ -122,11 +171,10 @@ public:
         return *_transactionCoordinatorMetricsObserver;
     }
 
-    void reportState(BSONObjBuilder& parent) const;
-    std::string toString(Step step) const;
+    void reportState(OperationContext* opCtx, BSONObjBuilder& parent) const;
+    static std::string toString(Step step);
 
     Step getStep() const;
-
 
 private:
     void _updateAssociatedClient(Client* client);
@@ -143,17 +191,12 @@ private:
      */
     void _logSlowTwoPhaseCommit(const txn::CoordinatorCommitDecision& decision);
 
-    /**
-     * Builds the diagnostic string for a commit coordination.
-     */
-    std::string _twoPhaseCommitInfoForLog(const txn::CoordinatorCommitDecision& decision) const;
-
     // Shortcut to the service context under which this coordinator runs
     ServiceContext* const _serviceContext;
 
-    // The lsid + transaction number that this coordinator is coordinating
+    // The lsid + txnNumber + txnRetryCounter that this coordinator is coordinating.
     const LogicalSessionId _lsid;
-    const TxnNumber _txnNumber;
+    const TxnNumberAndRetryCounter _txnNumberAndRetryCounter;
 
     // Scheduler and context wrapping all asynchronous work dispatched by this coordinator
     std::unique_ptr<txn::AsyncWorkScheduler> _scheduler;
@@ -164,7 +207,7 @@ private:
     std::unique_ptr<txn::AsyncWorkScheduler> _sendPrepareScheduler;
 
     // Protects the state below
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinator::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Tracks which step of the 2PC coordination is currently (or was most recently) executing
     Step _step{Step::kInactive};
@@ -187,14 +230,21 @@ private:
     // hasn't yet persisted it
     boost::optional<txn::CoordinatorCommitDecision> _decision;
 
+    // Set when the coordinator has heard back from all the participants and reached a commit
+    // decision.
+    std::vector<NamespaceString> _affectedNamespaces;
+
     // Set when the coordinator has durably persisted `_decision` to the `config.coordinators`
     // collection
     bool _decisionDurable{false};
     SharedPromise<txn::CommitDecision> _decisionPromise;
 
-    // A list of all promises corresponding to futures that were returned to callers of
-    // onCompletion.
-    SharedPromise<txn::CommitDecision> _completionPromise;
+    // Set when the coordinator has received acks from all participants that they have successfully
+    // committed or aborted the transaction..
+    SharedPromise<txn::CommitDecision> _decisionAcknowledgedPromise;
+
+    // Set when the coordinator has finished all work and the object can be deleted.
+    SharedPromise<void> _completionPromise;
 
     // Store as unique_ptr to avoid a circular dependency between the TransactionCoordinator and
     // the TransactionCoordinatorMetricsObserver.
@@ -202,6 +252,9 @@ private:
 
     // The deadline for the TransactionCoordinator to reach a decision
     Date_t _deadline;
+
+    // The cancellation token for WaitForMajority.
+    const CancellationToken _cancelToken;
 };
 
 }  // namespace mongo

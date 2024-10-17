@@ -27,12 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "mongo/s/request_types/add_shard_request_type.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/request_types/add_shard_request_type.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -40,15 +52,11 @@ namespace mongo {
 using std::string;
 using str::stream;
 
-class BSONObj;
-template <typename T>
-class StatusWith;
 
 const BSONField<std::string> AddShardRequest::mongosAddShard("addShard");
 const BSONField<std::string> AddShardRequest::mongosAddShardDeprecated("addshard");
 const BSONField<std::string> AddShardRequest::configsvrAddShard("_configsvrAddShard");
 const BSONField<std::string> AddShardRequest::shardName("name");
-const BSONField<long long> AddShardRequest::maxSizeMB("maxSize");
 
 namespace {
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
@@ -82,7 +90,7 @@ StatusWith<AddShardRequest> AddShardRequest::parseInternalFields(const BSONObj& 
                          << " must be a string"};
     }
 
-    auto swConnString = ConnectionString::parse(firstElement.valuestrsafe());
+    auto swConnString = ConnectionString::parse(firstElement.str());
     if (!swConnString.isOK()) {
         return swConnString.getStatus();
     }
@@ -107,15 +115,10 @@ StatusWith<AddShardRequest> AddShardRequest::parseInternalFields(const BSONObj& 
             return status;
         }
     }
-    {
-        long long requestMaxSizeMB;
-        Status status = bsonExtractIntegerField(obj, maxSizeMB.name(), &requestMaxSizeMB);
-        if (status.isOK()) {
-            request._maxSizeMB = std::move(requestMaxSizeMB);
-        } else if (status != ErrorCodes::NoSuchKey) {
-            return status;
-        }
-    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            "addShard no longer supports maxSize field",
+            !obj.hasField("maxSize"));
 
     return request;
 }
@@ -123,9 +126,6 @@ StatusWith<AddShardRequest> AddShardRequest::parseInternalFields(const BSONObj& 
 BSONObj AddShardRequest::toCommandForConfig() {
     BSONObjBuilder cmdBuilder;
     cmdBuilder.append(configsvrAddShard.name(), _connString.toString());
-    if (hasMaxSize()) {
-        cmdBuilder.append(maxSizeMB.name(), *_maxSizeMB);
-    }
     if (hasName()) {
         cmdBuilder.append(shardName.name(), *_name);
     }
@@ -136,21 +136,14 @@ Status AddShardRequest::validate(bool allowLocalHost) {
     // Check that if one of the new shard's hosts is localhost, we are allowed to use localhost
     // as a hostname. (Using localhost requires that every server in the cluster uses
     // localhost).
-    std::vector<HostAndPort> serverAddrs = _connString.getServers();
-    for (size_t i = 0; i < serverAddrs.size(); i++) {
-        if (serverAddrs[i].isLocalHost() != allowLocalHost) {
+    for (const auto& serverAddr : _connString.getServers()) {
+        if (serverAddr.isLocalHost() != allowLocalHost) {
             string errmsg = str::stream()
                 << "Can't use localhost as a shard since all shards need to"
                 << " communicate. Either use all shards and configdbs in localhost"
-                << " or all in actual IPs. host: " << serverAddrs[i].toString()
-                << " isLocalHost:" << serverAddrs[i].isLocalHost();
+                << " or all in actual IPs. host: " << serverAddr.toString()
+                << " isLocalHost:" << serverAddr.isLocalHost();
             return Status(ErrorCodes::InvalidOptions, errmsg);
-        }
-
-        // If the server has no port, assign it the default port.
-        if (!serverAddrs[i].hasPort()) {
-            serverAddrs[i] =
-                HostAndPort(serverAddrs[i].host(), ServerGlobalParams::ShardServerPort);
         }
     }
     return Status::OK();
@@ -161,8 +154,6 @@ string AddShardRequest::toString() const {
     ss << "AddShardRequest shard: " << _connString.toString();
     if (hasName())
         ss << ", name: " << *_name;
-    if (hasMaxSize())
-        ss << ", maxSize: " << *_maxSizeMB;
     return ss;
 }
 

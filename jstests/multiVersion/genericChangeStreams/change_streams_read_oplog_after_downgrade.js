@@ -4,10 +4,9 @@
  *
  * @tags: [uses_change_streams, requires_replication]
  */
-(function() {
-"use strict";
+import "jstests/multiVersion/libs/multi_cluster.js";
 
-load("jstests/multiVersion/libs/multi_cluster.js");  // For upgradeCluster.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Checking UUID consistency uses cached connections, which are not valid across restarts or
 // stepdowns.
@@ -24,12 +23,16 @@ const st = new ShardingTest({
         binVersion: "latest",
         setParameter: {logComponentVerbosity: '{command: {verbosity: 2}}'}
     },
-    other: {mongosOptions: {binVersion: "latest"}}
+    other: {
+        configOptions:
+            {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}},
+        mongosOptions: {binVersion: "latest"}
+    }
 });
 
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 let shardedColl = st.s.getDB(dbName)[collName];
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: shardedColl.getFullName(), key: {sk: 1}}));
 
 const largeStr = '*'.repeat(512);
@@ -121,6 +124,50 @@ const standardTestCases = [
                 deletes: [{q: {sk: 1}, limit: 0}, {q: {sk: -2}, limit: 0}, {q: {sk: -1}, limit: 0}]
             }));
         }
+    },
+    // Basic createIndex.
+    {
+        testName: "CreateIndex",
+        generateOpLogEntry: function(coll) {
+            const collName = "CreateIndex";
+            const targetColl = coll.getDB()[collName];
+            assert.commandWorked(targetColl.createIndex({x: 1}));
+            assert.commandWorked(targetColl.insert({x: 0}));
+        }
+    },
+    // Basic dropIndex.
+    {
+        testName: "DropIndex",
+        generateOpLogEntry: function(coll) {
+            const collName = "DropIndex";
+            const targetColl = coll.getDB()[collName];
+            assert.commandWorked(targetColl.createIndex({x: 1}));
+            assert.commandWorked(targetColl.dropIndex({x: 1}));
+        }
+    },
+    // Basic collMod.
+    {
+        testName: "CollMod",
+        generateOpLogEntry: function(coll) {
+            const collName = "collMod";
+            const targetColl = coll.getDB()[collName];
+            assert.commandWorked(targetColl.insert({x: 1}));
+            assert.commandWorked(targetColl.runCommand({
+                collMod: collName,
+                validator: {x: 1},
+                validationLevel: "moderate",
+                validationAction: "warn"
+            }));
+        }
+    },
+    // Basic reshardCollection.
+    {
+        testName: "ReshardCollection",
+        generateOpLogEntry: function(coll) {
+            assert.commandWorked(coll.insert({sk: 2, a: 1}));
+            assert.commandWorked(coll.getDB().adminCommand(
+                {reshardCollection: coll.getFullName(), key: {sk: 1, a: 1}}));
+        }
     }
 ];
 
@@ -165,6 +212,16 @@ const changeStreamsVariants = [
     {
         watch: function(options) {
             return st.s.watch([], Object.assign(options, {fullDocument: "updateLookup"}));
+        }
+    },
+    {
+        // With all the options enabled.
+        watch: function(options) {
+            return st.s.watch([], Object.assign(options, {
+                showExpandedEvents: true,
+                showSystemEvents: true,
+                fullDocument: "updateLookup"
+            }));
         }
     }
 ];
@@ -262,7 +319,8 @@ function resumeStreamsOnDowngradedVersion(changeStreams) {
             }
             try {
                 const nextEvent = csCursor.next();
-                return (nextEvent.documentKey._id == changeStream.endSentinelEntry);
+                return (nextEvent.documentKey &&
+                        nextEvent.documentKey._id == changeStream.endSentinelEntry);
             } catch (e) {
                 jsTestLog("Error occurred while reading change stream. " + tojson(e));
 
@@ -285,9 +343,9 @@ function runTests(downgradeVersion) {
     jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
     const downgradeFCV = downgradeVersion === "last-lts" ? lastLTSFCV : lastContinuousFCV;
     // Downgrade the entire cluster to the 'downgradeVersion' binVersion.
-    assert.commandWorked(
-        st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
-    st.upgradeCluster(downgradeVersion);
+    assert.commandWorked(st.s.getDB(dbName).adminCommand(
+        {setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
+    st.downgradeCluster(downgradeVersion);
 
     // Refresh our reference to the sharded collection post-downgrade.
     shardedColl = st.s.getDB(dbName)[collName];
@@ -302,9 +360,9 @@ runTests('last-continuous');
 
 // Upgrade the entire cluster back to the latest version.
 st.upgradeCluster('latest', {waitUntilStable: true});
-assert.commandWorked(st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+assert.commandWorked(
+    st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
 // Test resuming change streams after downgrading the cluster to 'last-lts'.
 runTests('last-lts');
 st.stop();
-}());

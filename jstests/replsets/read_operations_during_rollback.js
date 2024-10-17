@@ -1,17 +1,14 @@
-/*
+/**
  * This test makes sure 'find' and 'getMore' commands fail correctly during rollback.
  *
  * @tags: [
- *   # The 'getMoreHangAfterPinCursor' failpoint is not present in 4.4.
- *   requires_fcv_49,
  *   requires_majority_read_concern,
  * ]
  */
-(function() {
-"use strict";
 
-load("jstests/replsets/libs/rollback_test.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -32,9 +29,9 @@ assert.eq(2, findCmdRes.cursor.firstBatch.length, findCmdRes);
 const idleCursorId = findCmdRes.cursor.id;
 assert.neq(0, idleCursorId, findCmdRes);
 
-setFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
-
-setFailPoint(rollbackNode, "getMoreHangAfterPinCursor");
+const failPointAfterTransition =
+    configureFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
+const failPointAfterPinCursor = configureFailPoint(rollbackNode, "getMoreHangAfterPinCursor");
 
 const joinGetMoreThread = startParallelShell(() => {
     db.getMongo().setSecondaryOk();
@@ -69,10 +66,18 @@ rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 jsTestLog("Reconnecting to " + rollbackNode.host + " after rollback");
 reconnect(rollbackNode.getDB(dbName));
 
-// Wait for rollback to hang.
-checkLog.contains(rollbackNode, "rollbackHangAfterTransitionToRollback fail point enabled.");
+// Wait for rollback to hang. We continuously retry the wait command since the rollback node
+// might reject new connections initially, causing the command to fail.
+assert.soon(() => {
+    try {
+        failPointAfterTransition.wait();
+        return true;
+    } catch (e) {
+        return false;
+    }
+});
 
-clearFailPoint(rollbackNode, "getMoreHangAfterPinCursor");
+failPointAfterPinCursor.off();
 
 jsTestLog("Wait for 'getMore' thread to join.");
 joinGetMoreThread();
@@ -87,7 +92,8 @@ assert.commandFailedWithCode(rollbackNode.getDB(dbName).runCommand(
 
 // Disable the best-effort check for primary-ness in the service entry point, so that we
 // exercise the real check for primary-ness in 'find' and 'getMore' commands.
-setFailPoint(rollbackNode, "skipCheckingForNotPrimaryInCommandDispatch");
+configureFailPoint(rollbackNode, "skipCheckingForNotPrimaryInCommandDispatch");
+
 jsTestLog("Reading during rollback (again with command dispatch checks disabled).");
 assert.commandFailedWithCode(rollbackNode.getDB(dbName).runCommand({"find": collName}),
                              ErrorCodes.NotPrimaryOrSecondary);
@@ -95,18 +101,25 @@ assert.commandFailedWithCode(rollbackNode.getDB(dbName).runCommand(
                                  {"getMore": cursorIdToBeReadDuringRollback, collection: collName}),
                              ErrorCodes.NotPrimaryOrSecondary);
 
-clearFailPoint(rollbackNode, "rollbackHangAfterTransitionToRollback");
+failPointAfterTransition.off();
 
 rollbackTest.transitionToSteadyStateOperations();
 
 const replMetrics = assert.commandWorked(rollbackNode.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "rollback");
-assert(replMetrics.stateTransition.userOperationsRunning,
-       () => "Response should have a 'stateTransition.userOperationsRunning' field: " +
-           tojson(replMetrics));
-assert(replMetrics.stateTransition.userOperationsKilled,
-       () => "Response should have a 'stateTransition.userOperationsKilled' field: " +
-           tojson(replMetrics));
+// TODO (SERVER-85259): Remove references to replMetrics.stateTransition.userOperations*
+assert(
+    replMetrics.stateTransition.totalOperationsRunning ||
+        replMetrics.stateTransition.userOperationsRunning,
+    () =>
+        "Response should have a 'stateTransition.totalOperationsRunning' or 'stateTransition.userOperationsRunning' (bin <= 7.2) field: " +
+        tojson(replMetrics));
+assert(
+    replMetrics.stateTransition.totalOperationsKilled ||
+        replMetrics.stateTransition.userOperationsKilled,
+    () =>
+        "Response should have a 'stateTransition.totalOperationsKilled' or 'stateTransition.userOperationsKilled' (bin <= 7.2) field: " +
+        tojson(replMetrics));
 
 // Run a getMore against the idle cursor that remained open throughout the rollback. The getMore
 // should fail since the cursor has been invalidated by the rollback.
@@ -116,4 +129,3 @@ assert.commandFailedWithCode(
 
 // Check the replica set.
 rollbackTest.stop();
-}());

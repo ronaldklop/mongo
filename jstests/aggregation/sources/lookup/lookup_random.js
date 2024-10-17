@@ -1,9 +1,5 @@
 // Operators that use a random generator ($sample and $rand) are not allowed to be cached
 // as part of a non-correlated prefix.
-// @tags: [assumes_unsharded_collection]
-(function() {
-"use strict";
-
 const coll = db.getCollection('lookup_random');
 coll.drop();
 assert.commandWorked(coll.insert(Array.from({length: 200}, (_, i) => ({_id: i}))));
@@ -38,4 +34,3 @@ result = coll.aggregate([
 ]).toArray();
 assert.eq(result.length, 1, result);
 assert.gt(result[0].randomValues.length, 1, result);
-})();

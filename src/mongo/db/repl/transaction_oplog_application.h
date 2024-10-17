@@ -29,10 +29,15 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 
 namespace mongo {
 
@@ -40,21 +45,15 @@ namespace mongo {
  * Apply `commitTransaction` oplog entry.
  */
 Status applyCommitTransaction(OperationContext* opCtx,
-                              const repl::OplogEntry& entry,
+                              const repl::ApplierOperation& op,
                               repl::OplogApplication::Mode mode);
 
 /**
  * Apply `abortTransaction` oplog entry.
  */
 Status applyAbortTransaction(OperationContext* opCtx,
-                             const repl::OplogEntry& entry,
+                             const repl::ApplierOperation& op,
                              repl::OplogApplication::Mode mode);
-
-/**
- * Helper used to get previous oplog entry from the same transaction.
- */
-const repl::OplogEntry getPreviousOplogEntry(OperationContext* opCtx,
-                                             const repl::OplogEntry& entry);
 
 /**
  * Follow an oplog chain and copy the operations to destination.  Operations will be copied in
@@ -79,13 +78,13 @@ std::pair<std::vector<repl::OplogEntry>, bool> _readTransactionOperationsFromOpl
     OperationContext* opCtx,
     const repl::OplogEntry& lastEntryInTxn,
     const std::vector<repl::OplogEntry*>& cachedOps,
-    const bool checkForCommands) noexcept;
+    bool checkForCommands) noexcept;
 
 /**
  * Apply `prepareTransaction` oplog entry.
  */
 Status applyPrepareTransaction(OperationContext* opCtx,
-                               const repl::OplogEntry& entry,
+                               const repl::ApplierOperation& op,
                                repl::OplogApplication::Mode mode);
 
 /*

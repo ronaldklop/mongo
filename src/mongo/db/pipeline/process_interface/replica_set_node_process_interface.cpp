@@ -27,23 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr.hpp>
+#include <string>
 
-#include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/drop_collection.h"
-#include "mongo/db/catalog/rename_collection.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_time_tracker.h"
-#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/pipeline/process_interface/common_mongod_process_interface.h"
+#include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -69,26 +83,27 @@ void ReplicaSetNodeProcessInterface::setReplicaSetNodeExecutor(
     replicaSetNodeExecutor(service) = std::move(executor);
 }
 
-Status ReplicaSetNodeProcessInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              const NamespaceString& ns,
-                                              std::vector<BSONObj>&& objs,
-                                              const WriteConcernOptions& wc,
-                                              boost::optional<OID> targetEpoch) {
+Status ReplicaSetNodeProcessInterface::insert(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
     auto&& opCtx = expCtx->opCtx;
     if (_canWriteLocally(opCtx, ns)) {
-        return NonShardServerProcessInterface::insert(expCtx, ns, std::move(objs), wc, targetEpoch);
+        return NonShardServerProcessInterface::insert(
+            expCtx, ns, std::move(insertCommand), wc, targetEpoch);
     }
 
-    BatchedCommandRequest insertCommand(
-        buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+    BatchedCommandRequest batchInsertCommand(std::move(insertCommand));
 
-    return _executeCommandOnPrimary(opCtx, ns, std::move(insertCommand.toBSON())).getStatus();
+    return _executeCommandOnPrimary(opCtx, ns, batchInsertCommand.toBSON()).getStatus();
 }
 
 StatusWith<MongoProcessInterface::UpdateResult> ReplicaSetNodeProcessInterface::update(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& ns,
-    BatchedObjects&& batch,
+    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
     const WriteConcernOptions& wc,
     UpsertType upsert,
     bool multi,
@@ -96,11 +111,11 @@ StatusWith<MongoProcessInterface::UpdateResult> ReplicaSetNodeProcessInterface::
     auto&& opCtx = expCtx->opCtx;
     if (_canWriteLocally(opCtx, ns)) {
         return NonShardServerProcessInterface::update(
-            expCtx, ns, std::move(batch), wc, upsert, multi, targetEpoch);
+            expCtx, ns, std::move(updateCommand), wc, upsert, multi, targetEpoch);
     }
+    BatchedCommandRequest batchUpdateCommand(std::move(updateCommand));
 
-    BatchedCommandRequest updateCommand(buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
-    auto result = _executeCommandOnPrimary(opCtx, ns, std::move(updateCommand.toBSON()));
+    auto result = _executeCommandOnPrimary(opCtx, ns, batchUpdateCommand.toBSON());
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -124,27 +139,65 @@ void ReplicaSetNodeProcessInterface::createIndexesOnEmptyCollection(
     uassertStatusOK(_executeCommandOnPrimary(opCtx, ns, cmd.obj()));
 }
 
+void ReplicaSetNodeProcessInterface::createTimeseriesView(OperationContext* opCtx,
+                                                          const NamespaceString& ns,
+                                                          const BSONObj& cmdObj,
+                                                          const TimeseriesOptions& userOpts) {
+    if (_canWriteLocally(opCtx, ns)) {
+        return NonShardServerProcessInterface::createTimeseriesView(opCtx, ns, cmdObj, userOpts);
+    }
+
+    try {
+        uassertStatusOK(_executeCommandOnPrimary(opCtx, ns, cmdObj));
+    } catch (const DBException& ex) {
+        _handleTimeseriesCreateError(ex, opCtx, ns, userOpts);
+    }
+}
+
+Status ReplicaSetNodeProcessInterface::insertTimeseries(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    if (_canWriteLocally(expCtx->opCtx, ns)) {
+        return NonShardServerProcessInterface::insertTimeseries(
+            expCtx, ns, std::move(insertCommand), wc, targetEpoch);
+    } else {
+        return ReplicaSetNodeProcessInterface::insert(
+            expCtx, ns, std::move(insertCommand), wc, targetEpoch);
+    }
+}
+
 void ReplicaSetNodeProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     OperationContext* opCtx,
-    const BSONObj& renameCommandObj,
+    const NamespaceString& sourceNs,
     const NamespaceString& targetNs,
+    bool dropTarget,
+    bool stayTemp,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
     if (_canWriteLocally(opCtx, targetNs)) {
         return NonShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
-            opCtx, renameCommandObj, targetNs, originalCollectionOptions, originalIndexes);
+            opCtx,
+            sourceNs,
+            targetNs,
+            dropTarget,
+            stayTemp,
+            originalCollectionOptions,
+            originalIndexes);
     }
     // internalRenameIfOptionsAndIndexesMatch can only be run against the admin DB.
-    NamespaceString adminNs{NamespaceString::kAdminDb};
+    NamespaceString adminNs{DatabaseName::kAdmin};
     auto cmd = CommonMongodProcessInterface::_convertRenameToInternalRename(
-        opCtx, renameCommandObj, originalCollectionOptions, originalIndexes);
+        opCtx, sourceNs, targetNs, originalCollectionOptions, originalIndexes);
     uassertStatusOK(_executeCommandOnPrimary(opCtx, adminNs, cmd));
 }
 
 void ReplicaSetNodeProcessInterface::createCollection(OperationContext* opCtx,
-                                                      const std::string& dbName,
+                                                      const DatabaseName& dbName,
                                                       const BSONObj& cmdObj) {
-    NamespaceString dbNs{dbName};
+    NamespaceString dbNs = NamespaceString(dbName);
     if (_canWriteLocally(opCtx, dbNs)) {
         return NonShardServerProcessInterface::createCollection(opCtx, dbName, cmdObj);
     }
@@ -174,8 +227,7 @@ StatusWith<BSONObj> ReplicaSetNodeProcessInterface::_executeCommandOnPrimary(
         return StatusWith<BSONObj>{ErrorCodes::PrimarySteppedDown, "No primary exists currently"};
     }
 
-    executor::RemoteCommandRequest request(
-        std::move(hostAndPort), ns.db().toString(), cmd.obj(), opCtx);
+    executor::RemoteCommandRequest request(std::move(hostAndPort), ns.dbName(), cmd.obj(), opCtx);
     auto [promise, future] = makePromiseFuture<executor::TaskExecutor::RemoteCommandCallbackArgs>();
     auto promisePtr = std::make_shared<Promise<executor::TaskExecutor::RemoteCommandCallbackArgs>>(
         std::move(promise));
@@ -242,7 +294,7 @@ void ReplicaSetNodeProcessInterface::_attachGenericCommandArgs(OperationContext*
 
 bool ReplicaSetNodeProcessInterface::_canWriteLocally(OperationContext* opCtx,
                                                       const NamespaceString& ns) const {
-    Lock::ResourceLock rstl(opCtx->lockState(), resourceIdReplicationStateTransitionLock, MODE_IX);
+    Lock::ResourceLock rstl(opCtx, resourceIdReplicationStateTransitionLock, MODE_IX);
     return repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns);
 }
 

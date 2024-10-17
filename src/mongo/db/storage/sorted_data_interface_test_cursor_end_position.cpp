@@ -27,19 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 // Tests setEndPosition with next().
 void testSetEndPosition_Next_Forward(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -50,15 +57,19 @@ void testSetEndPosition_Next_Forward(bool unique, bool inclusive) {
                                                             {key5, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     // Dup key on end point. Illegal for unique indexes.
     if (!unique)
-        insertToIndex(opCtx, sorted, {{key3, loc2}});
+        insertToIndex(opCtx.get(), sorted.get(), {{key3, loc2}});
 
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key3, inclusive);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
     if (inclusive) {
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
@@ -84,7 +95,6 @@ TEST(SortedDataInterface, SetEndPosition_Next_Forward_Standard_Exclusive) {
 
 void testSetEndPosition_Next_Reverse(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -95,15 +105,19 @@ void testSetEndPosition_Next_Reverse(bool unique, bool inclusive) {
                                                             {key5, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     // Dup key on end point. Illegal for unique indexes.
     if (!unique)
-        insertToIndex(opCtx, sorted, {{key3, loc2}});
+        insertToIndex(opCtx.get(), sorted.get(), {{key3, loc2}});
 
     auto cursor = sorted->newCursor(opCtx.get(), false);
     cursor->setEndPosition(key3, inclusive);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key5, false, true)),
-              IndexKeyEntry(key5, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key5, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key5, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key4, loc1));
     if (inclusive) {
         if (!unique) {
@@ -127,10 +141,9 @@ TEST(SortedDataInterface, SetEndPosition_Next_Reverse_Standard_Exclusive) {
     testSetEndPosition_Next_Reverse(false, false);
 }
 
-// Tests setEndPosition with seek() and seekExact().
+// Tests setEndPosition with seek().
 void testSetEndPosition_Seek_Forward(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -140,29 +153,40 @@ void testSetEndPosition_Seek_Forward(bool unique, bool inclusive) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key3, inclusive);
 
     // Directly seeking past end is considered out of range.
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key4, true, inclusive)), boost::none);
-    ASSERT_EQ(cursor->seekExact(makeKeyString(sorted.get(), key4)), boost::none);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key4, true, inclusive).finishAndGetBuffer()),
+              boost::none);
 
     // Seeking to key3 directly or indirectly is only returned if endPosition is inclusive.
     auto maybeKey3 = inclusive ? boost::make_optional(IndexKeyEntry(key3, loc1)) : boost::none;
 
     // direct
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, inclusive)), maybeKey3);
-    ASSERT_EQ(cursor->seekExact(makeKeyString(sorted.get(), key3)), maybeKey3);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key3, true, inclusive).finishAndGetBuffer()),
+              maybeKey3);
 
     // indirect
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, inclusive)), maybeKey3);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key2, true, inclusive).finishAndGetBuffer()),
+              maybeKey3);
 
     cursor->saveUnpositioned();
-    removeFromIndex(opCtx, sorted, {{key3, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key3, loc1}});
     cursor->restore();
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, inclusive)), boost::none);
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, inclusive)), boost::none);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key2, true, inclusive).finishAndGetBuffer()),
+              boost::none);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key3, true, inclusive).finishAndGetBuffer()),
+              boost::none);
 }
 TEST(SortedDataInterface, SetEndPosition_Seek_Forward_Unique_Inclusive) {
     testSetEndPosition_Seek_Forward(true, true);
@@ -179,7 +203,6 @@ TEST(SortedDataInterface, SetEndPosition_Seek_Forward_Standard_Exclusive) {
 
 void testSetEndPosition_Seek_Reverse(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -189,30 +212,40 @@ void testSetEndPosition_Seek_Reverse(bool unique, bool inclusive) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get(), false);
     cursor->setEndPosition(key2, inclusive);
 
     // Directly seeking past end is considered out of range.
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, false, inclusive)),
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key1, false, inclusive).finishAndGetBuffer()),
               boost::none);
-    ASSERT_EQ(cursor->seekExact(makeKeyString(sorted.get(), key1)), boost::none);
 
     // Seeking to key2 directly or indirectly is only returned if endPosition is inclusive.
     auto maybeKey2 = inclusive ? boost::make_optional(IndexKeyEntry(key2, loc1)) : boost::none;
 
     // direct
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, inclusive)), maybeKey2);
-    ASSERT_EQ(cursor->seekExact(makeKeyString(sorted.get(), key2)), maybeKey2);
+    ASSERT_EQ(cursor->seek(
+                  makeKeyStringForSeek(sorted.get(), key2, false, inclusive).finishAndGetBuffer()),
+              maybeKey2);
 
     // indirect
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)), maybeKey2);
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true).finishAndGetBuffer()),
+        maybeKey2);
 
     cursor->saveUnpositioned();
-    removeFromIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)), boost::none);
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true)), boost::none);
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true).finishAndGetBuffer()),
+        boost::none);
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true).finishAndGetBuffer()),
+        boost::none);
 }
 TEST(SortedDataInterface, SetEndPosition_Seek_Reverse_Unique_Inclusive) {
     testSetEndPosition_Seek_Reverse(true, true);
@@ -230,7 +263,6 @@ TEST(SortedDataInterface, SetEndPosition_Seek_Reverse_Standard_Exclusive) {
 // Test that restore never lands on the wrong side of the endPosition.
 void testSetEndPosition_Restore_Forward(bool unique) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -240,11 +272,15 @@ void testSetEndPosition_Restore_Forward(bool unique) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key3, false);  // Should never see key3 or key4.
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
 
     cursor->save();
     cursor->restore();
@@ -252,8 +288,8 @@ void testSetEndPosition_Restore_Forward(bool unique) {
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx,
-                    sorted,
+    removeFromIndex(opCtx.get(),
+                    sorted.get(),
                     {
                         {key2, loc1},
                         {key3, loc1},
@@ -271,7 +307,6 @@ TEST(SortedDataInterface, SetEndPosition_Restore_Forward_Standard) {
 
 void testSetEndPosition_Restore_Reverse(bool unique) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -281,11 +316,15 @@ void testSetEndPosition_Restore_Reverse(bool unique) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get(), false);
     cursor->setEndPosition(key2, false);  // Should never see key1 or key2.
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true)),
-              IndexKeyEntry(key4, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key4, loc1));
 
     cursor->save();
     cursor->restore();
@@ -293,8 +332,8 @@ void testSetEndPosition_Restore_Reverse(bool unique) {
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx,
-                    sorted,
+    removeFromIndex(opCtx.get(),
+                    sorted.get(),
                     {
                         {key2, loc1},
                         {key3, loc1},
@@ -317,7 +356,6 @@ TEST(SortedDataInterface, SetEndPosition_Restore_Reverse_Standard) {
 // restore end cursors would tend to fail this test.
 void testSetEndPosition_RestoreEndCursor_Forward(bool unique) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -325,24 +363,29 @@ void testSetEndPosition_RestoreEndCursor_Forward(bool unique) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key2, true);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
 
     // A potential source of bugs is not restoring end cursor with saveUnpositioned().
     cursor->saveUnpositioned();
-    insertToIndex(opCtx,
-                  sorted,
+    insertToIndex(opCtx.get(),
+                  sorted.get(),
                   {
                       {key2, loc1},  // in range
                       {key3, loc1},  // out of range
                   });
     cursor->restore();
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
     ASSERT_EQ(cursor->next(), boost::none);
 }
@@ -355,7 +398,6 @@ TEST(SortedDataInterface, SetEndPosition_RestoreEndCursor_Forward_Standard) {
 
 void testSetEndPosition_RestoreEndCursor_Reverse(bool unique) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -363,23 +405,28 @@ void testSetEndPosition_RestoreEndCursor_Reverse(bool unique) {
                                                             {key4, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get(), false);
     cursor->setEndPosition(key3, true);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true)),
-              IndexKeyEntry(key4, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key4, loc1));
 
     cursor->saveUnpositioned();
-    insertToIndex(opCtx,
-                  sorted,
+    insertToIndex(opCtx.get(),
+                  sorted.get(),
                   {
                       {key2, loc1},  // in range
                       {key3, loc1},  // out of range
                   });
     cursor->restore();  // must restore end cursor even with saveUnpositioned().
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true)),
-              IndexKeyEntry(key4, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key4, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
     ASSERT_EQ(cursor->next(), boost::none);
 }
@@ -394,7 +441,6 @@ TEST(SortedDataInterface, SetEndPosition_RestoreEndCursor_Reverse_Unique) {
 // inclusive flag or direction.
 void testSetEndPosition_Empty_Forward(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -403,11 +449,15 @@ void testSetEndPosition_Empty_Forward(bool unique, bool inclusive) {
                                                             {key3, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(BSONObj(), inclusive);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
     ASSERT_EQ(cursor->next(), boost::none);
@@ -427,7 +477,6 @@ TEST(SortedDataInterface, SetEndPosition_Empty_Forward_Standard_Exclusive) {
 
 void testSetEndPosition_Empty_Reverse(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(unique,
                                                         /*partial=*/false,
                                                         {
@@ -436,11 +485,15 @@ void testSetEndPosition_Empty_Reverse(bool unique, bool inclusive) {
                                                             {key3, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get(), false);
     cursor->setEndPosition(BSONObj(), inclusive);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)),
-              IndexKeyEntry(key3, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key3, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
     ASSERT_EQ(cursor->next(), boost::none);
@@ -460,32 +513,43 @@ TEST(SortedDataInterface, SetEndPosition_Empty_Reverse_Standard_Exclusive) {
 
 void testSetEndPosition_Character_Limits(bool unique, bool inclusive) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    auto sorted = harnessHelper->newSortedDataInterface(unique,
+                                                        /*partial=*/false,
+                                                        {
+                                                            {key7, loc1},
+                                                            {key8, loc1},
+                                                        });
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(
-        unique, /*partial=*/false, {{key7, loc1}, {key8, loc1}});
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
 
     auto cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key7, inclusive);
 
     if (inclusive) {
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true)),
-                  IndexKeyEntry(key7, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key7, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     } else {
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true)), boost::none);
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true).finishAndGetBuffer()),
+            boost::none);
     }
 
     cursor = sorted->newCursor(opCtx.get());
     cursor->setEndPosition(key8, inclusive);
 
     if (inclusive) {
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true)),
-                  IndexKeyEntry(key7, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key7, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key8, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     } else {
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true)),
-                  IndexKeyEntry(key7, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key7, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key7, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 }

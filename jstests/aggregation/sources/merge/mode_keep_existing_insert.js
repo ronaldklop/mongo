@@ -2,12 +2,9 @@
 //
 // Cannot implicitly shard accessed collections because a collection can be implictly created and
 // exists when none is expected.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
-load("jstests/aggregation/extras/utils.js");          // For assertArrayEq.
-load("jstests/libs/fixture_helpers.js");              // For FixtureHelpers.isMongos.
+import {dropWithoutImplicitRecreate} from "jstests/aggregation/extras/merge_helpers.js";
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const source = db[`${jsTest.name()}_source`];
 source.drop();
@@ -254,17 +251,17 @@ const pipeline = [mergeStage];
 
     dropWithoutImplicitRecreate(source.getName());
     dropWithoutImplicitRecreate(target.getName());
-    assert.commandWorked(source.createIndex({"z": 1}, {unique: true}));
-    assert.commandWorked(target.createIndex({"z": 1}, {unique: true}));
+    assert.commandWorked(source.createIndex({"z": 1}, {unique: true, sparse: true}));
+    assert.commandWorked(target.createIndex({"z": 1}, {unique: true, sparse: true}));
 
-    // The 'on' field is missing.
+    // The 'on' field is missing and the index is sparse.
     assert.commandWorked(source.insert({_id: 1}));
     let error = assert.throws(
         () => source.aggregate(
             [{$project: {_id: 0}}, {$merge: Object.assign({on: "z"}, mergeStage.$merge)}]));
     assert.commandFailedWithCode(error, 51132);
 
-    // The 'on' field is null.
+    // The 'on' field is null and the index is sparse.
     assert.commandWorked(source.update({_id: 1}, {z: null}));
     error = assert.throws(
         () => source.aggregate(
@@ -374,4 +371,3 @@ const pipeline = [mergeStage];
         {actual: foreignDb[foreignTargetCollName].find().toArray(), expected: [{_id: 1, a: 1}]});
     assert.commandWorked(foreignDb.dropDatabase());
 })();
-}());

@@ -2,12 +2,12 @@
 // primary in each shard. However, this test shuts down the primary of the shard. Since whether or
 // not the shell detects the new primary before issuing the command is nondeterministic, skip the
 // consistency check for this test.
+
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({
     shards: {rs0: {nodes: [{}, {}, {rsConfig: {priority: 0}}]}},
@@ -61,4 +61,3 @@ assert.eq(5, dbother.bar.findOne({_id: 5}).x);
 assert.eq(5, dbother.foo.findOne({_id: 5}).x);
 
 s.stop();
-})();

@@ -1,4 +1,6 @@
 // test $out in a replicated environment
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var name = "pipelineout";
 var replTest = new ReplSetTest({name: name, nodes: 2});
 var nodes = replTest.nodeList();
@@ -11,7 +13,7 @@ var primary = replTest.getPrimary().getDB(name);
 var secondary = replTest.getSecondary().getDB(name);
 
 // populate the collection
-for (i = 0; i < 5; i++) {
+for (let i = 0; i < 5; i++) {
     primary.coll.insert({x: i});
 }
 replTest.awaitReplication();

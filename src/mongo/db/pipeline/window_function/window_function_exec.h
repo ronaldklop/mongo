@@ -29,14 +29,24 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
 #include <queue>
+#include <utility>
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
+#include "mongo/db/query/sort_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -56,8 +66,11 @@ public:
      * Creates an appropriate WindowFunctionExec that is capable of evaluating the window function
      * over the given bounds, both found within the WindowFunctionStatement.
      */
-    static std::unique_ptr<WindowFunctionExec> create(PartitionIterator* iter,
-                                                      const WindowFunctionStatement& functionStmt);
+    static std::unique_ptr<WindowFunctionExec> create(ExpressionContext* expCtx,
+                                                      PartitionIterator* iter,
+                                                      const WindowFunctionStatement& functionStmt,
+                                                      const boost::optional<SortPattern>& sortBy,
+                                                      MemoryUsageTracker* memTracker);
 
     virtual ~WindowFunctionExec() = default;
 
@@ -71,15 +84,12 @@ public:
      */
     virtual void reset() = 0;
 
-    /**
-     * Returns how much memory the accumulators or window functions being held are using.
-     */
-    virtual size_t getApproximateSize() const = 0;
-
 protected:
-    WindowFunctionExec(PartitionAccessor iter) : _iter(iter){};
+    WindowFunctionExec(PartitionAccessor iter, MemoryUsageTracker::Impl* memTracker)
+        : _iter(iter), _memTracker(memTracker){};
 
     PartitionAccessor _iter;
+    MemoryUsageTracker::Impl* _memTracker;
 };
 
 /**
@@ -90,57 +100,66 @@ protected:
  */
 class WindowFunctionExecRemovable : public WindowFunctionExec {
 public:
-    WindowFunctionExecRemovable(PartitionIterator* iter,
-                                boost::intrusive_ptr<Expression> input,
-                                std::unique_ptr<WindowFunctionState> function)
-        : WindowFunctionExec(
-              PartitionAccessor(iter, PartitionAccessor::Policy::kDefaultSequential)),
-          _input(std::move(input)),
-          _function(std::move(function)) {}
-
-    Value getNext() {
-        if (!_initialized) {
-            this->initialize();
-            _initialized = true;
-            return _function->getValue();
-        }
-        processDocumentsToUpperBound();
-        removeDocumentsUnderLowerBound();
+    Value getNext() override {
+        update();
         return _function->getValue();
     }
 
-    /**
-     * Return the byte size of the values being stored by this class. Does not include the constant
-     * size objects being held or the overhead of the data structures.
-     */
-    size_t getApproximateSize() const final {
-        return _function->getApproximateSize() + _memUsageBytes;
+    void reset() override {
+        _function->reset();
+        _values = std::queue<MemoryUsageTokenWith<Value>>();
+        _memTracker->set(_function->getApproximateSize());
+        doReset();
     }
-
 
 protected:
-    boost::intrusive_ptr<Expression> _input;
-    std::unique_ptr<WindowFunctionState> _function;
-    // Keep track of values in the window function that will need to be removed later.
-    std::queue<Value> _values;
-    // In one of two states: either the initial window has not been populated or we are sliding and
-    // accumulating/removing values.
-    bool _initialized = false;
-
-    void addValue(Value v) {
-        _function->add(v);
-        _values.push(v);
-        _memUsageBytes += v.getApproximateSize();
+    WindowFunctionExecRemovable(PartitionIterator* iter,
+                                PartitionAccessor::Policy policy,
+                                boost::intrusive_ptr<Expression> input,
+                                std::unique_ptr<WindowFunctionState> function,
+                                MemoryUsageTracker::Impl* memTracker)
+        : WindowFunctionExec(PartitionAccessor(iter, policy), memTracker),
+          _input(std::move(input)),
+          _function(std::move(function)) {
+        _memTracker->set(_function->getApproximateSize());
     }
 
-    // Track the byte size of the values being stored by this class. Does not include the constant
-    // size objects being held or the overhead of the data structures.
-    size_t _memUsageBytes = 0;
+    void addValue(Value v) {
+        long long prior = _function->getApproximateSize();
+        _function->add(v);
+        _values.emplace(MemoryUsageToken{v.getApproximateSize(), _memTracker}, std::move(v));
+        _memTracker->add(_function->getApproximateSize() - prior);
+    }
+
+    void removeValue() {
+        tassert(5429400, "Tried to remove more values than we added", !_values.empty());
+        long long prior = _function->getApproximateSize();
+        auto& v = _values.front();
+        _function->remove(std::move(v.value()));
+        _values.pop();
+        _memTracker->add(_function->getApproximateSize() - prior);
+    }
+
+    boost::intrusive_ptr<Expression> _input;
+    // Keep track of values in the window function that will need to be removed later.
+    std::queue<MemoryUsageTokenWith<Value>> _values;
 
 private:
-    virtual void processDocumentsToUpperBound() = 0;
-    virtual void removeDocumentsUnderLowerBound() = 0;
-    virtual void initialize() = 0;
+    /**
+     * This method notifies the executor that the underlying PartitionIterator
+     * '_iter' has been advanced one time since the last call to initialize() or
+     * update(). It should determine how the window has changed (which documents have
+     * entered it? which have left it?) and call addValue(), removeValue() as needed.
+     */
+    virtual void update() = 0;
+
+    /**
+     * Derived classes should reset their own internal state in the implementation of this instead
+     * of overriding `reset()` to allow for resetting the values owned by the base class.
+     */
+    virtual void doReset() = 0;
+
+    std::unique_ptr<WindowFunctionState> _function;
 };
 
 }  // namespace mongo

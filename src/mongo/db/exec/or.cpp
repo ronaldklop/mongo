@@ -29,17 +29,19 @@
 
 #include "mongo/db/exec/or.h"
 
+#include <iterator>
 #include <memory>
+#include <utility>
+#include <vector>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* OrStage::kStageType = "OR";
@@ -122,10 +124,8 @@ unique_ptr<PlanStageStats> OrStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (nullptr != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
     }
 
     unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_OR);

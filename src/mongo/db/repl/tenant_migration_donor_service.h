@@ -29,15 +29,44 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/fetcher.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_rs.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/serverless/serverless_types_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -47,7 +76,7 @@ public:
 
     explicit TenantMigrationDonorService(ServiceContext* const serviceContext)
         : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
-    ~TenantMigrationDonorService() = default;
+    ~TenantMigrationDonorService() override = default;
 
     StringData getServiceName() const override {
         return kServiceName;
@@ -60,27 +89,36 @@ public:
     ThreadPool::Limits getThreadPoolLimits() const override {
         ThreadPool::Limits limits;
         limits.maxThreads = repl::maxTenantMigrationDonorServiceThreadPoolSize;
+        limits.minThreads = repl::minTenantMigrationDonorServiceThreadPoolSize;
         return limits;
     }
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialState) const override {
-        return std::make_shared<TenantMigrationDonorService::Instance>(
-            _serviceContext, this, initialState);
-    }
+    void checkIfConflictsWithOtherInstances(
+        OperationContext* opCtx,
+        BSONObj initialState,
+        const std::vector<const Instance*>& existingInstances) override;
+
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
+
+    /**
+     * Sends an abort to all tenant migration instances on this donor.
+     */
+    void abortAllMigrations(OperationContext* opCtx);
 
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
         struct DurableState {
             TenantMigrationDonorStateEnum state;
-            boost::optional<Status> abortReason;
+            boost::optional<BSONObj> abortReason;
+            boost::optional<mongo::Date_t> expireAt;
+            boost::optional<Timestamp> blockTimestamp;
         };
 
-        explicit Instance(ServiceContext* const serviceContext,
+        explicit Instance(ServiceContext* serviceContext,
                           const TenantMigrationDonorService* donorService,
                           const BSONObj& initialState);
 
-        ~Instance();
+        ~Instance() override;
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                              const CancellationToken& token) noexcept override;
@@ -94,24 +132,28 @@ public:
             MongoProcessInterface::CurrentOpConnectionsMode connMode,
             MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
-        /**
-         * To be called on the instance returned by PrimaryOnlyService::getOrCreate. Returns an
-         * error if the options this Instance was created with are incompatible with the options
-         * given in 'stateDoc'.
-         */
-        Status checkIfOptionsConflict(const TenantMigrationDonorDocument& stateDoc);
+        void checkIfOptionsConflict(const BSONObj& stateDoc) const final;
 
         /**
-         * Returns the latest durable migration state.
+         * Returns the latest durable migration state, or boost::none if no state document has been
+         * inserted yet. The state document exists once getInitialStateDocumentDurableFuture() is
+         * resolved.
          */
-        DurableState getDurableState(OperationContext* opCtx);
+        boost::optional<DurableState> getDurableState() const;
 
         /**
-         * Returns a Future that will be resolved when all work associated with this Instance has
-         * completed running.
+         * Returns a Future that will be resolved once the initial state document has been inserted.
          */
-        SharedSemiFuture<void> getCompletionFuture() const {
-            return _completionPromise.getFuture();
+        SharedSemiFuture<void> getInitialStateDocumentDurableFuture() const {
+            return _initialDonorStateDurablePromise.getFuture();
+        }
+
+        /**
+         * Returns a Future that will be resolved when the instance has been durably marked garbage
+         * collectable.
+         */
+        SharedSemiFuture<void> getForgetMigrationDurableFuture() const {
+            return _forgetMigrationDurablePromise.getFuture();
         }
 
         /**
@@ -119,22 +161,6 @@ public:
          */
         SharedSemiFuture<void> getDecisionFuture() const {
             return _decisionPromise.getFuture();
-        }
-
-        /**
-         * Returns a Future that will be resolved when a migration has called the run() method and
-         * instantiated the CancellationSource.
-         */
-        SharedSemiFuture<void> getMigrationCancelableFuture() const {
-            return _migrationCancelablePromise.getFuture();
-        }
-
-        /**
-         * Returns a Future that will be resolved when the donor has majority-committed the write to
-         * insert the donor state doc for the migration.
-         */
-        SharedSemiFuture<void> getInitialDonorStateDurableFuture() const {
-            return _initialDonorStateDurablePromise.getFuture();
         }
 
         /**
@@ -148,23 +174,30 @@ public:
         void onReceiveDonorForgetMigration();
 
         StringData getTenantId() const {
-            return _stateDoc.getTenantId();
+            return _tenantId;
         }
 
         StringData getRecipientConnectionString() const {
             return _stateDoc.getRecipientConnectionString();
         }
 
+        const MigrationProtocolEnum& getProtocol() const {
+            return _protocol;
+        }
+
+        /**
+         * Returns the instance state document.
+         */
+        TenantMigrationDonorDocument getStateDoc() const;
+
     private:
         const NamespaceString _stateDocumentsNS = NamespaceString::kTenantMigrationDonorsNamespace;
 
         ExecutorFuture<void> _enterAbortingIndexBuildsState(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            const CancellationToken& serviceToken,
-            const CancellationToken& instanceToken);
+            const CancellationToken& token);
 
-        void _abortIndexBuilds(const CancellationToken& serviceToken,
-                               const CancellationToken& instanceToken);
+        void _abortIndexBuilds(const CancellationToken& token);
 
         /**
          * Fetches all key documents from the recipient's admin.system.keys collection, stores
@@ -173,42 +206,41 @@ public:
         ExecutorFuture<void> _fetchAndStoreRecipientClusterTimeKeyDocs(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancellationToken& serviceToken,
-            const CancellationToken& instanceToken);
+            const CancellationToken& token);
 
         ExecutorFuture<void> _enterDataSyncState(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            const CancellationToken& serviceToken,
-            const CancellationToken& instanceToken);
+            const CancellationToken& abortToken);
 
         ExecutorFuture<void> _waitForRecipientToBecomeConsistentAndEnterBlockingState(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancellationToken& serviceToken,
-            const CancellationToken& instanceToken);
+            const CancellationToken& abortToken);
+
+        ExecutorFuture<void> _waitUntilStartMigrationDonorTimestampIsCheckpointed(
+            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+            const CancellationToken& abortToken);
 
         ExecutorFuture<void> _waitForRecipientToReachBlockTimestampAndEnterCommittedState(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancellationToken& serviceToken,
-            const CancellationToken& instanceToken);
+            const CancellationToken& abortToken,
+            const CancellationToken& token);
 
         ExecutorFuture<void> _handleErrorOrEnterAbortedState(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            const CancellationToken& serviceToken,
+            const CancellationToken& token,
+            const CancellationToken& abortToken,
             Status status);
 
         ExecutorFuture<void> _waitForForgetMigrationThenMarkMigrationGarbageCollectable(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancellationToken& serviceToken);
+            const CancellationToken& token);
 
-        /**
-         * Makes a task executor for executing commands against the recipient. If the server
-         * parameter 'tenantMigrationDisableX509Auth' is false, configures the executor to use the
-         * migration certificate to establish an SSL connection to the recipient.
-         */
-        std::shared_ptr<executor::ThreadPoolTaskExecutor> _makeRecipientCmdExecutor();
+        ExecutorFuture<void> _waitForGarbageCollectionDelayThenDeleteStateDoc(
+            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+            const CancellationToken& token);
 
         /**
          * Inserts the state document to _stateDocumentsNS and returns the opTime for the insert
@@ -225,8 +257,16 @@ public:
          */
         ExecutorFuture<repl::OpTime> _updateStateDoc(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            const TenantMigrationDonorStateEnum nextState,
+            TenantMigrationDonorStateEnum nextState,
             const CancellationToken& token);
+
+        /**
+         * Deletes the state document. Does not return the opTime for the delete, since it's not
+         * necessary to wait for this delete to be majority committed (this is the last step in the
+         * chain, and if the delete rolls back, the new primary will re-do the delete).
+         */
+        ExecutorFuture<void> _removeStateDoc(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                             const CancellationToken& token);
 
         /**
          * Sets the "expireAt" time for the state document to be garbage collected, and returns the
@@ -239,15 +279,8 @@ public:
          * Waits for given opTime to be majority committed.
          */
         ExecutorFuture<void> _waitForMajorityWriteConcern(
-            std::shared_ptr<executor::ScopedTaskExecutor> executor, repl::OpTime opTime);
-
-        /**
-         * Sends the given command to the recipient replica set.
-         */
-        ExecutorFuture<void> _sendCommandToRecipient(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const BSONObj& cmdObj,
+            repl::OpTime opTime,
             const CancellationToken& token);
 
         /**
@@ -272,6 +305,17 @@ public:
             return recipientCmdThreadPoolLimits;
         }
 
+        /**
+         * Validate if the value of _tenantIds is correct for the given _protocol.
+         */
+        void validateTenantIdsForProtocol();
+
+        /*
+         * Initializes _abortMigrationSource and returns a token from it. The source will be
+         * immediately canceled if an abort has already been requested.
+         */
+        CancellationToken _initAbortMigrationSource(const CancellationToken& token);
+
         ServiceContext* const _serviceContext;
         const TenantMigrationDonorService* const _donorService;
 
@@ -282,17 +326,11 @@ public:
         // This data is provided in the initial state doc and never changes.  We keep copies to
         // avoid having to obtain the mutex to access them.
         const std::string _tenantId;
+        const std::vector<TenantId> _tenantIds;
+        const MigrationProtocolEnum _protocol;
         const std::string _recipientConnectionString;
         const ReadPreferenceSetting _readPreference;
         const UUID _migrationUuid;
-        const boost::optional<TenantMigrationPEMPayload> _donorCertificateForRecipient;
-        const boost::optional<TenantMigrationPEMPayload> _recipientCertificateForDonor;
-
-        // TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
-        const transport::ConnectSSLMode _sslMode;
-
-        // Task executor used for executing commands against the recipient.
-        std::shared_ptr<executor::TaskExecutor> _recipientCmdExecutor;
 
         // Weak pointer to the Fetcher used for fetching admin.system.keys documents from the
         // recipient. It is only not null when the instance is actively fetching the documents.
@@ -300,15 +338,12 @@ public:
 
         boost::optional<Status> _abortReason;
 
-        // Protects the durable state, state document, and the promises below.
-        mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationDonorService::_mutex");
+        // Protects the durable state, state document, abort requested boolean, and the promises
+        // below.
+        mutable stdx::mutex _mutex;
 
         // The latest majority-committed migration state.
-        DurableState _durableState;
-
-        // Promise that is resolved when run() has been called and the CancellationSource has been
-        // instantiated.
-        SharedPromise<void> _migrationCancelablePromise;
+        boost::optional<DurableState> _durableState;
 
         // Promise that is resolved when the donor has majority-committed the write to insert the
         // donor state doc for the migration.
@@ -317,16 +352,21 @@ public:
         // Promise that is resolved when the donor receives the donorForgetMigration command.
         SharedPromise<void> _receiveDonorForgetMigrationPromise;
 
-        // Promise that is resolved when the chain of work kicked off by run() has completed.
-        SharedPromise<void> _completionPromise;
+        // Promise that is resolved when the instance has been durably marked garbage collectable.
+        SharedPromise<void> _forgetMigrationDurablePromise;
 
         // Promise that is resolved when the donor has majority-committed the write to commit or
         // abort.
         SharedPromise<void> _decisionPromise;
 
-        // This CancellationSource is instantiated from CancellationToken that is passed into run().
-        // It allows for manual cancellation of work from the instance.
-        CancellationSource _abortMigrationSource;
+        // Set to true when a request to cancel the migration has been processed, e.g. after
+        // executing the donorAbortMigration command.
+        bool _abortRequested{false};
+
+        // Used for logical interrupts that require aborting the migration but not unconditionally
+        // interrupting the instance, e.g. receiving donorAbortMigration. Initialized in
+        // _initAbortMigrationSource().
+        boost::optional<CancellationSource> _abortMigrationSource;
     };
 
 private:

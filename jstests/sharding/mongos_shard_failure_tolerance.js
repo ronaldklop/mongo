@@ -10,22 +10,25 @@
 // sequence), idle (connection is connected but not used before a shard change), and new
 // (connection connected after shard change).
 //
-// Checking UUID and index consistency involves talking to shards, but this test shuts down shards.
+// The following checks involve talking to shards, but this test shuts down shards.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
 
 var st = new ShardingTest({shards: 3, mongos: 1});
 
 var admin = st.s0.getDB("admin");
 
-var collSharded = st.s0.getCollection("fooSharded.barSharded");
-var collUnsharded = st.s0.getCollection("fooUnsharded.barUnsharded");
-
-assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-st.ensurePrimaryShard(collSharded.getDB().toString(), st.shard0.shardName);
+const dbCollSharded = "fooSharded";
+const dbCollUnsharded = "fooUnsharded";
+assert.commandWorked(
+    admin.runCommand({enableSharding: dbCollSharded, primaryShard: st.shard0.shardName}));
+assert.commandWorked(
+    admin.runCommand({enableSharding: dbCollUnsharded, primaryShard: st.shard0.shardName}));
+var collSharded = st.s0.getCollection(dbCollSharded + ".barSharded");
+var collUnsharded = st.s0.getCollection(dbCollUnsharded + ".barUnsharded");
 
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
@@ -35,7 +38,6 @@ assert.commandWorked(
 // Create the unsharded database
 assert.commandWorked(collUnsharded.insert({some: "doc"}));
 assert.commandWorked(collUnsharded.remove({}));
-st.ensurePrimaryShard(collUnsharded.getDB().toString(), st.shard0.shardName);
 
 //
 // Setup is complete
@@ -137,4 +139,3 @@ mongosConnNew = new Mongo(st.s0.host);
 assert.commandWorked(mongosConnNew.getCollection(collUnsharded.toString()).insert({_id: 7}));
 
 st.stop();
-})();

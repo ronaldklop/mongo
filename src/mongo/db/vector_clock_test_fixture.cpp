@@ -27,37 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/vector_clock_test_fixture.h"
-
 #include <memory>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/signed_logical_time.h"
-#include "mongo/db/time_proof_service.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_mutable.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/vector_clock_test_fixture.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 
-VectorClockTestFixture::VectorClockTestFixture() = default;
+VectorClockTestFixture::VectorClockTestFixture()
+    : ShardingMongoDTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
 
 VectorClockTestFixture::~VectorClockTestFixture() = default;
 
 void VectorClockTestFixture::setUp() {
-    ShardingMongodTestFixture::setUp();
+    ShardingMongoDTestFixture::setUp();
 
     auto service = getServiceContext();
 
     _clock = VectorClock::get(service);
-
-    service->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(_mockClockSource));
-    service->setPreciseClockSource(std::make_unique<SharedClockSourceAdapter>(_mockClockSource));
 
     _dbDirectClient = std::make_unique<DBDirectClient>(operationContext());
 
@@ -66,7 +67,7 @@ void VectorClockTestFixture::setUp() {
 
 void VectorClockTestFixture::tearDown() {
     _dbDirectClient.reset();
-    ShardingMongodTestFixture::tearDown();
+    ShardingMongoDTestFixture::tearDown();
 }
 
 VectorClockMutable* VectorClockTestFixture::resetClock() {
@@ -88,20 +89,27 @@ LogicalTime VectorClockTestFixture::getClusterTime() const {
     return now.clusterTime();
 }
 
-ClockSourceMock* VectorClockTestFixture::getMockClockSource() const {
-    return _mockClockSource.get();
+ClockSourceMock* VectorClockTestFixture::getMockClockSource() {
+    return &_mockClockSource;
 }
 
-void VectorClockTestFixture::setMockClockSourceTime(Date_t time) const {
-    _mockClockSource->reset(time);
+void VectorClockTestFixture::setMockClockSourceTime(Date_t time) {
+    _mockClockSource.reset(time);
 }
 
-Date_t VectorClockTestFixture::getMockClockSourceTime() const {
-    return _mockClockSource->now();
+Date_t VectorClockTestFixture::getMockClockSourceTime() {
+    return _mockClockSource.now();
 }
 
 DBDirectClient* VectorClockTestFixture::getDBClient() const {
     return _dbDirectClient.get();
+}
+
+void VectorClockTestFixture::setupOpObservers() {
+    auto opObserverRegistry =
+        checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
+    opObserverRegistry->addObserver(
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
 }
 
 }  // namespace mongo

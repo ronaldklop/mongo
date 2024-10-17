@@ -29,19 +29,37 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <ctime>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/logv2/log_format.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/stdx/variant.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/cidr.h"
+#include "mongo/util/version/releases.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
 constexpr size_t DEFAULT_MAX_CONN = 1000000;
-
-enum class ClusterRole { None, ShardServer, ConfigServer };
 
 struct ServerGlobalParams {
     std::string binaryName;  // mongod or mongos
@@ -49,11 +67,19 @@ struct ServerGlobalParams {
 
     int port = DefaultDBPort;  // --port
     enum {
-        ConfigServerPort = 27019,
-        CryptDServerPort = 27020,
+        RouterPort = 27016,
         DefaultDBPort = 27017,
         ShardServerPort = 27018,
+        ConfigServerPort = 27019,
+        CryptDServerPort = 27020,
+// TODO: SERVER-80343 Remove this ifdef once gRPC is compiled on all variants
+#ifdef MONGO_CONFIG_GRPC
+        DefaultGRPCServerPort = 27021,
+#endif
+        DefaultMagicRestorePort = 27022,
     };
+
+    enum MaintenanceMode { None, ReplicaSetMode, StandaloneMode };
 
     static std::string getPortSettingHelpText();
 
@@ -61,30 +87,39 @@ struct ServerGlobalParams {
     bool enableIPv6 = false;
     bool rest = false;  // --rest
 
-    int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
+    int listenBacklog = SOMAXCONN;  // --listenBacklog
 
     AtomicWord<bool> quiet{false};  // --quiet
 
     ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
+    MaintenanceMode maintenanceMode;              // --maintenanceMode
 
-    bool cpu = false;  // --cpu show cpu time periodically
+    boost::optional<int> routerPort;      // --routerPort
+    bool doAutoBootstrapSharding{false};  // This is derived from other settings during startup.
 
     bool objcheck = true;  // --objcheck
 
+    // Shell parameter, used for testing only, to tell the shell to crash on InvalidBSON errors.
+    // Can be paired with --objcheck so that extra BSON validation occurs.
+    bool crashOnInvalidBSONError = false;  // --crashOnInvalidBSONError
+
+    // When specified, deterministically reproduces the execution order of mongo initializers.
+    unsigned initializerShuffleSeed = 0;  // --initializerShuffleSeed
+
     int defaultProfile = 0;  // --profile
     boost::optional<BSONObj> defaultProfileFilter;
-    int slowMS = 100;                      // --time in ms that is "slow"
-    double sampleRate = 1.0;               // --samplerate rate at which to sample slow queries
+    AtomicWord<int> slowMS{100};           // --time in ms that is "slow"
+    AtomicWord<double> sampleRate{1.0};    // --samplerate rate at which to sample slow queries
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
-    bool moveParanoia = false;             // for move chunk paranoia
 
-    bool noUnixSocket = false;    // --nounixsocket
-    bool doFork = false;          // --fork
+    bool noUnixSocket = false;  // --nounixsocket
+    bool doFork = false;        // --fork
+    bool isMongoBridge = false;
+
     std::string socket = "/tmp";  // UNIX domain socket directory
-    std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
 
     size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
-    std::vector<stdx::variant<CIDR, std::string>> maxConnsOverride;
+    std::vector<std::variant<CIDR, std::string>> maxConnsOverride;
     int reservedAdminThreads = 0;
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
@@ -105,14 +140,6 @@ struct ServerGlobalParams {
     int forkReadyFd = -1;  // for `--fork`. Write to it and close it when daemon service is up.
 #endif
 
-    /**
-     * Switches to enable experimental (unsupported) features.
-     */
-    struct ExperimentalFeatures {
-        ExperimentalFeatures() : storageDetailsCmdEnabled(false) {}
-        bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
-    } experimental;
-
     time_t started = ::time(nullptr);
 
     BSONArray argvArray;
@@ -122,31 +149,9 @@ struct ServerGlobalParams {
 
     AuthState authState = AuthState::kUndefined;
 
-    bool transitionToAuth = false;    // --transitionToAuth, mixed mode for rolling auth upgrade
-    AtomicWord<int> clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
+    bool transitionToAuth = false;  // --transitionToAuth, mixed mode for rolling auth upgrade
 
-    enum ClusterAuthModes {
-        ClusterAuthMode_undefined,
-        /**
-         * Authenticate using keyfile, accept only keyfiles
-         */
-        ClusterAuthMode_keyFile,
-
-        /**
-         * Authenticate using keyfile, accept both keyfiles and X.509
-         */
-        ClusterAuthMode_sendKeyFile,
-
-        /**
-         * Authenticate using X.509, accept both keyfiles and X.509
-         */
-        ClusterAuthMode_sendX509,
-
-        /**
-         * Authenticate using X.509, accept only X.509
-         */
-        ClusterAuthMode_x509
-    };
+    ClusterAuthMode startupClusterAuthMode;
 
     // for the YAML config, sharding._overrideShardIdentity. Can only be used when in
     // queryableBackupMode.
@@ -155,127 +160,84 @@ struct ServerGlobalParams {
     // True if the current binary version is an LTS Version.
     static constexpr bool kIsLTSBinaryVersion = false;
 
-    struct FeatureCompatibility {
+// TODO: SERVER-80343 Remove this ifdef once gRPC is compiled on all variants
+#ifdef MONGO_CONFIG_GRPC
+    int grpcPort = DefaultGRPCServerPort;
+    int grpcServerMaxThreads = 1000;
+#endif
+
+    /**
+     * Represents a "snapshot" of the in-memory FCV at a particular point in time.
+     * This is useful for callers who need to perform multiple FCV checks and expect the checks to
+     * be performed on a consistent (but possibly stale) FCV value.
+     *
+     * For example: checking isVersionInitialized() && isLessThan() with the same FCVSnapshot value
+     * would have the guarantee that if the FCV value is initialized during isVersionInitialized(),
+     * it will still be during isLessThan().
+     *
+     * Note that this can get stale, so if you call acquireFCVSnapshot() once, and then update
+     * serverGlobalParams.mutableFCV, and expect to use the new FCV value, you must acquire another
+     * snapshot. In general, if you want to check multiple properties of the FCV at a specific point
+     * in time, you should use one snapshot. For example, if you want to check both
+     * that the FCV is initialized and if it's less than some version, and that featureFlagXX is
+     * enabled on this FCV, this should all be using the same FCVSnapshot of the FCV value.
+     *
+     * But if you're doing multiple completely separate FCV checks at different points in time, such
+     * as over multiple functions, or multiple distinct feature flag enablement checks (i.e.
+     * featureFlagXX.isEnabled && featureFlagYY.isEnabled), you should get a new FCV snapshot for
+     * each check since the old one may be stale.
+     */
+    struct FCVSnapshot {
+        using FCV = multiversion::FeatureCompatibilityVersion;
+
         /**
-         * The combination of the fields (version, targetVersion, previousVersion) in the
-         * featureCompatibilityVersion document in the server configuration collection
-         * (admin.system.version) are represented by this enum and determine this node's behavior.
-         *
-         * Features can be gated for specific versions, or ranges of versions above or below some
-         * minimum or maximum version, respectively.
-         *
-         * While upgrading from version X to Y or downgrading from Y to X, the server supports the
-         * features of the older of the two versions.
-         *
-         * For versions X and Y, the legal enums and featureCompatibilityVersion documents are:
-         *
-         * kFullyDowngradedToX
-         * (X, Unset, Unset): Only version X features are available, and new and existing storage
-         *                    engine entries use the X format
-         *
-         * kUpgradingFromXToY
-         * (X, Y, Unset): Only version X features are available, but new storage engine entries
-         *                use the Y format, and existing entries may have either the X or
-         *                Y format
-         *
-         * kVersionX
-         * (X, Unset, Unset): X features are available, and new and existing storage engine
-         *                    entries use the X format
-         *
-         * kDowngradingFromXToY
-         * (Y, Y, X): Only Y features are available and new storage engine entries use the
-         *            Y format, but existing entries may have either the Y or X format
-         *
-         * kUnsetDefault44Behavior
-         * (Unset, Unset, Unset): This is the case on startup before the fCV document is loaded into
-         *                        memory. isVersionInitialized() will return false, and getVersion()
-         *                        will return the default (kUnsetDefault44Behavior).
-         *
+         * Creates an immutable "snapshot" of the passed in FCV.
          */
-        enum class Version {
-            // The order of these enums matter: sort by (version, targetVersion, previousVersion).
-            kInvalid,
-            kUnsetDefault44Behavior,
-            kFullyDowngradedTo44,    // { version: 4.4 }
-            kDowngradingFrom47To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.7 }
-            kDowngradingFrom48To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.8 }
-            kDowngradingFrom49To44,  // { version: 4.4, targetVersion: 4.4, previousVersion: 4.9 }
-            kUpgradingFrom44To47,    // { version: 4.4, targetVersion: 4.7 }
-            kUpgradingFrom44To48,    // { version: 4.4, targetVersion: 4.8 }
-            kUpgradingFrom44To49,    // { version: 4.4, targetVersion: 4.9 }
-            kVersion47,              // { version: 4.7 }
-            kDowngradingFrom48To47,  // { version: 4.7, targetVersion: 4.7, previousVersion: 4.8 }
-            kUpgradingFrom47To48,    // { version: 4.7, targetVersion: 4.8 }
-            kVersion48,              // { version: 4.8 }
-            kDowngradingFrom49To48,  // { version: 4.8, targetVersion: 4.8, previousVersion: 4.9 }
-            kUpgradingFrom48To49,    // { version: 4.8, targetVersion: 4.9 }
-            kVersion49,              // { version: 4.9 }
-        };
-
-        // These constants should only be used for generic FCV references. Generic references are
-        // FCV references that are expected to exist across LTS binary versions.
-        static constexpr Version kLatest = Version::kVersion49;
-        static constexpr Version kLastContinuous = Version::kVersion48;
-        static constexpr Version kLastLTS = Version::kFullyDowngradedTo44;
-
-        // These constants should only be used for generic FCV references. Generic references are
-        // FCV references that are expected to exist across LTS binary versions.
-        // NOTE: DO NOT USE THEM FOR REGULAR FCV CHECKS.
-        static constexpr Version kUpgradingFromLastLTSToLatest = Version::kUpgradingFrom44To49;
-        static constexpr Version kUpgradingFromLastContinuousToLatest =
-            Version::kUpgradingFrom48To49;
-        static constexpr Version kDowngradingFromLatestToLastLTS = Version::kDowngradingFrom49To44;
-        static constexpr Version kDowngradingFromLatestToLastContinuous =
-            Version::kDowngradingFrom49To48;
-        // kUpgradingFromLastLTSToLastContinuous is only ever set to a valid FCV when
-        // kLastLTS and kLastContinuous are not equal. Otherwise, this value should be set to
-        // kInvalid.
-        static constexpr Version kUpgradingFromLastLTSToLastContinuous =
-            Version::kUpgradingFrom44To48;
+        explicit FCVSnapshot(FCV version) : _version(version) {}
 
         /**
          * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
          * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
          */
-        const bool isVersionInitialized() const {
-            return _version.load() != Version::kUnsetDefault44Behavior;
+        bool isVersionInitialized() const {
+            return _version != FCV::kUnsetDefaultLastLTSBehavior;
         }
 
         /**
          * This safe getter for the featureCompatibilityVersion parameter ensures the parameter has
          * been initialized with a meaningful value.
          */
-        const Version getVersion() const {
+        FCV getVersion() const {
             invariant(isVersionInitialized());
-            return _version.load();
+            return _version;
         }
 
-        bool isLessThanOrEqualTo(Version version, Version* versionReturn = nullptr) const {
-            Version currentVersion = getVersion();
+        bool isLessThanOrEqualTo(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
             if (versionReturn != nullptr) {
                 *versionReturn = currentVersion;
             }
             return currentVersion <= version;
         }
 
-        bool isGreaterThanOrEqualTo(Version version, Version* versionReturn = nullptr) const {
-            Version currentVersion = getVersion();
+        bool isGreaterThanOrEqualTo(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
             if (versionReturn != nullptr) {
                 *versionReturn = currentVersion;
             }
             return currentVersion >= version;
         }
 
-        bool isLessThan(Version version, Version* versionReturn = nullptr) const {
-            Version currentVersion = getVersion();
+        bool isLessThan(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
             if (versionReturn != nullptr) {
                 *versionReturn = currentVersion;
             }
             return currentVersion < version;
         }
 
-        bool isGreaterThan(Version version, Version* versionReturn = nullptr) const {
-            Version currentVersion = getVersion();
+        bool isGreaterThan(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
             if (versionReturn != nullptr) {
                 *versionReturn = currentVersion;
             }
@@ -283,28 +245,67 @@ struct ServerGlobalParams {
         }
 
         // This function is to be used for generic FCV references only, and not for FCV-gating.
-        bool isUpgradingOrDowngrading(boost::optional<Version> version = boost::none) const {
-            if (version == boost::none) {
-                version = getVersion();
-            }
-            return version != kLatest && version != kLastContinuous && version != kLastLTS;
+        bool isUpgradingOrDowngrading() const {
+            return isUpgradingOrDowngrading(getVersion());
+        }
+
+        static bool isUpgradingOrDowngrading(FCV version) {
+            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+            return version != multiversion::GenericFCV::kLatest &&
+                version != multiversion::GenericFCV::kLastContinuous &&
+                version != multiversion::GenericFCV::kLastLTS;
+        }
+
+        /**
+         * Logs the current FCV global state.
+         * context: the context in which this function was called, to differentiate logs (e.g.
+         * startup, log rotation).
+         */
+        void logFCVWithContext(StringData context) const;
+
+    private:
+        const FCV _version;
+    };
+
+    /**
+     * Represents the in-memory FCV that can be changed.
+     * This should only be used to set/reset the in-memory FCV, or get a snapshot of the current
+     * in-memory FCV. It *cannot* be used to check the actual value of the in-memory FCV, and in
+     * particular, check the value over multiple function calls. This is because the in-memory FCV
+     * might change in between those calls (such as during initial sync). Instead, use
+     * acquireFCVSnapshot() to get a snapshot of the FCV, and use the functions available on
+     * FCVSnapshot.
+     */
+    struct MutableFCV {
+        using FCV = multiversion::FeatureCompatibilityVersion;
+
+        /**
+         * Gets an immutable copy/snapshot of the current FCV so that callers can check
+         * the FCV value at a particular point in time over multiple function calls
+         * without the snapshot value changing.
+         * Note that this snapshot might be when the FCV is uninitialized, which could happen
+         * during initial sync. The caller of this function and the subsequent functions
+         * within FCVSnapshot must handle that case.
+         */
+        FCVSnapshot acquireFCVSnapshot() const {
+            return FCVSnapshot(_version.load());
         }
 
         void reset() {
-            _version.store(Version::kUnsetDefault44Behavior);
+            _version.store(FCV::kUnsetDefaultLastLTSBehavior);
         }
 
-        void setVersion(Version version) {
+        void setVersion(FCV version) {
             return _version.store(version);
         }
 
     private:
-        AtomicWord<Version> _version{Version::kUnsetDefault44Behavior};
+        AtomicWord<FCV> _version{FCV::kUnsetDefaultLastLTSBehavior};
 
-    } mutableFeatureCompatibility;
+    } mutableFCV;
 
     // Const reference for featureCompatibilityVersion checks.
-    const FeatureCompatibility& featureCompatibility = mutableFeatureCompatibility;
+    const MutableFCV& featureCompatibility = mutableFCV;
 
     // Feature validation differs depending on the role of a mongod in a replica set. Replica set
     // primaries can accept user-initiated writes and validate based on the feature compatibility
@@ -313,8 +314,6 @@ struct ServerGlobalParams {
     AtomicWord<bool> validateFeaturesAsPrimary{true};
 
     std::vector<std::string> disabledSecureAllocatorDomains;
-
-    bool enableMajorityReadConcern = true;
 };
 
 extern ServerGlobalParams serverGlobalParams;
@@ -330,4 +329,5 @@ struct TraitNamedDomain {
         return ret;
     }
 };
+
 }  // namespace mongo

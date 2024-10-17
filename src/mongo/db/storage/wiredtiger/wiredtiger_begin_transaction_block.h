@@ -29,8 +29,6 @@
 
 #pragma once
 
-#include <string>
-
 #include <wiredtiger.h>
 
 #include "mongo/base/status.h"
@@ -39,6 +37,7 @@
 
 namespace mongo {
 
+class WiredTigerSession;
 /**
  * When constructed, this object begins a WiredTiger transaction on the provided session. The
  * transaction will be rolled back if done() is not called before the object is destructed.
@@ -47,25 +46,27 @@ class WiredTigerBeginTxnBlock {
 public:
     // Whether or not to round up to the oldest timestamp when the read timestamp is behind it.
     enum class RoundUpReadTimestamp {
-        kNoRoundError,  // Do not round to the oldest timestamp. BadValue error may be returned.
-        kNoRoundForce,  // Do not round to the oldest timestamp. Reading older than the oldest
-                        // timestamp is permitted with no error.
-        kRound          // Round the read timestamp up to the oldest timestamp when it is behind.
+        kNoRoundError = 0,  // Do not round to the oldest timestamp. BadValue error may be returned.
+        kRound,  // Round the read timestamp up to the oldest timestamp when it is behind.
+        kMax     // kMax should alwyas be last and is a counter of the number of enum values.
     };
 
     // Dictates whether to round up prepare and commit timestamp of a prepared transaction.
     // 'kNoRound' - Does not round up prepare and commit timestamp of a prepared transaction.
     // 'kRound' - The prepare timestamp will be rounded up to the oldest timestamp if found to be
     // earlier; and the commit timestamp will be rounded up to the prepare timestamp if found to be
-    // earlier.
-    enum class RoundUpPreparedTimestamps { kNoRound, kRound };
+    // earlier. kMax should alwyas be last and is a counter of the number of enum values.
+    enum class RoundUpPreparedTimestamps { kNoRound = 0, kRound, kMax };
 
-    WiredTigerBeginTxnBlock(
-        WT_SESSION* session,
-        PrepareConflictBehavior prepareConflictBehavior,
-        RoundUpPreparedTimestamps roundUpPreparedTimestamps,
-        RoundUpReadTimestamp roundUpReadTimestamp = RoundUpReadTimestamp::kNoRoundError);
-    WiredTigerBeginTxnBlock(WT_SESSION* session, const char* config);
+    // kMax should alwyas be last and is a counter of the number of enum values.
+    enum class NoReadTimestamp { kFalse = 0, kTrue, kMax };
+
+    WiredTigerBeginTxnBlock(WiredTigerSession* session,
+                            PrepareConflictBehavior prepareConflictBehavior,
+                            bool roundUpPreparedTimestamps,
+                            RoundUpReadTimestamp roundUpReadTimestamp,
+                            RecoveryUnit::UntimestampedWriteAssertionLevel allowUntimestampedWrite);
+    WiredTigerBeginTxnBlock(WiredTigerSession* session, const char* config);
     ~WiredTigerBeginTxnBlock();
 
     /**
@@ -80,7 +81,8 @@ public:
     void done();
 
 private:
-    WT_SESSION* _session;
+    WiredTigerSession* _session;
+    WT_SESSION* _wt_session;
     bool _rollback = false;
 };
 

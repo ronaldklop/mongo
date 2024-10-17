@@ -1,69 +1,70 @@
 """Unit tests for the evergreen_task_timeout script."""
-import itertools
+
 import unittest
-from mock import MagicMock, patch
 
-from buildscripts.validate_commit_message import main, STATUS_OK, STATUS_ERROR, GIT_SHOW_COMMAND
+from git import Commit, Repo
 
-# pylint: disable=missing-docstring,no-self-use
-
-INVALID_MESSAGES = [
-    "",  # You must provide a message
-    "RevertEVG-1",  # revert and ticket must be formatted
-    "revert EVG-1",  # revert must be capitalized
-    "This is not a valid message",  # message must be valid
-    "Fix Lint",  # Fix lint is strict in terms of caps
-]
-
-NS = "buildscripts.validate_commit_message"
-
-
-def ns(relative_name):  # pylint: disable=invalid-name
-    """Return a full name from a name relative to the test module"s name space."""
-    return NS + "." + relative_name
-
-
-def interleave_new_format(older):
-    """Create a new list containing a new and old format copy of each string."""
-    newer = [
-        f"Commit Queue Merge: '{old}' into 'mongodb/mongo:SERVER-45949-validate-message-format'"
-        for old in older
-    ]
-    return list(itertools.chain(*zip(older, newer)))
+from buildscripts.validate_commit_message import is_valid_commit
 
 
 class ValidateCommitMessageTest(unittest.TestCase):
     def test_valid(self):
+        fake_repo = Repo()
         messages = [
-            "Fix lint",
-            "EVG-1",  # Test valid projects with various number lengths
-            "SERVER-20",
-            "WT-300",
-            "SERVER-44338",
-            "Revert EVG-5",
-            "Revert SERVER-60",
-            "Revert WT-700",
-            "Revert 'SERVER-8000",
-            'Revert "SERVER-90000',
-            "Import wiredtiger: 58115abb6fbb3c1cc7bfd087d41a47347bce9a69 from branch mongodb-4.4",
-            "Import tools: 58115abb6fbb3c1cc7bfd087d41a47347bce9a69 from branch mongodb-4.4"
+            Commit(repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message="SERVER-44338"),
+            Commit(repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message='Revert "SERVER-60'),
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="Import wiredtiger: 58115abb6fbb3c1cc7bfd087d41a47347bce9a69 from branch mongodb-4.4",
+            ),
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message='Revert "Import wiredtiger: 58115abb6fbb3c1cc7bfd087d41a47347bce9a69 from branch mongodb-4.4"',
+            ),
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="SERVER-44338 blablablalbabla\nmultiline message\nasdfasdf",
+            ),
         ]
 
-        self.assertTrue(
-            all(main([message]) == STATUS_OK for message in interleave_new_format(messages)))
+        self.assertTrue(all(is_valid_commit(message) for message in messages))
 
-    def test_private(self):
-        self.assertEqual(main(["XYZ-1"]), STATUS_ERROR)
+    def test_invalid(self):
+        fake_repo = Repo()
+        messages = [
+            Commit(
+                repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message="SERVER-"
+            ),  # missing number
+            Commit(
+                repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message="Revert SERVER-60"
+            ),  # missing quote before SERVER
+            Commit(repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message=""),  # empty value
+            Commit(
+                repo=fake_repo, binsha=b"deadbeefdeadbeefdead", message="nonsense"
+            ),  # nonsense value
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="SERVER-123 asdf\nhttps://spruce.mongodb.com",
+            ),  # Contains some banned strings
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="SERVER-123 asdf\nhttps://evergreen.mongodb.com",
+            ),  # Contains some banned strings
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="SERVER-123 asdf\nAnything in this description will be included in the commit message. Replace or delete this text before merging. Add links to testing in the comments of the PR.",
+            ),  # Contains some banned strings
+            Commit(
+                repo=fake_repo,
+                binsha=b"deadbeefdeadbeefdead",
+                message="SERVER-123 asdf\nAnything\n\n in this description will be included in the commit message.\nReplace or delete this text before merging. Add links to testing in the\ncomments of the PR.",
+            ),  # Contains some banned strings with extra newlines
+        ]
 
-    def test_catch_all(self):
-        self.assertTrue(
-            all(
-                main([message]) == STATUS_ERROR
-                for message in interleave_new_format(INVALID_MESSAGES)))
-
-    def test_last_git_commit_success(self):
-        with patch(
-                ns("subprocess.check_output"),
-                return_value=bytearray('SERVER-1111 this is a test', 'utf-8')) as check_output_mock:
-            self.assertEqual(main([]), 0)
-            check_output_mock.assert_called_with(GIT_SHOW_COMMAND)
+        self.assertTrue(all(not is_valid_commit(message) for message in messages))

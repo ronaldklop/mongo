@@ -27,24 +27,41 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
+#include <fmt/format.h>
+#include <iterator>
+#include <list>
 #include <string>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -53,7 +70,6 @@ using std::string;
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
 using DocumentSourceMatchTest = AggregationContextFixture;
 
-constexpr auto kExplain = ExplainOptions::Verbosity::kQueryPlanner;
 
 TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
     auto expCtx = getExpCtx();
@@ -487,9 +503,24 @@ TEST_F(DocumentSourceMatchTest, MultipleMatchStagesShouldCombineIntoOne) {
     container.push_back(match3);
     match1->optimizeAt(container.begin(), &container);
     ASSERT_EQUALS(container.size(), 1U);
-    ASSERT_BSONOBJ_EQ(match1->getQuery(),
-                      fromjson("{'$and': [{'$and': [{a:1}, {b:1}]},"
-                               "{c:1}]}"));
+    ASSERT_BSONOBJ_EQ(match1->getQuery(), fromjson("{'$and': [{a:1}, {b:1}, {c:1}]}"));
+}
+
+TEST_F(DocumentSourceMatchTest, DoesNotPushProjectBeforeSelf) {
+    Pipeline::SourceContainer container;
+    auto match = DocumentSourceMatch::create(BSON("_id" << 1), getExpCtx());
+    auto project =
+        DocumentSourceProject::create(BSON("fullDocument" << true), getExpCtx(), "$project"_sd);
+
+    container.push_back(match);
+    container.push_back(project);
+
+    match->optimizeAt(container.begin(), &container);
+
+    ASSERT_EQUALS(2U, container.size());
+    ASSERT(dynamic_cast<DocumentSourceMatch*>(container.begin()->get()));
+    ASSERT(dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+        std::next(container.begin())->get()));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldPropagatePauses) {
@@ -521,7 +552,7 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     const auto match = DocumentSourceMatch::create(BSON("a" << 1), getExpCtx());
     const auto secondMatch = DocumentSourceMatch::create(BSON("b" << 1), getExpCtx());
 
-    match->joinMatchWith(secondMatch);
+    match->joinMatchWith(secondMatch, "$and"_sd);
 
     const auto mock = DocumentSourceMock::createForTest({Document{{"a", 1}, {"b", 1}},
                                                          Document{{"a", 2}, {"b", 1}},
@@ -542,9 +573,38 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     ASSERT_TRUE(match->getNext().isEOF());
 }
 
+TEST_F(DocumentSourceMatchTest, RepeatedJoinWithShouldNotNestAnds) {
+    auto match1 = DocumentSourceMatch::create(fromjson("{}"), getExpCtx());
+    Pipeline::SourceContainer container{
+        match1,
+        DocumentSourceMatch::create(fromjson("{}"), getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{a: 1}"), getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{b: 1}"), getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{$and: [{c: 1}, {d: 1}]}"), getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{$or: [{e: 1}, {f: 1}]}"), getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{}"), getExpCtx()),
+        DocumentSourceMatch::create(
+            fromjson("{$and: [{g: 1}, {h: 1}], $or: [{i: 1}, {j: 1}], $and: [{k: 1}, {l: 1}]}"),
+            getExpCtx()),
+        DocumentSourceMatch::create(fromjson("{$and: [{m: 1}, {$and: [{n: 1}, {o: 1}]}]}"),
+                                    getExpCtx())};
+
+    // Call optimizeAt() repeatedly to trigger joinWith() behavior
+    for (size_t i = 0; i < 8; i++) {
+        match1->optimizeAt(container.begin(), &container);
+    }
+
+    ASSERT_EQUALS(container.size(), 1U);
+    ASSERT_BSONOBJ_EQ(
+        match1->getQuery(),
+        fromjson("{'$and': [{}, {}, {a: 1}, {b: 1}, {c: 1}, {d: 1}, {$or: [{e: 1}, {f: 1}]}, {}, "
+                 "{g: 1}, {h: 1}, {$or: [{i: 1}, {j: 1}]}, {k: 1}, {l: 1}, {m: 1}, {$and: [{n: 1}, "
+                 "{o: 1}]}]}"));
+}
+
 DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
                    ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
-                   "Invariant failure.*expression::isPathPrefixOf") {
+                   "Tripwire assertion.*Expected 'a' to be a prefix of 'b.c', but it is not.") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a.b" << 1 << "b.c" << 1);
     const auto matchExpression =
@@ -552,25 +612,23 @@ DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
-                   ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
-                   R"#(Invariant failure.*node->matchType\(\))#") {
+DEATH_TEST_REGEX_F(
+    DocumentSourceMatchTest,
+    ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
+    "Tripwire assertion.*The given match expression has a node that represents a partial path.") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
     const auto matchExpression =
         unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx));
-    BSONObjBuilder out;
-    matchExpression->serialize(&out);
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-// Due to the order of traversal of the MatchExpression tree, this test may actually trigger the
-// invariant failure that the path being descended is not a prefix of the path of the
-// MatchExpression node corresponding to the '$gt' expression, which will report an empty path.
-DEATH_TEST_F(DocumentSourceMatchTest,
-             ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithValue,
-             "Invariant failure") {
+DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
+                   ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithValue,
+                   "Tripwire assertion.") {
     const auto expCtx = getExpCtx();
+    // We will either hit the assertion that $elemMatch is not allowed to be descended on or the
+    // assertion that the path of the '$gt' expression (empty path) is not prefixed by 'a'
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("$gt" << 0)));
     const auto matchExpression =
         unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx));
@@ -630,7 +688,7 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateJSONSchemaPredicate) {
         fromjson("{$jsonSchema: {properties: {a: {type: 'number'}}}}"), getExpCtx());
 
     const auto mock = DocumentSourceMock::createForTest(
-        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{nullptr, 1}}}}}},
+        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{{}, 1}}}}}},
         getExpCtx());
 
     match->setSource(mock.get());
@@ -654,8 +712,71 @@ TEST_F(DocumentSourceMatchTest, ShouldShowOptimizationsInExplainOutputWhenOptimi
     auto expectedMatch = fromjson("{$match: {a:{$eq: 1}}}");
 
     ASSERT_VALUE_EQ(
-        Value((static_cast<DocumentSourceMatch*>(optimizedMatch.get()))->serialize(kExplain)),
+        Value((static_cast<DocumentSourceMatch*>(optimizedMatch.get()))
+                  ->serialize(SerializationOptions{.verbosity = boost::make_optional(
+                                                       ExplainOptions::Verbosity::kQueryPlanner)})),
         Value(expectedMatch));
+}
+
+TEST_F(DocumentSourceMatchTest, RedactionWithAnd) {
+    auto spec = fromjson(R"({
+        $match: {
+            $and: [
+                {
+                    "a.c": "abc"
+                },
+                {
+                    "b": {
+                        $gt: 10
+                    }
+                }
+            ]
+        }})");
+    auto docSource = DocumentSourceMatch::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$match": {
+                "$and": [
+                    {
+                        "HASH<a>.HASH<c>": {
+                            "$eq": "?string"
+                        }
+                    },
+                    {
+                        "HASH<b>": {
+                            "$gt": "?number"
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceMatchTest, RedactionWithExprPipeline) {
+    auto spec = fromjson(R"({
+        $match: {
+            $expr: {
+                $eq: [
+                    '$foo',
+                    '$bar'
+                ]
+            }
+        }
+    })");
+    auto docSource = DocumentSourceMatch::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$match": {
+                "$expr": {
+                    "$eq": [
+                        "$HASH<foo>",
+                        "$HASH<bar>"
+                    ]
+                }
+            }
+        })",
+        redact(*docSource));
 }
 
 }  // namespace

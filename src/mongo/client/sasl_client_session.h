@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -70,6 +71,7 @@ public:
         parameterUser,
         parameterPassword,
         parameterAWSSessionToken,
+        parameterOIDCAccessToken,
         numParameters  // Must be last
     };
 

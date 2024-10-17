@@ -29,19 +29,31 @@
 
 #pragma once
 
-#include "boost/optional.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 
 namespace mongo {
 
-class IndexAccessMethod;
 class WorkingSetMember;
 
 typedef size_t WorkingSetID;
@@ -77,7 +89,7 @@ struct IndexKeyDatum {
 
             while (keyPatternIt.more()) {
                 BSONElement keyPatternElt = keyPatternIt.next();
-                verify(keyDataIt.more());
+                MONGO_verify(keyDataIt.more());
                 BSONElement keyDataElt = keyDataIt.next();
 
                 if (field == keyPatternElt.fieldName())
@@ -140,7 +152,9 @@ public:
     // Member state and state transitions
     //
 
-    MemberState getState() const;
+    MONGO_COMPILER_ALWAYS_INLINE MemberState getState() const {
+        return _state;
+    }
 
     void transitionToRecordIdAndObj();
 
@@ -154,9 +168,17 @@ public:
     Snapshotted<Document> doc;
     std::vector<IndexKeyDatum> keyData;
 
-    bool hasRecordId() const;
-    bool hasObj() const;
-    bool hasOwnedObj() const;
+    MONGO_COMPILER_ALWAYS_INLINE bool hasRecordId() const {
+        return _state == RID_AND_IDX || _state == RID_AND_OBJ;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE bool hasObj() const {
+        return _state == OWNED_OBJ || _state == RID_AND_OBJ;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE bool hasOwnedObj() const {
+        return _state == OWNED_OBJ || _state == RID_AND_OBJ;
+    }
 
     /**
      * Ensures that 'obj' of a WSM in the RID_AND_OBJ state is owned BSON. It is a no-op if the WSM
@@ -187,7 +209,7 @@ public:
      * Returns a const reference to an object housing the metadata fields associated with this
      * WorkingSetMember.
      */
-    const DocumentMetadataFields& metadata() const {
+    MONGO_COMPILER_ALWAYS_INLINE const DocumentMetadataFields& metadata() const {
         return _metadata;
     }
 
@@ -289,6 +311,7 @@ public:
     }
 
     SortableWorkingSetMember getOwned() const;
+    void makeOwned();
 
 private:
     std::shared_ptr<WorkingSetMember> _holder;
@@ -320,13 +343,13 @@ public:
      * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
      * release it.
      */
-    WorkingSetMember* get(WorkingSetID i) {
+    MONGO_COMPILER_ALWAYS_INLINE WorkingSetMember* get(WorkingSetID i) {
         dassert(i < _data.size());              // ID has been allocated.
         dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
         return &_data[i].member;
     }
 
-    const WorkingSetMember* get(WorkingSetID i) const {
+    MONGO_COMPILER_ALWAYS_INLINE const WorkingSetMember* get(WorkingSetID i) const {
         dassert(i < _data.size());              // ID has been allocated.
         dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
         return &_data[i].member;
@@ -342,7 +365,16 @@ public:
     /**
      * Deallocate the i-th query result and release its resources.
      */
-    void free(WorkingSetID i);
+    inline void free(WorkingSetID i) {
+        MemberHolder& holder = _data[i];
+        MONGO_verify(i < _data.size());            // ID has been allocated.
+        MONGO_verify(holder.nextFreeOrSelf == i);  // ID currently in use.
+
+        // Free resources and push this WSM to the head of the freelist.
+        holder.member.clear();
+        holder.nextFreeOrSelf = _freeList;
+        _freeList = i;
+    }
 
     /**
      * Removes and deallocates all members of this working set.
@@ -358,16 +390,16 @@ public:
     void transitionToOwnedObj(WorkingSetID id);
 
     /**
-     * Registers an IndexAccessMethod pointer with the WorkingSet, and returns a handle that can be
-     * used to recover the IndexAccessMethod.
+     * Registers the index ident with the WorkingSet, and returns a handle that can be used to
+     * recover the index ident.
      */
-    WorkingSetRegisteredIndexId registerIndexAccessMethod(const IndexAccessMethod* indexAccess);
+    WorkingSetRegisteredIndexId registerIndexIdent(const std::string& ident);
 
     /**
-     * Returns the IndexAccessMethod for an index that has previously been registered with the
-     * WorkingSet using 'registerIndexAccessMethod()'.
+     * Returns the index ident for an index that has previously been registered with the WorkingSet
+     * using 'registerIndexIdent()'.
      */
-    const IndexAccessMethod* retrieveIndexAccessMethod(WorkingSetRegisteredIndexId indexId) const {
+    StringData retrieveIndexIdent(WorkingSetRegisteredIndexId indexId) const {
         return _registeredIndexes[indexId];
     }
 
@@ -406,9 +438,9 @@ private:
     // If _freeList == INVALID_ID, the free list is empty and all elements in _data are in use.
     WorkingSetID _freeList;
 
-    // Holds IndexAccessMethods that have been registered with 'registerIndexAccessMethod()`. The
+    // Holds index idents that have been registered with 'registerIndexIdent()`. The
     // WorkingSetRegisteredIndexId is the offset into the vector.
-    std::vector<const IndexAccessMethod*> _registeredIndexes;
+    std::vector<std::string> _registeredIndexes;
 };
 
 }  // namespace mongo

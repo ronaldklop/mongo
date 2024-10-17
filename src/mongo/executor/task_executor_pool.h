@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <vector>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
@@ -72,6 +75,9 @@ public:
      */
     void shutdownAndJoin();
 
+    void shutdown_forTest();
+    void join_forTest();
+
     /**
      * Adds 'executors' and 'fixedExecutor' to the pool. May be called at most once to initialize an
      * empty pool.
@@ -109,6 +115,13 @@ public:
      * will be from slightly different points in time.
      */
     void appendConnectionStats(ConnectionPoolStats* stats) const;
+
+    /**
+     * Appends statistics for all the executors, in particular their underlying network interfaces,
+     * in the pool. The information is collected in a non-blocking fashion and is just an
+     * approximate.
+     */
+    void appendNetworkInterfaceStats(BSONObjBuilder&) const;
 
 private:
     AtomicWord<unsigned> _counter;

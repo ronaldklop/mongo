@@ -29,16 +29,29 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
 class RemoteCommandTargeterMock final : public RemoteCommandTargeter {
 public:
     RemoteCommandTargeterMock();
-    virtual ~RemoteCommandTargeterMock();
+    ~RemoteCommandTargeterMock() override;
 
     /**
      * Shortcut for unit-tests.
@@ -82,7 +95,7 @@ public:
     /**
      * Sets the return value for the next call to connectionString.
      */
-    void setConnectionStringReturnValue(const ConnectionString returnValue);
+    void setConnectionStringReturnValue(ConnectionString returnValue);
 
     /**
      * Sets the return value for the next call to findHost.
@@ -102,7 +115,7 @@ private:
     StatusWith<std::vector<HostAndPort>> _findHostReturnValue;
 
     // Protects _hostsMarkedDown.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("RemoteCommandTargeterMock::_mutex");
+    mutable stdx::mutex _mutex;
 
     // HostAndPorts marked not primary or unreachable. Meant to verify a code path updates the
     // RemoteCommandTargeterMock.

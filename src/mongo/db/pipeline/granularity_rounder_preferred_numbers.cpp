@@ -27,9 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/granularity_rounder.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -306,6 +319,13 @@ Value GranularityRounderPreferredNumbers::roundDown(Value value) {
             multiplier /= 10.0;
         }
 
+        // It is possible to get a number so small that the resulting multiplier would have to be
+        // smaller than the precision of a double, in which case the multiplier would equal 0. In
+        // this case, we can round down to 0.0.
+        if (multiplier == 0) {
+            return Value(0.0);
+        }
+
         double previousMax;
         while (number > (_baseSeries.back() * multiplier)) {
             previousMax = _baseSeries.back() * multiplier;
@@ -341,7 +361,7 @@ string GranularityRounderPreferredNumbers::getName() {
     return _name;
 }
 
-const vector<double> GranularityRounderPreferredNumbers::getSeries() const {
+vector<double> GranularityRounderPreferredNumbers::getSeries() const {
     return _baseSeries;
 }
 }  //  namespace mongo

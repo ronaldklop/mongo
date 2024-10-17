@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#ifndef MONGO_UTIL_DNS_QUERY_PLATFORM_INCLUDE_WHITELIST
+#ifndef MONGO_ALLOW_INCLUDE_UTIL_DNS_QUERY_PLATFORM
 #error Do not include the DNS Query platform implementation headers.  Please use "mongo/util/dns_query.h" instead.
 #endif
 
@@ -39,20 +39,23 @@
 #include <resolv.h>
 // clang-format on
 
-#include <stdio.h>
+#include <cstdio>
 
-#include <iostream>
-#include <cassert>
-#include <sstream>
-#include <string>
-#include <cstdint>
-#include <vector>
 #include <array>
-#include <stdexcept>
-#include <memory>
+#include <cassert>
+#include <cstdint>
 #include <exception>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include <boost/noncopyable.hpp>
+
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace dns {
@@ -75,6 +78,7 @@ enum class DNSQueryType {
     kSRV = ns_t_srv,
     kTXT = ns_t_txt,
     kAddress = ns_t_a,
+    kCNAME = ns_t_cname,
 };
 
 /**
@@ -172,6 +176,28 @@ public:
 
         // return by copy is equivalent to a `shrink_to_fit` and `move`.
         return {name, port};
+    }
+
+    /**
+     * View this record as a DNS CName record
+     */
+    std::string cnameEntry() const {
+        char buf[NS_MAXDNAME];
+        int length = dn_expand(
+            _answerStart, _answerEnd, ns_rr_rdata(this->_resource_record), &buf[0], sizeof(buf));
+        if (length == -1) {
+            uasserted(ErrorCodes::DNSProtocolError, "DNS CNAME record could not be decompressed");
+        }
+
+        return std::string(&buf[0]);
+    }
+
+    DNSQueryType getType() const {
+        return static_cast<DNSQueryType>(this->_resource_record.type);
+    }
+
+    Seconds getTtl() const {
+        return Seconds(ns_rr_ttl(this->_resource_record));
     }
 
 private:
@@ -340,12 +366,19 @@ public:
     }
 
     DNSQueryState() : _state() {
+        // res_ninit may modify the global conf object creating a data race when multiple instances
+        // of DNSQueryState are created concurrently.
+        stdx::lock_guard<stdx::mutex> lk(_staticMutex);
         res_ninit(&_state);
     }
 
 private:
     struct __res_state _state;
+    static stdx::mutex _staticMutex;
 };
+
+stdx::mutex DNSQueryState::_staticMutex;
+
 }  // namespace
 }  // namespace dns
 }  // namespace mongo

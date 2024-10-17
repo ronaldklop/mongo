@@ -26,13 +26,30 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
+#include <absl/container/node_hash_map.h>
+#include <boost/iterator/transform_iterator.hpp>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/active_index_builds.h"
 #include "mongo/db/catalog/index_builds_manager.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
-#include <boost/iterator/transform_iterator.hpp>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -40,8 +57,12 @@ ActiveIndexBuilds::~ActiveIndexBuilds() {
     invariant(_allIndexBuilds.empty());
 }
 
-void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> lk(_mutex);
+void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown() {
+    waitForAllIndexBuildsToStop(OperationContext::notInterruptible());
+}
+
+void ActiveIndexBuilds::waitForAllIndexBuildsToStop(Interruptible* interruptible) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     // All index builds should have been signaled to stop via the ServiceContext.
 
@@ -49,7 +70,9 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
         return;
     }
 
-    auto indexBuildToUUID = [](const auto& indexBuild) { return indexBuild.first; };
+    auto indexBuildToUUID = [](const auto& indexBuild) {
+        return indexBuild.first;
+    };
     auto begin = boost::make_transform_iterator(_allIndexBuilds.begin(), indexBuildToUUID);
     auto end = boost::make_transform_iterator(_allIndexBuilds.end(), indexBuildToUUID);
     LOGV2(4725201,
@@ -57,42 +80,48 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
           "indexBuilds"_attr = logv2::seqLog(begin, end));
 
     // Wait for all the index builds to stop.
-    auto pred = [this]() { return _allIndexBuilds.empty(); };
-    _indexBuildsCondVar.wait(lk, pred);
+    auto pred = [this]() {
+        return _allIndexBuilds.empty();
+    };
+    interruptible->waitForConditionOrInterrupt(_indexBuildsCondVar, lk, pred);
 }
 
 void ActiveIndexBuilds::assertNoIndexBuildInProgress() const {
-    stdx::unique_lock<Latch> lk(_mutex);
-    uassert(ErrorCodes::BackgroundOperationInProgressForDatabase,
-            str::stream() << "cannot perform operation: there are currently "
-                          << _allIndexBuilds.size() << " index builds running.",
-            _allIndexBuilds.size() == 0);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (!_allIndexBuilds.empty()) {
+        auto firstIndexBuild = _allIndexBuilds.cbegin()->second;
+        uasserted(ErrorCodes::BackgroundOperationInProgressForDatabase,
+                  fmt::format("cannot perform operation: there are currently {} index builds "
+                              "running. Found index build: {}",
+                              _allIndexBuilds.size(),
+                              firstIndexBuild->buildUUID.toString()));
+    }
 }
 
-void ActiveIndexBuilds::waitUntilAnIndexBuildFinishes(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> lk(_mutex);
+void ActiveIndexBuilds::waitUntilAnIndexBuildFinishes(OperationContext* opCtx, Date_t deadline) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_allIndexBuilds.empty()) {
         return;
     }
     const auto generation = _indexBuildsCompletedGen;
-    opCtx->waitForConditionOrInterrupt(
-        _indexBuildsCondVar, lk, [&] { return _indexBuildsCompletedGen != generation; });
+    opCtx->waitForConditionOrInterruptUntil(
+        _indexBuildsCondVar, lk, deadline, [&] { return _indexBuildsCompletedGen != generation; });
 }
 
 void ActiveIndexBuilds::sleepIndexBuilds_forTestOnly(bool sleep) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     _sleepForTest = sleep;
 }
 
 void ActiveIndexBuilds::verifyNoIndexBuilds_forTestOnly() const {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     invariant(_allIndexBuilds.empty());
 }
 
 void ActiveIndexBuilds::awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                                  const UUID& collectionUUID,
                                                                  IndexBuildProtocol protocol) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto noIndexBuildsPred = [&, this]() {
         auto indexBuilds = _filterIndexBuilds_inlock(lk, [&](const auto& replState) {
             return collectionUUID == replState.collectionUUID && protocol == replState.protocol;
@@ -104,7 +133,7 @@ void ActiveIndexBuilds::awaitNoIndexBuildInProgressForCollection(OperationContex
 
 void ActiveIndexBuilds::awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                                  const UUID& collectionUUID) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto pred = [&, this]() {
         auto indexBuilds = _filterIndexBuilds_inlock(
             lk, [&](const auto& replState) { return collectionUUID == replState.collectionUUID; });
@@ -115,7 +144,7 @@ void ActiveIndexBuilds::awaitNoIndexBuildInProgressForCollection(OperationContex
 
 StatusWith<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::getIndexBuild(
     const UUID& buildUUID) const {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto it = _allIndexBuilds.find(buildUUID);
     if (it == _allIndexBuilds.end()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "No index build with UUID: " << buildUUID};
@@ -123,11 +152,16 @@ StatusWith<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::getIndexBuil
     return it->second;
 }
 
+std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::getAllIndexBuilds() const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    return _filterIndexBuilds_inlock(lk, [](const auto& replState) { return true; });
+}
+
 void ActiveIndexBuilds::unregisterIndexBuild(
     IndexBuildsManager* indexBuildsManager,
     std::shared_ptr<ReplIndexBuildState> replIndexBuildState) {
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     invariant(_allIndexBuilds.erase(replIndexBuildState->buildUUID));
 
@@ -137,7 +171,7 @@ void ActiveIndexBuilds::unregisterIndexBuild(
                 "buildUUID"_attr = replIndexBuildState->buildUUID,
                 "collectionUUID"_attr = replIndexBuildState->collectionUUID);
 
-    indexBuildsManager->unregisterIndexBuild(replIndexBuildState->buildUUID);
+    indexBuildsManager->tearDownAndUnregisterIndexBuild(replIndexBuildState->buildUUID);
     _indexBuildsCompletedGen++;
     _indexBuildsCondVar.notify_all();
 }
@@ -145,7 +179,7 @@ void ActiveIndexBuilds::unregisterIndexBuild(
 std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::filterIndexBuilds(
     IndexBuildFilterFn indexBuildFilter) const {
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     return _filterIndexBuilds_inlock(lk, indexBuildFilter);
 }
 
@@ -153,7 +187,7 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     WithLock lk, IndexBuildFilterFn indexBuildFilter) const {
 
     std::vector<std::shared_ptr<ReplIndexBuildState>> indexBuilds;
-    for (auto pair : _allIndexBuilds) {
+    for (const auto& pair : _allIndexBuilds) {
         auto replState = pair.second;
         if (!indexBuildFilter(*replState)) {
             continue;
@@ -163,9 +197,12 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     return indexBuilds;
 }
 
-void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx, StringData db) {
-    stdx::unique_lock<Latch> lk(_mutex);
-    auto indexBuildFilter = [db](const auto& replState) { return db == replState.dbName; };
+void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx,
+                                               const DatabaseName& dbName) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    auto indexBuildFilter = [dbName](const auto& replState) {
+        return dbName == replState.dbName;
+    };
     auto pred = [&, this]() {
         auto dbIndexBuilds = _filterIndexBuilds_inlock(lk, indexBuildFilter);
         return dbIndexBuilds.empty();
@@ -176,14 +213,14 @@ void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx, StringDa
 Status ActiveIndexBuilds::registerIndexBuild(
     std::shared_ptr<ReplIndexBuildState> replIndexBuildState) {
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     // Check whether any indexes are already being built with the same index name(s). (Duplicate
     // specs will be discovered by the index builder.)
     auto pred = [&](const auto& replState) {
         return replIndexBuildState->collectionUUID == replState.collectionUUID;
     };
     auto collIndexBuilds = _filterIndexBuilds_inlock(lk, pred);
-    for (auto existingIndexBuild : collIndexBuilds) {
+    for (const auto& existingIndexBuild : collIndexBuilds) {
         for (const auto& name : replIndexBuildState->indexNames) {
             if (existingIndexBuild->indexNames.end() !=
                 std::find(existingIndexBuild->indexNames.begin(),
@@ -201,8 +238,22 @@ Status ActiveIndexBuilds::registerIndexBuild(
     return Status::OK();
 }
 
+size_t ActiveIndexBuilds::getActiveIndexBuildsCount() const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    return _allIndexBuilds.size();
+}
+
+void ActiveIndexBuilds::appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    auto it = _allIndexBuilds.find(buildUUID);
+    if (it == _allIndexBuilds.end()) {
+        return;
+    }
+    it->second->appendBuildInfo(builder);
+}
+
 void ActiveIndexBuilds::sleepIfNecessary_forTestOnly() const {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     while (_sleepForTest) {
         lk.unlock();
         sleepmillis(100);

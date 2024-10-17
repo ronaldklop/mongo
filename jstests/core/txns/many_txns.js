@@ -1,8 +1,11 @@
 // SERVER-38015 Test having many interactive transactions to ensure we don't hold on to too
 // many resources (like "write tickets") and don't prevent other operations from succeeding.
-// @tags: [uses_transactions]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
 const dbName = "test";
 const collName = "many_txns";
@@ -74,7 +77,16 @@ for (let txnNr = 0; txnNr < numTxns; ++txnNr) {
         continue;
     }
     assert.commandWorked(commitRes, "couldn't commit transaction " + txnNr);
-    assert.commandFailedWithCode(insertRes, ErrorCodes.MaxTimeMSExpired, tojson({insertCmd}));
+    // This assertion relies on the fact a previous transaction with the same insertion
+    // has started and is still pending.
+    // The test assumes inserting the same record will invariably return `MaxTimeMSExpired`
+    // but errors might be raised.
+    // `NetworkInterfaceExceededTimeLimit` is raised in the case the process runs out of
+    // resources to either create or repurpose a network connection for this operation.
+    assert.commandFailedWithCode(
+        insertRes,
+        [ErrorCodes.MaxTimeMSExpired, ErrorCodes.NetworkInterfaceExceededTimeLimit],
+        tojson({insertCmd}));
 
     // Read with default read concern sees the committed transaction.
     assert.eq(doc(1), coll.findOne(doc(1)));
@@ -93,4 +105,3 @@ const getParamRes = db.adminCommand({getParameter: 1, transactionLifetimeLimitSe
 if (getParamRes.ok && elapsedTime < getParamRes.transactionLifetimeLimitSeconds)
     assert.eq(
         numAborted, 0, "should not get aborts when transactionLifetimeLimitSeconds not exceeded");
-}());

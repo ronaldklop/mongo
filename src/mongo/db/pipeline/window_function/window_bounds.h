@@ -68,33 +68,30 @@ struct WindowBounds {
     struct Unbounded {};
     struct Current {};
     template <class T>
-    using Bound = stdx::variant<Unbounded, Current, T>;
+    using Bound = std::variant<Unbounded, Current, T>;
 
     struct DocumentBased {
         Bound<int> lower;
         Bound<int> upper;
     };
     struct RangeBased {
-        // Range-based bounds can be any numeric type: int, double, Decimal, etc.
         Bound<Value> lower;
         Bound<Value> upper;
-    };
-    struct TimeBased {
-        // Although time-based bounds look similar to range-based, they are more restricted:
-        // the numbers must be integers, like $dateAdd / $dateDiff.
-        Bound<int> lower;
-        Bound<int> upper;
-        TimeUnit unit;
+        boost::optional<TimeUnit> unit;
     };
 
-    stdx::variant<DocumentBased, RangeBased, TimeBased> bounds;
+    std::variant<DocumentBased, RangeBased> bounds;
 
     static WindowBounds defaultBounds() {
         return WindowBounds{DocumentBased{Unbounded{}, Unbounded{}}};
     }
 
+    static WindowBounds documentBounds(int lower, int upper) {
+        return WindowBounds{DocumentBased{lower, upper}};
+    }
+
     /**
-     * Check if these bounds are unbounded on both ends.
+     * Checks whether these bounds are unbounded on both ends.
      * This case is special because it means you don't need a sortBy to interpret the bounds:
      * the bounds include every document (in the current partition).
      */
@@ -120,11 +117,11 @@ struct WindowBounds {
      * doesn't make sense with time-based bounds. The 'sortBy' argument lets us check these
      * constraints during parsing.
      */
-    static WindowBounds parse(BSONObj args,
+    static WindowBounds parse(BSONElement args,
                               const boost::optional<SortPattern>& sortBy,
                               ExpressionContext* expCtx);
 
-    void serialize(MutableDocument& args) const;
+    void serialize(MutableDocument& args, const SerializationOptions& opts) const;
 };
 
 }  // namespace mongo

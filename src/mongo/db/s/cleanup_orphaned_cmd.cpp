@@ -27,31 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
-#include <boost/optional.hpp>
 #include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/range_arithmetic.h"
-#include "mongo/db/s/chunk_move_write_concern_options.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -77,23 +97,20 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
         if (!autoColl.getCollection()) {
             LOGV2(4416000,
                   "cleanupOrphaned skipping waiting for orphaned data cleanup because "
-                  "{namespace} does not exist",
-                  "cleanupOrphaned skipping waiting for orphaned data cleanup because "
                   "collection does not exist",
-                  "namespace"_attr = ns.ns());
+                  logAttrs(ns));
             return CleanupResult::kDone;
         }
         collectionUuid.emplace(autoColl.getCollection()->uuid());
 
-        auto* const csr = CollectionShardingRuntime::get(opCtx, ns);
-        const auto optCollDescr = csr->getCurrentMetadataIfKnown();
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, ns);
+        auto optCollDescr = scopedCsr->getCurrentMetadataIfKnown();
         if (!optCollDescr || !optCollDescr->isSharded()) {
             LOGV2(4416001,
                   "cleanupOrphaned skipping waiting for orphaned data cleanup because "
-                  "{namespace} is not sharded",
-                  "cleanupOrphaned skipping waiting for orphaned data cleanup because "
                   "collection is not sharded",
-                  "namespace"_attr = ns.ns());
+                  logAttrs(ns));
             return CleanupResult::kDone;
         }
         range.emplace(optCollDescr->getMinKey(), optCollDescr->getMaxKey());
@@ -121,7 +138,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
     // waitForClean will return though there are still tasks in config.rangeDeletions, so we
     // sleep for a short time and then try waitForClean again.
     while (auto numRemainingDeletionTasks =
-               migrationutil::checkForConflictingDeletions(opCtx, *range, *collectionUuid)) {
+               rangedeletionutil::checkForConflictingDeletions(opCtx, *range, *collectionUuid)) {
         uassert(ErrorCodes::ResumableRangeDeleterDisabled,
                 "Failing cleanupOrphaned because the disableResumableRangeDeleter server parameter "
                 "is set to true and this shard contains range deletion tasks for the collection.",
@@ -129,11 +146,12 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
 
         LOGV2(4416003,
               "cleanupOrphaned going to wait for range deletion tasks to complete",
-              "namespace"_attr = ns.ns(),
+              logAttrs(ns),
               "collectionUUID"_attr = *collectionUuid,
               "numRemainingDeletionTasks"_attr = numRemainingDeletionTasks);
 
-        auto status = CollectionShardingRuntime::waitForClean(opCtx, ns, *collectionUuid, *range);
+        auto status = CollectionShardingRuntime::waitForClean(
+            opCtx, ns, *collectionUuid, *range, Date_t::max());
 
         if (!status.isOK()) {
             *errMsg = status.reason();
@@ -167,11 +185,13 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::cleanupOrphaned)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::cleanupOrphaned)) {
             return Status(ErrorCodes::Unauthorized, "Not authorized for cleanupOrphaned command.");
         }
         return Status::OK();
@@ -186,7 +206,7 @@ public:
     static BSONField<BSONObj> startingFromKeyField;
 
     bool errmsgRun(OperationContext* opCtx,
-                   std::string const& db,
+                   const DatabaseName& dbName,
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
@@ -195,9 +215,10 @@ public:
             return false;
         }
 
-        const NamespaceString nss(ns);
+        const NamespaceString nss =
+            NamespaceStringUtil::deserialize(boost::none, ns, SerializationContext::stateDefault());
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid namespace: " << nss.ns(),
+                str::stream() << "Invalid namespace: " << nss.toStringForErrorMsg(),
                 nss.isValid());
 
         BSONObj startingFromKey;
@@ -213,7 +234,8 @@ public:
             return false;
         }
 
-        onShardVersionMismatch(opCtx, nss, boost::none);
+        FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+            opCtx, nss, boost::none);
 
         CleanupResult cleanupResult = cleanupOrphanedData(opCtx, nss, startingFromKey, &errmsg);
 
@@ -224,8 +246,8 @@ public:
 
         return true;
     }
-
-} cleanupOrphanedCmd;
+};
+MONGO_REGISTER_COMMAND(CleanupOrphanedCommand).forShard();
 
 BSONField<std::string> CleanupOrphanedCommand::nsField("cleanupOrphaned");
 BSONField<BSONObj> CleanupOrphanedCommand::startingFromKeyField("startingFromKey");

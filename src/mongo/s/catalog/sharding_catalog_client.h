@@ -29,39 +29,62 @@
 
 #pragma once
 
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
-#include <set>
+#include <boost/optional/optional.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_index_catalog.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/catalog/type_namespace_placement_gen.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/request_types/placement_history_commands_gen.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class BatchedCommandRequest;
-class BatchedCommandResponse;
 struct BSONArray;
 class BSONArrayBuilder;
 class BSONObj;
 class BSONObjBuilder;
 class ChunkType;
-struct ChunkVersion;
+
 class CollectionType;
 class ConnectionString;
+
 class DatabaseType;
 class LogicalTime;
-class NamespaceString;
 class OperationContext;
-class ShardingCatalogManager;
 class ShardKeyPattern;
-class Status;
-template <typename T>
-class StatusWith;
 class TagsType;
+
 class VersionType;
 
 namespace executor {
@@ -90,7 +113,20 @@ public:
     // Constant to use for configuration data local writes
     static const WriteConcernOptions kLocalWriteConcern;
 
+    // Identifier for the "initialization metadata" documents of config.placementHistory
+    static const NamespaceString kConfigPlacementHistoryInitializationMarker;
+
+    // Identifier of the config.shardRemovalLog document about the latest removeShard operation
+    // committed on the cluster.
+    static constexpr auto kLatestShardRemovalLogId = "latestShardRemovalLog"_sd;
+
     virtual ~ShardingCatalogClient() = default;
+
+    virtual std::vector<BSONObj> runCatalogAggregation(
+        OperationContext* opCtx,
+        AggregateCommandRequest& aggRequest,
+        const repl::ReadConcernArgs& readConcern,
+        const Milliseconds& maxTimeout = Milliseconds(defaultConfigCommandTimeoutMS.load())) = 0;
 
     /**
      * Retrieves the metadata for a given database, if it exists.
@@ -103,7 +139,7 @@ public:
      *  - NamespaceNotFound - database does not exist
      */
     virtual DatabaseType getDatabase(OperationContext* opCtx,
-                                     StringData db,
+                                     const DatabaseName& db,
                                      repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
@@ -129,14 +165,34 @@ public:
         const NamespaceString& nss,
         repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
+    virtual CollectionType getCollection(
+        OperationContext* opCtx,
+        const UUID& uuid,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
+
+    /**
+     * Retrieves all collections under a specified database (or in the system) which are sharded. If
+     * the dbName parameter is empty, returns all sharded collections.
+     *
+     * @param sort Fields to use for sorting the results. If empty, no sorting is performed.
+     */
+    virtual std::vector<CollectionType> getShardedCollections(
+        OperationContext* opCtx,
+        const DatabaseName& db,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern,
+        const BSONObj& sort = BSONObj()) = 0;
+
     /**
      * Retrieves all collections under a specified database (or in the system). If the dbName
      * parameter is empty, returns all collections.
+     *
+     * @param sort Fields to use for sorting the results. If empty, no sorting is performed.
      */
     virtual std::vector<CollectionType> getCollections(
         OperationContext* opCtx,
-        StringData db,
-        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
+        const DatabaseName& db,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern,
+        const BSONObj& sort = BSONObj()) = 0;
 
     /**
      * Returns the set of collections for the specified database, which have been marked as sharded.
@@ -145,16 +201,59 @@ public:
      *
      * Throws exception on errors.
      */
-    virtual std::vector<NamespaceString> getAllShardedCollectionsForDb(
-        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) = 0;
+    virtual std::vector<NamespaceString> getShardedCollectionNamespacesForDb(
+        OperationContext* opCtx,
+        const DatabaseName& dbName,
+        repl::ReadConcernLevel readConcern,
+        const BSONObj& sort = BSONObj()) = 0;
+
+    /**
+     * Returns the set of collections tracked for the specified database, regardless of being
+     * sharded or not. Goes directly to the config server's metadata, without checking the local
+     * cache so it should not be used in frequently called code paths.
+     *
+     * Throws exception on errors.
+     */
+    virtual std::vector<NamespaceString> getCollectionNamespacesForDb(
+        OperationContext* opCtx,
+        const DatabaseName& dbName,
+        repl::ReadConcernLevel readConcern,
+        const BSONObj& sort = BSONObj()) = 0;
+
+    /**
+     * Returns the set of collections for the specified database, which have been marked as
+     * unsplittable. Goes directly to the config server's metadata, without checking the local cache
+     * so it should not be used in frequently called code paths.
+     *
+     * Throws exception on errors.
+     */
+    virtual std::vector<NamespaceString> getUnsplittableCollectionNamespacesForDb(
+        OperationContext* opCtx,
+        const DatabaseName& dbName,
+        repl::ReadConcernLevel readConcern,
+        const BSONObj& sort = BSONObj()) = 0;
+
+    /**
+     * Returns the set of collections for the specified database, which have been marked as
+     * unsplittable excluding those whose data shard is in the list of shards to ignore. Goes
+     * directly to the config server's metadata, without checking the local cache so it should not
+     * be used in frequently called code paths.
+     *
+     * Throws exception on errors.
+     */
+    virtual std::vector<NamespaceString> getUnsplittableCollectionNamespacesForDbOutsideOfShards(
+        OperationContext* opCtx,
+        const DatabaseName& dbName,
+        const std::vector<ShardId>& excludedShards,
+        repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves all databases for a shard.
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
-                                                                      const ShardId& shardId) = 0;
+    virtual StatusWith<std::vector<DatabaseName>> getDatabasesForShard(OperationContext* opCtx,
+                                                                       const ShardId& shardId) = 0;
 
     /**
      * Gets the requested number of chunks (of type ChunkType) that satisfy a query.
@@ -165,7 +264,10 @@ public:
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that chunks can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
+     * @param epoch epoch associated to the collection, needed to build the chunks.
+     * @param timestamp timestamp associated to the collection, needed to build the chunks.
      * @param readConcern The readConcern to use while querying for chunks.
+
      *
      * Returns a vector of ChunkTypes, or a !OK status if an error occurs.
      */
@@ -175,6 +277,8 @@ public:
         const BSONObj& sort,
         boost::optional<int> limit,
         repl::OpTime* opTime,
+        const OID& epoch,
+        const Timestamp& timestamp,
         repl::ReadConcernLevel readConcern,
         const boost::optional<BSONObj>& hint = boost::none) = 0;
 
@@ -190,20 +294,41 @@ public:
         const repl::ReadConcernArgs& readConcern) = 0;
 
     /**
+     * Retrieves the collection metadata and its global index metadata. This function will return
+     * all of the global idexes for a collection.
+     */
+    virtual std::pair<CollectionType, std::vector<IndexCatalogType>>
+    getCollectionAndShardingIndexCatalogEntries(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const repl::ReadConcernArgs& readConcern) = 0;
+
+    /**
      * Retrieves all zones defined for the specified collection. The returned vector is sorted based
      * on the min key of the zones.
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
-                                                                   const NamespaceString& nss) = 0;
+    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        boost::optional<long long> limit = boost::none) = 0;
 
     /**
-     * Retrieves all shards in this sharded cluster.
+     * Retrieves all namespaces that have zones associated with a database.
+     */
+    virtual std::vector<NamespaceString> getAllNssThatHaveZonesForDatabase(
+        OperationContext* opCtx, const DatabaseName& dbName) = 0;
+
+    /**
+     * Retrieves the list of shards in this sharded cluster. If `excludeDraining` is set to `false`
+     * (default), it retrieves all shards. Otherwise, it retrieves only shards that are not
+     * draining.
      * Returns a !OK status if an error occurs.
      */
     virtual StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-        OperationContext* opCtx, repl::ReadConcernLevel readConcern) = 0;
+        OperationContext* opCtx,
+        repl::ReadConcernLevel readConcern,
+        bool excludeDraining = false) = 0;
 
     /**
      * Runs a user management command on the config servers. Do not use for general write command
@@ -217,7 +342,7 @@ public:
      */
     virtual Status runUserManagementWriteCommand(OperationContext* opCtx,
                                                  StringData commandName,
-                                                 StringData dbname,
+                                                 const DatabaseName& dbname,
                                                  const BSONObj& cmdObj,
                                                  BSONObjBuilder* result) = 0;
 
@@ -225,35 +350,9 @@ public:
      * Runs a user management related read-only command on a config server.
      */
     virtual bool runUserManagementReadCommand(OperationContext* opCtx,
-                                              const std::string& dbname,
+                                              const DatabaseName& dbname,
                                               const BSONObj& cmdObj,
                                               BSONObjBuilder* result) = 0;
-
-    /**
-     * Applies oplog entries to the config servers.
-     * Used by mergeChunk and splitChunk commands.
-     *
-     * @param updateOps: documents to write to the chunks collection.
-     * @param preCondition: preconditions for applying documents.
-     * @param nss: namespace string for the chunks collection.
-     * @param lastChunkVersion: version of the last document being written to the chunks
-     * collection.
-     * @param writeConcern: writeConcern to use for applying documents.
-     * @param readConcern: readConcern to use for verifying that documents have been applied.
-     *
-     * 'nss' and 'lastChunkVersion' uniquely identify the last document being written, which is
-     * expected to appear in the chunks collection on success. This is important for the
-     * case where network problems cause a retry of a successful write, which then returns
-     * failure because the precondition no longer matches. If a query of the chunks collection
-     * returns a document matching both 'nss' and 'lastChunkVersion,' the write succeeded.
-     */
-    virtual Status applyChunkOpsDeprecated(OperationContext* opCtx,
-                                           const BSONArray& updateOps,
-                                           const BSONArray& preCondition,
-                                           const NamespaceString& nss,
-                                           const ChunkVersion& lastChunkVersion,
-                                           const WriteConcernOptions& writeConcern,
-                                           repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Reads global sharding settings from the confing.settings collection. The key parameter is
@@ -275,13 +374,20 @@ public:
                                                      repl::ReadConcernLevel readConcern) = 0;
 
     /**
-     * Returns keys for the given purpose and with an expiresAt value greater than newerThanThis.
+     * Returns internal keys for the given purpose and have an expiresAt value greater than
+     * newerThanThis.
      */
-    virtual StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
+    virtual StatusWith<std::vector<KeysCollectionDocument>> getNewInternalKeys(
         OperationContext* opCtx,
         StringData purpose,
         const LogicalTime& newerThanThis,
         repl::ReadConcernLevel readConcernLevel) = 0;
+
+    /**
+     * Returns all external (i.e. validation-only) keys for the given purpose.
+     */
+    virtual StatusWith<std::vector<ExternalKeysCollectionDocument>> getAllExternalKeys(
+        OperationContext* opCtx, StringData purpose, repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
      * Directly inserts a document in the specified namespace on the config server. The document
@@ -293,19 +399,6 @@ public:
                                         const NamespaceString& nss,
                                         const BSONObj& doc,
                                         const WriteConcernOptions& writeConcern) = 0;
-
-    /**
-     * Directly inserts documents in the specified namespace on the config server. Inserts said
-     * documents using a retryable write. Underneath, a session is created and destroyed -- this
-     * ad-hoc session creation strategy should never be used outside of specific, non-performant
-     * code paths.
-     *
-     * Must only be used for insertions in the 'config' database.
-     */
-    virtual void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
-                                                       const NamespaceString& nss,
-                                                       std::vector<BSONObj> docs,
-                                                       const WriteConcernOptions& writeConcern) = 0;
 
     /**
      * Updates a single document in the specified namespace on the config server. Must only be used
@@ -329,6 +422,19 @@ public:
                                                   const WriteConcernOptions& writeConcern) = 0;
 
     /**
+     * Overload version of updateConfigDocument with the extra parameter 'maxTimeMs' for setting a
+     * custom timeout duration. Setting 'maxTimeMs' to Milliseconds::max() will entirely remove
+     * maxTimeMs from the command object sent over the wire.
+     */
+    virtual StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const BSONObj& query,
+                                                  const BSONObj& update,
+                                                  bool upsert,
+                                                  const WriteConcernOptions& writeConcern,
+                                                  Milliseconds maxTimeMs) = 0;
+
+    /**
      * Removes documents matching a particular query predicate from the specified namespace on the
      * config server. Must only be used for deletions from the 'config' database.
      *
@@ -337,7 +443,59 @@ public:
     virtual Status removeConfigDocuments(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          const BSONObj& query,
-                                         const WriteConcernOptions& writeConcern) = 0;
+                                         const WriteConcernOptions& writeConcern,
+                                         boost::optional<BSONObj> hint = boost::none) = 0;
+
+    /**
+     * Returns shard-placement information for collection named 'collName' at the requested point in
+     * time 'clusterTime'.
+     * - When an exact response may be computed, this will be composed by the shards hosting data of
+     *   collName + the primary shard of the parent db.
+     * - Otherwise, an approximated response is generated based on a past snapshot of config.shards.
+     * References to shards that aren't currently part of the cluster may be included in the
+     * response.
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataForCollAtClusterTime(
+        OperationContext* opCtx, const NamespaceString& collName, const Timestamp& clusterTime) = 0;
+
+    /**
+     * Returns shard-placement information for database named 'dbName' at the requested point in
+     * time 'clusterTime'.
+     * When no exact response may be computed, an approximated one is generated based on a past
+     * snapshot of config.shards.
+     * References to shards that aren't currently part of the cluster may be included in the
+     * response.
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataForDbAtClusterTime(
+        OperationContext* opCtx, const NamespaceString& dbName, const Timestamp& clusterTime) = 0;
+
+    /**
+     * Returns shard-placement information for the whole cluster at the requested point in time
+     * 'clusterTime'.
+     * When no exact response may be computed, an approximated one is generated based on a past
+     * snapshot of config.shards.
+     * References to shards that aren't currently part of the cluster may be included in the
+     * response.
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataAtClusterTime(OperationContext* opCtx,
+                                                                  const Timestamp& clusterTime) = 0;
+
+    /**
+     * Queries config.placementHistory to retrieve placement metadata on the requested namespace at
+     * a specific point in time. When no namespace is specified, placement metadata on the whole
+     * cluster will be returned. This function is meant to be exclusively invoked by config server
+     * nodes.
+     */
+    virtual HistoricalPlacement getHistoricalPlacement(
+        OperationContext* opCtx,
+        const Timestamp& atClusterTime,
+        const boost::optional<NamespaceString>& nss) = 0;
+
+    /**
+     * Provided a cluster time, returns whether there was a topology change caused by a removeShard
+     * committed on the commit server within the [clusterTime, +inf) time window.
+     */
+    virtual bool anyShardRemovedSince(OperationContext* opCtx, const Timestamp& clusterTime) = 0;
 
 protected:
     ShardingCatalogClient() = default;

@@ -13,15 +13,11 @@
  * 11. Everyone happy eventually
  *
  * This test assumes a 'newlyAdded' removal.
- *
- * SERVER-49428: Disable for ephemeralForTest, writeConcernMajorityJournalDefault is not off
- * @tags: [
- *   requires_fcv_47,
- *   incompatible_with_eft,
- * ]
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
+
 var basename = "jstests_initsync1";
 
 print("1. Bring up set");
@@ -59,8 +55,13 @@ admin_s1.runCommand({replSetFreeze: 999999});
 print("6. Bring up #3");
 var hostname = getHostName();
 
-var secondary2 =
-    MongoRunner.runMongod(Object.merge({replSet: basename, oplogSize: 2}, x509_options2));
+var secondary2 = MongoRunner.runMongod(Object.merge({
+    replSet: basename,
+    oplogSize: 2,
+    // Preserve the initial sync state to validate an assertion.
+    setParameter: {"failpoint.skipClearInitialSyncState": tojson({mode: 'alwaysOn'})}
+},
+                                                    x509_options2));
 
 var local_s2 = secondary2.getDB("local");
 var admin_s2 = secondary2.getDB("admin");

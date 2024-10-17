@@ -14,13 +14,14 @@
  * won't be fetched during oplog application and trying to apply the commitTransaction oplog entry
  * will cause initial sync to fail.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
 replTest.startSet();
@@ -28,6 +29,10 @@ replTest.initiate();
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "initial_sync_fetch_from_oldest_active_transaction_timestamp_no_oplog_application";
@@ -104,11 +109,10 @@ assert.eq(secondaryOplog.find({"ts": beginFetchingTs}).itcount(), 1);
 
 // Make sure the first transaction committed properly and is reflected after the initial sync.
 let res = secondary.getDB(dbName).getCollection(collName).findOne({_id: 2});
-assert.docEq(res, {_id: 2}, res);
+assert.docEq({_id: 2}, res);
 
 jsTestLog("Aborting the second transaction");
 
 assert.commandWorked(session2.abortTransaction_forTesting());
 
 replTest.stopSet();
-})();

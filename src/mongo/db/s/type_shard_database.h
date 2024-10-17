@@ -29,91 +29,23 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-#include <string>
-
-#include "mongo/db/jsobj.h"
-#include "mongo/s/database_version.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/s/type_shard_database_gen.h"
 
 namespace mongo {
 
-class Status;
-template <typename T>
-class StatusWith;
-
-/**
- * This class represents the layout and contents of documents contained in the shard server's
- * config.databases collection. All manipulation of documents coming from that collection should
- * be done with this class.
- *
- * Expected shard server config.databases collection format:
- *   {
- *      "_id" : "foo",
- *      "version" : {
- *          "uuid" : UUID
- *          "lastMod" : 1
- *      },
- *      "primary": "shard0000",
- *      "partitioned": true,
- *      "enterCriticalSectionCounter" : 4                    // optional
- *   }
- *
- * enterCriticalSectionCounter is currently just an OpObserver signal, thus otherwise ignored here.
- */
-class ShardDatabaseType {
+class ShardDatabaseType : private ShardDatabaseTypeBase {
 public:
-    static const BSONField<std::string> name;  // "_id"
-    static const BSONField<DatabaseVersion> version;
-    static const BSONField<std::string> primary;
-    static const BSONField<bool> partitioned;
-    static const BSONField<int> enterCriticalSectionCounter;
+    // Make field names accessible.
+    using ShardDatabaseTypeBase::kDbNameFieldName;
+    using ShardDatabaseTypeBase::kEnterCriticalSectionCounterFieldName;
 
-    ShardDatabaseType(const std::string dbName,
-                      DatabaseVersion version,
-                      const ShardId primary,
-                      bool partitioned);
+    // Make getters and setters accessible.
+    using ShardDatabaseTypeBase::getDbName;
+    using ShardDatabaseTypeBase::getPrimary;
+    using ShardDatabaseTypeBase::getVersion;
 
-    /**
-     * Constructs a new ShardDatabaseType object from BSON. Also does validation of the contents.
-     */
-    static StatusWith<ShardDatabaseType> fromBSON(const BSONObj& source);
-
-    /**
-     * Returns the BSON representation of this shard database type object.
-     */
-    BSONObj toBSON() const;
-
-    /**
-     * Returns a std::string representation of the current internal state.
-     */
-    std::string toString() const;
-
-    const std::string& getDbName() const {
-        return _name;
-    }
-    void setDbName(const std::string& dbName);
-
-    const DatabaseVersion getDbVersion() const {
-        return _version;
-    }
-    void setDbVersion(DatabaseVersion version);
-
-    const ShardId& getPrimary() const {
-        return _primary;
-    }
-    void setPrimary(const ShardId& primary);
-
-    bool getPartitioned() const {
-        return _partitioned;
-    }
-    void setPartitioned(bool partitioned);
-
-private:
-    std::string _name;
-    DatabaseVersion _version;
-    ShardId _primary;
-    bool _partitioned;
+    explicit ShardDatabaseType(const BSONObj& obj);
 };
 
 }  // namespace mongo

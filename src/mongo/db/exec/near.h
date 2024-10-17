@@ -91,7 +91,7 @@ class NearStage : public RequiresIndexStage {
 public:
     struct CoveredInterval;
 
-    ~NearStage();
+    ~NearStage() override;
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -108,7 +108,7 @@ protected:
               const char* typeName,
               StageType type,
               WorkingSet* workingSet,
-              const CollectionPtr& collection,
+              VariantCollectionPtrOrAcquisition collection,
               const IndexDescriptor* indexDescriptor);
 
     //
@@ -121,8 +121,7 @@ protected:
      * covering stage if required.
      */
     virtual std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
-                                                          WorkingSet* workingSet,
-                                                          const CollectionPtr& collection) = 0;
+                                                          WorkingSet* workingSet) = 0;
 
     /**
      * Computes the distance value for the given member data, or -1 if the member should not be

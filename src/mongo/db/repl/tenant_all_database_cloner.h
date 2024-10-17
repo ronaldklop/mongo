@@ -29,12 +29,25 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/db/repl/base_cloner.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/tenant_base_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
 #include "mongo/db/repl/tenant_migration_shared_data.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -63,7 +76,7 @@ public:
                             ThreadPool* dbPool,
                             StringData tenantId);
 
-    virtual ~TenantAllDatabaseCloner() = default;
+    ~TenantAllDatabaseCloner() override = default;
 
     Stats getStats() const;
 
@@ -102,6 +115,11 @@ private:
     AfterStageBehavior listExistingDatabasesStage();
 
     /**
+     * Stage function that initializes several stats before carrying on to the 'postStage'.
+     */
+    AfterStageBehavior initializeStatsStage();
+
+    /**
      * The preStage sets the start time in _stats.
      */
     void preStage() final;
@@ -130,6 +148,7 @@ private:
 
     TenantAllDatabaseClonerStage _listDatabasesStage;          // (R)
     TenantAllDatabaseClonerStage _listExistingDatabasesStage;  // (R)
+    TenantAllDatabaseClonerStage _initializeStatsStage;        // (R)
 
     // The operationTime returned with the listDatabases result.
     Timestamp _operationTime;  // (X)

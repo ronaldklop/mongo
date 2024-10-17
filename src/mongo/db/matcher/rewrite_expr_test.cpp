@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/rewrite_expr.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -57,7 +59,7 @@ void testExprRewrite(BSONObj expr, BSONObj expectedMatch) {
     if (!expectedMatch.isEmpty()) {
         ASSERT(result.matchExpression());
         BSONObjBuilder bob;
-        result.matchExpression()->serialize(&bob, true);
+        result.matchExpression()->serialize(&bob, {});
         ASSERT_BSONOBJ_EQ(expectedMatch, bob.obj());
     } else {
         ASSERT_FALSE(result.matchExpression());
@@ -159,6 +161,18 @@ TEST(RewriteExpr, EqWithComparisonToUndefinedDoesNotRewriteToMatch) {
 
 TEST(RewriteExpr, EqWithComparisonToMissingDoesNotRewriteToMatch) {
     BSONObj expr = fromjson("{$expr: {$eq: ['$x', '$$REMOVE']}}");
+    const BSONObj expectedMatch;
+    testExprRewrite(expr, expectedMatch);
+}
+
+TEST(RewriteExpr, EqWithComparisonToRootDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$eq: ['$$ROOT', {a: 1}]}}");
+    const BSONObj expectedMatch;
+    testExprRewrite(expr, expectedMatch);
+}
+
+TEST(RewriteExpr, EqWithComparisonToCurrentDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$eq: ['$$CURRENT', 2]}}");
     const BSONObj expectedMatch;
     testExprRewrite(expr, expectedMatch);
 }

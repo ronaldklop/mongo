@@ -32,8 +32,8 @@ global:
         - "mongo/db/s/transaction_coordinator_structures.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
     - "mongo/s/sharding_types.idl"
 
 types:
@@ -44,6 +44,7 @@ types:
         cpp_type: "txn::CommitDecision"
         serializer: "::mongo::txn::writeCommitDecisionEnumProperty"
         deserializer: "::mongo::txn::readCommitDecisionEnumProperty"
+        is_view: false
 
     status:
         bson_serialization_type: any
@@ -51,6 +52,8 @@ types:
         cpp_type: "::mongo::Status"
         serializer: "::mongo::txn::writeStatusProperty"
         deserializer: "::mongo::txn::readStatusProperty"
+        # Status is not a view type.
+        is_view: false
 
 structs:
     CoordinatorCommitDecision:
@@ -74,7 +77,7 @@ structs:
 
     TransactionCoordinatorDocument:
         description: "A document used for majority confirming the coordinator's state changes"
-        strict: true
+        strict: false
         fields:
             _id:
                 type: OperationSessionInfo
@@ -89,3 +92,8 @@ structs:
                 description: "The coordinator's decision for the transaction including the decision
                               ('commit' or 'abort') and a commit timestamp (if the decision is
                               'commit'). Only set if the coordinator has made a decision."
+            affectedNamespaces:
+                optional: true
+                type: array<namespacestring>
+                description: "The list of namespaces, affected by the transaction. Each participant
+                              returns a list in response to prepareTransaction command."

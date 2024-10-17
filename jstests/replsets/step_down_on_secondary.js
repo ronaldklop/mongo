@@ -11,13 +11,10 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-
-"use strict";
-load('jstests/libs/parallelTester.js');
-load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {waitForCurOpByFailPointNoNS} from "jstests/libs/curop_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -95,7 +92,7 @@ const wTPrintPrepareConflictLogFailPoint = configureFailPoint(primary, "WTPrintP
 
 const joinReadThread = startParallelShell(() => {
     db.getMongo().setSecondaryOk();
-    oldPrimaryDB = db.getSiblingDB(TestData.dbName);
+    let oldPrimaryDB = db.getSiblingDB(TestData.dbName);
 
     assert.commandFailedWithCode(oldPrimaryDB.runCommand({
         find: TestData.collName,
@@ -122,15 +119,12 @@ jsTestLog("Join parallel shells");
 joinStepDownThread();
 joinReadThread();
 
-// Validate that the read operation got killed during step down.
 const replMetrics = assert.commandWorked(primary.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
-assert.eq(replMetrics.stateTransition.userOperationsKilled, 1, replMetrics);
 
 jsTestLog("Check nodes have correct data");
-assert.docEq(newPrimary.getDB(dbName)[collName].find({_id: 0}).toArray(), [{_id: 0, b: 1}]);
+assert.docEq([{_id: 0, b: 1}], newPrimary.getDB(dbName)[collName].find({_id: 0}).toArray());
 rst.awaitReplication();
-assert.docEq(primary.getDB(dbName)[collName].find({_id: 0}).toArray(), [{_id: 0, b: 1}]);
+assert.docEq([{_id: 0, b: 1}], primary.getDB(dbName)[collName].find({_id: 0}).toArray());
 
 rst.stopSet();
-})();

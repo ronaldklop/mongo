@@ -29,12 +29,14 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo::logv2 {
@@ -102,11 +104,11 @@ private:
     explicit RamLog(StringData name);
     ~RamLog();  // want this private as we want to leak so we can use them till the very end
 
-    StringData getLine(size_t lineNumber, WithLock lock) const;
+    StringData getLine(size_t lineNumber) const;
 
-    size_t getLineCount(WithLock) const;
+    size_t getLineCount() const;
 
-    void trimIfNeeded(size_t newStr, WithLock lock);
+    void trimIfNeeded(size_t newStr);
 
 private:
     // Maximum number of lines
@@ -116,7 +118,8 @@ private:
     static constexpr size_t kMaxSizeBytes = 1024 * 1024;
 
     // Guards all non-static data.
-    stdx::mutex _mutex;  // NOLINT
+    // stdx::recursive_mutex // NOLINT is intentional, stdx::mutex can not be used here
+    mutable stdx::recursive_mutex _mutex;  // NOLINT
 
     // Array of lines
     std::array<std::string, kMaxLines> _lines;
@@ -156,14 +159,14 @@ public:
      * Returns true if there are more lines available to return by calls to next().
      */
     bool more() const {
-        return _nextLineIndex < _ramlog->getLineCount(_lock);
+        return _nextLineIndex < _ramlog->getLineCount();
     }
 
     /**
      * Returns the next line and advances the iterator.
      */
     StringData next() {
-        return _ramlog->getLine(_nextLineIndex++, _lock);  // Postfix increment.
+        return _ramlog->getLine(_nextLineIndex++);  // Postfix increment.
     }
 
     /**
@@ -175,7 +178,7 @@ private:
     const RamLog* _ramlog;
 
     // Holds RamLog's mutex
-    stdx::lock_guard<stdx::mutex> _lock;
+    stdx::lock_guard<stdx::recursive_mutex> _lock;
 
     size_t _nextLineIndex;
 };

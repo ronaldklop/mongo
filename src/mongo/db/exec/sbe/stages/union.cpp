@@ -27,18 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/sbe/stages/union.h"
 
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo::sbe {
-UnionStage::UnionStage(std::vector<std::unique_ptr<PlanStage>> inputStages,
+UnionStage::UnionStage(PlanStage::Vector inputStages,
                        std::vector<value::SlotVector> inputVals,
                        value::SlotVector outputVals,
-                       PlanNodeId planNodeId)
-    : PlanStage("union"_sd, planNodeId),
+                       PlanNodeId planNodeId,
+                       bool participateInTrialRunTracking)
+    : PlanStage("union"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inputVals{std::move(inputVals)},
       _outputVals{std::move(outputVals)} {
     _children = std::move(inputStages);
@@ -52,34 +64,43 @@ UnionStage::UnionStage(std::vector<std::unique_ptr<PlanStage>> inputStages,
 }
 
 std::unique_ptr<PlanStage> UnionStage::clone() const {
-    std::vector<std::unique_ptr<PlanStage>> inputStages;
+    Vector inputStages;
     for (auto& child : _children) {
         inputStages.emplace_back(child->clone());
     }
-    return std::make_unique<UnionStage>(
-        std::move(inputStages), _inputVals, _outputVals, _commonStats.nodeId);
+    return std::make_unique<UnionStage>(std::move(inputStages),
+                                        _inputVals,
+                                        _outputVals,
+                                        _commonStats.nodeId,
+                                        participateInTrialRunTracking());
 }
 
 void UnionStage::prepare(CompileCtx& ctx) {
-    value::SlotSet dupCheck;
-
     for (size_t childNum = 0; childNum < _children.size(); childNum++) {
         _children[childNum]->prepare(ctx);
-
-        for (auto slot : _inputVals[childNum]) {
-            auto [it, inserted] = dupCheck.insert(slot);
-            uassert(4822806, str::stream() << "duplicate field: " << slot, inserted);
-
-            _inValueAccessors[_children[childNum].get()].emplace_back(
-                _children[childNum]->getAccessor(ctx, slot));
-        }
     }
 
+    // All of the slots listed in '_outputVals' must be unique.
+    value::SlotSet dupCheck;
     for (auto slot : _outputVals) {
         auto [it, inserted] = dupCheck.insert(slot);
         uassert(4822807, str::stream() << "duplicate field: " << slot, inserted);
+    }
 
-        _outValueAccessors.emplace_back(value::ViewOfValueAccessor{});
+    for (size_t idx = 0; idx < _outputVals.size(); ++idx) {
+        std::vector<value::SlotAccessor*> accessors;
+        accessors.reserve(_children.size());
+
+        for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+            // Slots listed in '_inputVals' may not appear in '_outputVals'.
+            auto slot = _inputVals[childNum][idx];
+            bool slotFound = dupCheck.count(slot);
+            uassert(4822806, str::stream() << "duplicate field: " << slot, !slotFound);
+
+            accessors.emplace_back(_children[childNum]->getAccessor(ctx, slot));
+        }
+
+        _outValueAccessors.emplace_back(value::SwitchAccessor{std::move(accessors)});
     }
 }
 
@@ -98,16 +119,23 @@ void UnionStage::open(bool reOpen) {
 
     _commonStats.opens++;
     if (reOpen) {
-        std::queue<UnionBranch> emptyQueue;
-        swap(_remainingBranchesToDrain, emptyQueue);
+        // If we are re-opening, it is important to close() any active branches. If kept open, one
+        // of these branch's slots may soon hold pointers to stale (potentially freed) data. A
+        // yield would then cause the branch to attempt to copy the stale(unowned) data.
+        clearBranches();
     }
 
     for (auto& child : _children) {
-        _remainingBranchesToDrain.push({child.get(), reOpen});
+        _remainingBranchesToDrain.push({child.get()});
     }
 
     _remainingBranchesToDrain.front().open();
     _currentStage = _remainingBranchesToDrain.front().stage;
+    _currentStageIndex = 0;
+
+    for (auto& outAccesor : _outValueAccessors) {
+        outAccesor.setIndex(_currentStageIndex);
+    }
 }
 
 PlanState UnionStage::getNext() {
@@ -120,6 +148,11 @@ PlanState UnionStage::getNext() {
             auto& branch = _remainingBranchesToDrain.front();
             branch.open();
             _currentStage = branch.stage;
+            ++_currentStageIndex;
+
+            for (auto& outAccesor : _outValueAccessors) {
+                outAccesor.setIndex(_currentStageIndex);
+            }
         }
         state = _currentStage->getNext();
 
@@ -127,13 +160,6 @@ PlanState UnionStage::getNext() {
             _currentStage = nullptr;
             _remainingBranchesToDrain.front().close();
             _remainingBranchesToDrain.pop();
-        } else {
-            const auto& inValueAccessors = _inValueAccessors[_currentStage];
-
-            for (size_t idx = 0; idx < inValueAccessors.size(); idx++) {
-                auto [tag, val] = inValueAccessors[idx]->getViewOfValue();
-                _outValueAccessors[idx].reset(tag, val);
-            }
         }
     }
 
@@ -143,12 +169,8 @@ PlanState UnionStage::getNext() {
 void UnionStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
-    _currentStage = nullptr;
-    while (!_remainingBranchesToDrain.empty()) {
-        _remainingBranchesToDrain.front().close();
-        _remainingBranchesToDrain.pop();
-    }
+    trackClose();
+    clearBranches();
 }
 
 std::unique_ptr<PlanStageStats> UnionStage::getStats(bool includeDebugInfo) const {
@@ -158,10 +180,10 @@ std::unique_ptr<PlanStageStats> UnionStage::getStats(bool includeDebugInfo) cons
         BSONObjBuilder bob;
         BSONArrayBuilder childrenBob(bob.subarrayStart("inputSlots"));
         for (auto&& slots : _inputVals) {
-            childrenBob.append(slots);
+            childrenBob.append(slots.begin(), slots.end());
         }
         childrenBob.doneFast();
-        bob.append("outputSlots", _outputVals);
+        bob.append("outputSlots", _outputVals.begin(), _outputVals.end());
         ret->debugInfo = bob.obj();
     }
 
@@ -176,6 +198,7 @@ const SpecificStats* UnionStage::getSpecificStats() const {
 }
 
 std::vector<DebugPrinter::Block> UnionStage::debugPrint() const {
+    using namespace fmt::literals;
     auto ret = PlanStage::debugPrint();
 
     ret.emplace_back(DebugPrinter::Block("[`"));
@@ -187,9 +210,10 @@ std::vector<DebugPrinter::Block> UnionStage::debugPrint() const {
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
 
-    ret.emplace_back(DebugPrinter::Block("[`"));
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
     for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+        DebugPrinter::addKeyword(ret, "branch{}"_format(childNum));
+
         ret.emplace_back(DebugPrinter::Block("[`"));
         for (size_t idx = 0; idx < _inputVals[childNum].size(); idx++) {
             if (idx) {
@@ -199,16 +223,30 @@ std::vector<DebugPrinter::Block> UnionStage::debugPrint() const {
         }
         ret.emplace_back(DebugPrinter::Block("`]"));
 
+        ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
         DebugPrinter::addBlocks(ret, _children[childNum]->debugPrint());
-
-        if (childNum + 1 < _children.size()) {
-            ret.emplace_back(DebugPrinter::Block(","));
-            DebugPrinter::addNewLine(ret);
-        }
+        ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
     }
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
-    ret.emplace_back(DebugPrinter::Block("`]"));
 
     return ret;
+}
+
+size_t UnionStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_inputVals);
+    size += size_estimator::estimate(_outputVals);
+    return size;
+}
+
+void UnionStage::clearBranches() {
+    while (!_remainingBranchesToDrain.empty()) {
+        auto& branch = _remainingBranchesToDrain.front();
+        if (branch.isOpen) {
+            branch.close();
+        }
+        _remainingBranchesToDrain.pop();
+    }
 }
 }  // namespace mongo::sbe

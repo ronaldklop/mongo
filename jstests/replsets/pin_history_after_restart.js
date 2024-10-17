@@ -18,11 +18,13 @@
  * 5) Remove the pin at "original pin"
  * 6) Restart the node, see the incremented pin value from serverStatus.
  *
- * @tags: [requires_fcv_49, requires_majority_read_concern, requires_persistence]
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function incTs(ts) {
     return Timestamp(ts.t, ts.i + 1);
@@ -88,4 +90,3 @@ serverStatus = assert.commandWorked(primary.adminCommand("serverStatus"));
 pinnedTs = serverStatus["wiredTiger"]["snapshot-window-settings"]["min pinned timestamp"];
 assert.eq(newPinTs, pinnedTs);
 replTest.stopSet();
-})();

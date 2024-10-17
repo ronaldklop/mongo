@@ -32,7 +32,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 
 #include "libunwind_i.h"
 
-#if ELF_CLASS == ELFCLASS32
+#if UNW_ELF_CLASS == UNW_ELFCLASS32
 # define ELF_W(x)       ELF32_##x
 # define Elf_W(x)       Elf32_##x
 # define elf_w(x)       _Uelf32_##x
@@ -50,7 +50,6 @@ extern int elf_w (get_proc_name) (unw_addr_space_t as,
 extern int elf_w (get_proc_name_in_image) (unw_addr_space_t as,
                                            struct elf_image *ei,
                                            unsigned long segbase,
-                                           unsigned long mapoff,
                                            unw_word_t ip,
                                            char *buf, size_t buf_len, unw_word_t *offp);
 
@@ -64,7 +63,7 @@ elf_w (valid_object) (struct elf_image *ei)
     return 0;
 
   return (memcmp (ei->image, ELFMAG, SELFMAG) == 0
-          && ((uint8_t *) ei->image)[EI_CLASS] == ELF_CLASS
+          && ((uint8_t *) ei->image)[EI_CLASS] == UNW_ELF_CLASS
           && ((uint8_t *) ei->image)[EI_VERSION] != EV_NONE
           && ((uint8_t *) ei->image)[EI_VERSION] <= EV_CURRENT);
 }

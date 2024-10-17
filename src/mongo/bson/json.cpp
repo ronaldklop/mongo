@@ -27,26 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/json.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <exception>
 #include <fmt/format.h>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <type_traits>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/logv2/log.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/platform/decimal128.h"
-#include "mongo/platform/strtoll.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -73,9 +85,11 @@ using namespace fmt::literals;
 #define CONTROL "\a\b\f\n\r\t\v"
 #define JOPTIONS "gims"
 
+namespace {
 // Size hints given to char vectors
 enum {
     ID_RESERVE_SIZE = 24,
+    UUID_RESERVE_SIZE = 36,
     PAT_RESERVE_SIZE = 4096,
     OPT_RESERVE_SIZE = 64,
     FIELD_RESERVE_SIZE = 4096,
@@ -95,16 +109,76 @@ static const char *LBRACE = "{", *RBRACE = "}", *LBRACKET = "[", *RBRACKET = "]"
                   *RPAREN = ")", *COLON = ":", *COMMA = ",", *FORWARDSLASH = "/",
                   *SINGLEQUOTE = "'", *DOUBLEQUOTE = "\"";
 
+std::string escapeNewlines(const char* input, int len) {
+    std::ostringstream out;
+    for (int i = 0; i < len; ++i) {
+        if (input[i] == '\n') {
+            out << "\\n";
+        } else {
+            out << input[i];
+        }
+    }
+    return out.str();
+}
+}  // namespace
+
 JParse::JParse(StringData str)
     : _buf(str.rawData()), _input(_buf), _input_end(_input + str.size()) {}
+
+void JParse::addBadInputSnippet(std::ostringstream& errorBuffer) const {
+    // How many characters of context to provide? Half will be on either side of the error position.
+    const int contextChars = 8;
+
+    errorBuffer << "Bad character is in this snippet: \"";
+
+    int nAdded = 0;
+    // We may have had the parse error very near the beginning of the string, and the context range
+    // may go negative.
+    auto contextStart = std::max(offset() - contextChars, 0);
+    for (int i = contextStart; i < length() && nAdded <= contextChars; ++i) {
+        if (!ctype::isSpace(_buf[i])) {
+            // Whitespace isn't useful for determining what went wrong, so let's skip it. It is
+            // often present in large quantities if the input json is formatted nicely.
+            errorBuffer << _buf[i];
+            ++nAdded;
+        }
+    }
+    errorBuffer << "\". ";
+}
+
+void JParse::indicateOffsetPosition(std::ostringstream& errorBuffer) const {
+    errorBuffer << "Full input: ";
+    errorBuffer << std::endl;
+    auto escaped = escapeNewlines(_buf, length());
+    errorBuffer << escaped;
+    errorBuffer << std::endl;
+    int i = 0;
+    for (; i < offset(); ++i) {
+        if (_buf[i] == '\n') {
+            // Newlines were escaped, making each one character into two.
+            errorBuffer << " ";
+        }
+        errorBuffer << " ";
+    }
+    // Reading a token skips spaces, so we'll do the same here, highlighting the whole area:
+    for (; i < length() && ctype::isSpace(_buf[i]); ++i) {
+        errorBuffer << "^";
+    }
+    errorBuffer << "^";
+    errorBuffer << std::endl;
+}
 
 Status JParse::parseError(StringData msg) {
     std::ostringstream ossmsg;
     ossmsg << msg;
-    ossmsg << ": offset:";
+    ossmsg << ": offset ";
     ossmsg << offset();
-    ossmsg << " of:";
-    ossmsg << _buf;
+    ossmsg << " of input. ";
+    // Try to give a slice of the output, since our logging doesn't format newlines very well:
+    addBadInputSnippet(ossmsg);
+    // Then, in case the logs or environment can show newlines, print the full line and then
+    // highlight which character was bad:
+    indicateOffsetPosition(ossmsg);
     return Status(ErrorCodes::FailedToParse, ossmsg.str());
 }
 
@@ -160,6 +234,11 @@ Status JParse::value(StringData fieldName, BSONObjBuilder& builder) {
         if (ret != Status::OK()) {
             return ret;
         }
+    } else if (readToken("UUID")) {
+        Status ret = uuid(fieldName, builder);
+        if (ret != Status::OK()) {
+            return ret;
+        }
     } else if (peekToken(FORWARDSLASH)) {
         Status ret = regex(fieldName, builder);
         if (ret != Status::OK()) {
@@ -190,7 +269,9 @@ Status JParse::value(StringData fieldName, BSONObjBuilder& builder) {
     } else {
         Status ret = number(fieldName, builder);
         if (ret != Status::OK()) {
-            return ret;
+            return ret.withContext(
+                "Attempted to parse a number array element, not recognizing any other keywords. "
+                "Perhaps you left a trailing comma or forgot a '{'?");
         }
     }
     return Status::OK();
@@ -218,9 +299,9 @@ Status JParse::object(StringData fieldName, BSONObjBuilder& builder, bool subObj
     // Special object
     std::string firstField;
     firstField.reserve(FIELD_RESERVE_SIZE);
-    Status ret = field(&firstField);
-    if (ret != Status::OK()) {
-        return ret;
+    Status fieldParseResult = field(&firstField);
+    if (fieldParseResult != Status::OK()) {
+        return fieldParseResult;
     }
 
     if (firstField == "$oid") {
@@ -363,18 +444,18 @@ Status JParse::object(StringData fieldName, BSONObjBuilder& builder, bool subObj
             return valueRet;
         }
         while (readToken(COMMA)) {
-            std::string fieldName;
-            fieldName.reserve(FIELD_RESERVE_SIZE);
-            Status fieldRet = field(&fieldName);
+            std::string nextFieldName;
+            nextFieldName.reserve(FIELD_RESERVE_SIZE);
+            Status fieldRet = field(&nextFieldName);
             if (fieldRet != Status::OK()) {
                 return fieldRet;
             }
             if (!readToken(COLON)) {
                 return parseError("Expecting ':'");
             }
-            Status valueRet = value(fieldName, *objBuilder);
-            if (valueRet != Status::OK()) {
-                return valueRet;
+            Status nextFieldValueRet = value(nextFieldName, *objBuilder);
+            if (nextFieldValueRet != Status::OK()) {
+                return nextFieldValueRet;
             }
         }
     }
@@ -527,13 +608,13 @@ Status JParse::dateObject(StringData fieldName, BSONObjBuilder& builder) {
         }
         date = dateRet.getValue();
     } else if (readToken(LBRACE)) {
-        std::string fieldName;
-        fieldName.reserve(FIELD_RESERVE_SIZE);
-        Status ret = field(&fieldName);
+        std::string nextFieldName;
+        nextFieldName.reserve(FIELD_RESERVE_SIZE);
+        Status ret = field(&nextFieldName);
         if (ret != Status::OK()) {
             return ret;
         }
-        if (fieldName != "$numberLong") {
+        if (nextFieldName != "$numberLong") {
             return parseError("Expected field name: $numberLong for $date value object");
         }
         if (!readToken(COLON)) {
@@ -837,8 +918,8 @@ Status JParse::numberDecimalObject(StringData fieldName, BSONObjBuilder& builder
     if (!readToken(COLON)) {
         return parseError("Expecting ':'");
     }
-    // The number must be a quoted string, since large decimal numbers could overflow other types
-    // and thus may not be valid JSON
+    // The number must be a quoted string, since large decimal numbers could overflow other
+    // types and thus may not be valid JSON
     std::string numberDecimalString;
     numberDecimalString.reserve(NUMBERDECIMAL_RESERVE_SIZE);
     Status ret = quotedString(&numberDecimalString);
@@ -993,6 +1074,27 @@ Status JParse::objectId(StringData fieldName, BSONObjBuilder& builder) {
         return parseError("Expecting hex digits: " + id);
     }
     builder.append(fieldName, OID(id));
+    return Status::OK();
+}
+
+Status JParse::uuid(StringData fieldName, BSONObjBuilder& builder) {
+    if (!readToken(LPAREN)) {
+        return parseError("Expecting '('");
+    }
+    std::string uuid;
+    uuid.reserve(UUID_RESERVE_SIZE);
+    Status ret = quotedString(&uuid);
+    if (ret != Status::OK()) {
+        return ret;
+    }
+    if (!readToken(RPAREN)) {
+        return parseError("Expecting ')'");
+    }
+    StatusWith<UUID> swUUID = UUID::parse(uuid);
+    if (!swUUID.isOK()) {
+        return swUUID.getStatus();
+    }
+    swUUID.getValue().appendToBuilder(&builder, fieldName);
     return Status::OK();
 }
 
@@ -1169,7 +1271,7 @@ Status JParse::number(StringData fieldName, BSONObjBuilder& builder) {
         return parseError("Value cannot fit in double");
     }
     if (!parsedStatus.isOK()) {
-        return parseError("Bad characters in value");
+        return parseError(parsedStatus.withContext("Bad characters in value").reason());
     }
     parsedStatus = NumberParser::strToAny(10)(_input, &retll, &endptrll);
     if (endptrll < endptrd || parsedStatus == ErrorCodes::Overflow) {
@@ -1474,8 +1576,8 @@ BSONObj fromjson(const char* jsonString, int* len) {
     return builder.obj();
 }
 
-BSONObj fromjson(const std::string& str) {
-    return fromjson(str.c_str());
+BSONObj fromjson(StringData str) {
+    return fromjson(str.toString().c_str());
 }
 
 std::string tojson(const BSONObj& obj, JsonStringFormat format, bool pretty) {

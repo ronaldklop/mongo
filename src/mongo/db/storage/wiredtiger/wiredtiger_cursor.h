@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
 #include <wiredtiger.h>
 
-#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 
@@ -48,15 +49,14 @@ public:
      * already exists, and update/remove operations will not return error if the record does not
      * exist.
      */
-    WiredTigerCursor(const std::string& uri,
+    WiredTigerCursor(WiredTigerRecoveryUnit&,
+                     const std::string& uri,
                      uint64_t tableID,
-                     bool allowOverwrite,
-                     OperationContext* opCtx);
+                     bool allowOverwrite);
 
     ~WiredTigerCursor();
 
     WT_CURSOR* get() const {
-        // TODO(SERVER-16816): assertInActiveTxn();
         return _cursor;
     }
 
@@ -68,18 +68,51 @@ public:
         return _session;
     }
 
-    void reset();
-
     void assertInActiveTxn() const {
         _ru->assertInActiveTxn();
+    }
+
+    /**
+     *  Returns the checkpoint ID for checkpoint cursors, otherwise 0.
+     */
+    uint64_t getCheckpointId() const {
+        return _cursor->checkpoint_id(_cursor);
     }
 
 protected:
     uint64_t _tableID;
     WiredTigerRecoveryUnit* _ru;
     WiredTigerSession* _session;
-    bool _readOnce;
+    std::string _config;
+    bool _isCheckpoint;
 
+    WT_CURSOR* _cursor = nullptr;  // Owned
+};
+
+/**
+ * An owning object wrapper for a WT_SESSION and WT_CURSOR configured for bulk loading when
+ * possible. The cursor is created and closed independently of the cursor cache, which does not
+ * store bulk cursors. It uses its own session to avoid hijacking an existing transaction in the
+ * current session.
+ */
+class WiredTigerBulkLoadCursor {
+public:
+    WiredTigerBulkLoadCursor(WiredTigerRecoveryUnit&, const std::string& indexUri);
+
+    ~WiredTigerBulkLoadCursor() {
+        _cursor->close(_cursor);
+    }
+
+    WT_CURSOR* get() const {
+        return _cursor;
+    }
+
+    WT_CURSOR* operator->() const {
+        return get();
+    }
+
+private:
+    UniqueWiredTigerSession const _session;
     WT_CURSOR* _cursor = nullptr;  // Owned
 };
 }  // namespace mongo

@@ -29,9 +29,21 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -50,11 +62,6 @@ class ReplicationConsistencyMarkersImpl : public ReplicationConsistencyMarkers {
     ReplicationConsistencyMarkersImpl& operator=(const ReplicationConsistencyMarkersImpl&) = delete;
 
 public:
-    static constexpr StringData kDefaultMinValidNamespace = "local.replset.minvalid"_sd;
-    static constexpr StringData kDefaultOplogTruncateAfterPointNamespace =
-        "local.replset.oplogTruncateAfterPoint"_sd;
-    static constexpr StringData kDefaultInitialSyncIdNamespace = "local.replset.initialSyncId"_sd;
-
     explicit ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface);
     ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface,
                                       NamespaceString minValidNss,
@@ -66,10 +73,6 @@ public:
     bool getInitialSyncFlag(OperationContext* opCtx) const override;
     void setInitialSyncFlag(OperationContext* opCtx) override;
     void clearInitialSyncFlag(OperationContext* opCtx) override;
-
-    OpTime getMinValid(OperationContext* opCtx) const override;
-    void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
-    void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
 
     void ensureFastCountOnOplogTruncateAfterPoint(OperationContext* opCtx) override;
 
@@ -85,10 +88,8 @@ public:
     boost::optional<OpTimeAndWallTime> refreshOplogTruncateAfterPointIfPrimary(
         OperationContext* opCtx) override;
 
-    void setAppliedThrough(OperationContext* opCtx,
-                           const OpTime& optime,
-                           bool setTimestamp = true) override;
-    void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
+    void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
+    void clearAppliedThrough(OperationContext* opCtx) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
 
     Status createInternalCollections(OperationContext* opCtx) override;
@@ -110,7 +111,7 @@ private:
      *
      * This fasserts on failure.
      */
-    void _updateMinValidDocument(OperationContext* opCtx, const TimestampedBSONObj& updateSpec);
+    void _updateMinValidDocument(OperationContext* opCtx, const BSONObj& updateSpec);
 
     /**
      * Reads the OplogTruncateAfterPoint document from disk.
@@ -123,13 +124,16 @@ private:
      * Updates the oplogTruncateAfterPoint with 'timestamp'. Callers should use this codepath when
      * expecting write interruption errors.
      */
-    Status _setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp);
+    Status _setOplogTruncateAfterPoint(const CollectionPtr& collection,
+                                       OperationContext* opCtx,
+                                       const Timestamp& timestamp);
 
     /**
      * Upserts the OplogTruncateAfterPoint document according to the provided update spec. The
      * collection must already exist. See `createInternalCollections`.
      */
-    Status _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx,
+    Status _upsertOplogTruncateAfterPointDocument(const CollectionPtr& collection,
+                                                  OperationContext* opCtx,
                                                   const BSONObj& updateSpec);
 
     StorageInterface* _storageInterface;
@@ -138,8 +142,7 @@ private:
     const NamespaceString _initialSyncIdNss;
 
     // Protects modifying and reading _isPrimary below.
-    mutable Mutex _truncatePointIsPrimaryMutex =
-        MONGO_MAKE_LATCH("ReplicationConsistencyMarkers::_truncatePointIsPrimaryMutex");
+    mutable stdx::mutex _truncatePointIsPrimaryMutex;
 
     // Tracks whether or not the node is primary. Avoids potential deadlocks taking the replication
     // coordinator's mutex to check replication state. Also remains false for standalones that do
@@ -149,8 +152,7 @@ private:
     // Locks around fetching the 'all_durable' timestamp from the storage engine and updating the
     // oplogTruncateAfterPoint. This prevents the oplogTruncateAfterPoint from going backwards in
     // time in case of multiple callers to refreshOplogTruncateAfterPointIfPrimary.
-    mutable Mutex _refreshOplogTruncateAfterPointMutex =
-        MONGO_MAKE_LATCH("ReplicationConsistencyMarkers::_refreshOplogTruncateAfterPointMutex");
+    mutable stdx::mutex _refreshOplogTruncateAfterPointMutex;
 
     // In-memory cache of the of the oplog entry LTE to the oplogTruncateAfterPoint timestamp.
     // Eventually matches the oplogTruncateAfterPoint timestamp when parallel writes finish. Avoids
@@ -165,6 +167,12 @@ private:
     // serialization that exists in setting the oplog truncate after point.
     boost::optional<Timestamp> _lastNoHolesOplogTimestamp;
     boost::optional<OpTimeAndWallTime> _lastNoHolesOplogOpTimeAndWallTime;
+
+    // Cached initialSyncId from last initial sync. Will only be set on startup or initial sync.
+    BSONObj _initialSyncId;
+
+    // Cached recordId of the oplogTruncateAfterPoint to speed up subsequent updates
+    boost::optional<RecordId> _oplogTruncateRecordId;
 };
 
 }  // namespace repl

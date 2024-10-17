@@ -27,20 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/rpc/legacy_reply_builder.h"
-
-#include <iterator>
-#include <memory>
 
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/rpc/metadata.h"
-#include "mongo/rpc/metadata/sharding_metadata.h"
-#include "mongo/s/stale_exception.h"
+#include "mongo/rpc/legacy_reply_builder.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -108,9 +100,9 @@ Message LegacyReplyBuilder::done() {
     invariant(_haveCommandReply);
 
     QueryResult::View qr = _builder.buf();
-    qr.setResultFlagsToOk();
     qr.msgdata().setLen(_builder.len());
     qr.msgdata().setOperation(opReply);
+    qr.setResultFlagsToOk();
     qr.setCursorId(0);
     qr.setStartingFrom(0);
     qr.setNReturned(1);

@@ -26,9 +26,15 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <map>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/bson/bsonelement.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -38,19 +44,19 @@ void ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol
     BSONElement newParameter = parameterIterator.next();
     const auto foundParameter = findRSMProtocolServerParameter();
 
-    uassertStatusOK(foundParameter->second->set(newParameter));
+    uassertStatusOK(foundParameter->second->set(newParameter, boost::none));
 }
 
 void ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol() {
     const auto defaultParameter = kDefaultParameter[kRSMProtocolFieldName];
     const auto foundParameter = findRSMProtocolServerParameter();
 
-    uassertStatusOK(foundParameter->second->set(defaultParameter));
+    uassertStatusOK(foundParameter->second->set(defaultParameter, boost::none));
 }
 
 ServerParameter::Map::const_iterator
 ReplicaSetMonitorProtocolTestUtil::findRSMProtocolServerParameter() {
-    const ServerParameter::Map& parameterMap = ServerParameterSet::getGlobal()->getMap();
+    const auto& parameterMap = ServerParameterSet::getNodeParameterSet()->getMap();
     invariant(parameterMap.size());
     return parameterMap.find(kRSMProtocolFieldName);
 }

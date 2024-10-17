@@ -27,14 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <initializer_list>
 
-#include <memory>
-
-#include "mongo/bson/json.h"
-#include "mongo/db/ops/write_ops_parsers_test_helpers.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/query/write_ops/write_ops_parsers_test_helpers.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -51,7 +62,7 @@ TEST(BatchedCommandRequest, BasicInsert) {
         const auto opMsgRequest(toOpMsg("TestDB", origInsertRequestObj, docSeq));
         const auto insertRequest(BatchedCommandRequest::parseInsert(opMsgRequest));
 
-        ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns());
+        ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns_forTest());
         ASSERT(!insertRequest.hasShardVersion());
     }
 }
@@ -60,27 +71,33 @@ TEST(BatchedCommandRequest, InsertWithShardVersion) {
     BSONArray insertArray = BSON_ARRAY(BSON("a" << 1) << BSON("b" << 1));
 
     const OID epoch = OID::gen();
+    const Timestamp timestamp(2, 2);
+    const Timestamp majorAndMinor(1, 2);
 
     BSONObj origInsertRequestObj = BSON("insert"
                                         << "test"
                                         << "documents" << insertArray << "writeConcern"
                                         << BSON("w" << 1) << "ordered" << true << "shardVersion"
-                                        << BSON_ARRAY(Timestamp(1, 2) << epoch));
+                                        << BSON("e" << epoch << "t" << timestamp << "v"
+                                                    << majorAndMinor));
 
     for (auto docSeq : {false, true}) {
         const auto opMsgRequest(toOpMsg("TestDB", origInsertRequestObj, docSeq));
         const auto insertRequest(BatchedCommandRequest::parseInsert(opMsgRequest));
 
-        ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns());
+        ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns_forTest());
         ASSERT(insertRequest.hasShardVersion());
-        ASSERT_EQ(ChunkVersion(1, 2, epoch, boost::none /* timestamp */).toString(),
+        ASSERT_EQ(ShardVersionFactory::make(ChunkVersion({epoch, timestamp}, {1, 2}),
+                                            boost::optional<CollectionIndexes>(boost::none))
+                      .toString(),
                   insertRequest.getShardVersion().toString());
     }
 }
 
 TEST(BatchedCommandRequest, InsertCloneWithIds) {
     BatchedCommandRequest batchedRequest([&] {
-        write_ops::InsertCommandRequest insertOp(NamespaceString("xyz.abc"));
+        write_ops::InsertCommandRequest insertOp(
+            NamespaceString::createNamespaceString_forTest("xyz.abc"));
         insertOp.setWriteCommandRequestBase([] {
             write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(true);
@@ -90,14 +107,12 @@ TEST(BatchedCommandRequest, InsertCloneWithIds) {
         insertOp.setDocuments({BSON("x" << 1), BSON("x" << 2)});
         return insertOp;
     }());
-    batchedRequest.setWriteConcern(BSON("w" << 2));
 
     const auto clonedRequest(BatchedCommandRequest::cloneInsertWithIds(std::move(batchedRequest)));
 
-    ASSERT_EQ("xyz.abc", clonedRequest.getNS().ns());
+    ASSERT_EQ("xyz.abc", clonedRequest.getNS().ns_forTest());
     ASSERT(clonedRequest.getWriteCommandRequestBase().getOrdered());
     ASSERT(clonedRequest.getWriteCommandRequestBase().getBypassDocumentValidation());
-    ASSERT_BSONOBJ_EQ(BSON("w" << 2), clonedRequest.getWriteConcern());
 
     const auto& insertDocs = clonedRequest.getInsertRequest().getDocuments();
     ASSERT_EQ(2u, insertDocs.size());

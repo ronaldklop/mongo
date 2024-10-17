@@ -28,18 +28,31 @@
  */
 
 #include "mongo/client/sdam/server_description.h"
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include <algorithm>
-#include <boost/algorithm/string.hpp>
 #include <boost/optional.hpp>
+#include <iterator>
 #include <set>
+#include <tuple>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 
 namespace mongo::sdam {
@@ -129,7 +142,7 @@ void ServerDescription::saveHosts(const BSONObj response) {
 void ServerDescription::saveTags(BSONObj tagsObj) {
     const auto keys = tagsObj.getFieldNames<std::set<std::string>>();
     for (const auto& key : keys) {
-        _tags[key] = tagsObj.getStringField(key);
+        _tags[key] = tagsObj.getStringField(key).toString();
     }
 }
 
@@ -209,7 +222,7 @@ void ServerDescription::parseTypeFromHelloReply(const BSONObj helloReply) {
         t = ServerType::kMongos;
     } else if (hasSetName && helloReply.getBoolField("hidden")) {
         t = ServerType::kRSOther;
-    } else if (hasSetName && helloReply.getBoolField("ismaster")) {
+    } else if (hasSetName && helloReply.getBoolField("isWritablePrimary")) {
         t = ServerType::kRSPrimary;
     } else if (hasSetName && helloReply.getBoolField("secondary")) {
         t = ServerType::kRSSecondary;
@@ -221,9 +234,8 @@ void ServerDescription::parseTypeFromHelloReply(const BSONObj helloReply) {
         t = ServerType::kRSGhost;
     } else {
         LOGV2_ERROR(23931,
-                    "Unknown server type from successful hello reply: {helloReply}",
                     "Unknown server type from successful hello reply",
-                    "helloReply"_attr = helloReply.toString());
+                    "helloReply"_attr = helloReply);
         t = ServerType::kUnknown;
     }
     _type = t;
@@ -277,19 +289,15 @@ const boost::optional<std::string>& ServerDescription::getSetName() const {
     return _setName;
 }
 
-const boost::optional<int>& ServerDescription::getSetVersion() const {
-    return _setVersion;
-}
-
-const boost::optional<mongo::OID>& ServerDescription::getElectionId() const {
-    return _electionId;
+ElectionIdSetVersionPair ServerDescription::getElectionIdSetVersionPair() const {
+    return ElectionIdSetVersionPair{_electionId, _setVersion};
 }
 
 const boost::optional<HostAndPort>& ServerDescription::getPrimary() const {
     return _primary;
 }
 
-const mongo::Date_t ServerDescription::getLastUpdateTime() const {
+mongo::Date_t ServerDescription::getLastUpdateTime() const {
     return *_lastUpdateTime;
 }
 
@@ -440,7 +448,7 @@ ServerDescriptionPtr ServerDescription::cloneWithRTT(HelloRTT rtt) {
     return newServerDescription;
 }
 
-const boost::optional<TopologyDescriptionPtr> ServerDescription::getTopologyDescription() {
+boost::optional<TopologyDescriptionPtr> ServerDescription::getTopologyDescription() {
     if (_topologyDescription) {
         const auto result = _topologyDescription->lock();
         invariant(result);

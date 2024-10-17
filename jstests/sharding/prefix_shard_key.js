@@ -6,10 +6,8 @@
 // Part 3: Shard new collection on {skey : 1} but with a longer index.
 //         Insert docs with same val for 'skey' but different vals for 'extra'.
 //         Move chunks around and check that [min,max) chunk boundaries are properly obeyed.
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 // Shard key index does not exactly match shard key, so it is not compatible with $min/$max.
 TestData.skipCheckOrphans = true;
@@ -27,8 +25,7 @@ var db = s.getDB("test");
 var admin = s.getDB("admin");
 var config = s.getDB("config");
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enableSharding: "test", primaryShard: s.shard0.shardName}));
 
 //******************Part 1********************
 
@@ -61,6 +58,7 @@ assert.commandWorked(s.s0.adminCommand({shardCollection: coll.getFullName(), key
 assert.eq(2, coll.getIndexes().length);
 
 // make sure balancing happens
+s.startBalancer();
 s.awaitBalance(coll.getName(), db.getName());
 
 // Make sure our initial balance cleanup doesn't interfere with later migrations.
@@ -147,10 +145,7 @@ for (i = 0; i < 3; i++) {
     // setup new collection on shard0
     var coll2 = db.foo2;
     coll2.drop();
-    if (s.getPrimaryShardIdForDatabase(coll2.getDB()) != s.shard0.shardName) {
-        var moveRes = admin.runCommand({movePrimary: coll2.getDB() + "", to: s.shard0.shardName});
-        assert.eq(moveRes.ok, 1, "primary not moved correctly");
-    }
+    assert(s.getPrimaryShardIdForDatabase(coll2.getDB()) === s.shard0.shardName);
 
     // declare a longer index
     if (i == 0) {
@@ -180,7 +175,7 @@ for (i = 0; i < 3; i++) {
     assert.eq(findChunksUtil.findChunksByNs(config, coll2.getFullName()).count(), 2);
 
     // movechunk should move ALL docs since they have same value for skey
-    moveRes = admin.runCommand(
+    var moveRes = admin.runCommand(
         {moveChunk: coll2 + "", find: {skey: 0}, to: s.shard1.shardName, _waitForDelete: true});
     assert.eq(moveRes.ok, 1, "movechunk didn't work");
 
@@ -201,4 +196,3 @@ for (i = 0; i < 3; i++) {
 }
 
 s.stop();
-})();

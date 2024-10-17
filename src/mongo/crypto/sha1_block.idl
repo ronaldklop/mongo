@@ -34,7 +34,7 @@ global:
     - "mongo/crypto/sha1_block.h"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
 
 types:
   sha1Block:
@@ -44,6 +44,7 @@ types:
     cpp_type: mongo::SHA1Block
     serializer: "mongo::SHA1Block::toCDR"
     deserializer: "mongo::SHA1Block::fromBinData"
+    is_view: false
 
   sha1BlockHex:
     bson_serialization_type: string
@@ -51,3 +52,4 @@ types:
     cpp_type: mongo::SHA1Block
     serializer: "mongo::SHA1Block::toHexString"
     deserializer: "mongo::SHA1Block::fromHexString"
+    is_view: false

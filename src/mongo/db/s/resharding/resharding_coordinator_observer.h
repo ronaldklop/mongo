@@ -29,14 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -79,12 +82,6 @@ public:
     SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsFinishedCloning();
 
     /**
-     * Fulfills the '_allRecipientsFinishedApplying' promise when the last recipient writes that it
-     * is in 'steady-state'.
-     */
-    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsFinishedApplying();
-
-    /**
      * Fulfills the '_allRecipientsReportedStrictConsistencyTimestamp' promise when the last
      * recipient writes that it is in 'strict-consistency' state as well as its
      * 'strictConsistencyTimestamp'.
@@ -92,22 +89,16 @@ public:
     SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsInStrictConsistency();
 
     /**
-     * Fulfills the '_allRecipientsRenamedCollection' promise when the last recipient writes
+     * Fulfills the '_allRecipientsDone' promise when the last recipient writes
      * that it is in 'done' state.
      */
-    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsRenamedCollection();
+    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsDone();
 
     /**
-     * Fulfills the '_allDonorsDroppedOriginalCollection' promise when the last donor writes that it
+     * Fulfills the '_allDonorsDone' promise when the last donor writes that it
      * is in 'done' state.
      */
-    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllDonorsDroppedOriginalCollection();
-
-    /**
-     * Fulfills the '_allParticipantsDoneAborting' promise when the last recipient or donor writes
-     * that it is in 'kDone' with an abortReason.
-     */
-    SharedSemiFuture<void> awaitAllParticipantsDoneAborting();
+    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllDonorsDone();
 
     /**
      * Checks if all recipients are in steady state. Otherwise, sets an error state so that
@@ -120,6 +111,20 @@ public:
      */
     void interrupt(Status status);
 
+    /**
+     * Fulfills all promises prematurely. To be called only if no state document has been persisted
+     * yet.
+     */
+    void fulfillPromisesBeforePersistingStateDoc();
+
+    /**
+     * Indicates that the ReshardingCoordinator::run method has been called.
+     */
+    void reshardingCoordinatorRunCalled() {
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        _reshardingCoordinatorRunCalled = true;
+    }
+
 private:
     /**
      * Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
@@ -128,7 +133,7 @@ private:
     void _onAbortOrStepdown(WithLock, Status status);
 
     // Protects the state below
-    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingCoordinatorObserver::_mutex");
+    stdx::mutex _mutex;
 
     /**
      * Promises indicating that either all donors or all recipients have entered a specific state.
@@ -140,28 +145,23 @@ private:
      *
      *  {_allDonorsReportedMinFetchTimestamp, DonorStateEnum::kDonatingInitialData}
      *  {_allRecipientsFinishedCloning, RecipientStateEnum::kApplying}
-     *  {_allRecipientsFinishedApplying, RecipientStateEnum::kSteadyState}
      *  {_allRecipientsReportedStrictConsistencyTimestamp, RecipientStateEnum::kStrictConsistency}
-     *  {_allRecipientsRenamedCollection, RecipientStateEnum::kDone}
-     *  {_allDonorsDroppedOriginalCollection, DonorStateEnum::kDone}
-     *  {_allParticipantsDoneAborting,
-     *                          DonorStateEnum::kDone with abortReason AND
-     *                          RecipientStateEnum::kDone with abortReason}
+     *  {_allRecipientsDone, RecipientStateEnum::kDone}
+     *  {_allDonorsDone, DonorStateEnum::kDone}
      */
 
     SharedPromise<ReshardingCoordinatorDocument> _allDonorsReportedMinFetchTimestamp;
 
     SharedPromise<ReshardingCoordinatorDocument> _allRecipientsFinishedCloning;
 
-    SharedPromise<ReshardingCoordinatorDocument> _allRecipientsFinishedApplying;
-
     SharedPromise<ReshardingCoordinatorDocument> _allRecipientsReportedStrictConsistencyTimestamp;
 
-    SharedPromise<ReshardingCoordinatorDocument> _allRecipientsRenamedCollection;
+    SharedPromise<ReshardingCoordinatorDocument> _allRecipientsDone;
 
-    SharedPromise<ReshardingCoordinatorDocument> _allDonorsDroppedOriginalCollection;
+    SharedPromise<ReshardingCoordinatorDocument> _allDonorsDone;
 
-    SharedPromise<void> _allParticipantsDoneAborting;
+    // Tracks whether the ReshardingCoordinator::run method has been called.
+    bool _reshardingCoordinatorRunCalled = false;
 };
 
 }  // namespace mongo

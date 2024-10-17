@@ -30,21 +30,25 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
-#include "mongo/db/repl/optime.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
 class BalancerConfiguration;
 class ClusterCursorManager;
-class OperationContext;
-class ServiceContext;
 
 namespace executor {
 class NetworkInterface;
@@ -75,7 +79,7 @@ public:
      */
     void init(std::unique_ptr<ShardingCatalogClient> catalogClient,
               std::unique_ptr<CatalogCache> catalogCache,
-              std::unique_ptr<ShardRegistry> shardRegistry,
+              std::shared_ptr<ShardRegistry> shardRegistry,
               std::unique_ptr<ClusterCursorManager> cursorManager,
               std::unique_ptr<BalancerConfiguration> balancerConfig,
               std::unique_ptr<executor::TaskExecutorPool> executorPool,
@@ -88,10 +92,20 @@ public:
     bool isShardingInitialized() const;
 
     /**
+     * Throws if sharding is not initialized.
+     */
+    void assertShardingIsInitialized() const;
+
+    /**
      * Used to indicate the sharding initialization process is complete. Should only be called once
      * in the lifetime of a server. Protected by an atomic access guard.
      */
     void setShardingInitialized();
+
+    /**
+     * Returns true if init() has successfully completed.
+     */
+    bool isInitialized() const;
 
     /**
      * If the instance as which this sharding component is running (config/shard/mongos) uses
@@ -102,75 +116,42 @@ public:
     void setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn);
 
     /**
-     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-     * it can be deleted.
-     * @return true if shards and config servers are allowed to use 'localhost' in address
+     * These getter methods are safe to run only when Grid::init has been called.
      */
-    bool allowLocalHost() const;
-
-    /**
-     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-     * it can be deleted.
-     * @param whether to allow shards and config servers to use 'localhost' in address
-     */
-    void setAllowLocalHost(bool allow);
-
     ShardingCatalogClient* catalogClient() const {
+        dassert(_isGridInitialized.load());
         return _catalogClient.get();
     }
 
     CatalogCache* catalogCache() const {
+        dassert(_isGridInitialized.load());
         return _catalogCache.get();
     }
 
     ShardRegistry* shardRegistry() const {
+        dassert(_isGridInitialized.load());
         return _shardRegistry.get();
     }
 
     ClusterCursorManager* getCursorManager() const {
+        dassert(_isGridInitialized.load());
         return _cursorManager.get();
     }
 
     executor::TaskExecutorPool* getExecutorPool() const {
+        dassert(_isGridInitialized.load());
         return _executorPool.get();
     }
 
     executor::NetworkInterface* getNetwork() {
+        dassert(_isGridInitialized.load());
         return _network;
     }
 
     BalancerConfiguration* getBalancerConfiguration() const {
+        dassert(_isGridInitialized.load());
         return _balancerConfig.get();
     }
-
-    /**
-     * Returns a readConcern at the specified level for reading after the current ConfigTime.
-     */
-    repl::ReadConcernArgs readConcernWithConfigTime(repl::ReadConcernLevel readConcernLevel) const;
-
-    /**
-     * Returns a readPreference (based on the given one) for targeting a config server that is at or
-     * after the current ConfigTime.
-     */
-    ReadPreferenceSetting readPreferenceWithConfigTime(
-        const ReadPreferenceSetting& readPreference) const;
-
-    /**
-     * Returns the the last optime that a shard or config server has reported as the current
-     * committed optime on the config server.
-     * NOTE: This is not valid to call on a config server instance.
-     */
-    repl::OpTime configOpTime() const;
-
-    /**
-     * Called whenever a mongos or shard gets a response from a config server or shard and updates
-     * what we've seen as the last config server optime.
-     * If the config optime was updated, returns the previous value.
-     * NOTE: This is not valid to call on a config server instance.
-     */
-    boost::optional<repl::OpTime> advanceConfigOpTime(OperationContext* opCtx,
-                                                      repl::OpTime opTime,
-                                                      StringData what);
 
     /**
      * Clears the grid object so that it can be reused between test executions. This will not
@@ -186,7 +167,7 @@ public:
 private:
     std::unique_ptr<ShardingCatalogClient> _catalogClient;
     std::unique_ptr<CatalogCache> _catalogCache;
-    std::unique_ptr<ShardRegistry> _shardRegistry;
+    std::shared_ptr<ShardRegistry> _shardRegistry;
     std::unique_ptr<ClusterCursorManager> _cursorManager;
     std::unique_ptr<BalancerConfiguration> _balancerConfig;
 
@@ -198,28 +179,12 @@ private:
     // questions about the network configuration, such as getting the current server's hostname.
     executor::NetworkInterface* _network{nullptr};
 
-    CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
-
     AtomicWord<bool> _shardingInitialized{false};
+    AtomicWord<bool> _isGridInitialized{false};
 
-    // Protects _configOpTime.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "Grid::_mutex");
+    mutable stdx::mutex _mutex;
 
-    // Last known highest opTime from the config server that should be used when doing reads.
-    // This value is updated any time a shard or mongos talks to a config server or a shard.
-    repl::OpTime _configOpTime;
-
-    /**
-     * Called to update what we've seen as the last config server optime.
-     * If the config optime was updated, returns the previous value.
-     * NOTE: This is not valid to call on a config server instance.
-     */
-    boost::optional<repl::OpTime> _advanceConfigOpTime(const repl::OpTime& opTime);
-
-    // Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
-    // it can be deleted.
-    // Can 'localhost' be used in shard addresses?
-    bool _allowLocalShard{true};
+    CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
 };
 
 }  // namespace mongo

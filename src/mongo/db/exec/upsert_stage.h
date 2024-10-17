@@ -29,7 +29,14 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/update_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/field_ref_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 
@@ -54,7 +61,7 @@ public:
     UpsertStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                const CollectionPtr& collection,
+                CollectionAcquisition collection,
                 PlanStage* child);
 
     bool isEOF() final;
@@ -63,10 +70,6 @@ public:
 private:
     BSONObj _produceNewDocumentForInsert();
     void _performInsert(BSONObj newDocument);
-
-    void _generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths);
-    void _generateNewDocumentFromUpdateOp(const FieldRefSet& immutablePaths);
-
     void _assertDocumentToBeInsertedIsValid(const mutablebson::Document& document,
                                             const FieldRefSet& shardKeyPaths);
 };

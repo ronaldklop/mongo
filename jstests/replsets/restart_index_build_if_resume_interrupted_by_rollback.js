@@ -3,15 +3,14 @@
  * fails to run to completion before a subsequent rollback, it will restart from the beginning.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/rollback_resumable_index_build.js");
+import {
+    RollbackResumableIndexBuildTest
+} from "jstests/replsets/libs/rollback_resumable_index_build.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 
@@ -21,4 +20,3 @@ RollbackResumableIndexBuildTest.runResumeInterruptedByRollback(
     rollbackTest, dbName, [{a: 1}, {a: 2}], {a: 1}, [{a: 3}], [{a: 4}]);
 
 rollbackTest.stop();
-})();

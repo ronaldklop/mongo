@@ -6,10 +6,9 @@
 // We verify this requirement by running a map-reduce, examining the logs to find the names of
 // all collections created, and checking the oplog for entries logging the creation of each of those
 // collections.
-load("jstests/libs/logv2_helpers.js");
+// @tags: [requires_scripting]
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "mr_nonrepl_coll_in_local_db";
 const replSet = new ReplSetTest({name: name, nodes: 2});
@@ -46,12 +45,7 @@ assert.commandWorked(result);
 const logLines = checkLog.getGlobalLog(primaryDB);
 let createdCollections = [];
 logLines.forEach(function(line) {
-    let matchResult;
-    if (isJsonLogNoConn()) {
-        line.match(/createCollection: (.+) with/);
-    } else {
-        matchResult = line.match(/createCollection: .+ with.*"nss":"(.*)"/);
-    }
+    const matchResult = line.match(/createCollection: (.+) with/);
     if (matchResult) {
         createdCollections.push(matchResult[1]);
     }
@@ -90,4 +84,3 @@ createdCollections.forEach(function(createdCollectionName) {
 });
 
 replSet.stopSet();
-}());

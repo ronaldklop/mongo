@@ -29,27 +29,42 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
 class DatabaseImpl final : public Database {
 public:
-    explicit DatabaseImpl(StringData name);
+    explicit DatabaseImpl(const DatabaseName& dbName);
 
-    void init(OperationContext*) const final;
+    void init(OperationContext*) final;
 
-    const std::string& name() const final {
+    const DatabaseName& name() const final {
         return _name;
     }
 
-    void clearTmpCollections(OperationContext* opCtx) const final;
-
-    void setDropPending(OperationContext* opCtx, bool dropPending) final;
-
-    bool isDropPending(OperationContext* opCtx) const final;
-
-    void getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale = 1) const final;
+    void getStats(OperationContext* opCtx,
+                  DBStats* output,
+                  bool includeFreeStorage,
+                  double scale = 1) const final;
 
     /**
      * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
@@ -58,15 +73,20 @@ public:
      * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
      * of the oplog entry.
      *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility (e.g. in change streams).
+     *
      * The caller should hold a DB X lock and ensure there are no index builds in progress on the
      * collection.
      */
     Status dropCollection(OperationContext* opCtx,
                           NamespaceString nss,
-                          repl::OpTime dropOpTime) const final;
+                          repl::OpTime dropOpTime,
+                          bool markFromMigrate) const final;
     Status dropCollectionEvenIfSystem(OperationContext* opCtx,
                                       NamespaceString nss,
-                                      repl::OpTime dropOpTime) const final;
+                                      repl::OpTime dropOpTime,
+                                      bool markFromMigrate) const final;
 
     Status dropView(OperationContext* opCtx, NamespaceString viewName) const final;
 
@@ -74,13 +94,28 @@ public:
                         const NamespaceString& nss,
                         CollectionOptions collectionOptions,
                         bool createDefaultIndexes,
-                        const BSONObj& idIndex) const final;
+                        const BSONObj& idIndex,
+                        bool fromMigrate) const final;
+
+    Status userCreateVirtualNS(OperationContext* opCtx,
+                               const NamespaceString& fullns,
+                               CollectionOptions opts,
+                               const VirtualCollectionOptions& vopts) const final;
 
     Collection* createCollection(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  const CollectionOptions& options = CollectionOptions(),
                                  bool createDefaultIndexes = true,
-                                 const BSONObj& idIndex = BSONObj()) const final;
+                                 const BSONObj& idIndex = BSONObj(),
+                                 bool fromMigrate = false) const final;
+
+    Collection* createVirtualCollection(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        const CollectionOptions& opts,
+                                        const VirtualCollectionOptions& vopts) const final;
+
+    StatusWith<std::unique_ptr<CollatorInterface>> validateCollator(
+        OperationContext* opCtx, CollectionOptions& opts) const final;
 
     Status createView(OperationContext* opCtx,
                       const NamespaceString& viewName,
@@ -91,28 +126,24 @@ public:
                             NamespaceString toNss,
                             bool stayTemp) const final;
 
-    static Status validateDBName(StringData dbname);
+    static Status validateDBName(const DatabaseName& dbName);
 
     const NamespaceString& getSystemViewsName() const final {
         return _viewsName;
     }
 
-    /**
-     * Given an input pattern `collectionNameModel`, returns a namespace string where `%` characters
-     * are replaced with random alpha-numerics.
-     *
-     * When called while holding an exclusive database lock, the collection name is guaranteed to
-     * not exist. Otherwise the caller is responsible for acquiring locks to check uniqueness.
-     *
-     * Returns a NamespaceExists error status if multiple attempts fail to generate a possible
-     * unique name.
-     */
-    StatusWith<NamespaceString> makeUniqueCollectionNamespace(
-        OperationContext* opCtx, StringData collectionNameModel) const final;
-
-    void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const final;
-
 private:
+    StatusWith<std::unique_ptr<CollatorInterface>> _validateCollator(OperationContext* opCtx,
+                                                                     CollectionOptions& opts) const;
+    Collection* _createCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptions& opts = CollectionOptions(),
+        bool createDefaultIndexes = true,
+        const BSONObj& idIndex = BSONObj(),
+        bool fromMigrate = false,
+        const boost::optional<VirtualCollectionOptions>& vopts = boost::none) const;
+
     /**
      * Throws if there is a reason 'ns' cannot be created as a user collection. Namespace pattern
      * matching checks should be added to userAllowedCreateNS().
@@ -138,14 +169,9 @@ private:
                                 const NamespaceString& nss,
                                 Collection* collection) const;
 
-    const std::string _name;  // "dbname"
+    const DatabaseName _name;  // "dbname"
 
     const NamespaceString _viewsName;  // "dbname.system.views"
-
-    // If '_dropPending' is true, this Database is in the midst of a two-phase drop. No new
-    // collections may be created in this Database.
-    // This variable may only be read/written while the database is locked in MODE_X.
-    AtomicWord<bool> _dropPending{false};
 };
 
 }  // namespace mongo

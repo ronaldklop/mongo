@@ -29,14 +29,26 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-class AutoGetCollection;
+class CollectionAcquisition;
+
 class ThreadPool;
 
 /**
@@ -68,8 +80,13 @@ public:
      *
      * @param opts The options to use when creating the backing collection if it doesn't exist.
      * @param maxSize the maximum number of bytes to store in the buffer.
+     * @param retryOnReplStateChangeInterruption Attempt to retry writes in the event of failure
+     * with an 'InterruptedDueToReplStateChange' error.
      */
-    DeferredWriter(NamespaceString nss, CollectionOptions opts, int64_t maxSize);
+    DeferredWriter(NamespaceString nss,
+                   CollectionOptions opts,
+                   int64_t maxSize,
+                   bool retryOnReplStateChangeInterruption = false);
 
     /**
      * Start the background worker thread writing to the given collection.
@@ -131,12 +148,12 @@ private:
     /**
      * Ensure that the backing collection exists, and pass back a lock and handle to it.
      */
-    StatusWith<std::unique_ptr<AutoGetCollection>> _getCollection(OperationContext* opCtx);
+    StatusWith<CollectionAcquisition> _getCollection(OperationContext* opCtx);
 
     /**
      * The method that the worker thread will run.
      */
-    void _worker(InsertStatement stmt);
+    Status _worker(BSONObj doc) noexcept;
 
     /**
      * The options for the collection, in case we need to create it.
@@ -158,7 +175,7 @@ private:
     /**
      * Guards all non-const, non-thread-safe members.
      */
-    Mutex _mutex = MONGO_MAKE_LATCH("DeferredWriter::_mutex");
+    stdx::mutex _mutex;
 
     /**
      * The number of bytes currently in the in-memory buffer.
@@ -179,6 +196,12 @@ private:
     using TimePoint = stdx::chrono::time_point<stdx::chrono::system_clock>;
     TimePoint _lastLogged;
     TimePoint _lastLoggedDrop;
+
+    /**
+     * Attempt to retry writes in the event of failure with an 'InterruptedDueToReplStateChange'
+     * error.
+     */
+    bool _retryOnReplStateChangeInterruption;
 };
 
 }  // namespace mongo

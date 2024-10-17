@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <iosfwd>
 #include <memory>
@@ -40,26 +43,32 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/resumable_index_builds_gen.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
-
-extern FailPoint leaveIndexBuildUnfinishedForShutdown;
 
 class Collection;
 class CollectionPtr;
 class MatchExpression;
 class NamespaceString;
 class OperationContext;
+
+class ProgressMeterHolder;
 
 /**
  * Builds one or more indexes.
@@ -77,16 +86,15 @@ class MultiIndexBlock {
     MultiIndexBlock& operator=(const MultiIndexBlock&) = delete;
 
 public:
+    using RetrySkippedRecordMode = IndexBuildInterceptor::RetrySkippedRecordMode;
+
     MultiIndexBlock() = default;
     ~MultiIndexBlock();
 
     /**
-     * By default we enforce the 'unique' flag in specs when building an index by failing.
-     * If this is called before init(), we will ignore unique violations. This has no effect if
-     * no specs are unique.
-     *
-     * If this is called, any 'dupRecords' set passed to dumpInsertsFromBulk() will never be
-     * filled.
+     * When this is called:
+     * For hybrid index builds, the index interceptor will not track duplicates.
+     * For foreground index builds, the uniqueness constraint will be relaxed.
      */
     void ignoreUniqueConstraint();
 
@@ -97,6 +105,9 @@ public:
     void setTwoPhaseBuildUUID(UUID indexBuildUUID) {
         _buildUUID = indexBuildUUID;
     }
+
+    using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
+    enum class InitMode { SteadyState, InitialSync, Recovery };
 
     /**
      * Prepares the index(es) for building and returns the canonicalized form of the requested index
@@ -110,22 +121,17 @@ public:
      *
      * Requires holding an exclusive lock on the collection.
      */
-    using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
     StatusWith<std::vector<BSONObj>> init(
         OperationContext* opCtx,
         CollectionWriter& collection,
         const std::vector<BSONObj>& specs,
         OnInitFn onInit,
+        InitMode initMode = InitMode::SteadyState,
         const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
                                           CollectionWriter& collection,
                                           const BSONObj& spec,
                                           OnInitFn onInit);
-    StatusWith<std::vector<BSONObj>> initForResume(OperationContext* opCtx,
-                                                   const CollectionPtr& collection,
-                                                   const std::vector<BSONObj>& specs,
-                                                   const ResumeIndexInfo& resumeInfo);
-
     /**
      * Not all index initializations need an OnInitFn, in particular index builds that do not need
      * to timestamp catalog writes. This is a no-op.
@@ -155,7 +161,7 @@ public:
     Status insertAllDocumentsInCollection(
         OperationContext* opCtx,
         const CollectionPtr& collection,
-        boost::optional<RecordId> resumeAfterRecordId = boost::none);
+        const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
 
     /**
      * Call this after init() for each document in the collection.
@@ -163,10 +169,20 @@ public:
      * Do not call if you called insertAllDocumentsInCollection();
      *
      * Should be called inside of a WriteUnitOfWork.
+     *
+     * 'saveCursorBeforeWrite' and 'restoreCursorAfterWrite' will only be called if an index
+     * constraint violation is found and written out to the constraint violation side table. Any
+     * open cursors held by the caller should be saved in 'saveCursorBeforeWrite' and restored in
+     * 'saveCursorBeforeWrite'. Otherwise, the cursors may get reset unexpectedly because of an
+     * internally handled WCE.
      */
-    Status insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
-                                                        const BSONObj& wholeDocument,
-                                                        const RecordId& loc);
+    Status insertSingleDocumentForInitialSyncOrRecovery(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& wholeDocument,
+        const RecordId& loc,
+        const std::function<void()>& saveCursorBeforeWrite,
+        const std::function<void()>& restoreCursorAfterWrite);
 
     /**
      * Call this after the last insertSingleDocumentForInitialSyncOrRecovery(). This gives the index
@@ -201,16 +217,22 @@ public:
 
 
     /**
-     * Retries key generation and insertion for all records skipped during the collection scanning
-     * phase.
+     * By default, retries key generation and insertion for all records skipped during the
+     * collection scanning phase.
      *
      * Index builds ignore key generation errors on secondaries. In steady-state replication, all
      * writes from the primary are eventually applied, so an index build should always succeed when
      * the primary commits. In two-phase index builds, a secondary may become primary in the middle
      * of an index build, so it must ensure that before it finishes, it has indexed all documents in
      * a collection, requiring a call to this function upon completion.
+     *
+     * When featureFlagIndexBuildsGracefulErrorHandling is enagled, the function is also called to
+     * preemptively abort index builds on step-up if the skipped records remain invalid.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for
@@ -270,6 +292,14 @@ public:
     static OnCleanUpFn kNoopOnCleanUpFn;
 
     /**
+     * Returns an onCleanUp function for clean up when this index build should be timestamped. When
+     * called on primaries, this generates a new optime, writes a no-op oplog entry, and timestamps
+     * the catalog write to remove the index entry. Does nothing on secondaries.
+     */
+    static OnCleanUpFn makeTimestampedOnCleanUpFn(OperationContext* opCtx,
+                                                  const CollectionPtr& coll);
+
+    /**
      * May be called at any time after construction but before a successful commit(). Suppresses
      * the default behavior on destruction of removing all traces of uncommitted index builds. May
      * delete internal tables, but this is not transactional. Writes the resumable index build
@@ -289,6 +319,11 @@ public:
 
     void setIndexBuildMethod(IndexBuildMethod indexBuildMethod);
 
+    /**
+     * Appends the current state information of the index build to the builder.
+     */
+    void appendBuildInfo(BSONObjBuilder* builder) const;
+
 private:
     struct IndexToBuild {
         std::unique_ptr<IndexBuildBlock> block;
@@ -298,6 +333,10 @@ private:
         std::unique_ptr<IndexAccessMethod::BulkBuilder> bulk;
 
         InsertDeleteOptions options;
+
+        // We cache index catalog entry pointer for the collection scan phase. This is necessary for
+        // index build performance in the insert path.
+        const IndexCatalogEntry* entryForScan = nullptr;
     };
 
     void _writeStateToDisk(OperationContext* opCtx, const CollectionPtr& collection) const;
@@ -310,7 +349,22 @@ private:
                                      const BSONObj& doc,
                                      unsigned long long iteration) const;
 
-    Status _insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
+    Status _insert(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& wholeDocument,
+        const RecordId& loc,
+        const IndexAccessMethod::OnSuppressedErrorFn& onSuppressedError,
+        const IndexAccessMethod::ShouldRelaxConstraintsFn& shouldRelaxConstraints = nullptr);
+
+    /**
+     * Performs a collection scan on the given collection and inserts the relevant index keys into
+     * the external sorter.
+     */
+    void _doCollectionScan(OperationContext* opCtx,
+                           const CollectionPtr& collection,
+                           const boost::optional<RecordId>& resumeAfterRecordId,
+                           ProgressMeterHolder* progress);
 
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
@@ -320,6 +374,13 @@ private:
     IndexBuildMethod _method = IndexBuildMethod::kHybrid;
 
     bool _ignoreUnique = false;
+
+    // True if one or more indexes being built are on time-series measurements.
+    bool _containsIndexBuildOnTimeseriesMeasurement = false;
+
+    // True if at least one bucket document contains mixed-schema data and
+    // '_containsIndexBuildOnTimeseriesMeasurement=true'.
+    bool _timeseriesBucketContainsMixedSchemaData = false;
 
     // Set to true when no work remains to be done, the object can safely destruct without leaving
     // incorrect state set anywhere.
@@ -335,5 +396,10 @@ private:
 
     // The current phase of the index build.
     IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
+
+    // We cache the collection pointer for the collection scan phase. The collection pointer is
+    // compared after yielding, which is used to indicate whether we need to refetch the index
+    // catalog entry pointers in IndexToBuild. This is necessary for index build performance.
+    const Collection* _collForScan = nullptr;
 };
 }  // namespace mongo

@@ -1,5 +1,5 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 var test = new ShardingTest({shards: 1, mongos: 1, other: {chunkSize: 1}});
 
 var mongos = test.s0;
@@ -38,9 +38,9 @@ var dbEntryCheck = function(dbEntry, onConfig) {
     res = mongos.adminCommand("listDatabases");
     dbArray = res.databases;
 
-    dbEntryCheck(getDBSection(dbArray, "blah"), false);
-    dbEntryCheck(getDBSection(dbArray, "foo"), false);
-    dbEntryCheck(getDBSection(dbArray, "raw"), false);
+    dbEntryCheck(getDBSection(dbArray, "blah"), TestData.configShard);
+    dbEntryCheck(getDBSection(dbArray, "foo"), TestData.configShard);
+    dbEntryCheck(getDBSection(dbArray, "raw"), TestData.configShard);
 }
 
 // Local db is never returned.
@@ -73,7 +73,8 @@ var dbEntryCheck = function(dbEntry, onConfig) {
     var entry = getDBSection(dbArray, "config");
     dbEntryCheck(entry, true);
     assert(entry["shards"]);
-    assert.eq(Object.keys(entry["shards"]).length, 2);
+    // There's only the "config" shard in config shard mode.
+    assert.eq(Object.keys(entry["shards"]).length, TestData.configShard ? 1 : 2);
 }
 
 // Admin db is only reported on the config shard, never on other shards.
@@ -90,4 +91,3 @@ var dbEntryCheck = function(dbEntry, onConfig) {
 }
 
 test.stop();
-})();

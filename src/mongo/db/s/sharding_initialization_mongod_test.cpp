@@ -27,55 +27,69 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/collection_sharding_state_factory_shard.h"
-#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_mock.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_op_observer.h"
-#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace {
-
-const std::string kShardName("TestShard");
 
 /**
  * This test suite directly invokes the sharding initialization code and validates its behaviour and
  * proper state transitions.
  */
-class ShardingInitializationMongoDTest : public ShardingMongodTestFixture {
+class ShardingInitializationMongoDTest : public ShardingMongoDTestFixture {
 protected:
     void setUp() override {
-        serverGlobalParams.clusterRole = ClusterRole::None;
-        ShardingMongodTestFixture::setUp();
-
-        // When sharding initialization is triggered, initialize sharding state as a shard server.
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-
-        CatalogCacheLoader::set(getServiceContext(),
-                                std::make_unique<ShardServerCatalogCacheLoader>(
-                                    std::make_unique<ConfigServerCatalogCacheLoader>()));
+        ShardingMongoDTestFixture::setUp();
 
         ShardingInitializationMongoD::get(getServiceContext())
             ->setGlobalInitMethodForTest(
                 [&](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
                     const auto& configConnStr = shardIdentity.getConfigsvrConnectionString();
 
-                    uassertStatusOK(initializeGlobalShardingStateForMongodForTest(configConnStr));
+                    auto loader = std::make_shared<ShardServerCatalogCacheLoader>(
+                        std::make_unique<ConfigServerCatalogCacheLoader>());
+                    auto catalogCache =
+                        std::make_unique<CatalogCache>(opCtx->getServiceContext(), loader);
+                    uassertStatusOK(initializeGlobalShardingStateForMongodForTest(
+                        configConnStr, std::move(catalogCache), std::move(loader)));
 
                     // Set the ConnectionString return value on the mock targeter so that later
                     // calls to the targeter's getConnString() return the appropriate value
@@ -94,17 +108,14 @@ protected:
         _dbDirectClient.reset();
 
         // Restore the defaults before calling tearDown
-        storageGlobalParams.readOnly = false;
+        storageGlobalParams.queryableBackupMode = false;
         serverGlobalParams.overrideShardIdentity = BSONObj();
 
-        CatalogCacheLoader::clearForTests(getServiceContext());
-        ShardingState::get(getServiceContext())->clearForTests();
-
-        ShardingMongodTestFixture::tearDown();
+        ShardingMongoDTestFixture::tearDown();
     }
 
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
-        return std::make_unique<ShardingCatalogClientImpl>();
+        return std::make_unique<ShardingCatalogClientImpl>(nullptr /* overrideConfigShard */);
     }
 
     auto* shardingInitialization() {
@@ -114,6 +125,12 @@ protected:
     auto* shardingState() {
         return ShardingState::get(getServiceContext());
     }
+
+    const std::string kShardName{"TestShard"};
+    const ShardIdentity kShardIdentityDoc{
+        kShardName, OID::gen(), ConnectionString::forReplicaSet(kShardName, {HostAndPort("a:1")})};
+
+    service_context_test::ShardRoleOverride _shardRole;
 
     // Used to write to set up local collections before exercising server logic.
     std::unique_ptr<DBDirectClient> _dbDirectClient;
@@ -126,27 +143,17 @@ protected:
 class ScopedSetStandaloneMode {
 public:
     ScopedSetStandaloneMode(ServiceContext* serviceContext) : _serviceContext(serviceContext) {
-        CollectionShardingStateFactory::clear(serviceContext);
-
-        CollectionShardingStateFactory::set(
-            serviceContext,
-            std::make_unique<CollectionShardingStateFactoryStandalone>(serviceContext));
-
         serverGlobalParams.clusterRole = ClusterRole::None;
         _serviceContext->setOpObserver(std::make_unique<OpObserverRegistry>());
     }
 
     ~ScopedSetStandaloneMode() {
-        CollectionShardingStateFactory::clear(_serviceContext);
-
-        CollectionShardingStateFactory::set(
-            _serviceContext,
-            std::make_unique<CollectionShardingStateFactoryShard>(_serviceContext));
-
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+        serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
         _serviceContext->setOpObserver([&] {
             auto opObserver = std::make_unique<OpObserverRegistry>();
-            opObserver->addObserver(std::make_unique<OpObserverShardingImpl>());
+            opObserver->addObserver(
+                std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerMock>()));
+            opObserver->addObserver(std::make_unique<MigrationChunkClonerSourceOpObserver>());
             opObserver->addObserver(std::make_unique<ShardServerOpObserver>());
             return opObserver;
         }());
@@ -167,7 +174,7 @@ TEST_F(ShardingInitializationMongoDTest, ValidShardIdentitySucceeds) {
     shardIdentity.setClusterId(OID::gen());
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
-    ASSERT_OK(shardingState()->canAcceptShardedCommands());
+    shardingState()->assertCanAcceptShardedCommands();
     ASSERT(shardingState()->enabled());
     ASSERT_EQ(kShardName, shardingState()->shardId());
     ASSERT_EQ("config/a:1,b:2", shardRegistry()->getConfigServerConnectionString().toString());
@@ -200,8 +207,11 @@ TEST_F(ShardingInitializationMongoDTest, InitWhilePreviouslyInErrorStateWillStay
         shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity),
         AssertionException,
         ErrorCodes::ManualInterventionRequired);
-    ASSERT_NOT_OK(shardingState()->canAcceptShardedCommands());
-    ASSERT(!shardingState()->enabled());
+    ASSERT_THROWS_CODE(shardingState()->assertCanAcceptShardedCommands(),
+                       AssertionException,
+                       ErrorCodes::ManualInterventionRequired);
+    ASSERT_THROWS_CODE(
+        shardingState()->enabled(), AssertionException, ErrorCodes::ManualInterventionRequired);
 }
 
 TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingShardIdentitySucceeds) {
@@ -230,11 +240,61 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingShardIdentit
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
-    ASSERT_OK(shardingState()->canAcceptShardedCommands());
+    shardingState()->assertCanAcceptShardedCommands();
     ASSERT_TRUE(shardingState()->enabled());
 
     ASSERT_EQ(kShardName, shardingState()->shardId());
     ASSERT_EQ("config/a:1,b:2", shardRegistry()->getConfigServerConnectionString().toString());
+}
+
+TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithNonMatchingShardIdentityFails) {
+    // Must hold a lock to call initializeFromShardIdentity.
+    Lock::GlobalWrite lk(operationContext());
+
+    auto clusterID = OID::gen();
+    ShardIdentityType shardIdentity;
+    shardIdentity.setConfigsvrConnectionString(
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
+    shardIdentity.setShardName(kShardName);
+    shardIdentity.setClusterId(clusterID);
+
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
+
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+            FAIL("Should not be invoked!");
+        });
+
+    // Running again the initialization with a different shardName must result in an error
+    {
+        ShardIdentityType shardIdentity2 = shardIdentity;
+        shardIdentity2.setShardName("AnotherShardName");
+        ASSERT_THROWS_CODE(shardingInitialization()->initializeFromShardIdentity(operationContext(),
+                                                                                 shardIdentity2),
+                           AssertionException,
+                           40371);
+    }
+
+    // Running again the initialization with a different clusterId must result in an error
+    {
+        ShardIdentityType shardIdentity2 = shardIdentity;
+        shardIdentity2.setClusterId(OID::gen());
+        ASSERT_THROWS_CODE(shardingInitialization()->initializeFromShardIdentity(operationContext(),
+                                                                                 shardIdentity2),
+                           AssertionException,
+                           40372);
+    }
+
+    // Running again the initialization with a different ReplicaSetName must result in an error
+    {
+        ShardIdentityType shardIdentity2 = shardIdentity;
+        shardIdentity2.setConfigsvrConnectionString(
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config2"));
+        ASSERT_THROWS_CODE(shardingInitialization()->initializeFromShardIdentity(operationContext(),
+                                                                                 shardIdentity2),
+                           AssertionException,
+                           40374);
+    }
 }
 
 TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameSucceeds) {
@@ -263,7 +323,7 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameS
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
-    ASSERT_OK(shardingState()->canAcceptShardedCommands());
+    shardingState()->assertCanAcceptShardedCommands();
     ASSERT_TRUE(shardingState()->enabled());
 
     ASSERT_EQ(kShardName, shardingState()->shardId());
@@ -271,85 +331,42 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameS
 }
 
 // The tests below check for different combinations of the compatible startup parameters for
-// --shardsvr, --overrideShardIdentity, and queryableBackup (readOnly) mode
+// --shardsvr, --overrideShardIdentity, and queryableBackup mode
 
 /**
- * readOnly and --shardsvr
+ * queryableBackupMode and --shardsvr
  */
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededReadOnlyAndShardServerAndNoOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndShardServerAndNoOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
 }
 
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededReadOnlyAndShardServerAndInvalidOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndShardServerAndInvalidOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
     serverGlobalParams.overrideShardIdentity =
         BSON("_id"
              << "shardIdentity" << ShardIdentity::kShardNameFieldName << kShardName
              << ShardIdentity::kClusterIdFieldName << OID::gen()
              << ShardIdentity::kConfigsvrConnectionStringFieldName << "invalid");
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::UnsupportedFormat);
-}
-
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededReadOnlyAndShardServerAndValidOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
-    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-    serverGlobalParams.overrideShardIdentity = [] {
-        ShardIdentityType shardIdentity;
-        shardIdentity.setConfigsvrConnectionString(
-            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
-        shardIdentity.setShardName(kShardName);
-        shardIdentity.setClusterId(OID::gen());
-        ASSERT_OK(shardIdentity.validate());
-        return shardIdentity.toShardIdentityDocument();
-    }();
-
-    ASSERT(shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
-}
-
-/**
- * readOnly and not --shardsvr
- */
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededReadOnlyAndNotShardServerAndNoOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
-    serverGlobalParams.clusterRole = ClusterRole::None;
-
-    ASSERT(!shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::UnsupportedFormat);
 }
 
 TEST_F(
     ShardingInitializationMongoDTest,
-    InitializeShardingAwarenessIfNeededReadOnlyAndNotShardServerAndInvalidOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
-    serverGlobalParams.clusterRole = ClusterRole::None;
-    serverGlobalParams.overrideShardIdentity = BSON("_id"
-                                                    << "shardIdentity"
-                                                    << "configsvrConnectionString"
-                                                    << "invalid");
-
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
-}
-
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededReadOnlyAndNotShardServerAndValidOverrideShardIdentity) {
-    storageGlobalParams.readOnly = true;
-    serverGlobalParams.clusterRole = ClusterRole::None;
-    serverGlobalParams.overrideShardIdentity = [] {
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndShardServerAndValidOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
+    serverGlobalParams.overrideShardIdentity = [&] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
             ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
@@ -359,40 +376,48 @@ TEST_F(ShardingInitializationMongoDTest,
         return shardIdentity.toShardIdentityDocument();
     }();
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
+    Lock::GlobalWrite lk(operationContext());
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), kShardIdentityDoc);
+    ASSERT(shardingState()->enabled());
+
+    // A second call with the same parameters shouldn't trigger any error.
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), kShardIdentityDoc);
+    ASSERT(shardingState()->enabled());
 }
 
 /**
- * not readOnly and --overrideShardIdentity
+ * queryableBackupMode and not --shardsvr
  */
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndInvalidOverrideShardIdentity) {
-    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndNotShardServerAndNoOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
+    serverGlobalParams.clusterRole = ClusterRole::None;
+
+    ASSERT(!ShardingInitializationMongoD::getShardIdentityDoc(operationContext()));
+}
+
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndNotShardServerAndInvalidOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
+    serverGlobalParams.clusterRole = ClusterRole::None;
     serverGlobalParams.overrideShardIdentity = BSON("_id"
                                                     << "shardIdentity"
                                                     << "configsvrConnectionString"
                                                     << "invalid");
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
-
-    // Should error regardless of cluster role
-    serverGlobalParams.clusterRole = ClusterRole::None;
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
 }
 
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndValidOverrideShardIdentity) {
-    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-    serverGlobalParams.overrideShardIdentity = [] {
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededQueryableBackupModeAndNotShardServerAndValidOverrideShardIdentity) {
+    storageGlobalParams.queryableBackupMode = true;
+    serverGlobalParams.clusterRole = ClusterRole::None;
+    serverGlobalParams.overrideShardIdentity = [&] {
         ShardIdentityType shardIdentity;
         shardIdentity.setConfigsvrConnectionString(
             ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
@@ -402,29 +427,68 @@ TEST_F(ShardingInitializationMongoDTest,
         return shardIdentity.toShardIdentityDocument();
     }();
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
-
-    // Should error regardless of cluster role
-    serverGlobalParams.clusterRole = ClusterRole::None;
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::InvalidOptions);
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
 }
 
 /**
- * not readOnly and --shardsvr
+ * not queryableBackupMode and --overrideShardIdentity
  */
 TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndShardServerAndNoShardIdentity) {
-    ASSERT(!shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+       InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndInvalidOverrideShardIdentity) {
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
+    serverGlobalParams.overrideShardIdentity = BSON("_id"
+                                                    << "shardIdentity"
+                                                    << "configsvrConnectionString"
+                                                    << "invalid");
+
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
+
+    // Should error regardless of cluster role
+    serverGlobalParams.clusterRole = ClusterRole::None;
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
 }
 
 TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndShardServerAndInvalidShardIdentity) {
+       InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndValidOverrideShardIdentity) {
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
+    serverGlobalParams.overrideShardIdentity = [&] {
+        ShardIdentityType shardIdentity;
+        shardIdentity.setConfigsvrConnectionString(
+            ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
+        shardIdentity.setShardName(kShardName);
+        shardIdentity.setClusterId(OID::gen());
+        ASSERT_OK(shardIdentity.validate());
+        return shardIdentity.toShardIdentityDocument();
+    }();
+
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
+
+    // Should error regardless of cluster role
+    serverGlobalParams.clusterRole = ClusterRole::None;
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
+}
+
+/**
+ * not queryableBackupMode and --shardsvr
+ */
+TEST_F(ShardingInitializationMongoDTest,
+       InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndShardServerAndNoShardIdentity) {
+    ASSERT(!ShardingInitializationMongoD::getShardIdentityDoc(operationContext()));
+}
+
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndShardServerAndInvalidShardIdentity) {
     // Insert the shardIdentity doc to disk while pretending that we are in "standalone" mode,
     // otherwise OpObserver for inserts will prevent the insert from occurring because the
     // shardIdentity doc is invalid
@@ -438,18 +502,18 @@ TEST_F(ShardingInitializationMongoDTest,
                                             << ShardIdentity::kConfigsvrConnectionStringFieldName
                                             << "invalid");
 
-        _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
+        _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace,
                                 invalidShardIdentity);
     }
 
-    ASSERT_THROWS_CODE(
-        shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
-        AssertionException,
-        ErrorCodes::UnsupportedFormat);
+    ASSERT_THROWS_CODE(ShardingInitializationMongoD::getShardIdentityDoc(operationContext()),
+                       AssertionException,
+                       ErrorCodes::UnsupportedFormat);
 }
 
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndShardServerAndValidShardIdentity) {
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndShardServerAndValidShardIdentity) {
     // Insert the shardIdentity doc to disk while pretending that we are in "standalone" mode,
     // otherwise OpObserver for inserts will prevent the insert from occurring because the
     // shardIdentity doc is invalid
@@ -466,28 +530,83 @@ TEST_F(ShardingInitializationMongoDTest,
             return shardIdentity.toShardIdentityDocument();
         }();
 
-        _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
-                                validShardIdentity);
+        _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace, validShardIdentity);
     }
 
-    ASSERT(shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+    Lock::GlobalWrite lk(operationContext());
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), kShardIdentityDoc);
+    ASSERT(shardingState()->enabled());
+
+    // A second call with the same parameters shouldn't trigger any error.
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), kShardIdentityDoc);
+    ASSERT(shardingState()->enabled());
+}
+
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndShardServerAsIfLogicalInitialSync) {
+    // No valid ShardIdentity yet, since we will get it through initial sync.
+
+    ShardIdentityType shardIdentity;
+    shardIdentity.setConfigsvrConnectionString(
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
+    shardIdentity.setShardName(kShardName);
+    shardIdentity.setClusterId(OID::gen());
+    ASSERT_OK(shardIdentity.validate());
+
+    // An OpObserver will react to this insertion and initialize the ShardingState.
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace,
+                            shardIdentity.toShardIdentityDocument());
+    ASSERT(shardingState()->enabled());
+
+    // This call represents the one done by the onConsistentDataAvailable. It should be a no-op.
+    Lock::GlobalWrite lk(operationContext());
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
+    ASSERT(shardingState()->enabled());
+}
+
+TEST_F(ShardingInitializationMongoDTest,
+       InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndShardServerAsIfFCBIS) {
+    ShardIdentityType shardIdentity;
+    shardIdentity.setConfigsvrConnectionString(
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
+    shardIdentity.setShardName(kShardName);
+    shardIdentity.setClusterId(OID::gen());
+    ASSERT_OK(shardIdentity.validate());
+
+    // Insert the shardIdentity doc to disk while pretending that we are in "standalone" mode,
+    // otherwise OpObserver for inserts will prevent the insert from occurring because the
+    // shardIdentity doc is invalid
+    {
+        ScopedSetStandaloneMode standalone(getServiceContext());
+        _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace,
+                                shardIdentity.toShardIdentityDocument());
+    }
+
+    ASSERT(!shardingState()->enabled());
+
+    // This call represents the one done by the onConsistentDataAvailable. It should be a no-op.
+    Lock::GlobalWrite lk(operationContext());
+    shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
 }
 
 /**
- * not readOnly and not --shardsvr
+ * not queryableBackupMode and not --shardsvr
  */
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndNotShardServerAndNoShardIdentity) {
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndNotShardServerAndNoShardIdentity) {
     ScopedSetStandaloneMode standalone(getServiceContext());
 
-    ASSERT(!shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+    ASSERT(!ShardingInitializationMongoD::getShardIdentityDoc(operationContext()));
 }
 
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndNotShardServerAndInvalidShardIdentity) {
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndNotShardServerAndInvalidShardIdentity) {
     ScopedSetStandaloneMode standalone(getServiceContext());
 
-    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace,
                             BSON("_id"
                                  << "shardIdentity"
                                  << "configsvrConnectionString"
@@ -495,11 +614,12 @@ TEST_F(ShardingInitializationMongoDTest,
 
     // The shardIdentity doc on disk, even if invalid, is ignored if the ClusterRole is None. This
     // is to allow fixing the shardIdentity doc by starting without --shardsvr.
-    ASSERT(!shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+    ASSERT(!ShardingInitializationMongoD::getShardIdentityDoc(operationContext()));
 }
 
-TEST_F(ShardingInitializationMongoDTest,
-       InitializeShardingAwarenessIfNeededNotReadOnlyAndNotShardServerAndValidShardIdentity) {
+TEST_F(
+    ShardingInitializationMongoDTest,
+    InitializeShardingAwarenessIfNeededNotQueryableBackupModeAndNotShardServerAndValidShardIdentity) {
     ScopedSetStandaloneMode standalone(getServiceContext());
 
     BSONObj validShardIdentity = [&] {
@@ -512,12 +632,11 @@ TEST_F(ShardingInitializationMongoDTest,
         return shardIdentity.toShardIdentityDocument();
     }();
 
-    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
-                            validShardIdentity);
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace, validShardIdentity);
 
     // The shardIdentity doc on disk, even if invalid, is ignored if the ClusterRole is None. This
     // is to allow fixing the shardIdentity doc by starting without --shardsvr.
-    ASSERT(!shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()));
+    ASSERT(!ShardingInitializationMongoD::getShardIdentityDoc(operationContext()));
 }
 
 }  // namespace

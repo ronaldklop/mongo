@@ -29,10 +29,16 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <mutex>
 
 #include "mongo/db/repl/repl_sync_shared_data.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -58,20 +64,6 @@ public:
 
     int getTotalRetries(WithLock lk) {
         return _totalRetries;
-    }
-
-    /**
-     * Sets the wire version of the sync source.
-     */
-    void setSyncSourceWireVersion(WithLock, WireVersion wireVersion) {
-        _syncSourceWireVersion = wireVersion;
-    }
-
-    /**
-     * Returns the wire version of the sync source, if previously set.
-     */
-    boost::optional<WireVersion> getSyncSourceWireVersion(WithLock) {
-        return _syncSourceWireVersion;
     }
 
     /**
@@ -208,9 +200,6 @@ private:
 
     // Operation that may currently be retrying.
     RetryableOperation _retryableOp;
-
-    // The sync source wire version at the start of data cloning.
-    boost::optional<WireVersion> _syncSourceWireVersion;
 
     // The initial sync ID on the source at the start of data cloning.
     boost::optional<UUID> _initialSyncSourceId;

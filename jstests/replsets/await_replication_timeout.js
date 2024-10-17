@@ -1,9 +1,7 @@
 // Tests timeout behavior of waiting for write concern as well as its interaction with maxTimeMs
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var replTest = new ReplSetTest({nodes: 3});
 replTest.startSet();
@@ -12,6 +10,11 @@ var primary = replTest.getPrimary();
 var testDB = primary.getDB('test');
 const collName = 'foo';
 var testColl = testDB.getCollection(collName);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 
 // Insert a document and implicitly create the collection.
 let resetCollection = function(w) {
@@ -76,4 +79,3 @@ assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
 
 restartServerReplication(secondary);
 replTest.stopSet();
-})();

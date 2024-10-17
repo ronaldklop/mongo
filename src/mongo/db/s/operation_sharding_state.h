@@ -29,24 +29,68 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
 /**
+ * Marks the opCtx during scope in which it has been instantiated as running in the shard role for
+ * the specified collection. This indicates to the underlying storage system that the caller has
+ * performed 'routing', in the sense that it is aware of what data is located on this node.
+ */
+class ScopedSetShardRole {
+public:
+    ScopedSetShardRole(OperationContext* opCtx,
+                       NamespaceString nss,
+                       boost::optional<ShardVersion> shardVersion,
+                       boost::optional<DatabaseVersion> databaseVersion);
+    ScopedSetShardRole(const ScopedSetShardRole&) = delete;
+    ScopedSetShardRole(ScopedSetShardRole&&);
+    ~ScopedSetShardRole();
+
+private:
+    OperationContext* const _opCtx;
+
+    NamespaceString _nss;
+
+    boost::optional<ShardVersion> _shardVersion;
+    boost::optional<DatabaseVersion> _databaseVersion;
+};
+
+// Stashes the shard role for the given namespace.
+// DON'T USE unless you understand very well what you're doing.
+class ScopedStashShardRole {
+public:
+    ScopedStashShardRole(OperationContext* opCtx, const NamespaceString& nss);
+
+    ScopedStashShardRole(const ScopedSetShardRole&) = delete;
+    ScopedStashShardRole(ScopedSetShardRole&&) = delete;
+
+    ~ScopedStashShardRole();
+
+private:
+    OperationContext* _opCtx;
+    NamespaceString _nss;
+    boost::optional<ShardVersion> _stashedShardVersion;
+    boost::optional<DatabaseVersion> _stashedDatabaseVersion;
+};
+
+/**
  * A decoration on OperationContext representing per-operation shard version metadata sent to mongod
  * from mongos as a command parameter.
  *
  * The metadata for a particular operation can be retrieved using the get() method.
- *
- * Note: This only supports storing the version for a single namespace.
  */
 class OperationShardingState {
     OperationShardingState(const OperationShardingState&) = delete;
@@ -62,23 +106,36 @@ public:
     static OperationShardingState& get(OperationContext* opCtx);
 
     /**
-     * Returns true if the the current operation was sent by the caller with shard version
-     * information attached, meaning that it must perform shard version checking and orphan
-     * filtering.
+     * Returns true if the the current operation was sent from an upstream router, rather than it
+     * being a direct connection against the shard. The way this decision is made is based on
+     * whether there is shard version declared for any namespace.
      */
-    static bool isOperationVersioned(OperationContext* opCtx);
+    static bool isComingFromRouter(OperationContext* opCtx);
 
     /**
-     * Instantiating this object on the stack indicates to the storage execution subsystem that it
-     * is allowed to create a collection in this context and that the caller is responsible for
-     * notifying the shard Sharding sybsystem of the collection creation.
+     * Similar to 'isComingFromRouter()' but also considers '_treatAsFromRouter'. This should be
+     * used when an operation intentionally skips setting shard versions but still wants to tell if
+     * it's sent from a router.
+     */
+    static bool shouldBeTreatedAsFromRouter(OperationContext* opCtx);
+
+    /**
+     * NOTE: DO NOT ADD any new usages of this class without including someone from the Sharding
+     * Team on the code review.
      *
-     * DO NOT add any new usages of this class without including someone from the Sharding Team on
-     * the code review.
+     * Instantiating this object on the stack indicates to the storage execution subsystem that it
+     * is allowed to create any collection in this context and that the caller will be responsible
+     * for notifying the shard Sharding subsystem of the collection creation. Note that in most of
+     * cases the CollectionShardingRuntime associated to that nss will be set as UNSHARDED. However,
+     * there are some scenarios in which it is required to set is as UNKNOWN: that's the reason why
+     * the constructor has the 'forceCSRAsUnknownAfterCollectionCreation' parameter. You can find
+     * more information about how the CSR is modified in ShardServerOpObserver::onCreateCollection.
      */
     class ScopedAllowImplicitCollectionCreate_UNSAFE {
     public:
-        ScopedAllowImplicitCollectionCreate_UNSAFE(OperationContext* opCtx);
+        /* Please read the comment associated to this class */
+        ScopedAllowImplicitCollectionCreate_UNSAFE(
+            OperationContext* opCtx, bool forceCSRAsUnknownAfterCollectionCreation = false);
         ~ScopedAllowImplicitCollectionCreate_UNSAFE();
 
     private:
@@ -86,86 +143,26 @@ public:
     };
 
     /**
-     * Parses shardVersion and databaseVersion from 'cmdObj' and stores the results in this object
-     * along with the given namespace that is associated with the versions. Does nothing if no
-     * shardVersion or databaseVersion is attached to the command.
-     *
-     * Expects 'cmdObj' to have format
-     * { ...,
-     *   shardVersion: [<version>, <epoch>],
-     *   databaseVersion: { uuid: <UUID>, version: <int> },
-     * ...}
-     *
-     * This initialization may only be performed once for the lifetime of the object, which
-     * coincides with the lifetime of the client's request.
+     * Same semantics as ScopedSetShardRole above, but the role remains set for the lifetime of the
+     * opCtx.
      */
-    void initializeClientRoutingVersionsFromCommand(NamespaceString nss, const BSONObj& cmdObj);
-
-    /**
-     * Stores the given shardVersion and databaseVersion for the given namespace. Note: The shard
-     * version for the given namespace stored in the OperationShardingState can be overwritten if it
-     * has not been checked yet.
-     */
-    void initializeClientRoutingVersions(NamespaceString nss,
-                                         const boost::optional<ChunkVersion>& shardVersion,
-                                         const boost::optional<DatabaseVersion>& dbVersion);
-
-    /**
-     * Returns whether or not there is a shard version for the namespace associated with this
-     * operation.
-     */
-    bool hasShardVersion(const NamespaceString& nss) const;
+    static void setShardRole(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             const boost::optional<ShardVersion>& shardVersion,
+                             const boost::optional<DatabaseVersion>& dbVersion);
 
     /**
      * Returns the shard version (i.e. maximum chunk version) of a namespace being used by the
      * operation. Documents in chunks which did not belong on this shard at this shard version
      * will be filtered out.
      */
-    boost::optional<ChunkVersion> getShardVersion(const NamespaceString& nss);
-
-    /**
-     * Returns true if the client sent a databaseVersion for any namespace.
-     */
-    bool hasDbVersion() const;
+    boost::optional<ShardVersion> getShardVersion(const NamespaceString& nss);
 
     /**
      * If 'db' matches the 'db' in the namespace the client sent versions for, returns the database
      * version sent by the client (if any), else returns boost::none.
      */
-    boost::optional<DatabaseVersion> getDbVersion(const StringData dbName) const;
-
-    /**
-     * This call is a no op if there isn't a currently active migration critical section. Otherwise
-     * it will wait for the critical section to complete up to the remaining operation time.
-     *
-     * Returns true if the call actually waited because of migration critical section (regardless if
-     * whether it timed out or not), false if there was no active migration critical section.
-     */
-    bool waitForMigrationCriticalSectionSignal(OperationContext* opCtx);
-
-    /**
-     * Setting this value indicates that when the version check failed, there was an active
-     * migration for the namespace and that it would be prudent to wait for the critical section to
-     * complete before retrying so the router doesn't make wasteful requests.
-     */
-    void setMigrationCriticalSectionSignal(boost::optional<SharedSemiFuture<void>> critSecSignal);
-
-    /**
-     * This call is a no op if there isn't a currently active movePrimary critical section.
-     * Otherwise it will wait for the critical section to complete up to the remaining operation
-     * time.
-     *
-     * Returns true if the call actually waited because of movePrimary critical section (regardless
-     * whether it timed out or not), false if there was no active movePrimary critical section.
-     */
-    bool waitForMovePrimaryCriticalSectionSignal(OperationContext* opCtx);
-
-    /**
-     * Setting this value indicates that when the version check failed, there was an active
-     * movePrimary for the namespace and that it would be prudent to wait for the critical section
-     * to complete before retrying so the router doesn't make wasteful requests.
-     */
-    void setMovePrimaryCriticalSectionSignal(boost::optional<SharedSemiFuture<void>> critSecSignal);
+    boost::optional<DatabaseVersion> getDbVersion(const DatabaseName& dbName) const;
 
     /**
      * Stores the failed status in _shardingOperationFailedStatus.
@@ -183,33 +180,50 @@ public:
      */
     boost::optional<Status> resetShardingOperationFailedStatus();
 
+    void setTreatAsFromRouter(bool treatAsFromRouter = true) {
+        _treatAsFromRouter = treatAsFromRouter;
+    }
+
 private:
+    friend class ScopedSetShardRole;
+    friend class ScopedStashShardRole;
     friend class ShardServerOpObserver;  // For access to _allowCollectionCreation below
 
     // Specifies whether the request is allowed to create database/collection implicitly
     bool _allowCollectionCreation{false};
+    // Specifies whether the CollectionShardingRuntime should be set as unknown after collection
+    // creation
+    bool _forceCSRAsUnknownAfterCollectionCreation{false};
 
-    // The OperationShardingState class supports storing shardVersions for multiple namespaces (and
-    // databaseVersions for multiple databases), even though client code has not been written yet to
-    // *send* multiple shardVersions or databaseVersions.
-    StringMap<ChunkVersion> _shardVersions;
-    StringMap<DatabaseVersion> _databaseVersions;
+    // Stores the shard version expected for each collection that will be accessed
+    struct ShardVersionTracker {
+        ShardVersionTracker(ShardVersion v) : v(v) {}
+        ShardVersionTracker(ShardVersionTracker&&) = default;
+        ShardVersionTracker(const ShardVersionTracker&) = delete;
+        ShardVersionTracker& operator=(const ShardVersionTracker&) = delete;
+        ShardVersion v;
+        int recursion{0};
+    };
+    StringMap<ShardVersionTracker> _shardVersions;
 
-    // Stores shards that have undergone a version check.
-    StringSet _shardVersionsChecked;
-
-    // This value will only be non-null if version check during the operation execution failed due
-    // to stale version and there was a migration for that namespace, which was in critical section.
-    boost::optional<SharedSemiFuture<void>> _migrationCriticalSectionSignal;
-
-    // This value will only be non-null if version check during the operation execution failed due
-    // to stale version and there was a movePrimary for that namespace, which was in critical
-    // section.
-    boost::optional<SharedSemiFuture<void>> _movePrimaryCriticalSectionSignal;
+    // Stores the database version expected for each database that will be accessed
+    struct DatabaseVersionTracker {
+        DatabaseVersionTracker(DatabaseVersion v) : v(v) {}
+        DatabaseVersionTracker(DatabaseVersionTracker&&) = default;
+        DatabaseVersionTracker(const DatabaseVersionTracker&) = delete;
+        DatabaseVersionTracker& operator=(const DatabaseVersionTracker&) = delete;
+        DatabaseVersion v;
+        int recursion{0};
+    };
+    stdx::unordered_map<DatabaseName, DatabaseVersionTracker> _databaseVersions;
 
     // This value can only be set when a rerouting exception occurs during a write operation, and
     // must be handled before this object gets destructed.
     boost::optional<Status> _shardingOperationFailedStatus;
+
+    // Set when the operation comes from a router but intentionally skips setting the database or
+    // the shard version.
+    bool _treatAsFromRouter{false};
 };
 
 }  // namespace mongo

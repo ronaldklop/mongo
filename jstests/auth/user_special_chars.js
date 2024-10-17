@@ -1,7 +1,5 @@
-"use strict";
 // Test creating and authenticating users with special characters.
 
-(function() {
 var conn = MongoRunner.runMongod({auth: ''});
 
 var adminDB = conn.getDB('admin');
@@ -48,19 +46,7 @@ var testUserAndDatabaseAtSymbolConflation = function() {
     assert.commandWorked(bcDB.col.insert({data: 3}));
     assert.writeError(cDB.col.insert({data: 4}));
     assert(bcDB.logout());
-
-    // Ensure that the user cache permits both users to log in at the same time
-    assert(cDB.auth('a@b', 'pass1'));
-    assert(bcDB.auth('a', 'pass2'));
-    assert(cDB.logout());
-    assert(bcDB.logout());
-
-    assert(bcDB.auth('a', 'pass2'));
-    assert(cDB.auth('a@b', 'pass1'));
-    assert(cDB.logout());
-    assert(bcDB.logout());
 };
 testUserAndDatabaseAtSymbolConflation();
 
 MongoRunner.stopMongod(conn);
-})();

@@ -27,25 +27,54 @@
  *    it in the license file.
  */
 
+
 #include "log_domain_global.h"
 
-#include "mongo/config.h"
+#include <boost/core/null_deleter.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <iosfwd>
+#include <utility>
+#include <vector>
+
+#include <boost/exception/exception.hpp>
+#include <boost/log/core/core.hpp>
+// IWYU pragma: no_include "boost/log/detail/attachable_sstream_buf.hpp"
+// IWYU pragma: no_include "boost/log/detail/locking_ptr.hpp"
+#include <boost/log/keywords/facility.hpp>
+#include <boost/log/keywords/use_impl.hpp>
+#include <boost/log/sinks/attribute_mapping.hpp>
+#include <boost/log/sinks/syslog_backend.hpp>
+#include <boost/log/sinks/syslog_constants.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/log/sinks/unlocked_frontend.hpp>
+#include <boost/parameter/keyword.hpp>
+#include <boost/smart_ptr/make_shared_object.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+#include <boost/thread/exceptions.hpp>
+
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/attributes.h"
 #include "mongo/logv2/component_settings_filter.h"
 #include "mongo/logv2/composite_backend.h"
 #include "mongo/logv2/console.h"
 #include "mongo/logv2/file_rotate_sink.h"
 #include "mongo/logv2/json_formatter.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/logv2/log_source.h"
+#include "mongo/logv2/log_tag.h"
+#include "mongo/logv2/plain_formatter.h"
+#include "mongo/logv2/ramlog.h"
 #include "mongo/logv2/ramlog_sink.h"
-#include "mongo/logv2/shared_access_fstream.h"
 #include "mongo/logv2/tagged_severity_filter.h"
-#include "mongo/logv2/text_formatter.h"
 #include "mongo/logv2/uassert_sink.h"
+#include "mongo/util/assert_util_core.h"
 
-#include <boost/core/null_deleter.hpp>
-#include <boost/filesystem/operations.hpp>
-#include <boost/log/core.hpp>
-#include <boost/log/sinks.hpp>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo::logv2 {
 
@@ -69,9 +98,11 @@ struct LogDomainGlobal::Impl {
     typedef CompositeBackend<FileRotateSink, RamLogSink, RamLogSink, UserAssertSink>
         RotatableFileBackend;
 
+    typedef CompositeBackend<FileRotateSink> BacktraceBackend;
+
     Impl(LogDomainGlobal& parent);
     Status configure(LogDomainGlobal::ConfigurationOptions const& options);
-    Status rotate(bool rename, StringData renameSuffix);
+    Status rotate(bool rename, StringData renameSuffix, std::function<void(Status)> onMinorError);
 
     const ConfigurationOptions& config() const;
 
@@ -82,6 +113,7 @@ struct LogDomainGlobal::Impl {
     ConfigurationOptions _config;
     boost::shared_ptr<boost::log::sinks::unlocked_sink<ConsoleBackend>> _consoleSink;
     boost::shared_ptr<boost::log::sinks::unlocked_sink<RotatableFileBackend>> _rotatableFileSink;
+    boost::shared_ptr<boost::log::sinks::unlocked_sink<BacktraceBackend>> _backtraceSink;
 #ifndef _WIN32
     boost::shared_ptr<boost::log::sinks::unlocked_sink<SyslogBackend>> _syslogSink;
 #endif
@@ -108,7 +140,7 @@ LogDomainGlobal::Impl::Impl(LogDomainGlobal& parent) : _parent(parent) {
     _consoleSink->set_filter(ComponentSettingsFilter(_parent, _settings));
 
     // Set default configuration
-    invariant(configure({}).isOK());
+    invariant(configure({}));
 
     // Make a call to source() to make sure the internal thread_local is created as early as
     // possible and thus destroyed as late as possible.
@@ -136,7 +168,7 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
         mapping[LogSeverity::Debug(3)] = boost::log::sinks::syslog::debug;
         mapping[LogSeverity::Debug(2)] = boost::log::sinks::syslog::debug;
         mapping[LogSeverity::Debug(1)] = boost::log::sinks::syslog::debug;
-        mapping[LogSeverity::Log()] = boost::log::sinks::syslog::debug;
+        mapping[LogSeverity::Log()] = boost::log::sinks::syslog::info;
         mapping[LogSeverity::Info()] = boost::log::sinks::syslog::info;
         mapping[LogSeverity::Warning()] = boost::log::sinks::syslog::warning;
         mapping[LogSeverity::Error()] = boost::log::sinks::syslog::critical;
@@ -182,6 +214,28 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
         _rotatableFileSink.reset();
     }
 
+    if (!options.backtraceFilePath.empty()) {
+        auto backend = boost::make_shared<BacktraceBackend>(
+            boost::make_shared<FileRotateSink>(options.timestampFormat));
+        Status ret = backend->lockedBackend<0>()->addFile(
+            options.backtraceFilePath,
+            options.fileOpenMode == ConfigurationOptions::OpenMode::kAppend ? true : false);
+        if (!ret.isOK())
+            return ret;
+
+        backend->lockedBackend<0>()->auto_flush(true);
+
+        backend->setFilter<0>(
+            TaggedSeverityFilter(_parent, {LogTag::kBacktraceLog}, LogSeverity::Log()));
+
+        _backtraceSink =
+            boost::make_shared<boost::log::sinks::unlocked_sink<BacktraceBackend>>(backend);
+        boost::log::core::get()->add_sink(_backtraceSink);
+    } else {
+        boost::log::core::get()->remove_sink(_backtraceSink);
+        _backtraceSink.reset();
+    }
+
     auto setFormatters = [this](auto&& mkFmt) {
         _consoleSink->set_formatter(mkFmt());
         if (_rotatableFileSink)
@@ -190,6 +244,8 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
         if (_syslogSink)
             _syslogSink->set_formatter(mkFmt());
 #endif
+        if (_backtraceSink)
+            _backtraceSink->set_formatter(mkFmt());
     };
 
     switch (options.format) {
@@ -222,12 +278,21 @@ const LogDomainGlobal::ConfigurationOptions& LogDomainGlobal::Impl::config() con
     return _config;
 }
 
-Status LogDomainGlobal::Impl::rotate(bool rename, StringData renameSuffix) {
-    if (_rotatableFileSink) {
-        auto backend = _rotatableFileSink->locked_backend()->lockedBackend<0>();
-        return backend->rotate(rename, renameSuffix);
-    }
-    return Status::OK();
+Status LogDomainGlobal::Impl::rotate(bool rename,
+                                     StringData renameSuffix,
+                                     std::function<void(Status)> onMinorError) {
+    if (!_rotatableFileSink)
+        return Status::OK();
+    std::vector<Status> errors;
+    Status result = _rotatableFileSink->locked_backend()->lockedBackend<0>()->rotate(
+        rename, renameSuffix, [&](Status s) {
+            errors.push_back(s);
+            if (onMinorError)
+                onMinorError(s);
+        });
+    if (!errors.empty())
+        LOGV2_WARNING(4719804, "Errors occurred during log rotate", "errors"_attr = errors);
+    return result;
 }
 
 LogSource& LogDomainGlobal::Impl::source() {
@@ -279,8 +344,10 @@ const LogDomainGlobal::ConfigurationOptions& LogDomainGlobal::config() const {
     return _impl->config();
 }
 
-Status LogDomainGlobal::rotate(bool rename, StringData renameSuffix) {
-    return _impl->rotate(rename, renameSuffix);
+Status LogDomainGlobal::rotate(bool rename,
+                               StringData renameSuffix,
+                               std::function<void(Status)> onMinorError) {
+    return _impl->rotate(rename, renameSuffix, onMinorError);
 }
 
 LogComponentSettings& LogDomainGlobal::settings() {

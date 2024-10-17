@@ -29,21 +29,35 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_retry_scheduler.h"
-#include "mongo/db/clientcursor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/interruptible.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -69,6 +83,7 @@ public:
         Documents documents;
         struct OtherFields {
             BSONObj metadata;
+            boost::optional<BSONObj> postBatchResumeToken = boost::none;
         } otherFields;
         Microseconds elapsed = Microseconds(0);
         bool first = false;
@@ -79,7 +94,12 @@ public:
     /**
      * Represents next steps of fetcher.
      */
-    enum class NextAction : int { kInvalid = 0, kNoAction = 1, kGetMore = 2 };
+    enum class NextAction : int {
+        kInvalid = 0,
+        kNoAction = 1,
+        kGetMore = 2,
+        kExitAndKeepCursorAlive = 3
+    };
 
     /**
      * Type of a fetcher callback function.
@@ -124,7 +144,7 @@ public:
      */
     Fetcher(executor::TaskExecutor* executor,
             const HostAndPort& source,
-            const std::string& dbname,
+            const DatabaseName& dbname,
             const BSONObj& cmdObj,
             CallbackFn work,
             const BSONObj& metadata = ReadPreferenceSetting::secondaryPreferredMetadata(),
@@ -179,10 +199,13 @@ public:
     void shutdown();
 
     /**
-     * Waits for remote command requests to complete.
+     * Waits for remote command requests to complete subject to the Interruptible being interrupted.
      * Returns immediately if fetcher is not active.
+     *
+     * Returns an OK Status if the wait completed successfully without interruption.
+     * Returns a non-OK Status if the Interruptible had been interrupted.
      */
-    void join();
+    Status join(Interruptible* interruptible);
 
     // State transitions:
     // PreStart --> Running --> ShuttingDown --> Complete
@@ -198,8 +221,15 @@ public:
      */
     State getState_forTest() const;
 
+    /**
+     * Returns a Future that will be resolved when the fetcher completes its work.
+     */
+    SharedSemiFuture<void> onCompletion() const {
+        return _completionPromise.getFuture();
+    }
+
 private:
-    bool _isActive_inlock() const;
+    bool _isActive(WithLock lk) const;
 
     /**
      * Schedules getMore command to be run by the executor
@@ -222,7 +252,7 @@ private:
      *
      * Note: Errors are ignored and no retry is done
      */
-    void _sendKillCursors(const CursorId id, const NamespaceString& nss);
+    void _sendKillCursors(CursorId id, const NamespaceString& nss);
 
     /**
      * Returns whether the fetcher is in shutdown.
@@ -230,17 +260,23 @@ private:
     bool _isShuttingDown() const;
     bool _isShuttingDown_inlock() const;
 
+    /**
+     * Waits for remote command requests to complete.
+     * Returns immediately if fetcher is not active.
+     */
+    void _join();
+
     // Not owned by us.
     executor::TaskExecutor* _executor;
 
     HostAndPort _source;
-    std::string _dbname;
+    DatabaseName _dbname;
     BSONObj _cmdObj;
     BSONObj _metadata;
     CallbackFn _work;
 
     // Protects member data of this Fetcher.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("Fetcher::_mutex");
+    mutable stdx::mutex _mutex;
 
     mutable stdx::condition_variable _condition;
 
@@ -262,6 +298,9 @@ private:
     RemoteCommandRetryScheduler _firstRemoteCommandScheduler;
 
     const transport::ConnectSSLMode _sslMode;
+
+    // Promise that is resolved when a fetcher completes or shuts down.
+    SharedPromise<void> _completionPromise;
 };
 
 /**

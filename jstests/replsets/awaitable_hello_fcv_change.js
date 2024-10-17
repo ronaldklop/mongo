@@ -5,17 +5,12 @@
  * @tags: [multiversion_incompatible]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function runAwaitableHelloBeforeFCVChange(
     topologyVersionField, targetFCV, isPrimary, prevMinWireVersion, serverMaxWireVersion) {
-    const isUseSecondaryDelaySecsEnabled = db.adminCommand({
-                                                 getParameter: 1,
-                                                 featureFlagUseSecondaryDelaySecs: 1
-                                             }).featureFlagUseSecondaryDelaySecs.value;
     db.getMongo().setSecondaryOk();
     let response = assert.commandWorked(db.runCommand({
         hello: 1,
@@ -24,22 +19,6 @@ function runAwaitableHelloBeforeFCVChange(
         internalClient:
             {minWireVersion: NumberInt(0), maxWireVersion: NumberInt(serverMaxWireVersion)},
     }));
-    // If 'featureFlagUseSecondaryDelaySecs' is enabled, the primary will reconfig the replica
-    // set on dowgrade. This reconfig will increment the 'topologyVersion'
-    // before the 'minWireVersion' is updated. Therefore, we send another 'hello'
-    // command to wait for the downgrade to complete before validating the
-    // 'minWireVersion'.
-    if (isUseSecondaryDelaySecsEnabled && prevMinWireVersion === response.minWireVersion) {
-        jsTestLog("Min wire version didn't change: " + prevMinWireVersion + ". Retrying hello.");
-        topologyVersionField = response.topologyVersion;
-        response = assert.commandWorked(db.runCommand({
-            hello: 1,
-            topologyVersion: topologyVersionField,
-            maxAwaitTimeMS: 99999999,
-            internalClient:
-                {minWireVersion: NumberInt(0), maxWireVersion: NumberInt(serverMaxWireVersion)},
-        }));
-    }
 
     // We only expect to increment the server TopologyVersion when the minWireVersion has changed.
     // This can only happen in two scenarios:
@@ -54,7 +33,7 @@ function runAwaitableHelloBeforeFCVChange(
 
     const minWireVersion = response.minWireVersion;
     const maxWireVersion = response.maxWireVersion;
-    assert.neq(prevMinWireVersion, minWireVersion);
+    assert.neq(prevMinWireVersion, minWireVersion, response);
     if (targetFCV === latestFCV) {
         // minWireVersion should always equal maxWireVersion if we have not fully downgraded FCV.
         assert.eq(minWireVersion, maxWireVersion, response);
@@ -153,7 +132,8 @@ function runTest(downgradeFCV) {
     assert.eq(1, numAwaitingTopologyChangeOnSecondary);
 
     // Setting the FCV to the same version will not trigger an hello response.
-    assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
     checkFCV(primaryAdminDB, latestFCV);
     checkFCV(secondaryAdminDB, latestFCV);
 
@@ -168,13 +148,17 @@ function runTest(downgradeFCV) {
     jsTestLog("Downgrade the featureCompatibilityVersion.");
     // Downgrading the FCV will cause the hello requests to respond on both primary and
     // secondary.
-    assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    assert.commandWorked(
+        primaryAdminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
     awaitHelloBeforeDowngradeFCVOnPrimary();
     awaitHelloBeforeDowngradeFCVOnSecondary();
     // Ensure the featureCompatibilityVersion document update has been replicated.
     rst.awaitReplication();
     checkFCV(primaryAdminDB, downgradeFCV);
     checkFCV(secondaryAdminDB, downgradeFCV);
+    // The new configuration may not have been installed on the secondary yet, though it has reached
+    // the secondary.
+    rst.waitForConfigReplication(primary);
 
     // All hello requests should have been responded to after the FCV change.
     numAwaitingTopologyChangeOnPrimary =
@@ -232,8 +216,11 @@ function runTest(downgradeFCV) {
         assert.eq(1, numAwaitingTopologyChangeOnSecondary);
 
         // Upgrade the FCV to last-continuous.
-        assert.commandWorked(primaryAdminDB.runCommand(
-            {setFeatureCompatibilityVersion: lastContinuousFCV, fromConfigServer: true}));
+        assert.commandWorked(primaryAdminDB.runCommand({
+            setFeatureCompatibilityVersion: lastContinuousFCV,
+            fromConfigServer: true,
+            confirm: true
+        }));
         awaitHelloBeforeUpgradeOnPrimary();
         awaitHelloBeforeUpgradeOnSecondary();
 
@@ -254,12 +241,15 @@ function runTest(downgradeFCV) {
         // We must upgrade to latestFCV first since downgrading from last-continuous to last-stable
         // is forbidden.
         assert.commandWorked(
-            primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
+            primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
         assert.commandWorked(
-            primaryAdminDB.runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+            primaryAdminDB.runCommand({setFeatureCompatibilityVersion: lastLTSFCV, confirm: true}));
         rst.awaitReplication();
         checkFCV(primaryAdminDB, lastLTSFCV);
         checkFCV(secondaryAdminDB, lastLTSFCV);
+        // The new configuration may not have been installed on the secondary yet, though it has
+        // reached the secondary.
+        rst.waitForConfigReplication(primary);
 
         primaryResponseAfterDowngrade = helloAsInternalClient();
         assert(primaryResponseAfterDowngrade.hasOwnProperty("topologyVersion"),
@@ -305,7 +295,8 @@ function runTest(downgradeFCV) {
     assert.eq(1, numAwaitingTopologyChangeOnSecondary);
 
     // Setting the FCV to the same version will not trigger an hello response.
-    assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    assert.commandWorked(
+        primaryAdminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
     checkFCV(primaryAdminDB, downgradeFCV);
     checkFCV(secondaryAdminDB, downgradeFCV);
 
@@ -319,7 +310,8 @@ function runTest(downgradeFCV) {
 
     jsTestLog("Upgrade the featureCompatibilityVersion.");
     // Upgrading the FCV will cause the hello requests to respond on both primary and secondary.
-    assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        primaryAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
     awaitHelloBeforeUpgradeFCVOnPrimary();
     awaitHelloBeforeUpgradeFCVOnSecondary();
     // Ensure the featureCompatibilityVersion document update has been replicated.
@@ -339,4 +331,3 @@ function runTest(downgradeFCV) {
 
 runTest(lastLTSFCV);
 runTest(lastContinuousFCV);
-})();

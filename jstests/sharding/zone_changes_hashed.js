@@ -1,11 +1,17 @@
 /**
  * Test that chunks and documents are moved correctly after zone changes.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/zone_changes_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {chunkBoundsUtil} from "jstests/sharding/libs/chunk_bounds_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    assertChunksOnShards,
+    assertDocsOnShards,
+    assertShardTags,
+    moveZoneToShard,
+    runBalancer,
+} from "jstests/sharding/libs/zone_changes_util.js";
 
 /**
  * Adds each shard to the corresponding zone in zoneTags, and makes the zone range equal
@@ -47,7 +53,7 @@ function findHighestChunkBounds(chunkBounds) {
     return highestBounds;
 }
 
-let st = new ShardingTest({shards: 3});
+const st = new ShardingTest({shards: 3, other: {chunkSize: 1}});
 let primaryShard = st.shard0;
 let dbName = "test";
 let testDB = st.s.getDB(dbName);
@@ -56,18 +62,37 @@ let coll = testDB.hashed;
 let ns = coll.getFullName();
 let shardKey = {x: "hashed"};
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, primaryShard.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: primaryShard.shardName}));
 
-jsTest.log(
-    "Shard the collection. The command creates two chunks on each of the shards by default.");
+jsTest.log("Shard the collection. The command creates one chunk on each of the shards by default.");
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: shardKey}));
+
+jsTest.log("Insert docs (one per chunk) and check that they end up on the right shards.");
+const bigString = 'X'.repeat(1024 * 1024);  // 1MB
+let docs = [
+    {x: -25, s: bigString},
+    {x: -18, s: bigString},
+    {x: -5, s: bigString},
+    {x: -1, s: bigString},
+    {x: 5, s: bigString},
+    {x: 10, s: bigString}
+];
+// TODO SERVER-81884: update once 8.0 becomes last LTS.
+if (FeatureFlagUtil.isPresentAndEnabled(testDB,
+                                        "OneChunkPerShardEmptyCollectionWithHashedShardKey")) {
+    // Make sure that there is one chunk dedicated for each inserted document
+    assert.commandWorked(
+        st.s.adminCommand({split: ns, middle: {x: convertShardKeyToHashed(docs[1].x)}}));
+    assert.commandWorked(
+        st.s.adminCommand({split: ns, middle: {x: convertShardKeyToHashed(docs[3].x)}}));
+    assert.commandWorked(
+        st.s.adminCommand({split: ns, middle: {x: convertShardKeyToHashed(docs[5].x)}}));
+}
+assert.commandWorked(coll.insert(docs));
+
 let chunkDocs = findChunksUtil.findChunksByNs(configDB, ns).sort({min: 1}).toArray();
 let shardChunkBounds = chunkBoundsUtil.findShardChunkBounds(chunkDocs);
-
-jsTest.log("Insert docs (one for each chunk) and check that they end up on the right shards.");
-let docs = [{x: -25}, {x: -18}, {x: -5}, {x: -1}, {x: 5}, {x: 10}];
-assert.commandWorked(coll.insert(docs));
 
 let docChunkBounds = [];
 let minHash = MaxKey;
@@ -126,7 +151,7 @@ shardTags = {
 };
 assertShardTags(configDB, shardTags);
 
-let numChunksToMove = zoneChunkBounds["zoneB"].length / 2;
+const numChunksToMove = zoneChunkBounds["zoneB"].length - 1;
 runBalancer(st, numChunksToMove);
 shardChunkBounds = {
     [st.shard0.shardName]: zoneChunkBounds["zoneB"].slice(0, numChunksToMove),
@@ -215,7 +240,9 @@ assertChunksOnShards(configDB, ns, shardChunkBounds);
 assertDocsOnShards(st, ns, shardChunkBounds, docs, shardKey);
 
 jsTest.log("Make the chunk not aligned with zone ranges.");
-let splitPoint = {x: NumberLong(targetChunkBounds[1].x - 5000)};
+let splitPoint = (targetChunkBounds[1].x === MaxKey)
+    ? {x: NumberLong(targetChunkBounds[0].x + 5000)}
+    : {x: NumberLong(targetChunkBounds[1].x - 5000)};
 assert(chunkBoundsUtil.containsKey(splitPoint, ...targetChunkBounds));
 assert.commandWorked(st.s.adminCommand(
     {updateZoneKeyRange: ns, min: targetChunkBounds[0], max: targetChunkBounds[1], zone: null}));
@@ -236,4 +263,3 @@ assertChunksOnShards(configDB, ns, shardChunkBounds);
 assertDocsOnShards(st, ns, shardChunkBounds, docs, shardKey);
 
 st.stop();
-})();

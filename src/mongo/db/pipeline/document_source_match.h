@@ -29,24 +29,45 @@
 
 #pragma once
 
+#include <bitset>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
+#include <set>
+#include <string>
 #include <type_traits>
 #include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connpool.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/match_processor.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 class DocumentSourceMatch : public DocumentSource {
 public:
-    virtual boost::intrusive_ptr<DocumentSourceMatch> clone() const {
-        // Raw new is needed to access non-public constructors.
-        return new auto(*this);
-    }
+    DocumentSourceMatch(std::unique_ptr<MatchExpression> expr,
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    ~DocumentSourceMatch() override = default;
 
     static constexpr StringData kStageName = "$match"_sd;
     /**
@@ -78,20 +99,15 @@ public:
         const std::string& path,
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    DocumentSourceMatch(std::unique_ptr<MatchExpression> expr,
-                        const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSource(kStageName, expCtx) {
-        // TODO SERVER-48830: Remove need for holding serialized version of the MatchExpression.
-        _expression = std::move(expr);
-        _predicate = _expression->serialize();
-        _isTextQuery = isTextQuery(_predicate);
-        _dependencies =
-            DepsTracker(_isTextQuery ? DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore
-                                     : DepsTracker::kAllMetadata);
-        getDependencies(&_dependencies);
-    }
-
-    virtual ~DocumentSourceMatch() = default;
+    /**
+     * Returns a pair of pointers to $match stages, either of which can be null. The first entry in
+     * the pair is a $match stage that can be moved before this stage, the second is a $match stage
+     * that must remain after this stage.
+     */
+    static std::pair<boost::intrusive_ptr<DocumentSourceMatch>,
+                     boost::intrusive_ptr<DocumentSourceMatch>>
+    splitMatchByModifiedFields(const boost::intrusive_ptr<DocumentSourceMatch>& match,
+                               const DocumentSource::GetModPathsReturn& modifiedPathsRet);
 
     /**
      * Parses 'filter' and resets the member of this source to be consistent with the new
@@ -103,47 +119,60 @@ public:
 
     const char* getSourceName() const override;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kNone,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed,
-                UnionRequirement::kAllowed,
-                ChangeStreamRequirement::kWhitelist};
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kMatch;
     }
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed,
+                                     ChangeStreamRequirement::kAllowlist};
+        constraints.noFieldModifications = true;
+        return constraints;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const override;
 
     /**
      * Attempts to combine with any subsequent $match stages, joining the query objects with a
-     * $and.
+     * $and and flattening top-level $and's in the process.
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
+                                                     Pipeline::SourceContainer* container) override;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     GetModPathsReturn getModifiedPaths() const final {
         // This stage does not modify or rename any paths.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
+    }
+
+    MatchProcessor* getMatchProcessor() {
+        return _matchProcessor.get_ptr();
     }
 
     /**
-     * Access the MatchExpression stored inside the DocumentSourceMatch. Does not release ownership.
+     * Access the MatchExpression stored inside the DocumentSourceMatch. Does not release
+     * ownership.
      */
     MatchExpression* getMatchExpression() const {
-        return _expression.get();
+        return _matchProcessor->getExpression().get();
     }
 
     /**
-     * Combines the filter in this $match with the filter of 'other' using a $and, updating this
-     * match in place.
+     * Combines the filter in this $match with the filter of 'other' using a specified join
+     * predicate, updating this match in place. Currently, the join predicate can be "$and" or
+     * "$or".
      */
-    void joinMatchWith(boost::intrusive_ptr<DocumentSourceMatch> other);
+    void joinMatchWith(boost::intrusive_ptr<DocumentSourceMatch> other, StringData joinPred);
 
 
     bool hasQuery() const override;
@@ -172,69 +201,103 @@ public:
     }
 
     /**
-     * Attempt to split this $match into two stages, where the first is not dependent upon any path
-     * from 'fields', and where applying them in sequence is equivalent to applying this stage once.
+     * Attempt to split this $match into two stages, where the first is not dependent upon any
+     * path from 'fields', and where applying them in sequence is equivalent to applying this
+     * stage once.
      *
-     * Will return two intrusive_ptrs to new $match stages, where the first pointer is independent
-     * of 'fields', and the second is dependent. Either pointer may be null, so be sure to check the
-     * return value.
+     * Will return two intrusive_ptrs to new $match stages, where the first pointer is
+     * independent of 'fields', and the second is dependent. Either pointer may be null, so be
+     * sure to check the return value.
      *
-     * For example, {$match: {a: "foo", "b.c": 4}} split by "b" will return pointers to two stages:
+     * For example, {$match: {a: "foo", "b.c": 4}} split by "b" will return pointers to two
+     * stages:
      * {$match: {a: "foo"}}, and {$match: {"b.c": 4}}.
      *
-     * The 'renames' structure maps from a field to an alias that should be used in the independent
-     * portion of the match. For example, suppose that we split by fields "a" with the rename "b" =>
-     * "c". The match {$match: {a: "foo", b: "bar", z: "baz"}} will split into {$match: {c: "bar",
-     * z: "baz"}} and {$match: {a: "foo"}}.
+     * The 'renames' structure maps from a field to an alias that should be used in the
+     * independent portion of the match. For example, suppose that we split by fields "a" with
+     * the rename "b" => "c". The match {$match: {a: "foo", b: "bar", z: "baz"}} will split into
+     * {$match: {c: "bar", z: "baz"}} and {$match: {a: "foo"}}.
      */
     std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-    splitSourceBy(const std::set<std::string>& fields, const StringMap<std::string>& renames) &&;
-
-    /**
-     * Attempt to split this $match into two stages, where the first is ONLY dependent upon paths
-     * from 'fields', and where applying them in sequence is equivalent to applying this stage once.
-     *
-     * Will return two intrusive_ptrs to new $match stages, where the first pointer is dependent on
-     * 'fields' and the second is the remainder. Either pointer may be null, so be sure to check the
-     * return value.
-     *
-     * The 'renames' structure maps from a field to an alias that should be used in the dependent
-     * portion of the match. For example, suppose that we split by fields "a" with the rename "a" =>
-     * "c". The match {$match: {a: "foo", b: "bar", z: "baz"}} will split into {$match: {c: "foo"}}
-     * and {$match: {b: "bar", z: "baz"}}.
-     */
-    std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-    extractMatchOnFieldsAndRemainder(const std::set<std::string>& fields,
-                                     const StringMap<std::string>& renames) &&;
+    splitSourceBy(const OrderedPathSet& fields, const StringMap<std::string>& renames) &&;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
+    SbeCompatibility sbeCompatibility() const {
+        return _sbeCompatibility;
+    }
+
 protected:
-    DocumentSourceMatch(const DocumentSourceMatch& other)
+    DocumentSourceMatch(const DocumentSourceMatch& other,
+                        const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
         : DocumentSourceMatch(
               other.serialize().getDocument().toBson().firstElement().embeddedObject(),
-              other.pExpCtx) {}
+              newExpCtx ? newExpCtx : other.pExpCtx) {}
 
-    GetNextResult doGetNext() override;
     DocumentSourceMatch(const BSONObj& query,
                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    BSONObj _predicate;
+    GetNextResult doGetNext() override;
+
+    const BSONObj& getPredicate() const {
+        return _predicate;
+    }
 
 private:
+    void rebuild(BSONObj predicate, std::unique_ptr<MatchExpression> expr);
+
+    DepsTracker::State getDependencies(const MatchExpression* expr, DepsTracker* deps) const;
+
     std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-    splitSourceByFunc(const std::set<std::string>& fields,
+    splitSourceByFunc(const OrderedPathSet& fields,
                       const StringMap<std::string>& renames,
                       expression::ShouldSplitExprFunc func) &&;
 
-    std::unique_ptr<MatchExpression> _expression;
+    // TODO(SERVER-48830): Remove need for holding serialized version of the MatchExpression.
+    BSONObj _predicate;
+    bool _isTextQuery{false};
+    boost::optional<MatchProcessor> _matchProcessor;
+    SbeCompatibility _sbeCompatibility{SbeCompatibility::notCompatible};
+};
 
-    bool _isTextQuery;
+/**
+ * A DocumentSource class for all internal change stream stages that are also match stages. This
+ * currently handles parsing for query stats.
+ */
+class DocumentSourceInternalChangeStreamMatch : public DocumentSourceMatch {
+public:
+    DocumentSourceInternalChangeStreamMatch(std::unique_ptr<MatchExpression> expr,
+                                            const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceMatch(std::move(expr), expCtx) {}
 
-    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
-    DepsTracker _dependencies;
+    static boost::intrusive_ptr<DocumentSourceInternalChangeStreamMatch> create(
+        BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Must override the serialize method, since internal change stream stages are serialized
+     * differently than match stages. This function mirrors
+     * DocumentSourceInternalChangeStreamStage::serialize and was added because this class cannot
+     * inherit from both DocumentSourceInternalChangeStreamStage and DocumentSourceMatch.
+     */
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    virtual Value doSerialize(const SerializationOptions& opts) const {
+        return DocumentSourceMatch::serialize(opts);
+    };
+
+protected:
+    DocumentSourceInternalChangeStreamMatch(const BSONObj& query,
+                                            const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceMatch(query, expCtx) {}
+
+    DocumentSourceInternalChangeStreamMatch(
+        const DocumentSourceInternalChangeStreamMatch& other,
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
+        : DocumentSourceMatch(
+              other.serialize().getDocument().toBson().firstElement().embeddedObject(),
+              newExpCtx ? newExpCtx : other.pExpCtx) {}
 };
 
 }  // namespace mongo

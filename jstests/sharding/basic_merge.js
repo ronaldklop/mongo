@@ -1,10 +1,8 @@
 /**
  * Perform basic tests for the mergeChunks command against mongos.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var st = new ShardingTest({mongos: 2, shards: 2, other: {chunkSize: 1}});
 var mongos = st.s0;
@@ -16,8 +14,7 @@ var shard1 = st.shard1.shardName;
 
 var ns = kDbName + ".foo";
 
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, shard0);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: shard0}));
 
 // Fail if invalid namespace.
 assert.commandFailed(mongos.adminCommand({mergeChunks: '', bounds: [{a: -1}, {a: 1}]}));
@@ -64,4 +61,3 @@ assert.eq(1,
           findChunksUtil.countChunksForNs(mongos.getDB('config'), ns, {min: {a: -1}, max: {a: 1}}));
 
 st.stop();
-})();

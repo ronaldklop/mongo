@@ -1,5 +1,12 @@
 // SERVER-2111 Check that an in memory db name will block creation of a db with a similar but
 // differently cased name.
+// @tags: [
+//   # The simulate_atlas_proxy override in multi-tenant mode might choose different
+//   # prefixes for each sibling DB in this test.
+//   multiple_tenants_incompatible,
+//   # Can't have 2 databases that just differ on case
+//   assumes_no_implicit_collection_creation_on_get_collection,
+// ]
 
 var dbLowerCase = db.getSiblingDB("dbcase2test_dbnamea");
 var dbUpperCase = db.getSiblingDB("dbcase2test_dbnameA");

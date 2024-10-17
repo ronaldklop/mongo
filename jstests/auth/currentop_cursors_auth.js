@@ -1,12 +1,10 @@
 /**
  * Tests that a user's ability to view open cursors via $currentOp obeys authentication rules on
  * both mongoD and mongoS.
- * @tags: [assumes_read_concern_unchanged, requires_auth, requires_journaling, requires_replication]
+ * @tags: [assumes_read_concern_unchanged, requires_auth, requires_replication]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For isMongos.
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Create a new sharded cluster for testing and enable auth.
 const key = "jstests/libs/key1";
@@ -21,16 +19,31 @@ Random.setRandomSeed();
 const pass = "a" + Random.rand();
 
 // Create one root user and one regular user on the given connection.
-function createUsers(conn) {
+function createUsers(conn, grantDirectShardOperationsRole) {
     const adminDB = conn.getDB("admin");
+
     adminDB.createUser({user: "ted", pwd: pass, roles: ["root"]});
     assert(adminDB.auth("ted", pass), "Authentication 1 Failed");
-    adminDB.createUser({user: "yuta", pwd: pass, roles: ["readWriteAnyDatabase"]});
+
+    let yutaRoles = ["readWriteAnyDatabase"];
+    if (grantDirectShardOperationsRole)
+        yutaRoles.push("directShardOperations");
+
+    adminDB.createUser({user: "yuta", pwd: pass, roles: yutaRoles});
 }
 
-// Create the necessary users at both cluster and shard-local level.
-createUsers(shardConn);
-createUsers(mongosConn);
+// Create the necessary users at the shard local level.
+createUsers(shardConn, /* grantDirectShardOperationsRole */ true);
+
+// Create the necessary users at the cluster level. If the shard is a configShard, then the users
+// will have already been created on the config server from the previous createUsers() call.
+if (!TestData.configShard) {
+    createUsers(mongosConn, /* grantDirectShardOperationsRole */ false);
+} else {
+    // Even though we've skipped creating the users, we still need to log in on the mongos for the
+    // rest of the test.
+    assert(mongosConn.getDB("admin").auth("ted", pass), "Authentication 1 Failed");
+}
 
 // Run the various auth tests on the given shard or mongoS connection.
 function runCursorTests(conn) {
@@ -132,7 +145,7 @@ function runCursorTests(conn) {
         result = adminDB
                      .aggregate([
                          {$currentOp: {localOps: false, allUsers: true, idleCursors: true}},
-                         {$match: {type: "idleCursor", shard: st.rs0.name}}
+                         {$match: {type: "idleCursor", shard: st.shard0.shardName}}
                      ])
                      .toArray();
         assert.eq(result.length, 2, result);
@@ -153,4 +166,3 @@ jsTestLog("Running cursor tests on mongoS");
 runCursorTests(mongosConn);
 
 st.stop();
-})();

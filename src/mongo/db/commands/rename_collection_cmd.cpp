@@ -27,82 +27,121 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <iosfwd>
+#include <memory>
+#include <set>
+#include <string>
+#include <variant>
 
-#include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/rename_collection.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection_common.h"
 #include "mongo/db/commands/rename_collection_gen.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/ops/insert.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
-using std::min;
 using std::string;
 using std::stringstream;
 
 namespace {
 
-class CmdRenameCollection : public ErrmsgCommandDeprecated {
+class CmdRenameCollection final : public TypedCommand<CmdRenameCollection> {
 public:
-    CmdRenameCollection() : ErrmsgCommandDeprecated("renameCollection") {}
-    virtual bool adminOnly() const {
+    using Request = RenameCollectionCommand;
+
+    const std::set<std::string>& apiVersions() const override {
+        return kApiVersions1;
+    }
+
+    bool adminOnly() const override {
         return true;
     }
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
     }
 
     bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return rename_collection::checkAuthForRenameCollectionCommand(client, dbname, cmdObj);
-    }
     std::string help() const override {
         return " example: { renameCollection: foo.a, to: bar.b }";
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
-    }
-
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& dbname,
-                           const BSONObj& cmdObj,
-                           string& errmsg,
-                           BSONObjBuilder& result) {
-        auto renameRequest =
-            RenameCollectionCommand::parse(IDLParserErrorContext("renameCollection"), cmdObj);
-        RenameCollectionOptions options;
-        options.dropTarget = renameRequest.getDropTarget();
-        options.stayTemp = renameRequest.getStayTemp();
-        validateAndRunRenameCollection(
-            opCtx, renameRequest.getCommandParameter(), renameRequest.getTo(), options);
+    bool allowedWithSecurityToken() const final {
         return true;
     }
 
-} cmdrenamecollection;
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        void typedRun(OperationContext* opCtx) {
+            const auto& fromNss = getFrom();
+            const auto& toNss = request().getTo();
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't rename a collection to itself",
+                    fromNss != toNss);
+
+            RenameCollectionOptions options;
+            options.stayTemp = request().getStayTemp();
+            options.expectedSourceUUID = request().getCollectionUUID();
+            visit(OverloadedVisitor{
+                      [&options](bool dropTarget) { options.dropTarget = dropTarget; },
+                      [&options](const UUID& uuid) {
+                          options.dropTarget = true;
+                          options.expectedTargetUUID = uuid;
+                      },
+                  },
+                  request().getDropTarget());
+
+            validateAndRunRenameCollection(opCtx, fromNss, toNss, options);
+        }
+
+    private:
+        const NamespaceString& getFrom() const {
+            return request().getCommandParameter();
+        }
+
+        NamespaceString ns() const override {
+            return getFrom();
+        }
+
+        const DatabaseName& db() const override {
+            return request().getDbName();
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassertStatusOK(rename_collection::checkAuthForRenameCollectionCommand(
+                opCtx->getClient(), request()));
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(CmdRenameCollection).forShard();
 
 }  // namespace
 }  // namespace mongo

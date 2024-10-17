@@ -1,29 +1,41 @@
 // Verifies basic sharded transaction behavior with causal consistency.
 //
 // @tags: [
-//   requires_find_command,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {
+    withTxnAndAutoRetry
+} from "jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    disableStaleVersionAndSnapshotRetriesWithinTransactions,
+    enableStaleVersionAndSnapshotRetriesWithinTransactions,
+    kShardOptionsForDisabledStaleShardVersionRetries
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-const st = new ShardingTest({shards: 2, mongos: 2});
+Random.setRandomSeed();
+
+const st = new ShardingTest({
+    shards: 2,
+    mongos: 2,
+    other: {
+        shardOptions: kShardOptionsForDisabledStaleShardVersionRetries,
+    }
+});
 
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 // Set up a sharded collection with 2 chunks, [min, 0) and [0, max), one on each shard, with one
 // document in each.
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
@@ -51,22 +63,20 @@ function runTest(st, readConcern) {
     assert.commandWorked(
         otherRouter.adminCommand({moveChunk: ns, find: docToInsert, to: st.shard0.shardName}));
 
-    session.startTransaction({readConcern: readConcern});
-
-    // The transaction should always see the document written earlier through its session,
-    // regardless of the move.
-    //
-    // Note: until transactions can read from secondaries and/or disabling speculative snapshot
-    // is allowed, read concerns that do not require global snapshots (i.e. local and majority)
-    // will always read the inserted document here because the local snapshot established on
-    // this shard will include all currently applied operations, which must include all earlier
-    // acknowledged writes.
-    assert.docEq(docToInsert,
-                 sessionDB[collName].findOne(docToInsert),
-                 "sharded transaction with read concern " + tojson(readConcern) +
-                     " did not see expected document");
-
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetry(session, () => {
+        // The transaction should always see the document written earlier through its session,
+        // regardless of the move.
+        //
+        // Note: until transactions can read from secondaries and/or disabling speculative snapshot
+        // is allowed, read concerns that do not require global snapshots (i.e. local and majority)
+        // will always read the inserted document here because the local snapshot established on
+        // this shard will include all currently applied operations, which must include all earlier
+        // acknowledged writes.
+        assert.docEq(docToInsert,
+                     sessionDB[collName].findOne(docToInsert),
+                     "sharded transaction with read concern " + tojson(readConcern) +
+                         " did not see expected document");
+    }, {readConcern: readConcern});
 
     // Clean up for the next iteration.
     assert.commandWorked(
@@ -82,4 +92,3 @@ for (let readConcernLevel of kAllowedReadConcernLevels) {
 disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 st.stop();
-})();

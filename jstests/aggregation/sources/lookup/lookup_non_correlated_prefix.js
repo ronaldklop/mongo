@@ -1,12 +1,10 @@
-// Cannot implicitly shard accessed collections as $lookup does not support sharded target
-// collection. Facet in a lookup cannot be wrapped in a facet.
-// @tags: [assumes_unsharded_collection, do_not_wrap_aggregations_in_facets]
+// Facet in a lookup cannot be wrapped in a facet.
+// @tags: [do_not_wrap_aggregations_in_facets]
 
 /**
  * Confirms that $lookup with a non-correlated prefix returns expected results.
  */
-(function() {
-"use strict";
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 const testColl = db.lookup_non_correlated_prefix;
 testColl.drop();
@@ -77,4 +75,54 @@ cursor.toArray().forEach(user => {
     assert.eq(1, joinedDocs.length);
     assert.eq(user['_id'], joinedDocs[0].owner);
 });
-})();
+
+// Test for a non-correlated prefix followed by a $facet pipeline that contains a correlated
+// variable reference.
+cursor = testColl.aggregate([
+    {
+        $lookup: {
+            as: 'items_check',
+            from: joinColl.getName(),
+            let : {id: '$_id'},
+            pipeline: [
+                {$match: {owner: "user_1"}},
+                {
+                    $facet: {
+                        all: [{
+                            $redact: {
+                                $cond:
+                                    {if: {$eq: ["$$id", "user_1"]}, then: "$$KEEP", else: "$$PRUNE"}
+                            }
+                        }],
+                    },
+                },
+            ],
+        },
+    },
+]);
+res = cursor.toArray();
+assert(
+    arrayEq(res,
+            [
+                {"_id": "user_1", "items_check": [{"all": [{"_id": "item_1", "owner": "user_1"}]}]},
+                {"_id": "user_2", "items_check": [{"all": []}]}
+            ]),
+    res);
+
+// SERVER-57000: Test handling of lack of correlation (addFields with empty set of columns)
+assert.doesNotThrow(() => testColl.aggregate([
+    {
+        $lookup: {
+            as: 'items_check',
+            from: joinColl.getName(),
+            pipeline: [
+                {$addFields: {}},
+                {
+                    $facet: {
+                        all: [{$match: {}}],
+                    },
+                },
+            ],
+        },
+    },
+]));

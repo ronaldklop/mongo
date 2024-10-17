@@ -29,12 +29,29 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "mongo/s/client/shard.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -54,9 +71,9 @@ public:
                 const ConnectionString& connString,
                 std::unique_ptr<RemoteCommandTargeter> targeter);
 
-    ~ShardRemote();
+    ~ShardRemote() override;
 
-    const ConnectionString getConnString() const override {
+    const ConnectionString& getConnString() const override {
         return _connString;
     }
 
@@ -71,23 +88,22 @@ public:
 
     bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) final;
 
-    Status createIndexOnConfig(OperationContext* opCtx,
-                               const NamespaceString& ns,
-                               const BSONObj& keys,
-                               bool unique) override;
-
-    void updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) final;
-
-    LogicalTime getLastCommittedOpTime() const final;
-
     void runFireAndForgetCommand(OperationContext* opCtx,
                                  const ReadPreferenceSetting& readPref,
-                                 const std::string& dbName,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) final;
 
     Status runAggregation(OperationContext* opCtx,
                           const AggregateCommandRequest& aggRequest,
-                          std::function<bool(const std::vector<BSONObj>& batch)> callback);
+                          std::function<bool(const std::vector<BSONObj>& batch,
+                                             const boost::optional<BSONObj>& postBatchResumeToken)>
+                              callback) override;
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) final;
 
 private:
     struct AsyncCmdHandle {
@@ -104,14 +120,14 @@ private:
 
     StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,
                                                    const ReadPreferenceSetting& readPref,
-                                                   StringData dbName,
+                                                   const DatabaseName& dbName,
                                                    Milliseconds maxTimeMSOverride,
                                                    const BSONObj& cmdObj) final;
 
     StatusWith<Shard::QueryResponse> _runExhaustiveCursorCommand(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        StringData dbName,
+        const DatabaseName& dbName,
         Milliseconds maxTimeMSOverride,
         const BSONObj& cmdObj) final;
 
@@ -128,7 +144,7 @@ private:
     StatusWith<AsyncCmdHandle> _scheduleCommand(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        StringData dbName,
+        const DatabaseName& dbName,
         Milliseconds maxTimeMSOverride,
         const BSONObj& cmdObj,
         const executor::TaskExecutor::RemoteCommandCallbackFn& cb);
@@ -142,19 +158,6 @@ private:
      * Targeter for obtaining hosts from which to read or to which to write.
      */
     std::shared_ptr<RemoteCommandTargeter> _targeter;
-
-    /**
-     * Protects _lastCommittedOpTime.
-     */
-    mutable Mutex _lastCommittedOpTimeMutex =
-        MONGO_MAKE_LATCH("ShardRemote::_lastCommittedOpTimeMutex");
-
-    /**
-     * Logical time representing the latest opTime timestamp known to be in this shard's majority
-     * committed snapshot. Only the latest time is kept because lagged secondaries may return
-     * earlier times.
-     */
-    LogicalTime _lastCommittedOpTime;
 };
 
 }  // namespace mongo

@@ -27,12 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstring>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/dbmessage.h"
-
+#include "mongo/db/server_options.h"
 #include "mongo/platform/strnlen.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -61,16 +67,8 @@ DbMessage::DbMessage(const Message& msg) : _msg(msg), _nsStart(nullptr), _mark(n
 }
 
 const char* DbMessage::getns() const {
-    verify(messageShouldHaveNs());
+    MONGO_verify(messageShouldHaveNs());
     return _nsStart;
-}
-
-int DbMessage::getQueryNToReturn() const {
-    verify(messageShouldHaveNs());
-    const char* p = _nsStart + _nsLen + 1;
-    checkRead<int>(p, 2);
-
-    return ConstDataView(p).read<LittleEndian<int32_t>>(sizeof(int32_t));
 }
 
 int DbMessage::pullInt() {
@@ -99,8 +97,8 @@ BSONObj DbMessage::nextJsObj() {
     }
 
     BSONObj js(_nextjsobj);
-    verify(js.objsize() >= 5);
-    verify(js.objsize() <= (_theEnd - _nextjsobj));
+    MONGO_verify(js.objsize() >= 5);
+    MONGO_verify(js.objsize() <= (_theEnd - _nextjsobj));
 
     _nextjsobj += js.objsize();
     if (_nextjsobj >= _theEnd)
@@ -113,7 +111,7 @@ void DbMessage::markReset(const char* toMark = nullptr) {
         toMark = _mark;
     }
 
-    verify(toMark);
+    MONGO_verify(toMark);
     _nextjsobj = toMark;
 }
 
@@ -138,30 +136,17 @@ T DbMessage::readAndAdvance() {
     return t;
 }
 
-namespace {
-template <typename Func>
-Message makeMessage(NetworkOp op, Func&& bodyBuilder) {
-    BufBuilder b;
-    b.skip(sizeof(MSGHEADER::Layout));
-
-    bodyBuilder(b);
-
-    const int size = b.len();
-    auto out = Message(b.release());
-    out.header().setOperation(op);
-    out.header().setLen(size);
-    return out;
-}
-}  // namespace
-
-Message makeInsertMessage(StringData ns, const BSONObj* objs, size_t count, int flags) {
+Message makeUnsupportedOpInsertMessage(StringData ns,
+                                       const BSONObj* objs,
+                                       size_t count,
+                                       int flags) {
     return makeMessage(dbInsert, [&](BufBuilder& b) {
         int reservedFlags = 0;
         if (flags & InsertOption_ContinueOnError)
             reservedFlags |= InsertOption_ContinueOnError;
 
         b.appendNum(reservedFlags);
-        b.appendStr(ns);
+        b.appendCStr(ns);
 
         for (size_t i = 0; i < count; i++) {
             objs[i].appendSelfToBufBuilder(b);
@@ -169,72 +154,28 @@ Message makeInsertMessage(StringData ns, const BSONObj* objs, size_t count, int 
     });
 }
 
-Message makeUpdateMessage(StringData ns, BSONObj query, BSONObj update, int flags) {
-    return makeMessage(dbUpdate, [&](BufBuilder& b) {
-        const int reservedFlags = 0;
-        b.appendNum(reservedFlags);
-        b.appendStr(ns);
-        b.appendNum(flags);
+DbResponse makeErrorResponseToUnsupportedOpQuery(StringData errorMsg) {
+    BSONObjBuilder err;
+    err.append("$err",
+               str::stream() << errorMsg
+                             << ". The client driver may require an upgrade. For more details see "
+                                "https://dochub.mongodb.org/core/legacy-opcode-removal");
+    err.append("code", 5739101);
+    err.append("ok", 0.0);
+    BSONObj errObj = err.done();
 
-        query.appendSelfToBufBuilder(b);
-        update.appendSelfToBufBuilder(b);
-    });
-}
+    BufBuilder buffer(sizeof(QueryResult::Value) + errObj.objsize());
+    buffer.skip(sizeof(QueryResult::Value));
+    buffer.appendBuf(errObj.objdata(), errObj.objsize());
 
-Message makeRemoveMessage(StringData ns, BSONObj query, int flags) {
-    return makeMessage(dbDelete, [&](BufBuilder& b) {
-        const int reservedFlags = 0;
-        b.appendNum(reservedFlags);
-        b.appendStr(ns);
-        b.appendNum(flags);
-
-        query.appendSelfToBufBuilder(b);
-    });
-}
-
-Message makeKillCursorsMessage(long long cursorId) {
-    return makeMessage(dbKillCursors, [&](BufBuilder& b) {
-        b.appendNum((int)0);  // reserved
-        b.appendNum((int)1);  // number
-        b.appendNum(cursorId);
-    });
-}
-
-Message makeGetMoreMessage(StringData ns, long long cursorId, int nToReturn, int flags) {
-    return makeMessage(dbGetMore, [&](BufBuilder& b) {
-        b.appendNum(flags);
-        b.appendStr(ns);
-        b.appendNum(nToReturn);
-        b.appendNum(cursorId);
-    });
-}
-
-OpQueryReplyBuilder::OpQueryReplyBuilder() : _buffer(32768) {
-    _buffer.skip(sizeof(QueryResult::Value));
-}
-
-Message OpQueryReplyBuilder::toQueryReply(int queryResultFlags,
-                                          int nReturned,
-                                          int startingFrom,
-                                          long long cursorId) {
-    QueryResult::View qr = _buffer.buf();
-    qr.setResultFlags(queryResultFlags);
-    qr.msgdata().setLen(_buffer.len());
+    QueryResult::View qr = buffer.buf();
+    qr.msgdata().setLen(buffer.len());
     qr.msgdata().setOperation(opReply);
-    qr.setCursorId(cursorId);
-    qr.setStartingFrom(startingFrom);
-    qr.setNReturned(nReturned);
-    return Message(_buffer.release());
-}
+    qr.setResultFlags(ResultFlag_ErrSet);
+    qr.setCursorId(0);
+    qr.setStartingFrom(0);
+    qr.setNReturned(1);
 
-DbResponse replyToQuery(int queryResultFlags,
-                        const void* data,
-                        int size,
-                        int nReturned,
-                        int startingFrom,
-                        long long cursorId) {
-    OpQueryReplyBuilder reply;
-    reply.bufBuilderForResults().appendBuf(data, size);
-    return DbResponse{reply.toQueryReply(queryResultFlags, nReturned, startingFrom, cursorId)};
+    return DbResponse{Message(buffer.release())};
 }
 }  // namespace mongo

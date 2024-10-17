@@ -6,17 +6,12 @@
  *
  * For collections, this test verifies that the timestamp is properly updated when sharding a
  * collection, dropping and creating a collection, or refining the sharding key.
- *
- * The test can only run when the featureFlagShardingFullDDLSupportTimestampedVersion feature flag
- * is enabled. Tagging as multiversion_incompatible until SERVER-52588 is done.
- *
- * @tags: [multiversion_incompatible, featureFlagShardingFullDDLSupportTimestampedVersion]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/sharding/libs/find_chunks_util.js");
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
 function checkTimestampConsistencyInPersistentMetadata(
     dbName, nss, dbTimestampInConfig, collTimestampInConfig) {
@@ -33,11 +28,6 @@ function checkTimestampConsistencyInPersistentMetadata(
         st.shard0.getDB('config').cache.collections.findOne({_id: nss}).timestamp;
     assert.neq(null, collTimestampInShard);
     assert.eq(timestampCmp(collTimestampInConfig, collTimestampInShard), 0);
-
-    // Checking consistency on config server collection: config.chunks
-    var cursor = findChunksUtil.findChunksByNs(st.config, nss);
-    assert(cursor.hasNext());
-    assert.eq(collTimestampInConfig, cursor.next().lastmodTimestamp);
 }
 
 const kDbName = 'testdb';
@@ -45,16 +35,6 @@ const kCollName = 'coll';
 const kNs = kDbName + '.' + kCollName;
 
 var st = new ShardingTest({shards: 1, mongos: 1});
-
-const featureFlagParam = assert.commandWorked(st.configRS.getPrimary().adminCommand(
-    {getParameter: 1, featureFlagShardingFullDDLSupportTimestampedVersion: 1}));
-
-if (!featureFlagParam.featureFlagShardingFullDDLSupportTimestampedVersion.value) {
-    jsTest.log(
-        'Skipping test because featureFlagShardingFullDDLSupportTimestampedVersion feature flag is not enabled');
-    st.stop();
-    return;
-}
 
 let configDB = st.s.getDB('config');
 
@@ -128,4 +108,3 @@ checkTimestampConsistencyInPersistentMetadata(
     kDbName, kNs, dbTimestampAfterRefine, collTimestampAfterRefine);
 
 st.stop();
-})();

@@ -1,6 +1,10 @@
 // Tests whether a reset sharding version triggers errors
-(function() {
-'use strict';
+// @tags: [
+//   # TODO (SERVER-88123): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 1, mongos: 2});
 
@@ -34,4 +38,3 @@ assert.eq(3, collA.find().itcount());
 assert.eq(3, collB.find().itcount());
 
 st.stop();
-})();

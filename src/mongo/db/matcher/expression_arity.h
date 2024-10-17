@@ -52,13 +52,13 @@ public:
         return nargs;
     }
 
-    virtual ~FixedArityMatchExpression() = default;
+    ~FixedArityMatchExpression() override = default;
 
     void debugString(StringBuilder& debug, int indentationLevel) const final {
         _debugAddSpace(debug, indentationLevel);
 
         BSONObjBuilder builder;
-        serialize(&builder, true);
+        serialize(&builder, {});
         debug << builder.obj().toString();
     }
 
@@ -90,8 +90,13 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        invariant(i < nargs);
+        tassert(6400203, "Out-of-bounds access to child of MatchExpression.", i < nargs);
         return _expressions[i].get();
+    }
+
+    void resetChild(size_t i, MatchExpression* other) override {
+        tassert(6329406, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+        _expressions[i].reset(other);
     }
 
     /**
@@ -102,11 +107,13 @@ public:
     /**
      * Serializes each subexpression sequentially in a BSONArray.
      */
-    void serialize(BSONObjBuilder* builder, bool includePath) const final {
+    void serialize(BSONObjBuilder* builder,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final {
         BSONArrayBuilder exprArray(builder->subarrayStart(name()));
         for (const auto& expr : _expressions) {
             BSONObjBuilder exprBuilder(exprArray.subobjStart());
-            expr->serialize(&exprBuilder, includePath);
+            expr->serialize(&exprBuilder, opts, includePath);
             exprBuilder.doneFast();
         }
         exprArray.doneFast();
@@ -115,14 +122,13 @@ public:
     /**
      * Clones this MatchExpression by recursively cloning each sub-expression.
      */
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::array<std::unique_ptr<MatchExpression>, nargs> clonedExpressions;
         std::transform(_expressions.begin(),
                        _expressions.end(),
                        clonedExpressions.begin(),
                        [](const auto& orig) {
-                           return orig ? orig->shallowClone()
-                                       : std::unique_ptr<MatchExpression>(nullptr);
+                           return orig ? orig->clone() : std::unique_ptr<MatchExpression>(nullptr);
                        });
         std::unique_ptr<T> clone =
             std::make_unique<T>(std::move(clonedExpressions), _errorAnnotation);
@@ -156,7 +162,10 @@ private:
                 // Since 'subExpression' is a reference to a member of the
                 // FixedArityMatchExpression's child array, this assignment replaces the original
                 // child with the optimized child.
-                subExpression = MatchExpression::optimize(std::move(subExpression));
+                // The Boolean simplifier is disabled since we don't want to simplify
+                // sub-expressions, but simplify the whole expression instead.
+                subExpression = MatchExpression::optimize(std::move(subExpression),
+                                                          /* enableSimplification */ false);
             }
 
             return expression;

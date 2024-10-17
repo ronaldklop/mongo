@@ -27,24 +27,54 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <string>
-#include <vector>
 
-#include "mongo/db/auth/action_set.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -57,19 +87,22 @@ BSONObj selectMedianKey(OperationContext* opCtx,
                         const ShardId& shardId,
                         const NamespaceString& nss,
                         const ShardKeyPattern& shardKeyPattern,
+                        const CollectionRoutingInfo& cri,
                         const ChunkRange& chunkRange) {
     BSONObjBuilder cmd;
-    cmd.append("splitVector", nss.ns());
+    cmd.append("splitVector",
+               NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
     cmd.append("keyPattern", shardKeyPattern.toBSON());
     chunkRange.append(&cmd);
     cmd.appendBool("force", true);
+    cri.getShardVersion(shardId).serialize(ShardVersion::kShardVersionField, &cmd);
 
     auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
 
     auto cmdResponse = uassertStatusOK(
         shard->runCommandWithFixedRetryAttempts(opCtx,
                                                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                                "admin",
+                                                DatabaseName::kAdmin,
                                                 cmd.obj(),
                                                 Shard::RetryPolicy::kIdempotent));
 
@@ -108,31 +141,35 @@ public:
                " NOTE: this does not move the chunks, it just creates a logical separation.";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::splitChunk)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::splitChunk)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
+                   const DatabaseName& dbName,
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        const auto cm = uassertStatusOK(
+        const auto cri = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
                                                                                          nss));
+        const auto& cm = cri.cm;
 
         const BSONField<BSONObj> findField("find", BSONObj());
         const BSONField<BSONArray> boundsField("bounds", BSONArray());
@@ -192,8 +229,8 @@ public:
 
         if (!find.isEmpty()) {
             // find
-            BSONObj shardKey =
-                uassertStatusOK(cm.getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, find));
+            BSONObj shardKey = uassertStatusOK(
+                extractShardKeyFromBasicQuery(opCtx, nss, cm.getShardKeyPattern(), find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
@@ -251,14 +288,14 @@ public:
                               chunk->getShardId(),
                               nss,
                               cm.getShardKeyPattern(),
+                              cri,
                               ChunkRange(chunk->getMin(), chunk->getMax()));
 
         LOGV2(22758,
-              "Splitting chunk {chunkRange} in {namespace} on shard {shardId} at key {splitPoint}",
               "Splitting chunk",
               "chunkRange"_attr = redact(ChunkRange(chunk->getMin(), chunk->getMax()).toString()),
               "splitPoint"_attr = redact(splitPoint),
-              "namespace"_attr = nss.ns(),
+              logAttrs(nss),
               "shardId"_attr = chunk->getShardId());
 
         uassertStatusOK(
@@ -266,19 +303,17 @@ public:
                                                   chunk->getShardId(),
                                                   nss,
                                                   cm.getShardKeyPattern(),
-                                                  cm.getVersion(),
+                                                  cm.getVersion().epoch(),
+                                                  cm.getVersion().getTimestamp(),
                                                   ChunkRange(chunk->getMin(), chunk->getMax()),
                                                   {splitPoint}));
 
-        Grid::get(opCtx)
-            ->catalogCache()
-            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                nss, boost::none, chunk->getShardId());
+        Grid::get(opCtx)->catalogCache()->onStaleCollectionVersion(nss, boost::none);
 
         return true;
     }
-
-} splitChunk;
+};
+MONGO_REGISTER_COMMAND(SplitCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

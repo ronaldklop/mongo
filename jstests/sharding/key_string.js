@@ -1,15 +1,13 @@
-(function() {
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var s = new ShardingTest({name: "keystring", shards: 2});
 
-s.adminCommand({enablesharding: "test"});
-s.ensurePrimaryShard('test', s.shard1.shardName);
+s.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName});
 s.adminCommand({shardcollection: "test.foo", key: {name: 1}});
 
-primary = s.getPrimaryShard("test").getDB("test");
-seconday = s.getOther(primary).getDB("test");
+let primary = s.getPrimaryShard("test").getDB("test");
+let seconday = s.getOther(primary).getDB("test");
 
 assert.eq(1, findChunksUtil.countChunksForNs(s.config, "test.foo"), "sanity check A");
 
@@ -66,4 +64,3 @@ assert.throws(function() {
 });
 
 s.stop();
-})();

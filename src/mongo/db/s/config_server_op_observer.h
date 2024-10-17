@@ -29,8 +29,20 @@
 
 #pragma once
 
-#include "mongo/db/op_observer.h"
-#include "mongo/platform/mutex.h"
+#include <cstdint>
+#include <vector>
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -38,173 +50,50 @@ namespace mongo {
  * OpObserver which is installed on the op observers chain when the server is running as a config
  * server (--configsvr).
  */
-class ConfigServerOpObserver final : public OpObserver {
+class ConfigServerOpObserver final : public OpObserverNoop {
     ConfigServerOpObserver(const ConfigServerOpObserver&) = delete;
     ConfigServerOpObserver& operator=(const ConfigServerOpObserver&) = delete;
 
 public:
     ConfigServerOpObserver();
-    ~ConfigServerOpObserver();
+    ~ConfigServerOpObserver() override;
 
-    void onCreateIndex(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       CollectionUUID uuid,
-                       BSONObj indexDoc,
-                       bool fromMigrate) override {}
-
-    void onStartIndexBuild(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           CollectionUUID collUUID,
-                           const UUID& indexBuildUUID,
-                           const std::vector<BSONObj>& indexes,
-                           bool fromMigrate) override {}
-
-    void onStartIndexBuildSinglePhase(OperationContext* opCtx,
-                                      const NamespaceString& nss) override {}
-
-    void onCommitIndexBuild(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            CollectionUUID collUUID,
-                            const UUID& indexBuildUUID,
-                            const std::vector<BSONObj>& indexes,
-                            bool fromMigrate) override {}
-
-    void onAbortIndexBuild(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           CollectionUUID collUUID,
-                           const UUID& indexBuildUUID,
-                           const std::vector<BSONObj>& indexes,
-                           const Status& cause,
-                           bool fromMigrate) override {}
+    NamespaceFilters getNamespaceFilters() const final {
+        return {NamespaceFilter::kConfigAndSystem, NamespaceFilter::kConfigAndSystem};
+    }
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   OptionalCollectionUUID uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   const std::vector<RecordId>& recordIds,
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator = nullptr) override;
 
-    void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override {}
-
-    void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const BSONObj& doc) override {}
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  OptionalCollectionUUID uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
-
-    void onInternalOpMessage(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const boost::optional<UUID> uuid,
-                             const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj,
-                             const boost::optional<repl::OpTime> preImageOpTime,
-                             const boost::optional<repl::OpTime> postImageOpTime,
-                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
-                             const boost::optional<OplogSlot> slot) final{};
-
-    void onCreateCollection(OperationContext* opCtx,
-                            const CollectionPtr& coll,
-                            const NamespaceString& collectionName,
-                            const CollectionOptions& options,
-                            const BSONObj& idIndex,
-                            const OplogSlot& createOpTime) override {}
-
-    void onCollMod(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
-                   const BSONObj& collModCmd,
-                   const CollectionOptions& oldCollOptions,
-                   boost::optional<IndexCollModInfo> indexInfo) override {}
-
-    void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
-                                  OptionalCollectionUUID uuid,
+                                  const UUID& uuid,
                                   std::uint64_t numRecords,
-                                  CollectionDropType dropType) override;
+                                  CollectionDropType dropType,
+                                  bool markFromMigrate) override;
 
-    void onDropIndex(OperationContext* opCtx,
-                     const NamespaceString& nss,
-                     OptionalCollectionUUID uuid,
-                     const std::string& indexName,
-                     const BSONObj& indexInfo) override {}
-
-    void onRenameCollection(OperationContext* opCtx,
-                            const NamespaceString& fromCollection,
-                            const NamespaceString& toCollection,
-                            OptionalCollectionUUID uuid,
-                            OptionalCollectionUUID dropTargetUUID,
-                            std::uint64_t numRecords,
-                            bool stayTemp) override {}
-    void onImportCollection(OperationContext* opCtx,
-                            const UUID& importUUID,
-                            const NamespaceString& nss,
-                            long long numRecords,
-                            long long dataSize,
-                            const BSONObj& catalogEntry,
-                            const BSONObj& storageMetadata,
-                            bool isDryRun) override {}
-    repl::OpTime preRenameCollection(OperationContext* opCtx,
-                                     const NamespaceString& fromCollection,
-                                     const NamespaceString& toCollection,
-                                     OptionalCollectionUUID uuid,
-                                     OptionalCollectionUUID dropTargetUUID,
-                                     std::uint64_t numRecords,
-                                     bool stayTemp) override {
-        return repl::OpTime();
-    }
-    void postRenameCollection(OperationContext* opCtx,
-                              const NamespaceString& fromCollection,
-                              const NamespaceString& toCollection,
-                              OptionalCollectionUUID uuid,
-                              OptionalCollectionUUID dropTargetUUID,
-                              bool stayTemp) override {}
-
-    void onApplyOps(OperationContext* opCtx,
-                    const std::string& dbName,
-                    const BSONObj& applyOpCmd) override;
-
-    void onEmptyCapped(OperationContext* opCtx,
-                       const NamespaceString& collectionName,
-                       OptionalCollectionUUID uuid) override {}
-
-    void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       std::vector<repl::ReplOperation>* statements,
-                                       size_t numberOfPreImagesToWrite) override {}
-
-    void onPreparedTransactionCommit(
-        OperationContext* opCtx,
-        OplogSlot commitOplogEntryOpTime,
-        Timestamp commitTimestamp,
-        const std::vector<repl::ReplOperation>& statements) noexcept override {}
-
-    void onTransactionPrepare(OperationContext* opCtx,
-                              const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>* statements,
-                              size_t numberOfPreImagesToWrite) override {}
-
-    void onTransactionAbort(OperationContext* opCtx,
-                            boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
-
-    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
 
     void onMajorityCommitPointUpdate(ServiceContext* service,
                                      const repl::OpTime& newCommitPoint) override;
-
-private:
-    void _registerTopologyTimeTickPoint(Timestamp newTopologyTime);
-    void _tickTopologyTimeIfNecessary(ServiceContext* service, Timestamp newCommitPointTime);
-
-    // Guards access to the instance variables below.
-    Mutex _mutex = MONGO_MAKE_LATCH("ConfigServerOpObserver");
-
-    std::vector<Timestamp> _topologyTimeTickPoints;
 };
 
 }  // namespace mongo

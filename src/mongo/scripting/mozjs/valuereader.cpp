@@ -27,23 +27,53 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/valuereader.h"
 
 #include <cmath>
 #include <cstdio>
+#include <iosfwd>
+#include <js/Array.h>
 #include <js/CharacterEncoding.h>
 #include <js/Date.h>
+#include <js/GCVector.h>
+#include <js/Object.h>
+#include <js/String.h>
+#include <js/Utility.h>
+#include <js/Value.h>
+#include <js/ValueArray.h>
+#include <jscustomallocator.h>
+#include <mozilla/UniquePtr.h>
+
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/bindata.h"
+#include "mongo/scripting/mozjs/bson.h"
+#include "mongo/scripting/mozjs/code.h"
+#include "mongo/scripting/mozjs/dbpointer.h"
+#include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/maxkey.h"
+#include "mongo/scripting/mozjs/minkey.h"
+#include "mongo/scripting/mozjs/numberdecimal.h"
+#include "mongo/scripting/mozjs/numberlong.h"
+#include "mongo/scripting/mozjs/oid.h"
+#include "mongo/scripting/mozjs/regexp.h"
+#include "mongo/scripting/mozjs/timestamp.h"
+#include "mongo/scripting/mozjs/valuereader.h"
+#include "mongo/scripting/mozjs/wraptype.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace mozjs {
@@ -59,7 +89,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             // javascriptProtection prevents Code and CodeWScope BSON types from
             // being automatically marshalled into executable functions.
             if (scope->isJavaScriptProtectionEnabled()) {
-                JS::AutoValueArray<1> args(_context);
+                JS::RootedValueArray<1> args(_context);
                 ValueReader(_context, args[0]).fromStringData(elem.valueStringData());
 
                 JS::RootedObject obj(_context);
@@ -70,7 +100,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             return;
         case mongo::CodeWScope:
             if (scope->isJavaScriptProtectionEnabled()) {
-                JS::AutoValueArray<2> args(_context);
+                JS::RootedValueArray<2> args(_context);
 
                 ValueReader(_context, args[0]).fromStringData(elem.codeWScopeCode());
                 ValueReader(_context, args[1])
@@ -120,7 +150,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             _value.setUndefined();
             return;
         case mongo::RegEx: {
-            JS::AutoValueArray<2> args(_context);
+            JS::RootedValueArray<2> args(_context);
 
             ValueReader(_context, args[0]).fromStringData(elem.regex());
             ValueReader(_context, args[1]).fromStringData(elem.regexFlags());
@@ -138,7 +168,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             std::stringstream ss;
             base64::encode(ss, StringData(data, len));
 
-            JS::AutoValueArray<2> args(_context);
+            JS::RootedValueArray<2> args(_context);
 
             args[0].setInt32(elem.binDataType());
 
@@ -148,10 +178,10 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             return;
         }
         case mongo::bsonTimestamp: {
-            JS::AutoValueArray<2> args(_context);
+            JS::RootedValueArray<2> args(_context);
 
             ValueReader(_context, args[0])
-                .fromDouble(elem.timestampTime().toMillisSinceEpoch() / 1000);
+                .fromDouble(static_cast<double>(elem.timestampTime().toMillisSinceEpoch()) / 1000);
             ValueReader(_context, args[1]).fromDouble(elem.timestampInc());
 
             scope->getProto<TimestampInfo>().newInstance(args, _value);
@@ -161,13 +191,15 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
         case mongo::NumberLong: {
             JS::RootedObject thisv(_context);
             scope->getProto<NumberLongInfo>().newObject(&thisv);
-            JS_SetPrivate(thisv, scope->trackedNew<int64_t>(elem.numberLong()));
+            JS::SetReservedSlot(thisv,
+                                NumberLongInfo::Int64Slot,
+                                JS::PrivateValue(scope->trackedNew<int64_t>(elem.numberLong())));
             _value.setObjectOrNull(thisv);
             return;
         }
         case mongo::NumberDecimal: {
             Decimal128 decimal = elem.numberDecimal();
-            JS::AutoValueArray<1> args(_context);
+            JS::RootedValueArray<1> args(_context);
             ValueReader(_context, args[0]).fromDecimal128(decimal);
             JS::RootedObject obj(_context);
 
@@ -183,10 +215,10 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             scope->getProto<MaxKeyInfo>().newInstance(_value);
             return;
         case mongo::DBRef: {
-            JS::AutoValueArray<1> oidArgs(_context);
+            JS::RootedValueArray<1> oidArgs(_context);
             ValueReader(_context, oidArgs[0]).fromStringData(elem.dbrefOID().toString());
 
-            JS::AutoValueArray<2> dbPointerArgs(_context);
+            JS::RootedValueArray<2> dbPointerArgs(_context);
             ValueReader(_context, dbPointerArgs[0]).fromStringData(elem.dbrefNS());
             scope->getProto<OIDInfo>().newInstance(oidArgs, dbPointerArgs[1]);
 
@@ -226,7 +258,7 @@ void ValueReader::fromBSON(const BSONObj& obj, const BSONObj* parent, bool readO
 }
 
 void ValueReader::fromBSONArray(const BSONObj& obj, const BSONObj* parent, bool readOnly) {
-    JS::AutoValueVector avv(_context);
+    JS::RootedValueVector avv(_context);
 
     BSONForEach(elem, obj) {
         JS::RootedValue member(_context);
@@ -236,9 +268,9 @@ void ValueReader::fromBSONArray(const BSONObj& obj, const BSONObj* parent, bool 
             uasserted(ErrorCodes::JSInterpreterFailure, "Failed to append to JS array");
         }
     }
-    JS::RootedObject array(_context, JS_NewArrayObject(_context, avv));
+    JS::RootedObject array(_context, JS::NewArrayObject(_context, avv));
     if (!array) {
-        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewArrayObject");
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS::NewArrayObject");
     }
     _value.setObjectOrNull(array);
 }
@@ -256,7 +288,7 @@ void ValueReader::fromStringData(StringData sd) {
     // TODO: we have tests that involve dropping garbage in. Do we want to
     //       throw, or to take the lossy conversion?
     auto utf16 = JS::LossyUTF8CharsToNewTwoByteCharsZ(
-        _context, JS::UTF8Chars(sd.rawData(), sd.size()), &utf16Len);
+        _context, JS::UTF8Chars(sd.rawData(), sd.size()), &utf16Len, js::StringBufferArena);
 
     mozilla::UniquePtr<char16_t, JS::FreePolicy> utf16Deleter(utf16.get());
 
@@ -296,7 +328,7 @@ void ValueReader::fromDecimal128(Decimal128 decimal) {
  */
 void ValueReader::fromDouble(double d) {
     if (std::isnan(d)) {
-        _value.set(JS_GetNaNValue(_context));
+        _value.set(JS::NaNValue());
     } else {
         _value.setDouble(d);
     }
@@ -306,7 +338,8 @@ void ValueReader::fromInt64(int64_t i) {
     auto scope = getScope(_context);
     JS::RootedObject num(_context);
     scope->getProto<NumberLongInfo>().newObject(&num);
-    JS_SetPrivate(num, scope->trackedNew<int64_t>(i));
+    JS::SetReservedSlot(
+        num, NumberLongInfo::Int64Slot, JS::PrivateValue(scope->trackedNew<int64_t>(i)));
     _value.setObjectOrNull(num);
 }
 

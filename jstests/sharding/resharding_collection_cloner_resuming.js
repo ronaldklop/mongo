@@ -2,15 +2,14 @@
  * Tests the resuming behavior of resharding's collection cloning.
  *
  * @tags: [
- *   requires_fcv_49,
+ *   multiversion_incompatible,
  *   uses_atclustertime,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/uuid_util.js");
-load("jstests/sharding/libs/create_sharded_collection_util.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {extractUUIDFromObject, getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
+import {CreateShardedCollectionUtil} from "jstests/sharding/libs/create_sharded_collection_util.js";
 
 const st = new ShardingTest({
     mongos: 1,
@@ -23,6 +22,12 @@ const st = new ShardingTest({
         }
     },
 });
+
+if (FeatureFlagUtil.isEnabled(st.s, "ReshardingImprovements")) {
+    jsTestLog("Skipping test since featureFlagReshardingImprovements is enabled");
+    st.stop();
+    quit();
+}
 
 const inputCollection = st.s.getCollection("reshardingDb.coll");
 
@@ -42,6 +47,15 @@ CreateShardedCollectionUtil.shardCollectionWithChunks(
     temporaryReshardingCollection,
     {newKey: 1},
     [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: st.shard0.shardName}]);
+
+// The shardCollection command doesn't wait for the config.cache.chunks entries to have been written
+// on the primary shard for the database. We manually run the _flushRoutingTableCacheUpdates command
+// to guarantee they have been written and are visible with the atClusterTime used by the
+// testReshardCloneCollection command.
+for (const shard of [st.shard0, st.shard1]) {
+    assert.commandWorked(shard.rs.getPrimary().adminCommand(
+        {_flushRoutingTableCacheUpdates: temporaryReshardingCollection.getFullName()}));
+}
 
 const documents = [
     {_id: "a", info: "stays on shard0", oldKey: -10, newKey: 0},
@@ -101,5 +115,7 @@ assert.commandFailedWithCode(st.shard0.adminCommand({
 }),
                              ErrorCodes.DuplicateKey);
 
+// The temporary reshard collection must be dropped before checking metadata integrity.
+assert(temporaryReshardingCollection.drop());
+
 st.stop();
-})();

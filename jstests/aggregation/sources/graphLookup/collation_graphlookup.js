@@ -1,17 +1,9 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [
-//   assumes_unsharded_collection,
-// ]
-
 /**
  * Tests that the $graphLookup stage respects the collation when matching between the
  * 'connectFromField' and the 'connectToField'.  $graphLookup should use the collation
  * set on the aggregation, or the default collation of the collection.
+ * @tags: [assumes_no_implicit_collection_creation_after_drop]
  */
-(function() {
-"use strict";
-
 var res;
 const caseInsensitiveUS = {
     collation: {locale: "en_US", strength: 2}
@@ -30,29 +22,9 @@ assert.commandWorked(coll.insert({username: "erica", friends: ["jeremy", "jimmy"
 assert.commandWorked(coll.insert([{username: "JEREMY"}, {username: "JIMMY"}]));
 
 res = coll.aggregate(
-                  [
+                [
                     {$match: {username: "erica"}},
                     {
-                      $graphLookup: {
-                          from: coll.getName(),
-                          startWith: "$friends",
-                          connectFromField: "friends",
-                          connectToField: "username",
-                          as: "friendUsers"
-                      }
-                    }
-                  ],
-                  caseInsensitiveUS)
-              .toArray();
-assert.eq(1, res.length);
-assert.eq("erica", res[0].username);
-assert.eq(2, res[0].friendUsers.length);
-
-// Negative test: The local collation does not have a default collation, and so we use the simple
-// collation. Ensure that we don't find any friends when the collation is simple.
-res = coll.aggregate([
-                  {$match: {username: "erica"}},
-                  {
                     $graphLookup: {
                         from: coll.getName(),
                         startWith: "$friends",
@@ -60,9 +32,29 @@ res = coll.aggregate([
                         connectToField: "username",
                         as: "friendUsers"
                     }
-                  }
-              ])
-              .toArray();
+                    }
+                ],
+                caseInsensitiveUS)
+            .toArray();
+assert.eq(1, res.length);
+assert.eq("erica", res[0].username);
+assert.eq(2, res[0].friendUsers.length);
+
+// Negative test: The local collation does not have a default collation, and so we use the simple
+// collation. Ensure that we don't find any friends when the collation is simple.
+res = coll.aggregate([
+                {$match: {username: "erica"}},
+                {
+                    $graphLookup: {
+                        from: coll.getName(),
+                        startWith: "$friends",
+                        connectFromField: "friends",
+                        connectToField: "username",
+                        as: "friendUsers"
+                    }
+                }
+            ])
+            .toArray();
 assert.eq(1, res.length);
 assert.eq("erica", res[0].username);
 assert.eq(0, res[0].friendUsers.length);
@@ -80,7 +72,7 @@ assert.commandWorked(coll.insert({username: "gretchen", friends: ["jimmy"]}));
 // run does not have a default collation, and that this collation is used instead of the default
 // collation of the foreign collection. Exercises the fix for SERVER-43350.
 res = coll.aggregate([{$match: {username: {$in: ["erica", "fiona", "gretchen"]}}},
-                  {
+                {
                     $graphLookup: {
                         from: foreignColl.getName(),
                         startWith: "$friends",
@@ -88,9 +80,9 @@ res = coll.aggregate([{$match: {username: {$in: ["erica", "fiona", "gretchen"]}}
                         connectToField: "username",
                         as: "friendUsers"
                     }
-                  }
-              ])
-              .toArray();
+                }
+            ])
+            .toArray();
 assert.eq(3, res.length, tojson(res));
 for (let i = 0; i < res.length; ++i) {
     assert(["erica", "fiona", "gretchen"].includes(res[i].username));
@@ -109,8 +101,8 @@ assert.commandWorked(foreignColl.insert([{username: "JEREMY"}, {username: "JIMMY
 // Test that $graphLookup inherits the default collation of the collection on which it is run,
 // and that this collation is used instead of the default collation of the foreign collection.
 res = coll.aggregate([
-                  {$match: {username: "erica"}},
-                  {
+                {$match: {username: "erica"}},
+                {
                     $graphLookup: {
                         from: foreignColl.getName(),
                         startWith: "$friends",
@@ -118,9 +110,9 @@ res = coll.aggregate([
                         connectToField: "username",
                         as: "friendUsers"
                     }
-                  }
-              ])
-              .toArray();
+                }
+            ])
+            .toArray();
 assert.eq(1, res.length);
 assert.eq("erica", res[0].username);
 assert.eq(2, res[0].friendUsers.length);
@@ -133,20 +125,20 @@ assert.commandWorked(coll.insert({_id: "foo", username: "JEREMY", friends: ["jim
 assert.commandWorked(coll.insert({_id: "FOO", username: "jimmy", friends: []}));
 
 res = coll.aggregate(
-                  [
+                [
                     {$match: {username: "erica"}},
                     {
-                      $graphLookup: {
-                          from: coll.getName(),
-                          startWith: "$friends",
-                          connectFromField: "friends",
-                          connectToField: "username",
-                          as: "friendUsers"
-                      }
+                    $graphLookup: {
+                        from: coll.getName(),
+                        startWith: "$friends",
+                        connectFromField: "friends",
+                        connectToField: "username",
+                        as: "friendUsers"
                     }
-                  ],
-                  caseInsensitiveUS)
-              .toArray();
+                    }
+                ],
+                caseInsensitiveUS)
+            .toArray();
 assert.eq(1, res.length);
 assert.eq("erica", res[0].username);
 assert.eq(2, res[0].friendUsers.length);
@@ -159,21 +151,20 @@ assert.commandWorked(coll.insert({_id: "foo", username: "jeremy"}));
 assert.commandWorked(coll.insert({_id: "FOO", username: "JEREMY"}));
 
 res = coll.aggregate(
-                  [
+                [
                     {$match: {username: "erica"}},
                     {
-                      $graphLookup: {
-                          from: coll.getName(),
-                          startWith: "$friends",
-                          connectFromField: "friends",
-                          connectToField: "username",
-                          as: "friendUsers"
-                      }
+                    $graphLookup: {
+                        from: coll.getName(),
+                        startWith: "$friends",
+                        connectFromField: "friends",
+                        connectToField: "username",
+                        as: "friendUsers"
                     }
-                  ],
-                  caseInsensitiveUS)
-              .toArray();
+                    }
+                ],
+                caseInsensitiveUS)
+            .toArray();
 assert.eq(1, res.length);
 assert.eq("erica", res[0].username);
 assert.eq(2, res[0].friendUsers.length);
-})();

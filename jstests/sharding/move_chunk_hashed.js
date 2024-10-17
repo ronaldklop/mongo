@@ -2,12 +2,9 @@
  * Test that moveChunk moves the right chunks and documents and that deleted
  * rangeDeleter delete the right documents from the donor shard.
  */
-(function() {
-'use strict';
-
-load('jstests/libs/chunk_manipulation_util.js');
-load("jstests/sharding/libs/chunk_bounds_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {chunkBoundsUtil} from "jstests/sharding/libs/chunk_bounds_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 /*
  * Returns the shard with the given shard name.
@@ -39,8 +36,8 @@ let ns = dbName + "." + collName;
 let configDB = st.s.getDB('config');
 let testDB = st.s.getDB(dbName);
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard1.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard1.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 'hashed'}}));
 
 // Use docs that are expected to go to multiple different shards.
@@ -99,4 +96,3 @@ for (let chunk of chunksWithDocs) {
 }
 
 st.stop();
-})();

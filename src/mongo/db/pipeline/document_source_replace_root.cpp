@@ -27,45 +27,49 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_replace_root.h"
-
 #include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+#include <iterator>
+#include <memory>
+#include <string>
 
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_expr.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_source_replace_root_gen.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/query_planner_common.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
+using namespace fmt::literals;
 
-Document ReplaceRootTransformation::applyTransformation(const Document& input) {
+Document ReplaceRootTransformation::applyTransformation(const Document& input) const {
     // Extract subdocument in the form of a Value.
     Value newRoot = _newRoot->evaluate(input, &_expCtx->variables);
-
-    // To ensure an accurate user-facing message, any user-facing syntax that uses this stage
-    // internally must provide an message opener that complies with its documentation.
-    StringData msgOpener = [&]() {
-        switch (_specifiedName) {
-            case UserSpecifiedName::kReplaceRoot:
-                return "'newRoot' expression "_sd;
-            case UserSpecifiedName::kReplaceWith:
-                return "'replacement document' "_sd;
-            default:
-                MONGO_UNREACHABLE;
-        }
-    }();
-
     // The newRoot expression, if it exists, must evaluate to an object.
     uassert(40228,
-            str::stream() << msgOpener.toString()
-                          << "must evaluate to an object, but resulting value was: "
-                          << newRoot.toString() << ". Type of resulting value: '"
-                          << typeName(newRoot.getType())
-                          << "'. Input document: " << input.toString(),
+            fmt::format(kErrorTemplate.rawData(),
+                        _errMsgContextForNonObject,
+                        newRoot.toString(),
+                        typeName(newRoot.getType()),
+                        input.toString()),
             newRoot.getType() == BSONType::Object);
 
     // Turn the value into a document.
@@ -74,18 +78,152 @@ Document ReplaceRootTransformation::applyTransformation(const Document& input) {
     return newDoc.freeze();
 }
 
+boost::optional<std::string> ReplaceRootTransformation::unnestsPath() const {
+    // Ensure that expressionFieldPath exists and has a field path longer than 1 before we unnest.
+    // We don't want to unnest for {$replacewith: "$$ROOT"}, which has a field length of 1.
+    if (const ExpressionFieldPath* const expressionFieldPath =
+            dynamic_cast<ExpressionFieldPath*>(getExpression().get());
+        expressionFieldPath && expressionFieldPath->getFieldPath().getPathLength() > 1) {
+        return expressionFieldPath->getFieldPathWithoutCurrentPrefix().fullPath();
+    } else {
+        return boost::none;
+    }
+}
+
+boost::intrusive_ptr<DocumentSourceMatch> ReplaceRootTransformation::createTypeNEObjectPredicate(
+    const std::string& expression, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto matchExpr = std::make_unique<OrMatchExpression>();
+    {
+        MatcherTypeSet typeSet;
+        typeSet.bsonTypes.insert(BSONType::Array);
+        auto typeIsArrayExpr =
+            std::make_unique<TypeMatchExpression>(StringData(expression), typeSet);
+        matchExpr->add(std::move(typeIsArrayExpr));
+    }
+    {
+        MatcherTypeSet typeSet;
+        typeSet.bsonTypes.insert(BSONType::Object);
+        auto typeIsObjectExpr =
+            std::make_unique<TypeMatchExpression>(StringData(expression), typeSet);
+        auto typeIsNotObjectExpr =
+            std::make_unique<NotMatchExpression>(std::move(typeIsObjectExpr));
+        matchExpr->add(std::move(typeIsNotObjectExpr));
+    }
+
+    BSONObjBuilder bob;
+    matchExpr->serialize(&bob);
+    return DocumentSourceMatch::create(bob.obj(), expCtx);
+}
+
+void ReplaceRootTransformation::reportRenames(const MatchExpression* expr,
+                                              const std::string& prefixPath,
+                                              StringMap<std::string>& renames) {
+    DepsTracker deps = {};
+    match_expression::addDependencies(expr, &deps);
+    for (const auto& path : deps.fields) {
+        // Only record renames for top level paths.
+        const auto oldPathTopLevelField = FieldPath::extractFirstFieldFromDottedPath(path);
+        renames.emplace(
+            std::make_pair(oldPathTopLevelField, "{}.{}"_format(prefixPath, oldPathTopLevelField)));
+    }
+}
+
+bool ReplaceRootTransformation::pushDotRenamedMatchBefore(Pipeline::SourceContainer::iterator itr,
+                                                          Pipeline::SourceContainer* container) {
+    // Attempt to push match stage before replaceRoot/replaceWith stage.
+    const auto prospectiveMatch = dynamic_cast<DocumentSourceMatch*>(std::next(itr)->get());
+    const auto unnestedPath = unnestsPath();
+
+    if (prospectiveMatch && unnestedPath) {
+        MatchExpression* expr = prospectiveMatch->getMatchExpression();
+        // A MatchExpression that contains $expr is ineligible for pushdown because the match
+        // pushdown turned out to be comparatively slower in our benchmarks when $expr was used on
+        // dotted paths. Since MatchExpressions operate on BSONObj, while agg expressions operate on
+        // Documents. $expr also goes through an additional step of converting BSONObj to Document.
+        if (QueryPlannerCommon::hasNode(expr, MatchExpression::EXPRESSION)) {
+            return false;
+        }
+
+        // If we reach this point, we know:
+        // 1) The current stage is a ReplaceRoot stage whose transformation represents the unnesting
+        // of a field path (length > 1).
+        // 2) The stage after us is a non-$expr match. For a replaceRoot stage that unnests a field
+        // path, we will attempt to prepend the field path to subpaths in a copy of the match
+        // stage's MatchExpression.
+        //
+        // Ex: For the pipeline [{$replaceWith: {"$subDocument"}}, {$match: {x: 2}}], we make a copy
+        // of the original match expression and transform it to {$match: {"subDocument.x": 2}}. If
+        // the entire ME is eligible, we return a new match stage with the prepended ME.
+        auto& prefixPath = unnestedPath.get();
+        StringMap<std::string> renames;
+
+        // We will apply renames to the match stage and perform the swap if the match
+        // expression is eligible.
+        reportRenames(expr, prefixPath, renames);
+        // Report renames in ReplaceRoot stage,
+        auto modPaths = getModifiedPaths();
+        modPaths = {
+            DocumentSource::GetModPathsReturn::Type::kFiniteSet, {prefixPath}, std::move(renames)};
+
+        // Translate predicate statements based on the replace root stage renames.
+        auto splitMatchForReplaceRoot =
+            DocumentSourceMatch::splitMatchByModifiedFields(prospectiveMatch, modPaths);
+
+        if (splitMatchForReplaceRoot.first) {
+            // Join with "type != object" condition. This is to ensure that cases which would have
+            // resulted in an error before the optimization are not 'optimized' to cases which do
+            // not error. Optimizations should not change the behavior.
+            splitMatchForReplaceRoot.first->joinMatchWith(
+                createTypeNEObjectPredicate(prefixPath, _expCtx), "$or"_sd);
+
+            // Swap the eligible portion of the match stage with the replaceRoot stage. std::swap is
+            // used here as it performs reassignment of what the iterators point to in O(1) for
+            // non-array inputs.
+            *std::next(itr) = std::move(splitMatchForReplaceRoot.first);
+            std::swap(*itr, *std::next(itr));
+
+            if (splitMatchForReplaceRoot.second) {
+                // itr now points to the pushed down, eligible portion of the original match stage.
+                // Insert the remaining portion after the replaceRoot stage.
+                container->insert(std::next(std::next(itr)),
+                                  std::move(splitMatchForReplaceRoot.second));
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+Pipeline::SourceContainer::iterator ReplaceRootTransformation::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    // Attempt to push match stage before replaceRoot/replaceWith stage.
+    if (pushDotRenamedMatchBefore(itr, container)) {
+        // Optimize the previous stage. If this is the first stage, optimize the current stage
+        // instead.
+        return itr == container->begin() ? itr : std::prev(itr);
+    }
+
+    return std::next(itr);
+}
+
 REGISTER_DOCUMENT_SOURCE(replaceRoot,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceReplaceRoot::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 REGISTER_DOCUMENT_SOURCE(replaceWith,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceReplaceRoot::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
     const auto stageName = elem.fieldNameStringData();
+
+    SbeCompatibility originalSbeCompatibility =
+        std::exchange(expCtx->sbeCompatibility, SbeCompatibility::noRequirements);
+    ON_BLOCK_EXIT([&] { expCtx->sbeCompatibility = originalSbeCompatibility; });
     auto newRootExpression = [&]() {
         if (stageName == kAliasNameReplaceWith) {
             return Expression::parseOperand(expCtx.get(), elem, expCtx->variablesParseState);
@@ -100,8 +238,7 @@ intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
                               << " stage, got " << typeName(elem.type()),
                 elem.type() == Object);
 
-        auto spec =
-            ReplaceRootSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+        auto spec = ReplaceRootSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
 
         // The IDL doesn't give us back the type we need to feed into the expression parser, and
         // the expression parser needs the extra state in 'vps' and 'expCtx', so for now we have
@@ -119,10 +256,25 @@ intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
         std::make_unique<ReplaceRootTransformation>(
             expCtx,
             newRootExpression,
-            (stageName == kStageName) ? ReplaceRootTransformation::UserSpecifiedName::kReplaceRoot
-                                      : ReplaceRootTransformation::UserSpecifiedName::kReplaceWith),
+            (stageName == kStageName) ? "'newRoot' expression " : "'replacement document' ",
+            expCtx->sbeCompatibility),
         kStageName.rawData(),
         isIndependentOfAnyCollection);
 }
 
+boost::intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const boost::intrusive_ptr<Expression>& newRootExpression,
+    std::string errMsgContextForNonObjects,
+    SbeCompatibility sbeCompatibility) {
+    const bool isIndependentOfAnyCollection = false;
+    return new DocumentSourceSingleDocumentTransformation(
+        expCtx,
+        std::make_unique<ReplaceRootTransformation>(expCtx,
+                                                    newRootExpression,
+                                                    std::move(errMsgContextForNonObjects),
+                                                    expCtx->sbeCompatibility),
+        kStageName.rawData(),
+        isIndependentOfAnyCollection);
+}
 }  // namespace mongo

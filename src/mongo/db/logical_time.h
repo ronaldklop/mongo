@@ -29,6 +29,13 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <iosfwd>
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
 
 namespace mongo {

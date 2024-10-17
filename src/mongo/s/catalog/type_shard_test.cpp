@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/catalog/type_shard.h"
-
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -63,17 +64,7 @@ TEST(ShardType, OnlyMandatory) {
 
 TEST(ShardType, AllOptionalsPresent) {
     BSONObj obj = BSON(ShardType::name("shard0000")
-                       << ShardType::host("localhost:27017") << ShardType::draining(true)
-                       << ShardType::maxSizeMB(100));
-    StatusWith<ShardType> shardRes = ShardType::fromBSON(obj);
-    ASSERT(shardRes.isOK());
-    ShardType shard = shardRes.getValue();
-    ASSERT(shard.validate().isOK());
-}
-
-TEST(ShardType, MaxSizeAsFloat) {
-    BSONObj obj = BSON(ShardType::name("shard0000")
-                       << ShardType::host("localhost:27017") << ShardType::maxSizeMB() << 100.0);
+                       << ShardType::host("localhost:27017") << ShardType::draining(true));
     StatusWith<ShardType> shardRes = ShardType::fromBSON(obj);
     ASSERT(shardRes.isOK());
     ShardType shard = shardRes.getValue();

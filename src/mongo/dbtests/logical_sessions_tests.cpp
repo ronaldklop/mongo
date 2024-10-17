@@ -27,23 +27,47 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/index_spec.h"
+#include <absl/container/node_hash_set.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/sessions_collection_standalone.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/sessions_collection_standalone.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
 
-constexpr StringData kTestNS = "config.system.sessions"_sd;
+const NamespaceString kTestNS =
+    NamespaceString::createNamespaceString_forTest("config.system.sessions");
 
 LogicalSessionRecord makeRecord(Date_t time = Date_t::now()) {
     auto record = makeLogicalSessionRecordForTest();
@@ -53,30 +77,23 @@ LogicalSessionRecord makeRecord(Date_t time = Date_t::now()) {
 
 Status insertRecord(OperationContext* opCtx, LogicalSessionRecord record) {
     DBDirectClient client(opCtx);
-
-    client.insert(kTestNS.toString(), record.toBSON());
-    auto errorString = client.getLastError();
-    if (errorString.empty()) {
-        return Status::OK();
-    }
-
-    return {ErrorCodes::DuplicateSession, errorString};
-}
-
-BSONObj lsidQuery(const LogicalSessionId& lsid) {
-    return BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON());
+    auto response = client.insertAcknowledged(kTestNS, {record.toBSON()});
+    return getStatusFromWriteCommandReply(response);
 }
 
 StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
                                              const LogicalSessionId& lsid) {
     DBDirectClient client(opCtx);
-    auto cursor = client.query(NamespaceString(kTestNS), lsidQuery(lsid), 1);
+    FindCommandRequest findRequest{kTestNS};
+    findRequest.setFilter(BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON()));
+    findRequest.setLimit(1);
+    auto cursor = client.find(std::move(findRequest));
     if (!cursor->more()) {
         return {ErrorCodes::NoSuchSession, "No matching record in the sessions collection"};
     }
 
     try {
-        IDLParserErrorContext ctx("LogicalSessionRecord");
+        IDLParserContext ctx("LogicalSessionRecord");
         return LogicalSessionRecord::parse(ctx, cursor->next());
     } catch (...) {
         return exceptionToStatus();
@@ -89,12 +106,12 @@ public:
         : _collection(std::make_unique<SessionsCollectionStandalone>()) {
         _opCtx = cc().makeOperationContext();
         DBDirectClient db(opCtx());
-        db.remove(ns(), BSONObj());
+        db.remove(nss(), BSONObj());
     }
 
     virtual ~SessionsCollectionStandaloneTest() {
         DBDirectClient db(opCtx());
-        db.remove(ns(), BSONObj());
+        db.remove(nss(), BSONObj());
         _opCtx.reset();
     }
 
@@ -106,8 +123,8 @@ public:
         return _opCtx.get();
     }
 
-    const std::string& ns() const {
-        return NamespaceString::kLogicalSessionsNamespace.ns();
+    const NamespaceString& nss() const {
+        return NamespaceString::kLogicalSessionsNamespace;
     }
 
 private:
@@ -162,7 +179,7 @@ public:
         ASSERT_GTE(swRecord.getValue().getLastUse(), now);
 
         // Clear the collection.
-        db.remove(ns(), BSONObj());
+        db.remove(nss(), BSONObj());
 
         // Attempt to refresh a record that is not present, should upsert it.
         auto record2 = makeRecord(thePast);
@@ -172,7 +189,7 @@ public:
         ASSERT(swRecord.isOK());
 
         // Clear the collection.
-        db.remove(ns(), BSONObj());
+        db.remove(nss(), BSONObj());
 
         // Attempt a refresh of many records, split into batches.
         LogicalSessionRecordSet toRefresh;
@@ -194,7 +211,7 @@ public:
         collection()->refreshSessions(opCtx(), toRefresh);
 
         // Ensure that the right number of timestamps were updated.
-        auto n = db.count(NamespaceString(ns()), BSON("lastUse" << now));
+        auto n = db.count(nss(), BSON("lastUse" << now));
         ASSERT_EQ(n, notRefreshed);
     }
 };
@@ -260,18 +277,18 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("logical_sessions") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<SessionsCollectionStandaloneRemoveTest>();
         add<SessionsCollectionStandaloneRefreshTest>();
         add<SessionsCollectionStandaloneFindTest>();
     }
 };
 
-OldStyleSuiteInitializer<All> all;
+unittest::OldStyleSuiteInitializer<All> all;
 
 }  // namespace
 }  // namespace mongo

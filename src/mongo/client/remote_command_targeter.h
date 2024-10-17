@@ -57,11 +57,8 @@ public:
     virtual ConnectionString connectionString() = 0;
 
     /**
-     * Finds a host matching readPref blocking up to 20 seconds or until the given operation is
-     * interrupted or its deadline expires.
-     *
-     * TODO(schwerin): Once operation max-time behavior is more uniformly integrated into sharding,
-     * remove the 20-second ceiling on wait time.
+     * Finds a host matching readPref blocking up to gDefaultFindReplicaSetHostTimeoutMS
+     * milliseconds or until the given operation is interrupted or its deadline expires.
      */
     virtual StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                              const ReadPreferenceSetting& readPref) = 0;
@@ -69,16 +66,35 @@ public:
 
     /**
      * Finds a host that matches the read preference specified by readPref, blocking for up to
-     * specified maxWait milliseconds, if a match cannot be found immediately.
+     * gDefaultFindReplicaSetHostTimeoutMS milliseconds, if a match cannot be found immediately.
      *
-     * DEPRECATED. Prefer findHost(OperationContext*, const ReadPreferenceSetting&), whenever
-     * an OperationContext is available.
+     * DEPRECATED. Prefer findHost(OperationContext*, const ReadPreferenceSetting&), whenever an
+     * OperationContext is available.
      */
     virtual SemiFuture<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
                                              const CancellationToken& cancelToken) = 0;
 
     virtual SemiFuture<std::vector<HostAndPort>> findHosts(
         const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) = 0;
+
+
+    /**
+     * Checks the given status and updates the host bookkeeping accordingly.
+     */
+    void updateHostWithStatus(const HostAndPort& host, const Status& status) {
+        if (status.isOK())
+            return;
+
+        if (ErrorCodes::isNotPrimaryError(status.code())) {
+            markHostNotPrimary(host, status);
+        } else if (ErrorCodes::isNetworkError(status.code())) {
+            markHostUnreachable(host, status);
+        } else if (status == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
+            markHostUnreachable(host, status);
+        } else if (ErrorCodes::isShutdownError(status.code())) {
+            markHostShuttingDown(host, status);
+        }
+    };
 
     /**
      * Reports to the targeter that a 'status' indicating a not primary error was received when

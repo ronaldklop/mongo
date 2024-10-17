@@ -1,8 +1,16 @@
-// Tests that mongos and the shard discover changes to the shard's replica set membership.
-load("jstests/replsets/rslib.js");
+/**
+ * Tests that mongos and the shard discover changes to the shard's replica set membership.
+ *
+ * @tags: [
+ *   # TODO (SERVER-85629): Re-enable this test once redness is resolved in multiversion suites.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   requires_fcv_80
+ * ]
+ */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 var five_minutes = 5 * 60 * 1000;
 
@@ -129,5 +137,4 @@ assert.soon(
                 ", but is not seen in config.shards");
     });
 
-st.stop();
-}());
+st.stop({parallelSupported: false});

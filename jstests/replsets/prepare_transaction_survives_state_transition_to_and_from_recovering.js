@@ -5,9 +5,8 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({nodes: 2});
 replSet.startSet();
@@ -99,4 +98,3 @@ assert.commandWorked(PrepareHelpers.commitTransaction(newSession, prepareTimesta
 replSet.awaitReplication();
 
 replSet.stopSet();
-}());

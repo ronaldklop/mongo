@@ -29,11 +29,27 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <set>
 #include <utility>
+#include <vector>
 
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_array.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -48,7 +64,7 @@ public:
     static constexpr StringData kName = "$_internalSchemaUniqueItems"_sd;
 
     explicit InternalSchemaUniqueItemsMatchExpression(
-        StringData path, clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        boost::optional<StringData> path, clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ArrayMatchingMatchExpression(
               MatchExpression::INTERNAL_SCHEMA_UNIQUE_ITEMS, path, std::move(annotation)) {}
 
@@ -57,6 +73,10 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
+        MONGO_UNREACHABLE_TASSERT(6400219);
+    }
+
+    void resetChild(size_t i, MatchExpression*) final {
         MONGO_UNREACHABLE;
     }
 
@@ -71,7 +91,7 @@ public:
     BSONElement findFirstDuplicateValue(const BSONObj& array) const {
         auto set = _comparator.makeBSONEltSet();
         for (auto&& elem : array) {
-            if (!std::get<bool>(set.insert(elem))) {
+            if (!get<bool>(set.insert(elem))) {
                 return elem;
             }
         }
@@ -82,9 +102,11 @@ public:
 
     bool equivalent(const MatchExpression* other) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
         visitor->visit(this);
@@ -96,7 +118,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     // The comparator to use when comparing BSONElements, which will never use a collation.

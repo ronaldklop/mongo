@@ -12,13 +12,13 @@
  * After a rollback of commit/abort, we should correctly reconstruct the two prepared transactions
  * and be able to commit/abort them again.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/rollback_test.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 const collName = "recover_prepared_transaction_state_after_rollback";
@@ -192,4 +192,3 @@ assert.sameMembers(testColl.find().toArray(), [{_id: 1, a: 1}, {_id: 2}, {_id: 3
 assert.eq(testColl.count(), 3);
 
 rollbackTest.stop();
-}());

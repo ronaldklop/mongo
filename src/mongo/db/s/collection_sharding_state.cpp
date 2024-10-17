@@ -27,16 +27,28 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/collection_sharding_state.h"
 
-#include "mongo/db/repl/read_concern_args.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/string_map.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/none.hpp>
+#include <mutex>
+#include <shared_mutex>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/rwmutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -51,61 +63,66 @@ public:
     CollectionShardingStateMap(std::unique_ptr<CollectionShardingStateFactory> factory)
         : _factory(std::move(factory)) {}
 
-    /**
-     * Joins the factory, waiting for any outstanding tasks using the factory to be finished. Must
-     * be called before destruction.
-     */
-    void join() {
-        _factory->join();
-    }
+    struct CSSAndLock {
+        CSSAndLock(const NamespaceString& nss, std::unique_ptr<CollectionShardingState> css)
+            : cssMutex("CSSMutex::" +
+                       NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())),
+              css(std::move(css)) {}
 
-    std::shared_ptr<CollectionShardingState> getOrCreate(const NamespaceString& nss) {
-        stdx::lock_guard<Latch> lg(_mutex);
+        const Lock::ResourceMutex cssMutex;
+        std::unique_ptr<CollectionShardingState> css;
+    };
 
-        auto it = _collections.find(nss.ns());
-        if (it == _collections.end()) {
-            auto inserted = _collections.try_emplace(nss.ns(), _factory->make(nss));
-            invariant(inserted.second);
-            it = std::move(inserted.first);
+    CSSAndLock* getOrCreate(const NamespaceString& nss) noexcept {
+        std::shared_lock lk(_mutex);  // NOLINT
+        if (auto it = _collections.find(nss); MONGO_likely(it != _collections.end())) {
+            return it->second.get();
         }
-
-        return it->second;
+        lk.unlock();
+        stdx::lock_guard writeLock(_mutex);
+        auto [it, _] =
+            _collections.emplace(nss, std::make_unique<CSSAndLock>(nss, _factory->make(nss)));
+        return it->second.get();
     }
 
-    void appendInfoForShardingStateCommand(BSONObjBuilder* builder) {
-        BSONObjBuilder versionB(builder->subobjStart("versions"));
-
+    void appendInfoForShardingStateCommand(BSONObjBuilder* builder) const {
+        std::vector<CSSAndLock*> cssAndLocks;
         {
-            stdx::lock_guard<Latch> lg(_mutex);
-            for (const auto& coll : _collections) {
-                coll.second->appendShardVersion(builder);
+            std::shared_lock lk(_mutex);  // NOLINT
+            cssAndLocks.reserve(_collections.size());
+            for (const auto& [_, cssAndLock] : _collections) {
+                cssAndLocks.emplace_back(cssAndLock.get());
             }
         }
 
+        BSONObjBuilder versionB(builder->subobjStart("versions"));
+        for (auto cssAndLock : cssAndLocks) {
+            cssAndLock->css->appendShardVersion(builder);
+        }
         versionB.done();
     }
 
-    void appendInfoForServerStatus(BSONObjBuilder* builder) {
-        auto totalNumberOfRangesScheduledForDeletion = ([this] {
-            stdx::lock_guard lg(_mutex);
-            return std::accumulate(_collections.begin(),
-                                   _collections.end(),
-                                   0LL,
-                                   [](long long total, const auto& coll) {
-                                       return total +
-                                           coll.second->numberOfRangesScheduledForDeletion();
-                                   });
-        })();
-
-        builder->appendNumber("rangeDeleterTasks", totalNumberOfRangesScheduledForDeletion);
+    std::vector<NamespaceString> getCollectionNames() const {
+        std::shared_lock lk(_mutex);  // NOLINT
+        std::vector<NamespaceString> result;
+        result.reserve(_collections.size());
+        for (const auto& [nss, _] : _collections) {
+            result.emplace_back(nss);
+        }
+        return result;
     }
 
 private:
-    using CollectionsMap = StringMap<std::shared_ptr<CollectionShardingState>>;
-
     std::unique_ptr<CollectionShardingStateFactory> _factory;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("CollectionShardingStateMap::_mutex");
+    // Adding entries to `_collections` is expected to be very infrequent and far apart (collection
+    // creation), so the majority of accesses to this map are read-only and benefit from using a
+    // shared mutex type for synchronization.
+    mutable RWMutex _mutex;
+
+    // Entries of the _collections map must never be deleted or replaced. This is to guarantee that
+    // a 'nss' is always associated to the same 'ResourceMutex'.
+    using CollectionsMap = absl::flat_hash_map<NamespaceString, std::unique_ptr<CSSAndLock>>;
     CollectionsMap _collections;
 };
 
@@ -115,25 +132,53 @@ const ServiceContext::Decoration<boost::optional<CollectionShardingStateMap>>
 
 }  // namespace
 
-CollectionShardingState* CollectionShardingState::get(OperationContext* opCtx,
-                                                      const NamespaceString& nss) {
-    // Collection lock must be held to have a reference to the collection's sharding state
-    dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
+CollectionShardingState::ScopedCollectionShardingState::ScopedCollectionShardingState(
+    Lock::ResourceLock lock, CollectionShardingState* css)
+    : _lock(std::move(lock)), _css(css) {}
 
-    auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    return collectionsMap->getOrCreate(nss).get();
+CollectionShardingState::ScopedCollectionShardingState::ScopedCollectionShardingState(
+    CollectionShardingState* css)
+    : _lock(boost::none), _css(css) {}
+
+CollectionShardingState::ScopedCollectionShardingState::ScopedCollectionShardingState(
+    ScopedCollectionShardingState&& other)
+    : _lock(std::move(other._lock)), _css(other._css) {
+    other._css = nullptr;
 }
 
-std::shared_ptr<CollectionShardingState> CollectionShardingState::getSharedForLockFreeReads(
+CollectionShardingState::ScopedCollectionShardingState::~ScopedCollectionShardingState() = default;
+
+CollectionShardingState::ScopedCollectionShardingState
+CollectionShardingState::ScopedCollectionShardingState::acquireScopedCollectionShardingState(
+    OperationContext* opCtx, const NamespaceString& nss, LockMode mode) {
+    CollectionShardingStateMap::CSSAndLock* cssAndLock =
+        CollectionShardingStateMap::get(opCtx->getServiceContext())->getOrCreate(nss);
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
+        // First lock the RESOURCE_MUTEX associated to this nss to guarantee stability of the
+        // CollectionShardingState* . After that, it is safe to get and store the
+        // CollectionShadingState*, as long as the RESOURCE_MUTEX is kept locked.
+        Lock::ResourceLock lock(opCtx, cssAndLock->cssMutex.getRid(), mode);
+        return ScopedCollectionShardingState(std::move(lock), cssAndLock->css.get());
+    } else {
+        // No need to lock the CSSLock on non-shardsvrs. For performance, skip doing it.
+        return ScopedCollectionShardingState(cssAndLock->css.get());
+    }
+}
+
+CollectionShardingState::ScopedCollectionShardingState
+CollectionShardingState::assertCollectionLockedAndAcquire(OperationContext* opCtx,
+                                                          const NamespaceString& nss) {
+    dassert(opCtx->isLockFreeReadsOp() ||
+            shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IS) ||
+            (nss.isOplog() && shard_role_details::getLocker(opCtx)->isReadLocked()));
+
+    return acquire(opCtx, nss);
+}
+
+CollectionShardingState::ScopedCollectionShardingState CollectionShardingState::acquire(
     OperationContext* opCtx, const NamespaceString& nss) {
-    auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    return collectionsMap->getOrCreate(nss);
-}
-
-CollectionShardingState* CollectionShardingState::get_UNSAFE(ServiceContext* svcCtx,
-                                                             const NamespaceString& nss) {
-    auto& collectionsMap = CollectionShardingStateMap::get(svcCtx);
-    return collectionsMap->getOrCreate(nss).get();
+    return ScopedCollectionShardingState::acquireScopedCollectionShardingState(opCtx, nss, MODE_IS);
 }
 
 void CollectionShardingState::appendInfoForShardingStateCommand(OperationContext* opCtx,
@@ -142,10 +187,9 @@ void CollectionShardingState::appendInfoForShardingStateCommand(OperationContext
     collectionsMap->appendInfoForShardingStateCommand(builder);
 }
 
-void CollectionShardingState::appendInfoForServerStatus(OperationContext* opCtx,
-                                                        BSONObjBuilder* builder) {
+std::vector<NamespaceString> CollectionShardingState::getCollectionNames(OperationContext* opCtx) {
     auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    collectionsMap->appendInfoForServerStatus(builder);
+    return collectionsMap->getCollectionNames();
 }
 
 void CollectionShardingStateFactory::set(ServiceContext* service,
@@ -157,11 +201,8 @@ void CollectionShardingStateFactory::set(ServiceContext* service,
 }
 
 void CollectionShardingStateFactory::clear(ServiceContext* service) {
-    auto& collectionsMap = CollectionShardingStateMap::get(service);
-    if (collectionsMap) {
-        collectionsMap->join();
+    if (auto& collectionsMap = CollectionShardingStateMap::get(service))
         collectionsMap.reset();
-    }
 }
 
 }  // namespace mongo

@@ -1,10 +1,14 @@
 /**
  * Tests that benchRun can understand pipeline-style updates and findAndModifys.
  *
- * @tags: [uses_multiple_connections]
+ * @tags: [
+ *     uses_multiple_connections,
+ *     # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+ *     simulate_atlas_proxy_incompatible,
+ *     # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+ *     grpc_incompatible,
+ * ]
  */
-(function() {
-"use strict";
 const coll = db.benchrun_pipeline_updates;
 coll.drop();
 
@@ -51,4 +55,3 @@ res = benchRun(benchArgs);
 assert.eq(res.errCount, 0);
 assert.lte(
     coll.findOne({_id: 0}).x, 3, "Expected 'x' to be no more than 3 after randInt replacement");
-}());

@@ -35,6 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -51,22 +52,26 @@ namespace repl {
  */
 class CollectionBulkLoader {
 public:
+    // A function that returns the recordId and original document from
+    // a projected find query.
+    typedef std::function<std::pair<RecordId, BSONObj>(const BSONObj&)> ParseRecordIdAndDocFunc;
     virtual ~CollectionBulkLoader() = default;
 
     virtual Status init(const std::vector<BSONObj>& indexSpecs) = 0;
     /**
      * Inserts the documents into the collection record store, and indexes them with the
      * MultiIndexBlock on the side.
+     *
+     * If the stream of BSONObj provided requires transformation to pull out the original
+     * recordId and original document, 'fn' can be provided to perform that transformation.
      */
-    virtual Status insertDocuments(const std::vector<BSONObj>::const_iterator begin,
-                                   const std::vector<BSONObj>::const_iterator end) = 0;
+    virtual Status insertDocuments(std::vector<BSONObj>::const_iterator begin,
+                                   std::vector<BSONObj>::const_iterator end,
+                                   ParseRecordIdAndDocFunc fn) = 0;
     /**
      * Called when inserts are done and indexes can be committed.
      */
     virtual Status commit() = 0;
-
-    virtual std::string toString() const = 0;
-    virtual BSONObj toBSON() const = 0;
 };
 
 }  // namespace repl

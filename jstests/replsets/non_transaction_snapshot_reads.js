@@ -2,15 +2,12 @@
  * Tests readConcern level snapshot outside of transactions.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/global_snapshot_reads_util.js");
+import {SnapshotReadsTest} from "jstests/libs/global_snapshot_reads_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const options = {
     // Set a large snapshot window of 10 minutes for the test.
@@ -50,4 +47,3 @@ const distinctResult = assert.commandWorked(primaryDB.runCommand({distinct: "tes
 assert(!distinctResult.hasOwnProperty("atClusterTime"));
 
 replSet.stopSet();
-})();

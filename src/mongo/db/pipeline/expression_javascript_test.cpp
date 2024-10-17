@@ -27,18 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/db/pipeline/expression_js_emit.h"
+#include <memory>
 
-#include "mongo/db/commands/test_commands_enabled.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/expression_function.h"
+#include "mongo/db/pipeline/expression_js_emit.h"
 #include "mongo/db/pipeline/process_interface/standalone_process_interface.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -76,7 +90,7 @@ private:
 
 void MapReduceFixture::setUp() {
     ServiceContextMongoDTest::setUp();
-    ScriptEngine::setup(false);
+    ScriptEngine::setup(ExecutionEnvironment::Server);
 }
 
 void MapReduceFixture::tearDown() {
@@ -150,8 +164,10 @@ TEST_F(MapReduceFixture, ExpressionFunctionFailsIfBodyNotSpecified) {
 }
 
 TEST_F(MapReduceFixture, ExpressionFunctionFailsIfBodyIsNotConstantExpression) {
-    auto bsonExpr = BSON("expr" << BSON("body" << BSONObj() << "args" << BSON_ARRAY(1 << 2)
-                                               << "lang" << ExpressionFunction::kJavaScript));
+    auto bsonExpr = BSON("expr" << BSON("body"
+                                        << "$a"
+                                        << "args" << BSON_ARRAY(1 << 2) << "lang"
+                                        << ExpressionFunction::kJavaScript));
     ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
                        AssertionException,
                        31432);

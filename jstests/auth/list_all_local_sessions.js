@@ -1,9 +1,8 @@
 // Auth tests for the $listLocalSessions {allUsers:true} aggregation stage.
 // @tags: [requires_sharding]
 
-(function() {
-'use strict';
-load('jstests/aggregation/extras/utils.js');
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
@@ -49,8 +48,15 @@ const mongod = MongoRunner.runMongod({auth: ""});
 runListAllLocalSessionsTest(mongod);
 MongoRunner.stopMongod(mongod);
 
-const st =
-    new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
+const st = new ShardingTest({
+    shards: 1,
+    mongos: 1,
+    config: 1,
+    other: {
+        keyFile: 'jstests/libs/key1',
+        mongosOptions:
+            {setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}}
+    }
+});
 runListAllLocalSessionsTest(st.s0);
 st.stop();
-})();

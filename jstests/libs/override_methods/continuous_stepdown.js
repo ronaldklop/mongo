@@ -25,13 +25,39 @@
  *        The amount of time allowed for newly-elected primaries to catch up.
  */
 
-let ContinuousStepdown;
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {reconfig, reconnect} from "jstests/replsets/rslib.js";
 
-(function() {
-"use strict";
+export class ContinuousStepdown {
+    /**
+     * Defines two methods on ReplSetTest, startContinuousFailover and stopContinuousFailover, that
+     * allow starting and stopping a separate thread that will periodically step down the replica
+     * set's primary node. Also defines these methods on ShardingTest, which allow starting and
+     * stopping a stepdown thread for the test's config server replica set and each of the shard
+     * replica sets, as specified by the given stepdownOptions object.
+     */
+    static configure(stepdownOptions, {verbositySetting: verbositySetting = {}} = {}) {
+        const defaultOptions = {
+            configStepdown: true,
+            electionTimeoutMS: 5 * 1000,
+            shardStepdown: true,
+            stepdownDurationSecs: 10,
+            stepdownIntervalMS: 8 * 1000,
+            catchUpTimeoutMS: 0,
+        };
+        stepdownOptions = Object.merge(defaultOptions, stepdownOptions);
+        verbositySetting = tojson(verbositySetting);
 
-load("jstests/libs/parallelTester.js");  // Thread and CountDownLatch
-load("jstests/replsets/rslib.js");       // reconfig
+        return {
+            ReplSetTestWithContinuousPrimaryStepdown:
+                makeReplSetTestWithContinuousPrimaryStepdown(stepdownOptions, verbositySetting),
+            ShardingTestWithContinuousPrimaryStepdown:
+                makeShardingTestWithContinuousPrimaryStepdown(stepdownOptions, verbositySetting)
+        };
+    }
+}
 
 /**
  * Helper class to manage the Thread instance that will continuously step down the primary
@@ -63,8 +89,6 @@ const StepdownThread = function() {
      *          the error.
      */
     function _continuousPrimaryStepdownFn(stopCounter, seedNode, options) {
-        "use strict";
-
         print("*** Continuous stepdown thread running with seed node " + seedNode);
 
         try {
@@ -144,55 +168,25 @@ const StepdownThread = function() {
     };
 };
 
-ContinuousStepdown = {};
-
 /**
- * Defines two methods on ReplSetTest, startContinuousFailover and stopContinuousFailover, that
- * allow starting and stopping a separate thread that will periodically step down the replica
- * set's primary node. Also defines these methods on ShardingTest, which allow starting and
- * stopping a stepdown thread for the test's config server replica set and each of the shard
- * replica sets, as specified by the given stepdownOptions object.
+ * Overrides the ReplSetTest constructor to start the continuous primary stepdown thread.
  */
-ContinuousStepdown.configure = function(stepdownOptions,
-                                        {verbositySetting: verbositySetting = {}} = {}) {
-    const defaultOptions = {
-        configStepdown: true,
-        electionTimeoutMS: 5 * 1000,
-        shardStepdown: true,
-        stepdownDurationSecs: 10,
-        stepdownIntervalMS: 8 * 1000,
-        catchUpTimeoutMS: 0,
-    };
-    stepdownOptions = Object.merge(defaultOptions, stepdownOptions);
-
-    verbositySetting = tojson(verbositySetting);
-
-    // Preserve the original ReplSetTest and ShardingTest constructors, because they are being
-    // overriden.
-    const originalReplSetTest = ReplSetTest;
-    const originalShardingTest = ShardingTest;
-
-    /**
-     * Overrides the ReplSetTest constructor to start the continuous primary stepdown thread.
-     */
-    ReplSetTest = function ReplSetTestWithContinuousPrimaryStepdown() {
-        // Preserve the original set of nodeOptions passed to the constructor.
-        const origNodeOpts = Object.assign({}, (arguments[0] && arguments[0].nodeOptions) || {});
-
-        // Construct the original object
-        originalReplSetTest.apply(this, arguments);
-
-        // Preserve the original versions of functions that are overrided below.
-        const _originalStartSetFn = this.startSet;
-        const _originalStopSetFn = this.stopSet;
-        const _originalAwaitLastOpCommitted = this.awaitLastOpCommitted;
+function makeReplSetTestWithContinuousPrimaryStepdown(stepdownOptions, verbositySetting) {
+    return class ReplSetTestWithContinuousPrimaryStepdown extends ReplSetTest {
+        constructor(options) {
+            super(options);
+            // Handle for the continuous stepdown thread.
+            this._stepdownThread = new StepdownThread();
+            // Preserve the original set of nodeOptions passed to the constructor.
+            this._origNodeOpts = Object.assign({}, (options && options.nodeOptions) || {});
+        }
 
         /**
          * Overrides startSet call to increase logging verbosity. Ensure that we only override the
          * 'logComponentVerbosity' server parameter, but retain any other parameters that were
          * supplied during ReplSetTest construction.
          */
-        this.startSet = function() {
+        startSet(options, restart) {
             // Helper function to convert a string representation of setParameter to object form.
             function setParamToObj(setParam) {
                 if (typeof (setParam) === "string") {
@@ -206,33 +200,27 @@ ContinuousStepdown.configure = function(stepdownOptions,
                 return Object.assign({}, setParam || {});
             }
 
-            const options = arguments[0] || {};
-
-            options.setParameter = Object.assign(setParamToObj(origNodeOpts.setParameter),
+            options = options || {};
+            options.setParameter = Object.assign(setParamToObj(this._origNodeOpts.setParameter),
                                                  setParamToObj(options.setParameter),
                                                  {logComponentVerbosity: verbositySetting});
-            arguments[0] = options;
-
-            return _originalStartSetFn.apply(this, arguments);
-        };
+            return super.startSet(options, restart);
+        }
 
         /**
          * Overrides stopSet to terminate the failover thread.
          */
-        this.stopSet = function() {
-            this.stopContinuousFailover({waitForPrimary: false});
-            _originalStopSetFn.apply(this, arguments);
-        };
+        stopSet(signal, forRestart, options) {
+            this.stopContinuousFailover({waitForPrimary: true});
+            super.stopSet(signal, forRestart, options);
+        }
 
         /**
          * Overrides awaitLastOpCommitted to retry on network errors.
          */
-        this.awaitLastOpCommitted = function() {
-            return retryOnNetworkError(_originalAwaitLastOpCommitted.bind(this));
-        };
-
-        // Handle for the continuous stepdown thread.
-        const _stepdownThread = new StepdownThread();
+        awaitLastOpCommitted() {
+            return retryOnNetworkError(() => super.awaitLastOpCommitted());
+        }
 
         /**
          * Reconfigures the replica set, then starts the stepdown thread. As part of the new
@@ -243,8 +231,8 @@ ContinuousStepdown.configure = function(stepdownOptions,
          * - catchUpTimeoutMillis to stepdownOptions.catchUpTimeoutMS. Lower values increase
          *   the likelihood and volume of rollbacks.
          */
-        this.startContinuousFailover = function() {
-            if (_stepdownThread.hasStarted()) {
+        startContinuousFailover() {
+            if (this._stepdownThread.hasStarted()) {
                 throw new Error("Continuous failover thread is already active");
             }
 
@@ -274,66 +262,73 @@ ContinuousStepdown.configure = function(stepdownOptions,
                               stepdownOptions.catchUpTimeoutMS + " milliseconds.");
             }
 
-            _stepdownThread.start(this.nodes[0].host, stepdownOptions);
-        };
+            this._stepdownThread.start(this.nodes[0].host, stepdownOptions);
+        }
 
         /**
          * Blocking method, which tells the thread running continuousPrimaryStepdownFn to stop
          * and waits for it to terminate.
          *
-         * If waitForPrimary is true, blocks until a new primary has been elected.
+         * If waitForPrimary is true, blocks until a new primary has been elected and reestablishes
+         * all connections.
          */
-        this.stopContinuousFailover = function({waitForPrimary: waitForPrimary = false} = {}) {
-            if (!_stepdownThread.hasStarted()) {
+        stopContinuousFailover({waitForPrimary: waitForPrimary = false} = {}) {
+            if (!this._stepdownThread.hasStarted()) {
                 return;
             }
 
-            _stepdownThread.stop();
+            this._stepdownThread.stop();
 
             if (waitForPrimary) {
                 this.getPrimary();
+                this.nodes.forEach(node => reconnect(node));
             }
-        };
+        }
     };
+}
 
-    Object.extend(ReplSetTest, originalReplSetTest);
+/**
+ * Overrides the ShardingTest constructor to start the continuous primary stepdown thread.
+ */
+function makeShardingTestWithContinuousPrimaryStepdown(stepdownOptions, verbositySetting) {
+    return class ShardingTestWithContinuousPrimaryStepdown extends ShardingTest {
+        constructor(params) {
+            params.other = params.other || {};
 
-    /**
-     * Overrides the ShardingTest constructor to start the continuous primary stepdown thread.
-     */
-    ShardingTest = function ShardingTestWithContinuousPrimaryStepdown(params) {
-        params.other = params.other || {};
+            if (stepdownOptions.configStepdown) {
+                params.other.configOptions = params.other.configOptions || {};
+                params.other.configOptions.setParameter =
+                    params.other.configOptions.setParameter || {};
+                params.other.configOptions.setParameter.logComponentVerbosity = verbositySetting;
+            }
 
-        if (stepdownOptions.configStepdown) {
-            params.other.configOptions = params.other.configOptions || {};
-            params.other.configOptions.setParameter = params.other.configOptions.setParameter || {};
-            params.other.configOptions.setParameter.logComponentVerbosity = verbositySetting;
-        }
+            if (stepdownOptions.shardStepdown) {
+                params.other.shardOptions = params.other.shardOptions || {};
+                params.other.shardOptions.setParameter =
+                    params.other.shardOptions.setParameter || {};
+                params.other.shardOptions.setParameter.logComponentVerbosity = verbositySetting;
+            }
 
-        if (stepdownOptions.shardStepdown) {
-            params.other.shardOptions = params.other.shardOptions || {};
-            params.other.shardOptions.setParameter = params.other.shardOptions.setParameter || {};
-            params.other.shardOptions.setParameter.logComponentVerbosity = verbositySetting;
-        }
+            // Construct the original object.
+            super(params);
 
-        // Construct the original object.
-        originalShardingTest.apply(this, arguments);
+            // Validate the stepdown options.
+            if (stepdownOptions.configStepdown && !this.configRS) {
+                throw new Error(
+                    "Continuous config server primary step down only available with CSRS");
+            }
 
-        // Validate the stepdown options.
-        if (stepdownOptions.configStepdown && !this.configRS) {
-            throw new Error("Continuous config server primary step down only available with CSRS");
-        }
-
-        if (stepdownOptions.shardStepdown && this._rs.some(rst => !rst)) {
-            throw new Error(
-                "Continuous shard primary step down only available with replica set shards");
+            if (stepdownOptions.shardStepdown && this._rs.some(rst => !rst)) {
+                throw new Error(
+                    "Continuous shard primary step down only available with replica set shards");
+            }
         }
 
         /**
          * Calls startContinuousFailover on the config server and/or each shard replica set as
          * specifed by the stepdownOptions object.
          */
-        this.startContinuousFailover = function() {
+        startContinuousFailover() {
             if (stepdownOptions.configStepdown) {
                 this.configRS.startContinuousFailover();
             }
@@ -343,19 +338,16 @@ ContinuousStepdown.configure = function(stepdownOptions,
                     rst.test.startContinuousFailover();
                 });
             }
-        };
+        }
 
         /**
          * Calls stopContinuousFailover on the config server and each shard replica set as
          * specified by the stepdownOptions object.
          *
          * If waitForPrimary is true, blocks until each replica set has elected a primary.
-         * If waitForMongosRetarget is true, blocks until each mongos has an up to date view of
-         * the cluster.
          */
-        this.stopContinuousFailover = function({
+        stopContinuousFailover({
             waitForPrimary: waitForPrimary = false,
-            waitForMongosRetarget: waitForMongosRetarget = false
         } = {}) {
             if (stepdownOptions.configStepdown) {
                 this.configRS.stopContinuousFailover({waitForPrimary: waitForPrimary});
@@ -366,59 +358,13 @@ ContinuousStepdown.configure = function(stepdownOptions,
                     rst.test.stopContinuousFailover({waitForPrimary: waitForPrimary});
                 });
             }
-
-            if (waitForMongosRetarget) {
-                // Run validate on each collection in each database to ensure mongos can target
-                // the primary for each shard with data, including the config servers.
-                this._mongos.forEach(s => {
-                    const res = assert.commandWorked(s.adminCommand({listDatabases: 1}));
-                    res.databases.forEach(dbInfo => {
-                        const startTime = Date.now();
-                        print("Waiting for mongos: " + s.host + " to retarget db: " + dbInfo.name);
-
-                        const db = s.getDB(dbInfo.name);
-                        assert.soon(() => {
-                            let collInfo;
-                            try {
-                                collInfo = db.getCollectionInfos();
-                            } catch (e) {
-                                if (ErrorCodes.isNotPrimaryError(e.code)) {
-                                    return false;
-                                }
-                                throw e;
-                            }
-
-                            collInfo.forEach(collDoc => {
-                                const res = db.runCommand({collStats: collDoc["name"]});
-                                if (ErrorCodes.isNotPrimaryError(res.code)) {
-                                    return false;
-                                }
-                                assert.commandWorked(res);
-                            });
-
-                            return true;
-                        });
-                        const totalTime = Date.now() - startTime;
-                        print("Finished waiting for mongos: " + s.host +
-                              " to retarget db: " + dbInfo.name + ", in " + totalTime + " ms");
-                    });
-                });
-            }
-        };
+        }
 
         /**
          * This method is disabled because it runs aggregation, which doesn't handle config
          * server stepdown correctly.
          */
-        this.printShardingStatus = function() {};
+        printShardingStatus() {
+        }
     };
-
-    Object.extend(ShardingTest, originalShardingTest);
-
-    // The checkUUIDsConsistentAcrossCluster() function is defined on ShardingTest's prototype,
-    // but ShardingTest's prototype gets reset when ShardingTest is reassigned. We reload the
-    // override to redefine checkUUIDsConsistentAcrossCluster() on the new ShardingTest's
-    // prototype.
-    load('jstests/libs/override_methods/check_uuids_consistent_across_cluster.js');
-};
-})();
+}

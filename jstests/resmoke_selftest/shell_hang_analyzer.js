@@ -1,6 +1,3 @@
-'use strict';
-(function() {
-
 const anyLineMatches = function(lines, rex) {
     for (const line of lines) {
         if (line.match(rex)) {
@@ -23,22 +20,22 @@ clearRawMongoProgramOutput();
 MongoRunner.runHangAnalyzer.disable();
 MongoRunner.runHangAnalyzer.enable();
 
-MongoRunner.runHangAnalyzer([child.pid]);
+assert.eq(0, MongoRunner.runHangAnalyzer([child.pid]));
 
 if (TestData && TestData.inEvergreen) {
     assert.soon(() => {
         // Ensure the hang-analyzer has killed the process.
         return !checkProgram(child.pid).alive;
-    });
+    }, undefined, undefined, undefined, {runHangAnalyzer: false});
 
     const lines = rawMongoProgramOutput().split('\n');
-    if (_isAddressSanitizerActive()) {
+    const buildInfo = globalThis.db.getServerBuildInfo();
+    if (buildInfo.isAddressSanitizerActive() || buildInfo.isThreadSanitizerActive()) {
         assert.soon(() => {
-            // On ASAN builds, we never dump the core during hang analyzer runs,
-            // nor should the output be empty (empty means it didn't run).
-            // If you're trying to debug why this test is failing, confirm that the
-            // hang_analyzer_dump_core expansion has not been set to true.
-            return !anyLineMatches(lines, /Dumping core/) && lines.length != 0;
+            // On ASAN/TSAN builds, the processes have a lot of shadow memory that gdb
+            // likes to include in the core dumps. We send a SIGABRT to the processes
+            // on these builds because the kernel knows how to get rid of the shadow memory.
+            return anyLineMatches(lines, /Attempting to send SIGABRT from resmoke/);
         });
     } else {
         assert.soon(() => {
@@ -71,7 +68,7 @@ assert.eq(7, TestData.peerPids.length);
 clearRawMongoProgramOutput();
 
 MongoRunner.runHangAnalyzer.disable();
-MongoRunner.runHangAnalyzer([20200125]);
+assert.eq(undefined, MongoRunner.runHangAnalyzer([20200125]));
 
 const lines = rawMongoProgramOutput().split('\n');
 // Nothing should be executed, so there's no output.
@@ -89,7 +86,7 @@ const origInEvg = TestData.inEvergreen;
 try {
     TestData.inEvergreen = false;
     MongoRunner.runHangAnalyzer.enable();
-    MongoRunner.runHangAnalyzer(TestData.peerPids);
+    assert.eq(undefined, MongoRunner.runHangAnalyzer(TestData.peerPids));
 } finally {
     TestData.inEvergreen = origInEvg;
 }
@@ -97,5 +94,4 @@ try {
 const lines = rawMongoProgramOutput().split('\n');
 // Nothing should be executed, so there's no output.
 assert.eq(lines, ['']);
-})();
 })();

@@ -1,10 +1,20 @@
 // Confirm correctness of $concatArrays expression evaluation.
 
-(function() {
-"use strict";
+// When SBE is enabled, we expect that each $concatArrays expression will be pushed down into the
+// query layer. This does not happen when we wrap aggregations in facets, so we prevent this
+// test from running in the 'aggregation_facet_unwind_passthrough' suite.
+// @tags: [
+//   do_not_wrap_aggregations_in_facets,
+//
+//   # This test makes assertions about queries erroring or returning null depending on whether SBE
+//   # is used or not. SBE may be chosen if an implicit column index is created, so we ban this
+//   # tests from implicit index creation suites.
+//   assumes_no_implicit_index_creation,
+// ]
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");        // For assertArrayEq.
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
 
 const coll = db.projection_expr_concat_arrays;
 coll.drop();
@@ -32,7 +42,6 @@ function runAndAssert(operands, expectedResult) {
         expected: expectedResult
     });
 }
-
 function runAndAssertNull(operands) {
     runAndAssert(operands, [null]);
 }
@@ -41,6 +50,14 @@ function runAndAssertThrows(operands) {
     const error =
         assert.throws(() => coll.aggregate([{$project: {f: {$concatArrays: operands}}}]).toArray());
     assert.commandFailedWithCode(error, 28664);
+}
+
+function runAndAssertThrowsOrNull(operands) {
+    try {
+        runAndAssertNull(operands);
+    } catch (error) {
+        assert.commandFailedWithCode(error, 28664);
+    }
 }
 
 runAndAssert(["$int_arr"], [[1, 2, 3, 4]]);
@@ -75,6 +92,14 @@ runAndAssert(["$str_arr", {$filter: {input: "$int_arr",
                                 ] }}}, "$int_arr"],
              [["a", "b", "c", 2, 3, 1, 2, 3, 4]]);
 
+// Confirm that empty arrays can be concatenated with variables.
+runAndAssert(
+    ["$str_arr", {$filter: {input: [], cond: {$isArray: [{$concatArrays: [[], "$$this"]}]}}}],
+    [["a", "b", "c"]]);
+
+// Concatenation with no arguments results in the empty array.
+runAndAssert([], [[]]);
+
 // Confirm that having any combination of null or missing inputs and valid inputs produces null.
 runAndAssertNull(["$int_arr", "$null_val"]);
 runAndAssertNull(["$int_arr", null]);
@@ -96,6 +121,7 @@ runAndAssertNull([
 
 // Confirm edge case where if null precedes non-array input, null is returned.
 runAndAssertNull(["$int_arr", "$null_val", "$int_val"]);
+runAndAssertNull(["$null_val", null, "$null_val"]);
 
 //
 // Confirm error cases.
@@ -112,13 +138,16 @@ runAndAssertThrows(["$int_arr", "$int_val"]);
 runAndAssertThrows(["$dbl_arr", "$dbl_val"]);
 
 // Confirm edge case where if invalid input precedes null or missing inputs, the command fails.
-runAndAssertThrows(["$int_arr", "$dbl_val", "$null_val"]);
-runAndAssertThrows(["$int_arr", "some_string_value", "$null_val"]);
+// Depending on execution engine null might be returned before we throw an error. A query might
+// execute in Classic or SBE depending on a lot of factors: plan cache, runtime planners and so
+// on, so we can't assert exactly what will happen.
+runAndAssertThrowsOrNull(["$int_arr", "$dbl_val", "$null_val"]);
+runAndAssertThrowsOrNull(["$int_arr", "some_string_value", "$null_val"]);
+runAndAssertThrowsOrNull(["$dbl_val", "$null_val"]);
+runAndAssertThrowsOrNull(["$int_arr", "$int_val", "$not_a_field"]);
+runAndAssertThrowsOrNull(["$int_val", "$not_a_field"]);
+runAndAssertThrowsOrNull(["$int_val", "$not_a_field", "$null_val"]);
 runAndAssertThrows(["$int_arr", 32]);
-runAndAssertThrows(["$dbl_val", "$null_val"]);
-runAndAssertThrows(["$int_arr", "$int_val", "$not_a_field"]);
-runAndAssertThrows(["$int_val", "$not_a_field"]);
-runAndAssertThrows(["$int_val", "$not_a_field", "$null_val"]);
 
 // Clear collection.
 assert(coll.drop());
@@ -151,4 +180,3 @@ runAndAssert(["$arr1", [1, 2, 3], "$arr2"], [
     null,
     null
 ]);
-}());

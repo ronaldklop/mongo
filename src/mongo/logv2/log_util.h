@@ -29,18 +29,20 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 
-#include <boost/optional.hpp>
-#include <mongo/base/status.h>
-#include <mongo/base/string_data.h>
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo::logv2 {
 
 constexpr auto kServerLogTag = "server"_sd;
 constexpr auto kAuditLogTag = "audit"_sd;
 
-using LogRotateCallback = std::function<Status(bool, StringData)>;
+using LogRotateCallback = std::function<Status(bool, StringData, std::function<void(Status)>)>;
+using ShouldEmitLogServiceFn = std::function<bool()>;
 
 /**
  * logType param needs to have static lifetime. If a new logType needs to be defined, add it above
@@ -49,7 +51,25 @@ using LogRotateCallback = std::function<Status(bool, StringData)>;
 void addLogRotator(StringData logType, LogRotateCallback cb);
 
 /**
- * Rotates the log files.  Returns true if all logs rotate successfully.
+ * Class that combines error Status objects into a single Status object.
+ */
+class LogRotateErrorAppender {
+public:
+    LogRotateErrorAppender() : _combined(Status::OK()) {}
+    LogRotateErrorAppender(const Status& init) : _combined(init) {}
+
+    const Status& getCombinedStatus() const {
+        return _combined;
+    }
+
+    void append(const Status& err);
+
+private:
+    Status _combined;
+};
+
+/**
+ * Rotates the log files.  Returns Status::OK() if all logs rotate successfully.
  *
  * renameFiles - true means we rename files, false means we expect the file to be renamed
  *               externally
@@ -59,7 +79,9 @@ void addLogRotator(StringData logType, LogRotateCallback cb);
  * We expect logrotate to rename the existing file before we rotate, and so the next open
  * we do should result in a file create.
  */
-bool rotateLogs(bool renameFiles, boost::optional<StringData> logType = boost::none);
+Status rotateLogs(bool renameFiles,
+                  boost::optional<StringData> logType,
+                  std::function<void(Status)> onMinorError);
 
 /**
  * Returns true if system logs should be redacted.
@@ -70,4 +92,27 @@ bool shouldRedactLogs();
  * Set the 'redact' mode of the server.
  */
 void setShouldRedactLogs(bool enabled);
+
+/**
+ * Returns true if the BinData Encrypt should be redacted. Default true.
+ */
+bool shouldRedactBinDataEncrypt();
+
+/**
+ * Sets the redact mode of the bin data encrypt field.
+ */
+void setShouldRedactBinDataEncrypt(bool enabled);
+
+/**
+ * Returns true if log service names should be emitted. Returns false until setShouldEmitLogService
+ * is called.
+ */
+bool shouldEmitLogService();
+
+/**
+ * Set a callback which shouldEmitLogService() invokes to determine whether log service names should
+ * be emitted.
+ */
+void setShouldEmitLogService(ShouldEmitLogServiceFn fn);
+
 }  // namespace mongo::logv2

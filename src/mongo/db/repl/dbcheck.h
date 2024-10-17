@@ -29,17 +29,36 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/health_log_gen.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/repl/dbcheck_gen.h"
-#include "mongo/util/md5.hpp"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/util/md5.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
 // Forward declarations.
+class ClusteredIndexSpec;
 class Collection;
 class CollectionPtr;
 class OperationContext;
@@ -49,54 +68,123 @@ class OpTime;
 }
 
 /**
- * Get an error message if the check fails.
+ * Converts OplogEntriesEnum or DbCheckValidationModeEnum into string for health log.
  */
-std::unique_ptr<HealthLogEntry> dbCheckErrorHealthLogEntry(const NamespaceString& nss,
-                                                           const std::string& msg,
-                                                           OplogEntriesEnum operation,
-                                                           const Status& err);
+std::string renderForHealthLog(OplogEntriesEnum op);
+std::string renderForHealthLog(DbCheckValidationModeEnum validateMode);
 
+/**
+ * Logs an entry into 'local.system.healthLog'.
+ *
+ * The parameters nss and collectionUUID are boost::optional because they are not present in
+ * DbCheckOplogStartStop health log entries. DbCheckOplogStartStop entries will use boost::none
+ * for both nss and collectionUUID.
+ */
+std::unique_ptr<HealthLogEntry> dbCheckHealthLogEntry(
+    const boost::optional<SecondaryIndexCheckParameters>& parameters,
+    const boost::optional<NamespaceString>& nss,
+    const boost::optional<UUID>& collectionUUID,
+    SeverityEnum severity,
+    const std::string& msg,
+    ScopeEnum scope,
+    OplogEntriesEnum operation,
+    const boost::optional<BSONObj>& data);
+
+/**
+ * Logs an error into 'local.system.healthLog'.
+ */
+std::unique_ptr<HealthLogEntry> dbCheckErrorHealthLogEntry(
+    const boost::optional<SecondaryIndexCheckParameters>& parameters,
+    const boost::optional<NamespaceString>& nss,
+    const boost::optional<UUID>& collectionUUID,
+    const std::string& msg,
+    ScopeEnum scope,
+    OplogEntriesEnum operation,
+    const Status& err,
+    const BSONObj& context = BSONObj());
+
+std::unique_ptr<HealthLogEntry> dbCheckWarningHealthLogEntry(
+    const boost::optional<SecondaryIndexCheckParameters>& parameters,
+    const NamespaceString& nss,
+    const boost::optional<UUID>& collectionUUID,
+    const std::string& msg,
+    ScopeEnum scope,
+    OplogEntriesEnum operation,
+    const Status& err,
+    const BSONObj& context = BSONObj());
 /**
  * Get a HealthLogEntry for a dbCheck batch.
  */
-std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(const NamespaceString& nss,
-                                                  int64_t count,
-                                                  int64_t bytes,
-                                                  const std::string& expectedHash,
-                                                  const std::string& foundHash,
-                                                  const BSONKey& minKey,
-                                                  const BSONKey& maxKey,
-                                                  const repl::OpTime& optime);
+std::unique_ptr<HealthLogEntry> dbCheckBatchHealthLogEntry(
+    const boost::optional<SecondaryIndexCheckParameters>& parameters,
+    const boost::optional<UUID>& batchId,
+    const NamespaceString& nss,
+    const boost::optional<UUID>& collectionUUID,
+    int64_t count,
+    int64_t bytes,
+    const std::string& expectedHash,
+    const std::string& foundHash,
+    const BSONObj& batchStart,
+    const BSONObj& batchEnd,
+    const BSONObj& lastKeyChecked,
+    int64_t nConsecutiveIdenticalIndexKeysAtEnd,
+    const boost::optional<Timestamp>& timestamp,
+    const repl::OpTime& optime,
+    const boost::optional<CollectionOptions>& options = boost::none,
+    const boost::optional<BSONObj>& indexSpec = boost::none);
 
-/**
- * The collection metadata dbCheck sends between nodes.
- */
-struct DbCheckCollectionInformation {
-    std::string collectionName;
-    boost::optional<UUID> prev;
-    boost::optional<UUID> next;
-    std::vector<BSONObj> indexes;
-    BSONObj options;
+bool isIndexOrderAndUniquenessPreserved(const KeyStringEntry& curr,
+                                        const KeyStringEntry& next,
+                                        bool isUnique);
+
+struct ReadSourceWithTimestamp {
+    RecoveryUnit::ReadSource readSource;
+    boost::optional<Timestamp> timestamp = boost::none;
 };
 
 /**
- * Returns a pair of previous and next UUIDs around the given collections uuid. If there is no
- * previous or next UUID, return boost::none respectively.
+ * Helper for converting a keystring to its BSON format. Converting a keystring to BSON will remove
+ * the RecordId, as BSON objects cannot store the RecordId. As a result, if you then convert the
+ * BSON back to keystring format, that keystring will not have a RecordId.
  */
-std::pair<boost::optional<UUID>, boost::optional<UUID>> getPrevAndNextUUIDs(
-    OperationContext* opCtx, const CollectionPtr& collection);
+BSONObj _keyStringToBsonSafeHelper(const key_string::Value& keyString, const Ordering& ordering);
+BSONObj _builderToBsonSafeHelper(const key_string::Builder& builder, const Ordering& ordering);
 
 /**
- * Get a HealthLogEntry for a dbCheck collection.
+ * Helper for getting the next distinct key in the index after currKeyStringBson.
  */
-std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& nss,
-                                                       const UUID& uuid,
-                                                       const DbCheckCollectionInformation& expected,
-                                                       const DbCheckCollectionInformation& found,
-                                                       const repl::OpTime& optime);
+boost::optional<KeyStringEntry> _getNextDistinctKeyInIndex(
+    OperationContext* opCtx,
+    const std::unique_ptr<SortedDataInterfaceThrottleCursor>& indexCursor,
+    const key_string::Version& version,
+    const Ordering& ordering,
+    const BSONObj& currKeyStringBson);
 
 /**
- * Hashing collections and plans.
+ * DbCheckAcquisition is a helper class to acquire locks and set RecoveryUnit state for the dbCheck
+ * operation.
+ */
+class DbCheckAcquisition {
+public:
+    explicit DbCheckAcquisition(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                ReadSourceWithTimestamp readSource,
+                                PrepareConflictBehavior prepareConflictBehavior);
+
+    ~DbCheckAcquisition();
+
+private:
+    OperationContext* _opCtx;
+
+public:
+    const ReadSourceScope readSourceScope;
+    const PrepareConflictBehavior prevPrepareConflictBehavior;
+    const DataCorruptionDetectionMode prevDataCorruptionMode;
+    const CollectionAcquisition coll;
+};
+
+/**
+ * Hashing collections or indexes.
  *
  * Provides MD5-based hashing of ranges of documents.  Note that this class does *not* provide
  * synchronization: clients must, for example, lock the database to ensure that named collections
@@ -106,7 +194,7 @@ std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& ns
 class DbCheckHasher {
 public:
     /**
-     * Create a new DbCheckHasher hashing documents within the given limits.
+     * Create a new DbCheckHasher hashing documents or index keys within the given limits.
      *
      * The check will end when any of the specified limits are reached.  Must be called on a
      * collection with an _id index; otherwise a DBException with code ErrorCodes::IndexNotFound
@@ -115,116 +203,120 @@ public:
      * @param collection The collection to hash from.
      * @param start The first key to hash (exclusive).
      * @param end The last key to hash (inclusive).
-     * @param maxCount The maximum number of documents to hash.
+     * @param maxCount The maximum number of documents or index keys to hash.
      * @param maxBytes The maximum number of bytes to hash.
+     * @param deadlineOnSecondary The time deadline to finish this batch by on the secondary.
      */
     DbCheckHasher(OperationContext* opCtx,
-                  const CollectionPtr& collection,
-                  const BSONKey& start,
-                  const BSONKey& end,
+                  const DbCheckAcquisition& acquisition,
+                  const BSONObj& start,
+                  const BSONObj& end,
+                  boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParameters,
+                  DataThrottle* dataThrottle,
+                  boost::optional<StringData> indexName = boost::none,
                   int64_t maxCount = std::numeric_limits<int64_t>::max(),
-                  int64_t maxBytes = std::numeric_limits<int64_t>::max());
+                  int64_t maxBytes = std::numeric_limits<int64_t>::max(),
+                  Date_t deadlineOnSecondary = Date_t::max());
+
+    ~DbCheckHasher() = default;
 
     /**
-     * Hash all of our documents.
+     * Hashes all documents up to the deadline.
      */
-    Status hashAll(void);
+    Status hashForCollectionCheck(OperationContext* opCtx,
+                                  const CollectionPtr& collPtr,
+                                  Date_t deadlineOnPrimary = Date_t::max());
 
     /**
-     * Return the total hash of all documents seen so far.
+     * Hash index keys between first and last inclusive.
+     * If nConsecutiveIdenticalKeysAtEnd > 1, this means that the last keystring is in a series
+     * of consecutive identical keys, and we should only hash nConsecutiveIdenticalKeysAtEnd of
+     * those.
+     */
+    Status hashForExtraIndexKeysCheck(OperationContext* opCtx,
+                                      const Collection* collection,
+                                      const BSONObj& batchStartBson,
+                                      const BSONObj& batchEndBson,
+                                      const BSONObj& lastKeyCheckedBson);
+
+    /**
+     * Checks if a document has missing index keys by finding the index keys that should be
+     * generated for each document and checking that they actually exist in the index.
+     */
+    Status validateMissingKeys(OperationContext* opCtx,
+                               BSONObj& currentObj,
+                               RecordId& currentRecordId,
+                               const CollectionPtr& collPtr);
+
+    /**
+     * Returns the total hash of all items seen so far.
      */
     std::string total(void);
 
     /**
-     * Get the last key this hasher has hashed.
+     * Gets the last key this hasher has hashed.
      *
-     * Again, not the same as the `end` passed in; this is MinKey if no documents have been hashed.
+     * Again, not the same as the `end` passed in; this is MinKey if no items have been hashed.
      */
-    BSONKey lastKey(void) const;
+    BSONObj lastKeySeen(void) const;
 
     int64_t bytesSeen(void) const;
 
     int64_t docsSeen(void) const;
 
+    int64_t keysSeen(void) const;
+
+    int64_t countSeen(void) const;
+
+    int64_t nConsecutiveIdenticalIndexKeysSeenAtEnd(void) const;
+
 private:
     /**
-     * Can we hash `obj` without going over our limits?
+     * Checks if we can hash `obj` without going over our limits for collection check.
      */
-    bool _canHash(const BSONObj& obj);
+    bool _canHashForCollectionCheck(const BSONObj& obj);
+
+    bool _isIdSameAsRecordId(const RecordId& rid,
+                             const BSONObj& doc,
+                             const ClusteredIndexSpec& indexSpec,
+                             const CollatorInterface* collator);
 
     OperationContext* _opCtx;
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
     md5_state_t _state;
 
-    BSONKey _maxKey;
-    BSONKey _last = BSONKey::min();
+    BSONObj _maxKey;
+    BSONObj _lastKeySeen = kMinBSONKey;
 
+    boost::optional<StringData> _indexName;
+
+    // Represents the max number of docs or keys seen, which varies based on the validation mode:
+    //  - "dataConsistency": _countDocsSeen <= _maxCount
+    //  - "dataConsistencyAndMissingIndexKeysCheck": (_countDocsSeen + _countKeysSeen) <= _maxCount
+    //  - "extraIndexKeysCheck": _countKeysSeen <= _maxCount
     int64_t _maxCount = 0;
-    int64_t _countSeen = 0;
+    int64_t _countDocsSeen = 0;
+    int64_t _countKeysSeen = 0;
 
     int64_t _maxBytes = 0;
     int64_t _bytesSeen = 0;
+    int64_t _nConsecutiveIdenticalIndexKeysSeenAtEnd = 0;
+
+    std::vector<const IndexCatalogEntry*> _indexes;
+    std::vector<BSONObj> _missingIndexKeys;
+
+    boost::optional<SecondaryIndexCheckParameters> _secondaryIndexCheckParameters;
+    DataThrottle* _dataThrottle;
+
+    // Max time that the hasher should spend on a batch. This should only be populated on the
+    // secondary since the primary has its own batch time limit.
+    Date_t _deadlineOnSecondary;
 };
-
-/**
- * Get the given database in MODE_S, while also blocking stepdown (SERVER-28544) and allowing writes
- * to "local".
- */
-class AutoGetDbForDbCheck {
-public:
-    AutoGetDbForDbCheck(OperationContext* opCtx, const NamespaceString& nss);
-
-    Database* getDb(void) {
-        return agd.getDb();
-    }
-
-private:
-    Lock::DBLock localLock;
-    AutoGetDb agd;
-};
-
-/**
- * Get the given collection in MODE_S, except that if the collection is missing it will report that
- * to the health log, and it takes an IX lock on "local" as a workaround to SERVER-28544.
- */
-class AutoGetCollectionForDbCheck {
-public:
-    AutoGetCollectionForDbCheck(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const OplogEntriesEnum& type);
-    explicit operator bool() const {
-        return static_cast<bool>(getCollection());
-    }
-
-    const Collection* operator->() const {
-        return getCollection().get();
-    }
-
-    const CollectionPtr& getCollection() const {
-        return _collection;
-    }
-
-private:
-    AutoGetDbForDbCheck _agd;
-    Lock::CollectionLock _collLock;
-    CollectionPtr _collection;
-};
-
-
-/**
- * Gather the index information for a collection.
- */
-std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, const CollectionPtr& collection);
-
-/**
- * Gather other information for a collection.
- */
-BSONObj collectionOptions(OperationContext* opCtx, const CollectionPtr& collection);
 
 namespace repl {
 
 /**
- * Perform the dbCheck oplog command.
+ * Performs the dbCheck oplog command.
  *
  * Returns a `Status` to match the type used for oplog command hooks, but in fact always handles
  * errors (primarily by writing to the health log), so always returns `Status::OK`.

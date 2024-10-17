@@ -27,17 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/query/collation/collator_interface_mock.h"
-
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -198,30 +206,13 @@ TEST(CollatorInterfaceMockSelfTest, MockCollatorReportsMockVersionString) {
 
 TEST(CollatorInterfaceMockSelfTest, StringsAreHashedWithRespectToCollation) {
     CollatorInterfaceMock toLowerCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    ASSERT_EQ(toLowerCollator.hash("foo"), toLowerCollator.hash("FOO"));
-    ASSERT_NE(toLowerCollator.hash("foo"), toLowerCollator.hash("FOOz"));
-}
-
-TEST(CollatorInterfaceMockSelfTest, CollatorGeneratedUnorderedSetOfStringsRespectsCollation) {
-    CollatorInterfaceMock toLowerCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    auto set = toLowerCollator.makeStringDataUnorderedSet();
-    set.insert("foo");
-    set.insert("FOO");
-    set.insert("FOOz");
-    ASSERT_EQ(set.size(), 2U);
-    ASSERT_EQ(set.count("FoO"), 1U);
-    ASSERT_EQ(set.count("fooZ"), 1U);
-}
-
-TEST(CollatorInterfaceMockSelfTest, CollatorGeneratedUnorderedMapOfStringsRespectsCollation) {
-    CollatorInterfaceMock toLowerCollator(CollatorInterfaceMock::MockType::kToLowerString);
-    auto map = toLowerCollator.makeStringDataUnorderedMap<int>();
-    map["foo"] = 1;
-    map["FOO"] = 2;
-    map["FOOz"] = 3;
-    ASSERT_EQ(map.size(), 2U);
-    ASSERT_EQ(map["FoO"], 2);
-    ASSERT_EQ(map["fooZ"], 3);
+    auto tryHash = [&](StringData s) {
+        size_t h = 0;
+        toLowerCollator.hash_combine(h, s);
+        return h;
+    };
+    ASSERT_EQ(tryHash("foo"), tryHash("FOO"));
+    ASSERT_NE(tryHash("foo"), tryHash("FOOz"));
 }
 
 TEST(CollatorInterfaceMockSelfTest, BSONObjsEqualUnderCollatorHashEqually) {

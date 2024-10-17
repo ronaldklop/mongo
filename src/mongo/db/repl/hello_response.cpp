@@ -27,17 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <ctime>
+#include <memory>
+#include <utility>
 
-#include "mongo/db/repl/hello_response.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/repl/hello_response.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -199,12 +211,11 @@ void HelloResponse::addToBSON(BSONObjBuilder* builder, bool useLegacyResponseFie
     if (_lastWrite || _lastMajorityWrite) {
         BSONObjBuilder lastWrite(builder->subobjStart(kLastWriteFieldName));
         if (_lastWrite) {
-            lastWrite.append(kLastWriteOpTimeFieldName, _lastWrite->opTime.toBSON());
+            _lastWrite->opTime.append(kLastWriteOpTimeFieldName, &lastWrite);
             lastWrite.appendTimeT(kLastWriteDateFieldName, _lastWrite->value);
         }
         if (_lastMajorityWrite) {
-            lastWrite.append(kLastMajorityWriteOpTimeFieldName,
-                             _lastMajorityWrite->opTime.toBSON());
+            _lastMajorityWrite->opTime.append(kLastMajorityWriteOpTimeFieldName, &lastWrite);
             lastWrite.appendTimeT(kLastMajorityWriteDateFieldName, _lastMajorityWrite->value);
         }
     }
@@ -521,24 +532,24 @@ void HelloResponse::setReplSetVersion(long long version) {
     _setVersion = version;
 }
 
-void HelloResponse::addHost(const HostAndPort& host) {
+void HelloResponse::addHost(HostAndPort host) {
     _hostsSet = true;
-    _hosts.push_back(host);
+    _hosts.push_back(std::move(host));
 }
 
-void HelloResponse::addPassive(const HostAndPort& passive) {
+void HelloResponse::addPassive(HostAndPort passive) {
     _passivesSet = true;
-    _passives.push_back(passive);
+    _passives.push_back(std::move(passive));
 }
 
-void HelloResponse::addArbiter(const HostAndPort& arbiter) {
+void HelloResponse::addArbiter(HostAndPort arbiter) {
     _arbitersSet = true;
-    _arbiters.push_back(arbiter);
+    _arbiters.push_back(std::move(arbiter));
 }
 
-void HelloResponse::setPrimary(const HostAndPort& primary) {
+void HelloResponse::setPrimary(HostAndPort primary) {
     _primarySet = true;
-    _primary = primary;
+    _primary = std::move(primary);
 }
 
 void HelloResponse::setIsArbiterOnly(bool arbiterOnly) {
@@ -575,9 +586,9 @@ void HelloResponse::addTag(const std::string& tagKey, const std::string& tagValu
     _tags[tagKey] = tagValue;
 }
 
-void HelloResponse::setMe(const HostAndPort& me) {
+void HelloResponse::setMe(HostAndPort me) {
     _meSet = true;
-    _me = me;
+    _me = std::move(me);
 }
 
 void HelloResponse::setElectionId(const OID& electionId) {

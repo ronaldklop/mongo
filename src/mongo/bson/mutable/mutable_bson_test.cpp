@@ -27,20 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/bson/mutable/document.h"
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/damage_vector.h"
+#include "mongo/bson/mutable/const_element.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/mutable/element.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/storage/damage_vector.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/safe_num.h"
+#include "mongo/util/time_support.h"
 
 namespace {
 
@@ -949,12 +966,12 @@ TEST(Documentation, Example2) {
 }
 
 namespace {
-void apply(mongo::BSONObj* obj, const mmb::DamageVector& damages, const char* source) {
-    const mmb::DamageVector::const_iterator end = damages.end();
-    mmb::DamageVector::const_iterator where = damages.begin();
+void apply(mongo::BSONObj* obj, const DamageVector& damages, const char* source) {
+    const DamageVector::const_iterator end = damages.end();
+    DamageVector::const_iterator where = damages.begin();
     char* const target = const_cast<char*>(obj->objdata());
     for (; where != end; ++where) {
-        std::memcpy(target + where->targetOffset, source + where->sourceOffset, where->size);
+        std::memcpy(target + where->targetOffset, source + where->sourceOffset, where->sourceSize);
     }
 }
 }  // namespace
@@ -1016,7 +1033,7 @@ TEST(Documentation, Example2InPlaceWithDamageVector) {
     ASSERT_EQUALS(mmb::Document::kInPlaceEnabled, doc.getCurrentInPlaceMode());
 
     // Extract the damage events
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
     size_t size = 0;
     ASSERT_EQUALS(true, doc.getInPlaceUpdates(&damages, &source, &size));
@@ -2773,7 +2790,7 @@ TEST(DocumentInPlace, InPlaceModeWorksWithNoMutations) {
     mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     const char* source = nullptr;
-    mmb::DamageVector damages;
+    DamageVector damages;
     ASSERT_TRUE(damages.empty());
     doc.getInPlaceUpdates(&damages, &source);
     ASSERT_TRUE(damages.empty());
@@ -2870,8 +2887,8 @@ TEST(DocumentInPlace, GettingInPlaceUpdatesWhenDisabledClearsArguments) {
     mmb::Document doc(obj, mmb::Document::kInPlaceDisabled);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
-    mmb::DamageVector damages;
-    const mmb::DamageEvent event = {0};
+    DamageVector damages;
+    const DamageEvent event{};
     damages.push_back(event);
     const char* source = "foo";
     ASSERT_FALSE(doc.getInPlaceUpdates(&damages, &source));
@@ -2928,7 +2945,7 @@ TEST(DocumentInPlace, StringLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueString("bar").transitional_ignore();
@@ -2954,7 +2971,7 @@ TEST(DocumentInPlace, BinDataLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueBinary(binData2.length, binData2.type, binData2.data).transitional_ignore();
@@ -2984,7 +3001,7 @@ TEST(DocumentInPlace, OIDLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueOID(oid2).transitional_ignore();
@@ -3004,7 +3021,7 @@ TEST(DocumentInPlace, BooleanLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueBool(false).transitional_ignore();
@@ -3030,7 +3047,7 @@ TEST(DocumentInPlace, DateLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueDate(mongo::Date_t::fromMillisSinceEpoch(20000)).transitional_ignore();
@@ -3052,7 +3069,7 @@ TEST(DocumentInPlace, NumberIntLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueInt(value2).transitional_ignore();
@@ -3078,7 +3095,7 @@ TEST(DocumentInPlace, TimestampLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueTimestamp(mongo::Timestamp(mongo::Date_t::fromMillisSinceEpoch(20000)))
@@ -3102,7 +3119,7 @@ TEST(DocumentInPlace, NumberLongLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueLong(value2).transitional_ignore();
@@ -3131,7 +3148,7 @@ TEST(DocumentInPlace, NumberDoubleLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueDouble(value2).transitional_ignore();
@@ -3160,7 +3177,7 @@ TEST(DocumentInPlace, NumberDecimalLifecycle) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueDecimal(value2).transitional_ignore();
@@ -3191,7 +3208,7 @@ TEST(DocumentInPlace, DoubleToLongAndBack) {
 
     mmb::Element x = doc.root().leftChild();
 
-    mmb::DamageVector damages;
+    DamageVector damages;
     const char* source = nullptr;
 
     x.setValueLong(value2).transitional_ignore();
@@ -3244,7 +3261,7 @@ TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
     ASSERT_EQUALS(0, doc1Copy.compareWith(doc1, nullptr));
 
     // Perform an operation on 'c' that doesn't change the serialized value, but
-    // deserializeds the node.
+    // deserializes the node.
     mmb::Document doc2(obj.getOwned());
     const mmb::Document doc2Copy(obj.getOwned());
     mmb::Element c = doc2.root()["c"];

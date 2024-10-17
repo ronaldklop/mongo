@@ -27,40 +27,72 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/query/document_source_merge_cursors.h"
-
+// IWYU pragma: no_include "cxxabi.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <fmt/format.h>
 #include <memory>
+#include <string>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document_source_limit.h"
-#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/executor/thread_pool_mock.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/query/exec/async_results_merger_params_gen.h"
+#include "mongo/s/query/exec/document_source_merge_cursors.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
-
-using executor::NetworkInterfaceMock;
-using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
 
 using ResponseStatus = executor::TaskExecutor::ResponseStatus;
 
@@ -71,25 +103,26 @@ const std::vector<HostAndPort> kTestShardHosts = {HostAndPort("FakeShard1Host", 
                                                   HostAndPort("FakeShard2Host", 12345),
                                                   HostAndPort("FakeShard3Host", 12345)};
 
-const NamespaceString kTestNss = NamespaceString("test.mergeCursors"_sd);
+const std::string kMergeCursorNsStr{"test.mergeCursors"};
 const HostAndPort kTestHost = HostAndPort("localhost:27017"_sd);
 
 const CursorId kExhaustedCursorID = 0;
 
+}  // namespace
+
 class DocumentSourceMergeCursorsTest : public ShardingTestFixture {
 public:
-    DocumentSourceMergeCursorsTest() {
+    DocumentSourceMergeCursorsTest()
+        : _nss(NamespaceString::createNamespaceString_forTest(boost::none, kMergeCursorNsStr)) {
         TimeZoneDatabase::set(getServiceContext(), std::make_unique<TimeZoneDatabase>());
     }
 
     void setUp() override {
         ShardingTestFixture::setUp();
-        setRemote(HostAndPort("ClientHost", 12345));
-
-        _expCtx = new ExpressionContext(operationContext(), nullptr, kTestNss);
-        _expCtx->mongoProcessInterface = std::make_shared<StubMongoProcessInterface>(executor());
-
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
+
+        _expCtx = makeExpCtx();
+        _expCtx->mongoProcessInterface = std::make_shared<StubMongoProcessInterface>(executor());
 
         std::vector<ShardType> shards;
         for (size_t i = 0; i < kTestShardIds.size(); i++) {
@@ -117,6 +150,17 @@ public:
         return _expCtx.get();
     }
 
+    NamespaceString getTenantIdNss() const {
+        return _nss;
+    }
+
+protected:
+    virtual boost::intrusive_ptr<ExpressionContext> makeExpCtx() {
+        return new ExpressionContext(operationContext(), nullptr, _nss);
+    }
+
+    NamespaceString _nss;
+
 private:
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
@@ -137,8 +181,9 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldRejectEmptyArray) {
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldRejectLegacySerializationFormats) {
     // Formats like this were used in old versions of the server but are no longer supported.
-    auto spec = BSON("$mergeCursors" << BSON_ARRAY(BSON("ns" << kTestNss.ns() << "id" << 0LL
-                                                             << "host" << kTestHost.toString())));
+    auto spec =
+        BSON("$mergeCursors" << BSON_ARRAY(BSON("ns" << getTenantIdNss().ns_forTest() << "id" << 0LL
+                                                     << "host" << kTestHost.toString())));
     ASSERT_THROWS_CODE(DocumentSourceMergeCursors::createFromBson(spec.firstElement(), getExpCtx()),
                        AssertionException,
                        17026);
@@ -161,14 +206,39 @@ RemoteCursor makeRemoteCursor(ShardId shardId, HostAndPort host, CursorResponse 
     return remoteCursor;
 }
 
-TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToParseSerializedARMParams) {
+void checkSerializedAsyncResultsMergerParams(const AsyncResultsMergerParams& params,
+                                             const AsyncResultsMergerParams& serializedParam,
+                                             const NamespaceString& testNss) {
+    ASSERT_TRUE(params.getSort());
+    ASSERT_BSONOBJ_EQ(*params.getSort(), *serializedParam.getSort());
+    ASSERT_EQ(params.getCompareWholeSortKey(), serializedParam.getCompareWholeSortKey());
+    ASSERT(params.getTailableMode() == serializedParam.getTailableMode());
+    ASSERT(params.getBatchSize() == serializedParam.getBatchSize());
+    ASSERT_EQ(params.getNss(), serializedParam.getNss());
+    ASSERT_EQ(params.getAllowPartialResults(), serializedParam.getAllowPartialResults());
+    ASSERT_EQ(serializedParam.getRemotes().size(), 1UL);
+    ASSERT(serializedParam.getRemotes()[0].getShardId() == kTestShardIds[0].toString());
+    ASSERT(serializedParam.getRemotes()[0].getHostAndPort() == kTestShardHosts[0]);
+    ASSERT_EQ(serializedParam.getRemotes()[0].getCursorResponse().getNSS(), testNss);
+    ASSERT_EQ(serializedParam.getRemotes()[0].getCursorResponse().getCursorId(),
+              kExhaustedCursorID);
+    ASSERT(serializedParam.getRemotes()[0].getCursorResponse().getBatch().empty());
+}
+
+AsyncResultsMergerParams createAsynchResultsMergerParams(const NamespaceString& nss) {
     AsyncResultsMergerParams params;
     params.setSort(BSON("y" << 1 << "z" << 1));
-    params.setNss(kTestNss);
+    params.setNss(nss);
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(makeRemoteCursor(
-        kTestShardIds[0], kTestShardHosts[0], CursorResponse(kTestNss, kExhaustedCursorID, {})));
+        kTestShardIds[0], kTestShardHosts[0], CursorResponse(nss, kExhaustedCursorID, {})));
     params.setRemotes(std::move(cursors));
+    return params;
+}
+
+TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToParseSerializedARMParams) {
+    AsyncResultsMergerParams params = createAsynchResultsMergerParams(getTenantIdNss());
+
     auto spec = BSON("$mergeCursors" << params.toBSON());
     auto mergeCursors =
         DocumentSourceMergeCursors::createFromBson(spec.firstElement(), getExpCtx());
@@ -179,21 +249,9 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToParseSerializedARMParams) {
     // Make sure the serialized version can be parsed into an identical AsyncResultsMergerParams.
     auto newSpec = serializationArray[0].getDocument().toBson();
     ASSERT(newSpec["$mergeCursors"].type() == BSONType::Object);
-    auto newParams = AsyncResultsMergerParams::parse(IDLParserErrorContext("$mergeCursors test"),
+    auto newParams = AsyncResultsMergerParams::parse(IDLParserContext("$mergeCursors test"),
                                                      newSpec["$mergeCursors"].Obj());
-    ASSERT_TRUE(params.getSort());
-    ASSERT_BSONOBJ_EQ(*params.getSort(), *newParams.getSort());
-    ASSERT_EQ(params.getCompareWholeSortKey(), newParams.getCompareWholeSortKey());
-    ASSERT(params.getTailableMode() == newParams.getTailableMode());
-    ASSERT(params.getBatchSize() == newParams.getBatchSize());
-    ASSERT_EQ(params.getNss(), newParams.getNss());
-    ASSERT_EQ(params.getAllowPartialResults(), newParams.getAllowPartialResults());
-    ASSERT_EQ(newParams.getRemotes().size(), 1UL);
-    ASSERT(newParams.getRemotes()[0].getShardId() == kTestShardIds[0].toString());
-    ASSERT(newParams.getRemotes()[0].getHostAndPort() == kTestShardHosts[0]);
-    ASSERT_EQ(newParams.getRemotes()[0].getCursorResponse().getNSS(), kTestNss);
-    ASSERT_EQ(newParams.getRemotes()[0].getCursorResponse().getCursorId(), kExhaustedCursorID);
-    ASSERT(newParams.getRemotes()[0].getCursorResponse().getBatch().empty());
+    checkSerializedAsyncResultsMergerParams(params, newParams, getTenantIdNss());
 
     // Test that the $mergeCursors stage will accept the serialized format of
     // AsyncResultsMergerParams.
@@ -203,7 +261,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToParseSerializedARMParams) {
 TEST_F(DocumentSourceMergeCursorsTest, ShouldReportEOFWithNoCursors) {
     auto expCtx = getExpCtx();
     AsyncResultsMergerParams armParams;
-    armParams.setNss(kTestNss);
+    armParams.setNss(getTenantIdNss());
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(makeRemoteCursor(
         kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, kExhaustedCursorID, {})));
@@ -226,7 +284,7 @@ BSONObj cursorResponseObj(const NamespaceString& nss,
 TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToIterateCursorsUntilEOF) {
     auto expCtx = getExpCtx();
     AsyncResultsMergerParams armParams;
-    armParams.setNss(kTestNss);
+    armParams.setNss(getTenantIdNss());
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, 1, {})));
@@ -274,7 +332,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToIterateCursorsUntilEOF) {
 TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfTheyAreNotOwned) {
     auto expCtx = getExpCtx();
     AsyncResultsMergerParams armParams;
-    armParams.setNss(kTestNss);
+    armParams.setNss(getTenantIdNss());
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, 1, {})));
@@ -290,14 +348,13 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfTheyAreNotOwned) {
 
     pipeline.reset();  // Delete the pipeline before using it.
 
-    network()->enterNetwork();
-    ASSERT_FALSE(network()->hasReadyRequests());
+    ASSERT_FALSE(executor::NetworkInterfaceMock::InNetworkGuard(network())->hasReadyRequests());
 }
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldKillCursorIfPartiallyIterated) {
     auto expCtx = getExpCtx();
     AsyncResultsMergerParams armParams;
-    armParams.setNss(kTestNss);
+    armParams.setNss(getTenantIdNss());
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, 1, {})));
@@ -340,7 +397,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
 
     // Make a $mergeCursors stage with a sort on "x" and add it to the front of the pipeline.
     AsyncResultsMergerParams armParams;
-    armParams.setNss(kTestNss);
+    armParams.setNss(getTenantIdNss());
     armParams.setSort(BSON("x" << 1));
     std::vector<RemoteCursor> cursors;
     cursors.emplace_back(
@@ -380,5 +437,173 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
 
     future.default_timed_get();
 }
-}  // namespace
+
+class DocumentSourceMergeCursorsMultiTenancyTest : public DocumentSourceMergeCursorsTest {
+public:
+    DocumentSourceMergeCursorsMultiTenancyTest()
+        : _multitenancyController(
+              std::make_unique<RAIIServerParameterControllerForTest>("multitenancySupport", true)) {
+        _nss =
+            NamespaceString::createNamespaceString_forTest(TenantId(OID::gen()), kMergeCursorNsStr);
+    }
+
+protected:
+    boost::optional<NamespaceString> getAsyncResultMergerParamsNssFromMergeCursors(
+        DocumentSourceMergeCursors* mergeCursors) {
+        return mergeCursors->getAsyncResultMergerParamsNss_forTest();
+    }
+
+private:
+    boost::intrusive_ptr<ExpressionContext> makeExpCtx() override {
+        return new ExpressionContext(operationContext(), nullptr, _nss);
+    }
+
+    std::unique_ptr<RAIIServerParameterControllerForTest> _multitenancyController;
+};
+
+TEST_F(DocumentSourceMergeCursorsMultiTenancyTest, ShouldBeAbleToParseSerializedARMParams) {
+    AsyncResultsMergerParams params = createAsynchResultsMergerParams(getTenantIdNss());
+
+    const auto paramsBsonObj = params.toBSON();
+    const auto tenantId = *params.getNss().dbName().tenantId();
+    ASSERT_EQ(tenantId, getTenantIdNss().tenantId());
+    const std::string expectedTenantNsStr = str::stream()
+        << tenantId.toString() << "_" << kMergeCursorNsStr;
+    auto paramBsonNssStr = paramsBsonObj["nss"].str();
+    ASSERT_EQ(paramBsonNssStr, expectedTenantNsStr);
+    ASSERT_TRUE(paramBsonNssStr.find('_') != std::string::npos);  // check tenantid does prefix.
+
+    // Deserialize from BSON.
+    const auto spec = BSON("$mergeCursors" << paramsBsonObj);
+    const auto mergeCursorsTmp =
+        DocumentSourceMergeCursors::createFromBson(spec.firstElement(), getExpCtx());
+    const auto mergeCursorsPtr = checked_cast<DocumentSourceMergeCursors*>(mergeCursorsTmp.get());
+
+    // Deserialization check
+    auto armpNss = getAsyncResultMergerParamsNssFromMergeCursors(mergeCursorsPtr);
+    ASSERT(armpNss);
+    ASSERT_EQ(*armpNss, getTenantIdNss());                          // check the namespace
+    ASSERT_EQ((*armpNss).tenantId(), getTenantIdNss().tenantId());  // check the nss tenantid
+
+    std::vector<Value> serializationArray;
+    mergeCursorsPtr->serializeToArray(serializationArray);
+    ASSERT_EQ(serializationArray.size(), 1UL);
+
+    // Make sure the serialized version can be parsed into an identical AsyncResultsMergerParams.
+    const auto newSpec = serializationArray[0].getDocument().toBson();
+    ASSERT(newSpec["$mergeCursors"].type() == BSONType::Object);
+    const auto vts = auth::ValidatedTenancyScopeFactory::create(
+        tenantId,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+    const auto newParams = AsyncResultsMergerParams::parse(
+        IDLParserContext("$mergeCursors test", vts, tenantId, SerializationContext::stateDefault()),
+        newSpec["$mergeCursors"].Obj());
+
+    // Check that the namespace contains the tenantid prefix.
+    ASSERT_EQ(newParams.toBSON()["nss"].str(), expectedTenantNsStr);
+    ASSERT_EQ(newParams.getNss(), getTenantIdNss());
+    checkSerializedAsyncResultsMergerParams(params, newParams, getTenantIdNss());
+
+    // Test that the $mergeCursors stage will accept the serialized format of
+    // AsyncResultsMergerParams.
+    ASSERT(DocumentSourceMergeCursors::createFromBson(newSpec.firstElement(), getExpCtx()));
+}
+
+class DocumentSourceMergeCursorsMultiTenancyAndFeatureFlagTest
+    : public DocumentSourceMergeCursorsMultiTenancyTest {
+public:
+    DocumentSourceMergeCursorsMultiTenancyAndFeatureFlagTest()
+        : _featureFlagController(std::make_unique<RAIIServerParameterControllerForTest>(
+              "featureFlagRequireTenantID", true)) {}
+
+private:
+    std::unique_ptr<RAIIServerParameterControllerForTest> _featureFlagController;
+};
+
+TEST_F(DocumentSourceMergeCursorsMultiTenancyAndFeatureFlagTest,
+       ShouldBeAbleToParseSerializedARMParams) {
+    AsyncResultsMergerParams params = createAsynchResultsMergerParams(getTenantIdNss());
+
+    const auto paramsBsonObj = params.toBSON();
+    const auto tenantId = *params.getNss().dbName().tenantId();
+    ASSERT_EQ(tenantId, getTenantIdNss().tenantId());
+    auto paramBsonNssStr = paramsBsonObj["nss"].str();
+    ASSERT_EQ(paramBsonNssStr, kMergeCursorNsStr);
+    ASSERT_TRUE(paramBsonNssStr.find('_') == std::string::npos);  // check doesn't tenantid prefix.
+
+    // Deserialize from BSON.
+    const auto spec = BSON("$mergeCursors" << paramsBsonObj);
+    const auto mergeCursorsTmp =
+        DocumentSourceMergeCursors::createFromBson(spec.firstElement(), getExpCtx());
+    const auto mergeCursorsPtr = checked_cast<DocumentSourceMergeCursors*>(mergeCursorsTmp.get());
+
+    // Deserialization check.
+    auto armpNss = getAsyncResultMergerParamsNssFromMergeCursors(mergeCursorsPtr);
+    ASSERT(armpNss);
+    ASSERT_EQ(*armpNss, getTenantIdNss());                          // check the namespace
+    ASSERT_EQ((*armpNss).tenantId(), getTenantIdNss().tenantId());  // check the nss tenantid
+
+    std::vector<Value> serializationArray;
+    mergeCursorsPtr->serializeToArray(serializationArray);
+    ASSERT_EQ(serializationArray.size(), 1UL);
+
+    // Make sure the serialized version can be parsed into an identical AsyncResultsMergerParams.
+    const auto newSpec = serializationArray[0].getDocument().toBson();
+    ASSERT(newSpec["$mergeCursors"].type() == BSONType::Object);
+    const auto vts = auth::ValidatedTenancyScopeFactory::create(
+        tenantId,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+    const auto newParams = AsyncResultsMergerParams::parse(
+        IDLParserContext("$mergeCursors test", vts, tenantId, SerializationContext::stateDefault()),
+        newSpec["$mergeCursors"].Obj());
+
+    // Check that the namespace doesn't contain the tenantid prefix.
+    ASSERT_EQ(newParams.toBSON()["nss"].str(), kMergeCursorNsStr);
+    ASSERT_EQ(newParams.getNss(), getTenantIdNss());
+    checkSerializedAsyncResultsMergerParams(params, newParams, getTenantIdNss());
+
+    // Test that the $mergeCursors stage will accept the serialized format of
+    // AsyncResultsMergerParams.
+    ASSERT(DocumentSourceMergeCursors::createFromBson(newSpec.firstElement(), getExpCtx()));
+}
+using DocumentSourceMergeCursorsShapeTest = AggregationContextFixture;
+TEST_F(DocumentSourceMergeCursorsShapeTest, QueryShape) {
+    auto expCtx = getExpCtx();
+    AsyncResultsMergerParams armParams;
+    armParams.setNss(
+        NamespaceString::createNamespaceString_forTest(boost::none, kMergeCursorNsStr));
+    std::vector<RemoteCursor> cursors;
+    cursors.emplace_back(
+        makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, 1, {})));
+    cursors.emplace_back(
+        makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(expCtx->ns, 2, {})));
+    armParams.setRemotes(std::move(cursors));
+    auto stage = DocumentSourceMergeCursors::create(expCtx, std::move(armParams));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$mergeCursors": {
+                "compareWholeSortKey": "?bool",
+                "remotes": [
+                    {
+                        "shardId": "HASH<FakeShard1>",
+                        "hostAndPort": "HASH<FakeShard1Host:12345>",
+                        "cursorResponse": "?object"
+                    },
+                    {
+                        "shardId": "HASH<FakeShard2>",
+                        "hostAndPort": "HASH<FakeShard2Host:12345>",
+                        "cursorResponse": "?object"
+                    }
+                ],
+                "nss": "HASH<test.mergeCursors>",
+                "allowPartialResults": false,
+                "recordRemoteOpWaitTime": false,
+                "requestQueryStatsFromRemotes": false
+            }
+        })",
+        redact(*stage));
+}
 }  // namespace mongo

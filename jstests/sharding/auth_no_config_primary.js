@@ -3,18 +3,21 @@
  *
  * This test cannot be run on ephemeral storage engines because it requires the users to persist
  * across a restart.
- * @tags: [requires_persistence]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
 
-// Checking UUID and index consistency involves talking to the config server primary, but there is
-// no config server primary by the end of this test.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks involve talking to the config server primary, which is shut down in this
+// test
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckDBHashes = true;
 TestData.skipCheckOrphans = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var st = new ShardingTest({shards: 1, other: {keyFile: 'jstests/libs/key1'}});
 
@@ -42,7 +45,7 @@ assert.eq('world', res.hello);
 
 // Test authenticate through new mongos.
 var otherMongos =
-    MongoRunner.runMongos({keyFile: "jstests/libs/key1", configdb: st.s.savedOptions.configdb});
+    MongoRunner.runMongos({keyFile: "jstests/libs/key1", configdb: st.configRS.getURL()});
 
 assert.commandFailedWithCode(otherMongos.getDB('test').runCommand({find: 'user'}),
                              ErrorCodes.Unauthorized);
@@ -55,4 +58,3 @@ assert.eq('world', res.hello);
 
 st.stop();
 MongoRunner.stopMongos(otherMongos);
-})();

@@ -1,5 +1,7 @@
 
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({name: 'unicomplex', nodes: 2});
 var conns = replTest.startSet({verbose: 1});
 var config = replTest.getReplSetConfig();
@@ -23,7 +25,7 @@ assert.soon(function() {
     return conns[1].getDB("admin").hello().secondary;
 });
 
-join =
+let join =
     startParallelShell("db.getSiblingDB('bar').runCommand({compact : 'foo'});", replTest.ports[1]);
 
 print("joining");
@@ -81,7 +83,7 @@ assert.eq(recv.errmsg, "node is recovering");
 
 print("now getmore shouldn't work");
 var ex = assert.throws(function() {
-    lastDoc = null;
+    let lastDoc = null;
     while (cursor.hasNext()) {
         lastDoc = cursor.next();
     }

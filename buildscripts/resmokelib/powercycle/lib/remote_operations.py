@@ -7,14 +7,14 @@ import re
 import shlex
 import subprocess
 import sys
-import time
 import textwrap
+import time
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-_IS_WINDOWS = sys.platform == "win32" or sys.platform == "cygwin"
+_IS_WINDOWS = sys.platform in ["win32", "cygwin"]
 
 _SSH_CONNECTION_ERRORS = [
     "Connection refused",
@@ -36,8 +36,8 @@ class SSHOperation(object):
 def posix_path(path):
     """Return posix path, used on Windows since scp requires posix style paths."""
     # If path is already quoted, we need to remove the quotes before calling
-    path_quote = "\'" if path.startswith("\'") else ""
-    path_quote = "\"" if path.startswith("\"") else path_quote
+    path_quote = "'" if path.startswith("'") else ""
+    path_quote = '"' if path.startswith('"') else path_quote
     if path_quote:
         path = path[1:-1]
     drive, new_path = os.path.splitdrive(path)
@@ -46,23 +46,31 @@ def posix_path(path):
     return "{quote}{path}{quote}".format(quote=path_quote, path=new_path)
 
 
-class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
+class RemoteOperations(object):
     """Class to support remote operations."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, user_host, ssh_connection_options=None, ssh_options=None, scp_options=None,
-            shell_binary="/bin/bash", use_shell=False, ignore_ret=False):
+    def __init__(
+        self,
+        user_host,
+        ssh_connection_options=None,
+        ssh_options=None,
+        scp_options=None,
+        shell_binary="/bin/bash",
+        use_shell=False,
+        ignore_ret=False,
+        access_retry_count=5,
+    ):
         """Initialize RemoteOperations."""
 
         self.user_host = user_host
         self.ssh_connection_options = ssh_connection_options if ssh_connection_options else ""
         self.ssh_options = ssh_options if ssh_options else ""
         self.scp_options = scp_options if scp_options else ""
-        self.retries = 5
         self.retry_sleep = 10
         self.ignore_ret = ignore_ret
         self.shell_binary = shell_binary
         self.use_shell = use_shell
+        self.access_retry_count = access_retry_count
         # Check if we can remotely access the host.
         self._access_code, self._access_buff = self._remote_access()
 
@@ -72,15 +80,16 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
         if not self.use_shell:
             cmd = shlex.split(cmd)
         # Use a common pipe for stdout & stderr for logging.
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   shell=self.use_shell)
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=self.use_shell
+        )
         buff_stdout, _ = process.communicate()
         buff = buff_stdout.decode("utf-8", "replace")
         print("Result of command:")
         print(textwrap.indent(buff, "[result body] "))
         return process.poll(), buff
 
-    def _call_retries(self, cmd):
+    def _call_retries(self, cmd, retry_count):
         attempt_num = 0
         while True:
             ret, buff = self._call(cmd)
@@ -88,23 +97,27 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
             if not ret and not any(ssh_error in buff for ssh_error in _SSH_CONNECTION_ERRORS):
                 return ret, buff
             attempt_num += 1
-            if attempt_num > self.retries:
+            if attempt_num > retry_count:
                 print("Exhausted all retry attempts.")
                 break
-            print("Remote attempt {} unsuccessful, retrying in {} seconds".format(
-                attempt_num, self.retry_sleep))
+            print(
+                "Remote attempt {} unsuccessful, retrying in {} seconds".format(
+                    attempt_num, self.retry_sleep
+                )
+            )
             time.sleep(self.retry_sleep)
         return ret, buff
 
     def _remote_access(self):
         """Check if a remote session is possible."""
-        cmd = "ssh {} {} {} date".format(self.ssh_connection_options, self.ssh_options,
-                                         self.user_host)
-        return self._call_retries(cmd)
+        cmd = "ssh {} {} {} date".format(
+            self.ssh_connection_options, self.ssh_options, self.user_host
+        )
+        return self._call_retries(cmd, self.access_retry_count)
 
-    def _perform_operation(self, cmd, retry):
+    def _perform_operation(self, cmd, retry, retry_count):
         if retry:
-            return self._call_retries(cmd)
+            return self._call_retries(cmd, retry_count)
 
         return self._call(cmd)
 
@@ -125,8 +138,10 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
         """
         return message.startswith("ssh:")
 
-    # pylint: disable=too-many-branches,too-many-arguments,too-many-locals,inconsistent-return-statements
-    def operation(self, operation_type, operation_param, operation_dir=None, retry=False):
+    # pylint: disable=inconsistent-return-statements
+    def operation(
+        self, operation_type, operation_param, operation_dir=None, retry=False, retry_count=5
+    ):
         """Execute Main entry for remote operations. Returns (code, output).
 
         'operation_type' supports remote shell and copy operations.
@@ -154,18 +169,23 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
                 # See https://stackoverflow.com/questions/8254120/
                 #   how-to-escape-a-single-quote-in-single-quote-string-in-bash
                 operation_param = "{}".format(operation_param.replace("'", r"\'"))
-                operation_param = "{}".format(operation_param.replace("\"", r"\""))
+                operation_param = "{}".format(operation_param.replace('"', r"\""))
                 dollar = "$"
-            cmd = "ssh {} {} {} {} -c \"{}'{}'\"".format(self.ssh_connection_options,
-                                                         self.ssh_options, self.user_host,
-                                                         self.shell_binary, dollar, operation_param)
+            cmd = "ssh {} {} {} {} -c \"{}'{}'\"".format(
+                self.ssh_connection_options,
+                self.ssh_options,
+                self.user_host,
+                self.shell_binary,
+                dollar,
+                operation_param,
+            )
 
         elif operation_type == "copy_to":
             cmd = "scp -r {} {} ".format(self.ssh_connection_options, self.scp_options)
             # To support spaces in the filename or directory, we quote them one at a time.
             for copy_file in operation_param:
                 # Quote file on Posix.
-                quote = "\"" if not _IS_WINDOWS else ""
+                quote = '"' if not _IS_WINDOWS else ""
                 cmd += "{quote}{file}{quote} ".format(quote=quote, file=posix_path(copy_file))
             operation_dir = operation_dir if operation_dir else ""
             cmd += " {}:{}".format(self.user_host, posix_path(operation_dir))
@@ -180,14 +200,16 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
             # Note - this is a method which scp does not support directly.
             for copy_file in operation_param:
                 copy_file = posix_path(copy_file)
-                cmd = "scp -r {} {} {}:".format(self.ssh_connection_options, self.scp_options,
-                                                self.user_host)
+                cmd = "scp -r {} {} {}:".format(
+                    self.ssh_connection_options, self.scp_options, self.user_host
+                )
                 # Quote (on Posix), and escape the file if there are spaces.
                 # Note - we do not support other non-ASCII characters in a file name.
-                quote = "\"" if not _IS_WINDOWS else ""
+                quote = '"' if not _IS_WINDOWS else ""
                 if " " in copy_file:
-                    copy_file = re.escape("{quote}{file}{quote}".format(
-                        quote=quote, file=copy_file))
+                    copy_file = re.escape(
+                        "{quote}{file}{quote}".format(quote=quote, file=copy_file)
+                    )
                 cmd += "{} {}".format(copy_file, posix_path(operation_dir))
 
         else:
@@ -196,7 +218,7 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
         print(f"Created {operation_type} operation")
         buff = ""
 
-        ret, new_buff = self._perform_operation(cmd, retry)
+        ret, new_buff = self._perform_operation(cmd, retry, retry_count)
         buff += new_buff
 
         if ret != 0:
@@ -209,15 +231,18 @@ class RemoteOperations(object):  # pylint: disable=too-many-instance-attributes
 
     def shell(self, operation_param, operation_dir=None):
         """Provide helper for remote shell operations."""
-        return self.operation(operation_type="shell", operation_param=operation_param,
-                              operation_dir=operation_dir)
+        return self.operation(
+            operation_type="shell", operation_param=operation_param, operation_dir=operation_dir
+        )
 
     def copy_to(self, operation_param, operation_dir=None):
         """Provide helper for remote copy_to operations."""
-        return self.operation(operation_type="copy_to", operation_param=operation_param,
-                              operation_dir=operation_dir)
+        return self.operation(
+            operation_type="copy_to", operation_param=operation_param, operation_dir=operation_dir
+        )
 
     def copy_from(self, operation_param, operation_dir=None):
         """Provide helper for remote copy_from operations."""
-        return self.operation(operation_type="copy_from", operation_param=operation_param,
-                              operation_dir=operation_dir)
+        return self.operation(
+            operation_type="copy_from", operation_param=operation_param, operation_dir=operation_dir
+        )

@@ -26,7 +26,7 @@
 # it in the license file.
 
 global:
-    cpp_namespace: mongo
+    cpp_namespace: mongo::initialize_server_global_state
     cpp_includes:
       - mongo/logv2/constants.h
 
@@ -40,6 +40,7 @@ server_parameters:
       gte: 0
     description: 'Max log attribute size in kilobytes'
     set_at: [ startup, runtime ]
+    redact: false
 
   honorSystemUmask:
     description: 'Use the system provided umask, rather than overriding with processUmask config value'
@@ -47,6 +48,7 @@ server_parameters:
     cpp_class: HonorSystemUMaskServerParameter
     condition:
       preprocessor: '!defined(_WIN32)'
+    redact: false
 
   processUmask:
     description: >
@@ -56,4 +58,12 @@ server_parameters:
     cpp_class: ProcessUMaskServerParameter
     condition:
       preprocessor: '!defined(_WIN32)'
+    redact: false
 
+  backtraceLogFile:
+    description: >
+        File path to log backtraces to if test proctor is enabled.
+    set_at: startup
+    cpp_varname: gBacktraceLogFile
+    cpp_vartype: std::string
+    redact: false

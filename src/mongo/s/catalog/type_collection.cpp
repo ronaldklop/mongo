@@ -27,49 +27,46 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/s/catalog/type_collection.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/status_with.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-const NamespaceString CollectionType::ConfigNS("config.collections");
-
-CollectionType::CollectionType(NamespaceString nss, OID epoch, Date_t updatedAt, UUID uuid)
-    : CollectionTypeBase(std::move(nss), std::move(updatedAt)) {
-    setEpoch(std::move(epoch));
-    setUuid(std::move(uuid));
-}
+const NamespaceString CollectionType::ConfigNS(NamespaceString::kConfigsvrCollectionsNamespace);
 
 CollectionType::CollectionType(NamespaceString nss,
                                OID epoch,
-                               boost::optional<Timestamp> creationTime,
+                               Timestamp creationTime,
                                Date_t updatedAt,
-                               UUID uuid)
-    : CollectionTypeBase(std::move(nss), std::move(updatedAt)) {
+                               UUID uuid,
+                               KeyPattern keyPattern)
+    : CollectionTypeBase(std::move(nss),
+                         std::move(updatedAt),
+                         std::move(creationTime),
+                         std::move(uuid),
+                         std::move(keyPattern)) {
+    invariant(getTimestamp() != Timestamp(0, 0));
     setEpoch(std::move(epoch));
-    setUuid(std::move(uuid));
-    setTimestamp(creationTime);
 }
 
 CollectionType::CollectionType(const BSONObj& obj) {
-    CollectionType::parseProtected(IDLParserErrorContext("CollectionType"), obj);
+    CollectionType::parseProtected(IDLParserContext("CollectionType"), obj);
+    invariant(getTimestamp() != Timestamp(0, 0));
     uassert(ErrorCodes::BadValue,
-            str::stream() << "Invalid namespace " << getNss(),
+            str::stream() << "Invalid namespace " << getNss().toStringForErrorMsg(),
             getNss().isValid());
     if (!getPre22CompatibleEpoch()) {
         setPre22CompatibleEpoch(OID());
     }
-    uassert(ErrorCodes::NoSuchKey,
-            "Shard key is missing",
-            getPre50CompatibleKeyPattern() || getDropped());
 }
 
 std::string CollectionType::toString() const {
@@ -80,17 +77,17 @@ void CollectionType::setEpoch(OID epoch) {
     setPre22CompatibleEpoch(std::move(epoch));
 }
 
-void CollectionType::setUuid(UUID uuid) {
-    setPre50CompatibleUuid(std::move(uuid));
-}
-
-void CollectionType::setKeyPattern(KeyPattern keyPattern) {
-    setPre50CompatibleKeyPattern(std::move(keyPattern));
-}
-
 void CollectionType::setDefaultCollation(const BSONObj& defaultCollation) {
-    if (!defaultCollation.isEmpty())
-        setPre50CompatibleDefaultCollation(defaultCollation);
+    if (!defaultCollation.isEmpty()) {
+        CollectionTypeBase::setDefaultCollation(defaultCollation);
+    } else {
+        CollectionTypeBase::setDefaultCollation(boost::none);
+    }
+}
+
+void CollectionType::setMaxChunkSizeBytes(int64_t value) {
+    uassert(ErrorCodes::BadValue, "Default chunk size is out of range", value > 0);
+    CollectionTypeBase::setMaxChunkSizeBytes(value);
 }
 
 }  // namespace mongo

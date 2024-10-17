@@ -29,17 +29,29 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/secure_compare_memory.h"
 
 namespace mongo {
 namespace scram {
@@ -115,6 +127,8 @@ private:
         return std::tie(_password, _salt, _iterationCount);
     }
 
+    // clang-tidy flags this return type as readability-const-return-type
+    // NOLINTNEXTLINE(readability-const-return-type)
     static constexpr auto saltLength() -> decltype(HashBlock::kHashLength) {
         return HashBlock::kHashLength - 4;
     }

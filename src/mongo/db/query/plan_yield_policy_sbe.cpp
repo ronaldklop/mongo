@@ -27,20 +27,68 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/query/plan_yield_policy_sbe.h"
 
 namespace mongo {
+std::unique_ptr<PlanYieldPolicySBE> PlanYieldPolicySBE::make(
+    OperationContext* opCtx,
+    PlanYieldPolicy::YieldPolicy policy,
+    const MultipleCollectionAccessor& collections,
+    NamespaceString nss) {
+
+    std::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable;
+    if (collections.isAcquisition()) {
+        yieldable = PlanYieldPolicy::YieldThroughAcquisitions{};
+    } else {
+        yieldable = &collections.getMainCollection();
+    }
+
+    return make(opCtx,
+                policy,
+                opCtx->getServiceContext()->getFastClockSource(),
+                internalQueryExecYieldIterations.load(),
+                Milliseconds{internalQueryExecYieldPeriodMS.load()},
+                yieldable,
+                std::make_unique<YieldPolicyCallbacksImpl>(nss));
+}
+
+std::unique_ptr<PlanYieldPolicySBE> PlanYieldPolicySBE::make(
+    OperationContext* opCtx,
+    YieldPolicy policy,
+    ClockSource* clockSource,
+    int yieldFrequency,
+    Milliseconds yieldPeriod,
+    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<YieldPolicyCallbacks> callbacks) {
+    return std::unique_ptr<PlanYieldPolicySBE>(new PlanYieldPolicySBE(
+        opCtx, policy, clockSource, yieldFrequency, yieldPeriod, yieldable, std::move(callbacks)));
+}
+
+PlanYieldPolicySBE::PlanYieldPolicySBE(
+    OperationContext* opCtx,
+    YieldPolicy policy,
+    ClockSource* clockSource,
+    int yieldFrequency,
+    Milliseconds yieldPeriod,
+    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<YieldPolicyCallbacks> callbacks)
+    : PlanYieldPolicy(
+          opCtx, policy, clockSource, yieldFrequency, yieldPeriod, yieldable, std::move(callbacks)),
+      _useExperimentalCommitTxnBehavior(gYieldingSupportForSBE) {
+    uassert(4822879,
+            "WRITE_CONFLICT_RETRY_ONLY yield policy is not supported in SBE",
+            policy != YieldPolicy::WRITE_CONFLICT_RETRY_ONLY);
+}
+
 void PlanYieldPolicySBE::saveState(OperationContext* opCtx) {
     for (auto&& root : _yieldingPlans) {
-        root->saveState();
+        root->saveState(!_useExperimentalCommitTxnBehavior /* relinquish cursor */);
     }
 }
 
 void PlanYieldPolicySBE::restoreState(OperationContext* opCtx, const Yieldable*) {
     for (auto&& root : _yieldingPlans) {
-        root->restoreState();
+        root->restoreState(!_useExperimentalCommitTxnBehavior /* relinquish cursor */);
     }
 }
 }  // namespace mongo

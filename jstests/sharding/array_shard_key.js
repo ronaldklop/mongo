@@ -3,8 +3,7 @@
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 3});
 
@@ -52,7 +51,7 @@ assert.commandFailedWithCode(coll.update(value, Object.merge(value, {i: [3, 4]})
 // Multi-update the value with other fields (won't work, but no error)
 value = coll.findOne({i: 1});
 assert.commandWorked(coll.update(Object.merge(value, {i: [1, 1]}), {$set: {k: 4}}, false, true));
-assert.docEq(coll.findOne({i: 1}, {_id: 0}), {i: 1, j: 2});
+assert.docEq({i: 1, j: 2}, coll.findOne({i: 1}, {_id: 0}));
 
 // Query the value with other fields (won't work, but no error)
 value = coll.findOne({i: 1});
@@ -143,4 +142,3 @@ st.shardColl(coll, {_id: 1, i: 1}, {_id: ObjectId(), i: 1});
 st.printShardingStatus();
 
 st.stop();
-})();

@@ -2,7 +2,6 @@
  * Test that config servers keep chunk history for up to minSnapshotHistoryWindowInSeconds.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
@@ -16,10 +15,10 @@
  * - Read at insertTS and assert failure with StaleChunkHistory.
  * - Read at T2 - 1 sec, assert success.
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 // The snapshot window is the max of minSnapshotHistoryWindowInSeconds and
 // transactionLifetimeLimitSeconds.
@@ -65,8 +64,8 @@ const mongosDB = st.s.getDB(jsTestName());
 const mongosColl = mongosDB.test;
 const ns = `${jsTestName()}.test`;
 
-assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
-st.ensurePrimaryShard(mongosDB.getName(), st.rs0.getURL());
+assert.commandWorked(
+    mongosDB.adminCommand({enableSharding: mongosDB.getName(), primaryShard: st.rs0.getURL()}));
 st.shardColl(mongosColl, {_id: 1}, false);
 
 const getChunkHistory = (query) => {
@@ -139,4 +138,3 @@ assert.commandWorked(
     mongosDB.runCommand({find: "test", readConcern: {level: "snapshot", atClusterTime: recentTS}}));
 
 st.stop();
-})();

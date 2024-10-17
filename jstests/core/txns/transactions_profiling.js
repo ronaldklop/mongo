@@ -1,17 +1,24 @@
 // Test profiling for commands in multi-document transactions.
+//
 // @tags: [
+//   # The test runs commands that are not allowed with security token: endSession,
+//   # setProfilingLevel.
+//   not_allowed_with_signed_security_token,
 //   uses_transactions,
+//   requires_profiling,
 // ]
-(function() {
-"use strict";
-load("jstests/libs/profiler.js");  // For getLatestProfilerEntry.
+
+import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
 
 const dbName = "test";
 const collName = "transactions_profiling";
 const testDB = db.getSiblingDB(dbName);
 testDB[collName].drop({writeConcern: {w: "majority"}});
 
-testDB.setProfilingLevel(2);
+// Don't profile the setFCV command, which could be run during this test in the
+// fcv_upgrade_downgrade_replica_sets_jscore_passthrough suite.
+assert.commandWorked(testDB.setProfilingLevel(
+    1, {filter: {'command.setFeatureCompatibilityVersion': {'$exists': false}}}));
 
 const sessionOptions = {
     causalConsistency: false
@@ -232,4 +239,4 @@ assert.eq(profileObj.errCode, ErrorCodes.WriteConflict, tojson(profileObj));
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 session.endSession();
-}());
+assert.commandWorked(testDB.setProfilingLevel(0));

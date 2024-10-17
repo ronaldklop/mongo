@@ -29,11 +29,9 @@
 
 global:
   cpp_namespace: "mongo"
-  cpp_includes:
-    - "mongo/s/mongos_server_parameters.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
   loadRoutingTableOnStartup:
@@ -43,6 +41,7 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: "gLoadRoutingTableOnStartup"
     default: true
+    redact: false
 
   warmMinConnectionsInShardingTaskExecutorPoolOnStartup:
     description: >-
@@ -51,6 +50,7 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: "gWarmMinConnectionsInShardingTaskExecutorPoolOnStartup"
     default: true
+    redact: false
 
   warmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS:
     description: >-
@@ -61,11 +61,24 @@ server_parameters:
     default: 2000 # 2secs
     validator:
       gte: 0
+    redact: false
 
   enableFinerGrainedCatalogCacheRefresh:
     description: >-
-        Enables the finer grained catalog cache refresh behavior.
+        DEPRECATED: This parameter has been deprecated and is here only for maintaining backward compatibility.
     set_at: [ startup ]
     cpp_vartype: bool
     cpp_varname: "gEnableFinerGrainedCatalogCacheRefresh"
     default: false
+    redact: false
+
+  routingTableCacheChunkBucketSize:
+    description: >-
+        Size of the routing table cache buckets used to implement chunk grouping optimization.
+    set_at: [ startup ]
+    cpp_vartype: long long
+    cpp_varname: "gRoutingTableCacheChunkBucketSize"
+    default: 500
+    validator:
+      gt: 0
+    redact: false

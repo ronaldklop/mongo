@@ -27,12 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <string>
+#include <vector>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -1310,8 +1322,8 @@ public:
                                                        BSONObj predicate,
                                                        ErrorCodes::Error errorCode) {
         for (auto version : versions) {
-            params.indices.clear();
-            for (auto keyPattern : keyPatterns) {
+            params.mainCollectionInfo.indexes.clear();
+            for (const auto& keyPattern : keyPatterns) {
                 addIndex(keyPattern, BSON("2dsphereIndexVersion" << version));
             }
 
@@ -1327,15 +1339,15 @@ public:
                                            BSONObj predicate,
                                            std::vector<std::string> expectedSolutions) {
         for (auto version : versions) {
-            params.indices.clear();
-            for (auto keyPattern : keyPatterns) {
+            params.mainCollectionInfo.indexes.clear();
+            for (const auto& keyPattern : keyPatterns) {
                 addIndex(keyPattern, BSON("2dsphereIndexVersion" << version));
             }
 
             runQuery(predicate);
 
             assertNumSolutions(expectedSolutions.size());
-            for (auto solution : expectedSolutions) {
+            for (const auto& solution : expectedSolutions) {
                 assertSolutionExists(solution);
             }
         }
@@ -1348,8 +1360,8 @@ public:
                                            BSONObj predicate,
                                            size_t numExpectedSolutions) {
         for (auto version : versions) {
-            params.indices.clear();
-            for (auto keyPattern : keyPatterns) {
+            params.mainCollectionInfo.indexes.clear();
+            for (const auto& keyPattern : keyPatterns) {
                 addIndex(keyPattern, BSON("2dsphereIndexVersion" << version));
             }
 
@@ -1437,7 +1449,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, TwoDNearCompound) {
 }
 
 TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseBelowOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("geo1"
@@ -1462,7 +1474,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseBelowOr) {
 }
 
 TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseBelowElemMatch) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a.b"
@@ -1480,7 +1492,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseBelowElemMatch) {
 
 TEST_F(QueryPlanner2dsphereVersionTest,
        TwoDSphereSparseGeoPredicateInsideElemMatchWithOneElementOnTrailingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b.c"
@@ -1497,7 +1509,7 @@ TEST_F(QueryPlanner2dsphereVersionTest,
 
 TEST_F(QueryPlanner2dsphereVersionTest,
        TwoDSphereSparseGeoPredicateInsideElemMatchWithTwoElementsOnTrailingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b.c" << 1 << "b.d"
@@ -1515,7 +1527,7 @@ TEST_F(QueryPlanner2dsphereVersionTest,
 
 TEST_F(QueryPlanner2dsphereVersionTest,
        TwoDSphereSparseGeoPredicateInsideElemMatchWithUnindexedPredicate) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b.c" << 1 << "b.d"
@@ -1532,7 +1544,7 @@ TEST_F(QueryPlanner2dsphereVersionTest,
 }
 
 TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseNestedElemMatch) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b.c" << 1 << "b.d.e"
@@ -1550,7 +1562,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseNestedElemMatch) {
 }
 
 TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseNestedElemMatchInsideOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b.c" << 1 << "b.d.e"
@@ -1572,7 +1584,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, TwoDSphereSparseNestedElemMatchInsideOr)
 }
 
 TEST_F(QueryPlanner2dsphereVersionTest, NegationWithoutGeoPredCannotUseGeoIndex) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     std::vector<int> versions{2, 3};
     std::vector<BSONObj> keyPatterns = {BSON("a" << 1 << "b"
@@ -1586,7 +1598,7 @@ TEST_F(QueryPlanner2dsphereVersionTest, NegationWithoutGeoPredCannotUseGeoIndex)
 }
 
 TEST_F(QueryPlannerTest, 2dInexactFetchPredicateOverTrailingFieldHandledCorrectly) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a"
                   << "2d"
@@ -1600,7 +1612,7 @@ TEST_F(QueryPlannerTest, 2dInexactFetchPredicateOverTrailingFieldHandledCorrectl
 }
 
 TEST_F(QueryPlannerTest, 2dInexactFetchPredicateOverTrailingFieldHandledCorrectlyMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     const bool multikey = true;
     addIndex(BSON("a"
@@ -1616,7 +1628,7 @@ TEST_F(QueryPlannerTest, 2dInexactFetchPredicateOverTrailingFieldHandledCorrectl
 }
 
 TEST_F(QueryPlannerTest, 2dNearInexactFetchPredicateOverTrailingFieldHandledCorrectly) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a"
                   << "2d"
@@ -1629,7 +1641,7 @@ TEST_F(QueryPlannerTest, 2dNearInexactFetchPredicateOverTrailingFieldHandledCorr
 }
 
 TEST_F(QueryPlannerTest, 2dNearInexactFetchPredicateOverTrailingFieldMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     const bool multikey = true;
     addIndex(BSON("a"
@@ -1644,31 +1656,35 @@ TEST_F(QueryPlannerTest, 2dNearInexactFetchPredicateOverTrailingFieldMultikey) {
 }
 
 TEST_F(QueryPlannerTest, 2dNearWithInternalExprEqOverTrailingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a"
                   << "2d"
                   << "b" << 1));
 
+    // Normally $_internalExpr would be accompanied by a $expr expression. In this case we omit
+    // that, since we're just trying to ensure that the filter on 'b' can get pushed into the
+    // geoNear2d stage.
     runQuery(fromjson("{a: {$near: [0, 0]}, b: {$_internalExprEq: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists("{geoNear2d: {a: '2d', b: 1}}}}");
 }
 
-TEST_F(QueryPlannerTest, 2dNearWithInternalExprEqOverTrailingFieldMultikey) {
+TEST_F(QueryPlannerTest, 2dNearWithExprEqOverTrailingFieldMultikey) {
     const bool multikey = true;
     addIndex(BSON("a"
                   << "2d"
                   << "b" << 1),
              multikey);
 
-    runQuery(fromjson("{a: {$near: [0, 0]}, b: {$_internalExprEq: 1}}"));
+    runQuery(fromjson("{$and: [{$expr: {$eq: ['$b', 1]}}, {a: {$near: [0, 0]}}]}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {b: {$_internalExprEq: 1}}, node: {geoNear2d: {a: '2d', b: 1}}}}");
+        "{fetch: {filter: {$and: [{$expr: {$eq: ['$b', {$const:1}]}}]}, node: {geoNear2d: {a: "
+        "'2d', b: 1}}}}");
 }
 
 TEST_F(QueryPlannerTest, 2dGeoWithinWithInternalExprEqOverTrailingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a"
                   << "2d"
                   << "b" << 1));
@@ -1695,7 +1711,7 @@ TEST_F(QueryPlannerTest, 2dsphereNearWithInternalExprEq) {
 }
 
 TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverLeadingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "b"
                       << "2dsphere"));
 
@@ -1713,7 +1729,7 @@ TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverLeadingField) {
 }
 
 TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverLeadingFieldMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     const bool multikey = true;
     addIndex(BSON("a" << 1 << "b"
                       << "2dsphere"),
@@ -1725,7 +1741,7 @@ TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverLeadingFieldMultik
 }
 
 TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverTrailingField) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a"
                   << "2dsphere"
                   << "b" << 1));
@@ -1745,29 +1761,65 @@ TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverTrailingField) {
 }
 
 TEST_F(QueryPlannerTest, 2dsphereNonNearWithInternalExprEqOverTrailingFieldMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     const bool multikey = true;
     addIndex(BSON("a"
                   << "2dsphere"
                   << "b" << 1),
              multikey);
 
-    runQuery(
-        fromjson("{a: {$geoWithin: {$centerSphere: [[0, 0], 10]}}, b: {$_internalExprEq: 0}}"));
+    runQuery(fromjson(
+        "{$and: [{a: {$geoWithin: {$centerSphere: [[0, 0], 10]}}}, {$expr: {$eq: ['$b', 0]}}]}"));
 
     // This query will generate complex bounds, so we relax the checks to make the test readable.
     relaxBoundsCheckingToSubsetOnly();
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {a: {$geoWithin: {$centerSphere: [[0,0],10]}}, b: {$_internalExprEq: 0}},"
+        "{fetch: {filter: {$and: [{a: {$geoWithin: {$centerSphere: [[0, 0], 10]}}},"
+        "                         {$expr: {$eq: ['$b', 0]}}]},"
         "node: {ixscan: {pattern: {a : '2dsphere', b: 1}, filter: null, bounds:"
         "{a: [],"  // Complex, so leaving empty.
         "b: [['MinKey','MaxKey',true,true]]}}}}}");
 }
 
+TEST_F(QueryPlannerTest, 2dsphereBucketWithInternalBucketGeoWithin) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+    addIndex(BSON("data.a"
+                  << "2dsphere_bucket"),
+             false);
+
+    runQuery(
+        fromjson("{$_internalBucketGeoWithin: {withinRegion: {$centerSphere: [[0, 0], 10]}, field: "
+                 "\"a\"}}"));
+
+    // This query will generate complex bounds, so we relax the checks to make the test readable.
+    relaxBoundsCheckingToSubsetOnly();
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {$_internalBucketGeoWithin: {withinRegion: {$centerSphere: [[0,0],10]}, "
+        "field: 'a'}},"
+        "node: {ixscan: {pattern: {'data.a' : '2dsphere_bucket'}, filter: null, bounds:"
+        "{'data.a': []"  // Complex, so leaving empty.
+        "}}}}}");
+}
+
+TEST_F(QueryPlannerTest, 2dsphereBucketWithInternalBucketGeoWithin2dGeneratesCollScan) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+    addIndex(BSON("data.a"
+                  << "2dsphere_bucket"),
+             false);
+
+    // This query should not produce bounds.
+    runInvalidQuery(
+        fromjson("{$_internalBucketGeoWithin: {withinRegion: {$center: [[0, 0], 10]}, field: "
+                 "\"a\"}}"));
+    ASSERT_EQUALS(plannerStatus.code(), ErrorCodes::NoQueryExecutionPlans);
+}
+
 TEST_F(QueryPlannerTest, 2dWithinPredicateOverTrailingFieldElemMatchMultikey) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     const bool multikey = true;
     addIndex(BSON("a"

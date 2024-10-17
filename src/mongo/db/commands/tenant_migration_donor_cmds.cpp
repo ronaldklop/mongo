@@ -27,28 +27,68 @@
  *    it in the license file.
  */
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
+#include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/repl/tenant_migration_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/serverless/serverless_types_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(returnResponseCommittedForDonorStartMigrationCmd);
 
 class DonorStartMigrationCmd : public TypedCommand<DonorStartMigrationCmd> {
 public:
     using Request = DonorStartMigration;
     using Response = DonorStartMigrationResponse;
-
-    std::set<StringData> sensitiveFieldNames() const final {
-        return {Request::kDonorCertificateForRecipientFieldName,
-                Request::kRecipientCertificateForDonorFieldName};
-    }
 
     class Invocation : public InvocationBase {
 
@@ -56,38 +96,55 @@ public:
         using InvocationBase::InvocationBase;
 
         Response typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    "donorStartMigration command not enabled",
-                    repl::feature_flags::gTenantMigrations.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available on config servers",
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
             uassert(
                 5356100,
                 "donorStartMigration not available while upgrading or downgrading the donor FCV",
-                !serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
+                !serverGlobalParams.featureCompatibility.acquireFCVSnapshot()
+                     .isUpgradingOrDowngrading());
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are only available if --serverless is enabled",
+                    repl::ReplicationCoordinator::get(opCtx)->getSettings().isServerless());
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "Cannot run tenant migration with x509 authentication",
+                    repl::tenantMigrationDisableX509Auth);
 
             const auto& cmd = request();
+            const auto migrationProtocol = cmd.getProtocol().value_or(kDefaultMigrationProtocol);
+            const auto& tenantId = cmd.getTenantId();
+            const auto& tenantIds = cmd.getTenantIds();
 
+            tenant_migration_util::protocolTenantIdCompatibilityCheck(migrationProtocol, tenantId);
+            tenant_migration_util::protocolTenantIdsCompatibilityCheck(migrationProtocol,
+                                                                       tenantIds);
+            tenant_migration_util::protocolStorageOptionsCompatibilityCheck(opCtx,
+                                                                            migrationProtocol);
+            tenant_migration_util::protocolReadPreferenceCompatibilityCheck(
+                opCtx, migrationProtocol, cmd.getReadPreferenceSettings());
+
+            // tenantId will be set to empty string for the "shard merge" protocol.
             TenantMigrationDonorDocument stateDoc(cmd.getMigrationId(),
                                                   cmd.getRecipientConnectionString().toString(),
-                                                  cmd.getReadPreference(),
-                                                  cmd.getTenantId().toString());
-
-            if (!repl::tenantMigrationDisableX509Auth) {
-                uassert(ErrorCodes::InvalidOptions,
-                        str::stream() << "'" << Request::kDonorCertificateForRecipientFieldName
-                                      << "' is a required field",
-                        cmd.getDonorCertificateForRecipient());
-                uassert(ErrorCodes::InvalidOptions,
-                        str::stream() << "'" << Request::kRecipientCertificateForDonorFieldName
-                                      << "' is a required field",
-                        cmd.getRecipientCertificateForDonor());
-                stateDoc.setDonorCertificateForRecipient(cmd.getDonorCertificateForRecipient());
-                stateDoc.setRecipientCertificateForDonor(cmd.getRecipientCertificateForDonor());
-            }
+                                                  cmd.getReadPreferenceSettings());
+            stateDoc.setTenantId(tenantId);
+            stateDoc.setTenantIds(tenantIds);
+            stateDoc.setProtocol(migrationProtocol);
 
             const auto stateDocBson = stateDoc.toBSON();
+
+            if (MONGO_unlikely(returnResponseCommittedForDonorStartMigrationCmd.shouldFail())) {
+                LOGV2(5949401,
+                      "Immediately returning committed because "
+                      "'returnResponseCommittedForDonorStartMigrationCmd' failpoint is enabled",
+                      "tenantMigrationDonorInstance"_attr = stateDoc.toBSON());
+                return Response(TenantMigrationDonorStateEnum::kCommitted);
+            }
 
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
@@ -95,31 +152,27 @@ public:
             auto donor = TenantMigrationDonorService::Instance::getOrCreate(
                 opCtx, donorService, stateDocBson);
 
-            // If the conflict is discovered here, it implies that there is an existing instance
-            // with the same migrationId but different options (e.g. tenantId or
-            // recipientConnectionString or readPreference).
-            uassertStatusOK(donor->checkIfOptionsConflict(stateDoc));
+            // always ensure we wait for the initial state document to be inserted.
+            donor->getInitialStateDocumentDurableFuture().get(opCtx);
+            auto durableState = donor->getDurableState();
 
-            auto durableState = [&] {
-                try {
-                    return donor->getDurableState(opCtx);
-                } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>& ex) {
-                    // The conflict is discovered while inserting the donor instance's state doc.
-                    // This implies that there is no other instance with the same migrationId, but
-                    // there is another instance with the same tenantId. Therefore, the instance
-                    // above was created by this command, so remove it.
-                    // The status from this exception will be passed to the instance interrupt()
-                    // method.
-                    donorService->releaseInstance(stateDocBson["_id"].wrap(), ex.toStatus());
-                    throw;
-                }
-            }();
-
-            auto response = Response(durableState.state);
-            if (durableState.abortReason) {
-                BSONObjBuilder bob;
-                durableState.abortReason.get().serializeErrorToBSON(&bob);
-                response.setAbortReason(bob.obj());
+            auto response = Response(durableState->state);
+            switch (durableState->state) {
+                case TenantMigrationDonorStateEnum::kUninitialized:
+                case TenantMigrationDonorStateEnum::kAbortingIndexBuilds:
+                case TenantMigrationDonorStateEnum::kDataSync:
+                    break;
+                case TenantMigrationDonorStateEnum::kBlocking:
+                case TenantMigrationDonorStateEnum::kCommitted: {
+                    invariant(durableState->blockTimestamp);
+                    response.setBlockTimestamp(durableState->blockTimestamp);
+                } break;
+                case TenantMigrationDonorStateEnum::kAborted: {
+                    invariant(durableState->abortReason);
+                    response.setAbortReason(durableState->abortReason);
+                } break;
+                default:
+                    MONGO_UNREACHABLE;
             }
 
             return response;
@@ -130,19 +183,20 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::runTenantMigration));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::runTenantMigration));
         }
 
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
         }
     };
 
-    std::string help() const {
+    std::string help() const override {
         return "Start migrating databases whose names match the specified prefix to the specified "
                "replica set.";
     }
@@ -153,8 +207,8 @@ public:
     BasicCommand::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return BasicCommand::AllowedOnSecondary::kNever;
     }
-
-} donorStartMigrationCmd;
+};
+MONGO_REGISTER_COMMAND(DonorStartMigrationCmd).forShard();
 
 class DonorForgetMigrationCmd : public TypedCommand<DonorForgetMigrationCmd> {
 public:
@@ -166,32 +220,42 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    "donorForgetMigration command not enabled",
-                    repl::feature_flags::gTenantMigrations.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available on config servers",
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are only available if --serverless is enabled",
+                    repl::ReplicationCoordinator::get(opCtx)->getSettings().isServerless());
 
             const auto& cmd = request();
 
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
-            auto donor = TenantMigrationDonorService::Instance::lookup(
+            auto [optionalDonor, _] = TenantMigrationDonorService::Instance::lookup(
                 opCtx, donorService, BSON("_id" << cmd.getMigrationId()));
             uassert(ErrorCodes::NoSuchTenantMigration,
                     str::stream() << "Could not find tenant migration with id "
                                   << cmd.getMigrationId(),
-                    donor);
+                    optionalDonor);
 
-            auto durableState = donor.get()->getDurableState(opCtx);
+            // Retrieve the shared_ptr from boost::optional to improve readability.
+            auto donorPtr = optionalDonor.value();
+
+            // always ensure we wait for the initial state document to be inserted.
+            donorPtr->getInitialStateDocumentDurableFuture().get(opCtx);
+
+            auto durableState = donorPtr->getDurableState();
             uassert(ErrorCodes::TenantMigrationInProgress,
                     str::stream() << "Could not forget migration with id " << cmd.getMigrationId()
                                   << " since no decision has been made yet",
-                    durableState.state == TenantMigrationDonorStateEnum::kCommitted ||
-                        durableState.state == TenantMigrationDonorStateEnum::kAborted);
+                    durableState->state == TenantMigrationDonorStateEnum::kCommitted ||
+                        durableState->state == TenantMigrationDonorStateEnum::kAborted);
 
-            donor.get().get()->onReceiveDonorForgetMigration();
-            donor.get().get()->getCompletionFuture().get(opCtx);
+            donorPtr->onReceiveDonorForgetMigration();
+            donorPtr->getForgetMigrationDurableFuture().get(opCtx);
         }
 
     private:
@@ -199,15 +263,16 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::runTenantMigration));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::runTenantMigration));
         }
 
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -222,7 +287,8 @@ public:
     BasicCommand::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return BasicCommand::AllowedOnSecondary::kNever;
     }
-} donorForgetMigrationCmd;
+};
+MONGO_REGISTER_COMMAND(DonorForgetMigrationCmd).forShard();
 
 class DonorAbortMigrationCmd : public TypedCommand<DonorAbortMigrationCmd> {
 public:
@@ -234,23 +300,26 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    "donorAbortMigration command not enabled",
-                    repl::feature_flags::gTenantMigrations.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available on config servers",
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are only available if --serverless is enabled",
+                    repl::ReplicationCoordinator::get(opCtx)->getSettings().isServerless());
 
             const RequestType& cmd = request();
 
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
-            auto donorPtr = TenantMigrationDonorService::Instance::lookup(
+            auto [optionalDonor, _] = TenantMigrationDonorService::Instance::lookup(
                 opCtx, donorService, BSON("_id" << cmd.getMigrationId()));
 
             // If there is NoSuchTenantMigration, perform a noop write and wait for it to be
             // majority committed to verify that any durable data read up to this point is majority
             // committed.
-            if (!donorPtr) {
+            if (!optionalDonor) {
                 tenant_migration_access_blocker::performNoopWrite(opCtx,
                                                                   "NoSuchTenantMigration error");
 
@@ -267,20 +336,16 @@ public:
                                         << cmd.getMigrationId());
             }
 
-            const auto& donor = donorPtr.get().get();
+            // Retrieve the shared_ptr from boost::optional to improve readability
+            auto donorPtr = optionalDonor.value();
 
-            // Ensure that we only are able to run donorAbortMigration after the donor has called
-            // run() and has inserted a majority committed state document for the migration.
-            donor->getMigrationCancelableFuture().get(opCtx);
-            donor->getInitialDonorStateDurableFuture().get(opCtx);
-            donor->onReceiveDonorAbortMigration();
-            donor->getDecisionFuture().get(opCtx);
-
-            auto durableState = donor->getDurableState(opCtx);
+            donorPtr->onReceiveDonorAbortMigration();
+            donorPtr->getDecisionFuture().get(opCtx);
+            auto durableState = donorPtr->getDurableState();
 
             uassert(ErrorCodes::TenantMigrationCommitted,
                     "Tenant migration already committed",
-                    durableState.state == TenantMigrationDonorStateEnum::kAborted);
+                    durableState->state == TenantMigrationDonorStateEnum::kAborted);
         }
 
     private:
@@ -288,15 +353,16 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::runTenantMigration));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::runTenantMigration));
         }
 
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -311,7 +377,8 @@ public:
     BasicCommand::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return BasicCommand::AllowedOnSecondary::kNever;
     }
-} donorAbortMigrationCmd;
+};
+MONGO_REGISTER_COMMAND(DonorAbortMigrationCmd).forShard();
 
 }  // namespace
 }  // namespace mongo

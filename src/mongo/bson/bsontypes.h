@@ -30,13 +30,18 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstdint>
+#include <fmt/format.h>
 #include <iosfwd>
+#include <limits>
 #include <type_traits>
 
 #include "mongo/base/counter.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
 
@@ -135,6 +140,12 @@ std::ostream& operator<<(std::ostream& stream, BSONType type);
  */
 bool isValidBSONType(int type);
 
+/**
+ * IDL callback validator
+ */
+Status isValidBSONTypeName(StringData typeName);
+
+
 inline bool isNumericBSONType(BSONType type) {
     switch (type) {
         case NumberDouble:
@@ -192,7 +203,10 @@ enum BinDataType {
     bdtUUID = 3,             /* deprecated */
     newUUID = 4,             /* language-independent UUID format across all drivers */
     MD5Type = 5,
-    Encrypt = 6, /* encryption placeholder or encrypted data */
+    Encrypt = 6,   /* encryption placeholder or encrypted data */
+    Column = 7,    /* compressed column */
+    Sensitive = 8, /* data that should be redacted and protected from unnecessary exposure */
+    Vector = 9,    /* A denser format of an array of numbers representing a vector */
     bdtCustom = 128
 };
 
@@ -209,13 +223,19 @@ bool isValidBinDataType(int type);
 /** Returns a number for where a given type falls in the sort order.
  *  Elements with the same return value should be compared for value equality.
  *  The return value is not a BSONType and should not be treated as one.
- *  Note: if the order changes, indexes have to be re-built or than can be corruption
+ *  Note: if the order changes, indexes have to be re-built or there can be corruption
  */
-inline int canonicalizeBSONType(BSONType type) {
+inline constexpr std::int8_t canonicalizeBSONTypeUnsafeLookup(BSONType type) {
+    // This switch statement gets compiled down to a lookup table in GCC >= 8.5
+    // To achieve this there must be NO exceptions thrown nor functions called as
+    // otherwise it would break the optimization.
+    // Additionally, it must also contain a default case in order to fully build
+    // out the lookup table as it won't generate it as such without it.
     switch (type) {
         case MinKey:
+            return MinKey;
         case MaxKey:
-            return type;
+            return MaxKey;
         case EOO:
         case Undefined:
             return 0;
@@ -252,9 +272,29 @@ inline int canonicalizeBSONType(BSONType type) {
         case CodeWScope:
             return 65;
         default:
-            verify(0);
-            return -1;
+            // As all possible values are mapped in the BSONType enum, we'll return a signal value
+            // to be checked (if desired) by callers of the method if something completely
+            // unexpected comes in. This codepath would only be reached if the given BSONType is not
+            // a valid BSONType. One way this could occur is if the given value was constructed by
+            // forcibly casting something into a BSONType without checking if it's valid.
+            const auto ret = std::numeric_limits<std::int8_t>::min();
+            static_assert(ret < MinKey);  // To explicitly make it different than all BSONTypes
+            return ret;
     }
+}
+
+/** Returns a number for where a given type falls in the sort order.
+ *  Elements with the same return value should be compared for value equality.
+ *  The return value is not a BSONType and should not be treated as one.
+ *  Note: if the order changes, indexes have to be re-built or there can be corruption
+ */
+inline int canonicalizeBSONType(BSONType type) {
+    auto ret = canonicalizeBSONTypeUnsafeLookup(type);
+    if (ret != std::numeric_limits<std::int8_t>::min()) {
+        return ret;
+    }
+    msgasserted(ErrorCodes::InvalidBSONType,
+                fmt::format("Invalid/undefined BSONType value was provided ({:d})", type));
 }
 
 template <BSONType value>

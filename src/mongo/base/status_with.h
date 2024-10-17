@@ -30,24 +30,21 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <iosfwd>
+#include <string>
 #include <type_traits>
 #include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/compiler.h"
-
-#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
-#include "mongo/util/invariant.h"
-#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
-
+#include "mongo/unittest/stringify.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
-
-// Including builder.h here would cause a cycle.
-template <typename Allocator>
-class StringBuilderImpl;
 
 template <typename T>
 class StatusWith;
@@ -102,16 +99,16 @@ public:
     using value_type = T;
 
     /**
-     * for the error case
+     * For the error case.
+     * As with the `Status` constructors, `reason` can be `std::string` or
+     * anything that can construct one (e.g. `StringData`, `str::stream`).
      */
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, StringData reason)
-        : _status(code, reason) {}
     MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, std::string reason)
         : _status(code, std::move(reason)) {}
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const char* reason)
-        : _status(code, reason) {}
-    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const str::stream& reason)
-        : _status(code, reason) {}
+    template <typename Reason,
+              std::enable_if_t<std::is_constructible_v<std::string, Reason&&>, int> = 0>
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, Reason&& reason)
+        : StatusWith(code, std::string{std::forward<Reason>(reason)}) {}
 
     /**
      * for the error case
@@ -159,110 +156,6 @@ public:
     }
 
     /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the lvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, T&>> transform(F&& f) & {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the const overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, const T&>> transform(F&& f) const& {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the rvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, T&&>> transform(F&& f) && {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the const rvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, const T&&>> transform(F&& f) const&& {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the lvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, T&>::value_type> andThen(F&& f) & {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the const overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, const T&>::value_type> andThen(F&& f) const& {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the rvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, T&&>::value_type> andThen(F&& f) && {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the const rvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, const T&&>::value_type> andThen(F&& f) const&& {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
      * This method is a transitional tool, to facilitate transition to compile-time enforced status
      * checking.
      *
@@ -287,6 +180,15 @@ private:
     Status _status;
     boost::optional<T> _t;
 };
+
+template <typename T>
+std::string stringifyForAssert(const StatusWith<T>& sw) {
+    if (sw.isOK()) {
+        return unittest::stringify::invoke(sw.getValue());
+    } else {
+        return unittest::stringify::invoke(sw.getStatus());
+    }
+}
 
 template <typename T>
 auto operator<<(std::ostream& stream, const StatusWith<T>& sw)
@@ -359,22 +261,22 @@ bool operator!=(const Status& status, const StatusWith<T>& sw) {
 //
 
 template <typename T>
-bool operator==(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+bool operator==(const StatusWith<T>& sw, ErrorCodes::Error code) {
     return sw.getStatus() == code;
 }
 
 template <typename T>
-bool operator==(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+bool operator==(ErrorCodes::Error code, const StatusWith<T>& sw) {
     return code == sw.getStatus();
 }
 
 template <typename T>
-bool operator!=(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+bool operator!=(const StatusWith<T>& sw, ErrorCodes::Error code) {
     return !(sw == code);
 }
 
 template <typename T>
-bool operator!=(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+bool operator!=(ErrorCodes::Error code, const StatusWith<T>& sw) {
     return !(code == sw);
 }
 

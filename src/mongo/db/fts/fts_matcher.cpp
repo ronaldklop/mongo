@@ -27,12 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
+#include <vector>
 
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/fts/fts_element_iterator.h"
 #include "mongo/db/fts/fts_matcher.h"
 #include "mongo/db/fts/fts_phrase_matcher.h"
 #include "mongo/db/fts/fts_tokenizer.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -139,6 +144,13 @@ bool FTSMatcher::negativePhrasesMatch(const BSONObj& obj) const {
     }
 
     return true;
+}
+
+size_t FTSMatcher::getApproximateSize() const {
+    auto size = sizeof(FTSMatcher);
+    size += _query.getApproximateSize() - sizeof(_query);
+    size += _spec.getApproximateSize() - sizeof(_spec);
+    return size;
 }
 
 bool FTSMatcher::_phraseMatch(const string& phrase, const BSONObj& obj) const {

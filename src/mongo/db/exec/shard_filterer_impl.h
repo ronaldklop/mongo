@@ -29,7 +29,13 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
 
@@ -54,10 +60,11 @@ public:
 
     const KeyPattern& getKeyPattern() const override;
 
+    size_t getApproximateSize() const override;
+
 private:
     DocumentBelongsResult keyBelongsToMeHelper(const BSONObj& doc) const;
 
     ScopedCollectionFilter _collectionFilter;
-    boost::optional<ShardKeyPattern> _keyPattern;
 };
 }  // namespace mongo

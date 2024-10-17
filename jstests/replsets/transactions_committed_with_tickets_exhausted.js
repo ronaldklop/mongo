@@ -2,13 +2,15 @@
  * Test ensures that exhausting the number of write tickets in the system does not prevent
  * transactions from being committed.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   requires_fcv_70,
+ *   uses_transactions,
+ *   uses_prepare_transaction,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/parallelTester.js");  // for Thread
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // We set the number of write tickets to be a small value in order to avoid needing to spawn a
 // large number of threads to exhaust all of the available ones.
@@ -18,6 +20,8 @@ const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
         setParameter: {
+            // This test requires a fixed ticket pool size.
+            storageEngineConcurrencyAdjustmentAlgorithm: "fixedConcurrentTransactions",
             wiredTigerConcurrentWriteTransactions: kNumWriteTickets,
 
             // Setting a transaction lifetime of 20 seconds works fine locally because the
@@ -92,4 +96,3 @@ for (let thread of threads) {
 }
 
 rst.stopSet();
-})();

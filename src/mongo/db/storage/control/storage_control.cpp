@@ -27,18 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
-#include "mongo/db/storage/control/storage_control.h"
 
+#include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/checkpointer.h"
 #include "mongo/db/storage/control/journal_flusher.h"
+#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -68,24 +73,20 @@ void startStorageControls(ServiceContext* serviceContext, bool forTestOnly) {
     // Ephemeral engines are not durable -- waitUntilDurable() returns early -- but frequent updates
     // to replication's JournalListener in the waitUntilDurable() code may help update replication
     // timestamps more quickly.
-    //
-    // (Note: the ephemeral engine returns false for isDurable(), so we must be careful not to
-    // disable it.)
     if (journalFlusherPaused) {
         // This is a restart and the JournalListener was paused. Resume the existing JournalFlusher.
         JournalFlusher::get(serviceContext)->resume();
         journalFlusherPaused = false;
     } else {
         std::unique_ptr<JournalFlusher> journalFlusher = std::make_unique<JournalFlusher>(
-            /*disablePeriodicFlushes*/ forTestOnly ||
-            (!storageEngine->isDurable() && !storageEngine->isEphemeral()));
-        journalFlusher->go();
+            /*disablePeriodicFlushes*/ forTestOnly);
         JournalFlusher::set(serviceContext, std::move(journalFlusher));
+        JournalFlusher::get(serviceContext)->go();
     }
 
-    if (!storageEngine->isEphemeral() && !storageGlobalParams.readOnly) {
-        std::unique_ptr<Checkpointer> checkpointer =
-            std::make_unique<Checkpointer>(storageEngine->getEngine());
+    if (storageEngine->supportsCheckpoints() && !storageEngine->isEphemeral() &&
+        !storageGlobalParams.queryableBackupMode) {
+        std::unique_ptr<Checkpointer> checkpointer = std::make_unique<Checkpointer>();
         checkpointer->go();
         Checkpointer::set(serviceContext, std::move(checkpointer));
     }
@@ -116,18 +117,6 @@ void stopStorageControls(ServiceContext* serviceContext, const Status& reason, b
         // stopped.
         invariant(!forRestart);
     }
-}
-
-void triggerJournalFlush(ServiceContext* serviceContext) {
-    JournalFlusher::get(serviceContext)->triggerJournalFlush();
-}
-
-void waitForJournalFlush(OperationContext* opCtx) {
-    JournalFlusher::get(opCtx)->waitForJournalFlush();
-}
-
-void interruptJournalFlusherForReplStateChange(ServiceContext* serviceContext) {
-    JournalFlusher::get(serviceContext)->interruptJournalFlusherForReplStateChange();
 }
 
 }  // namespace StorageControl

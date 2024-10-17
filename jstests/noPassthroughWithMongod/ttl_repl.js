@@ -7,7 +7,8 @@
  *  @tags: [requires_replication]
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 var rt = new ReplSetTest({name: "ttl_repl", nodes: 2});
 
@@ -15,7 +16,7 @@ var rt = new ReplSetTest({name: "ttl_repl", nodes: 2});
 
 // setup set
 var nodes = rt.startSet();
-rt.initiate();
+rt.initiateWithHighElectionTimeout();
 var primary = rt.getPrimary();
 rt.awaitSecondaryNodes();
 var secondary1 = rt.getSecondary();
@@ -30,9 +31,9 @@ primarycol.drop();
 primarydb.createCollection(primarycol.getName());
 
 // create new collection. insert 24 docs, aged at one-hour intervalss
-now = (new Date()).getTime();
+let now = (new Date()).getTime();
 var bulk = primarycol.initializeUnorderedBulkOp();
-for (i = 0; i < 24; i++) {
+for (let i = 0; i < 24; i++) {
     bulk.insert({x: new Date(now - (3600 * 1000 * i))});
 }
 assert.commandWorked(bulk.execute());
@@ -104,7 +105,7 @@ var primaryOplog = primary.getDB('local').oplog.rs.find().sort({$natural: 1}).to
 var collModEntry = primaryOplog.find(op => op.o.collMod);
 
 assert(collModEntry, "collMod entry was not present in the oplog.");
-assert.eq(initialExpireAfterSeconds, collModEntry.o2["expireAfterSeconds_old"]);
+assert.eq(initialExpireAfterSeconds, collModEntry.o2["indexOptions_old"]["expireAfterSeconds"]);
 assert.eq("x_1", collModEntry.o["index"]["name"]);
 
 // finish up

@@ -30,32 +30,45 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
 class AccumulatorInternalJsReduce final : public AccumulatorState {
 public:
-    static constexpr auto kAccumulatorName = "$_internalJsReduce"_sd;
+    static constexpr auto kName = "$_internalJsReduce"_sd;
 
-    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx,
+    const char* getOpName() const final {
+        return kName.rawData();
+    }
+
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx,
                                                          StringData funcSource);
 
-    static AccumulationExpression parseInternalJsReduce(ExpressionContext* const expCtx,
+    static AccumulationExpression parseInternalJsReduce(ExpressionContext* expCtx,
                                                         BSONElement elem,
                                                         VariablesParseState vps);
 
     AccumulatorInternalJsReduce(ExpressionContext* const expCtx, StringData funcSource)
         : AccumulatorState(expCtx), _funcSource(funcSource) {
-        _memUsageBytes = sizeof(*this);
-    }
-
-    const char* getOpName() const final {
-        return kAccumulatorName.rawData();
+        _memUsageTracker.set(sizeof(*this));
     }
 
     void processInternal(const Value& input, bool merging) final;
@@ -64,9 +77,9 @@ public:
 
     void reset() final;
 
-    virtual Document serialize(boost::intrusive_ptr<Expression> initializer,
-                               boost::intrusive_ptr<Expression> argument,
-                               bool explain) const override;
+    Document serialize(boost::intrusive_ptr<Expression> initializer,
+                       boost::intrusive_ptr<Expression> argument,
+                       const SerializationOptions& options = {}) const override;
 
 private:
     static std::string parseReduceFunction(BSONElement func);
@@ -78,20 +91,21 @@ private:
 
 class AccumulatorJs final : public AccumulatorState {
 public:
-    static constexpr auto kAccumulatorName = "$accumulator"_sd;
+    static constexpr auto kName = "$accumulator"_sd;
+
     const char* getOpName() const final {
-        return kAccumulatorName.rawData();
+        return kName.rawData();
     }
 
     // An AccumulatorState instance only owns its "static" arguments: those that don't need to be
     // evaluated per input document.
-    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx,
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx,
                                                          std::string init,
                                                          std::string accumulate,
                                                          std::string merge,
                                                          boost::optional<std::string> finalize);
 
-    static AccumulationExpression parse(ExpressionContext* const expCtx,
+    static AccumulationExpression parse(ExpressionContext* expCtx,
                                         BSONElement elem,
                                         VariablesParseState vps);
 
@@ -100,10 +114,9 @@ public:
     void processInternal(const Value& input, bool merging) final;
     void reduceMemoryConsumptionIfAble() final;
 
-
     Document serialize(boost::intrusive_ptr<Expression> initializer,
                        boost::intrusive_ptr<Expression> argument,
-                       bool explain) const final;
+                       const SerializationOptions& options = {}) const final;
     void startNewGroup(Value const& input) final;
 
 private:

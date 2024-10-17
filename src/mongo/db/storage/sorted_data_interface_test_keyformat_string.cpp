@@ -27,13 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstring>
 #include <memory>
+#include <string>
 
-#include "mongo/db/storage/key_string.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 namespace {
@@ -42,11 +57,9 @@ TEST(SortedDataInterface, KeyFormatStringInsertDuplicates) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
         /*unique=*/false, /*partial=*/false, KeyFormat::String));
-    if (!sorted) {
-        // Not supported by this storage engine.
-        return;
-    }
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     ASSERT(sorted->isEmpty(opCtx.get()));
 
     char buf1[12];
@@ -78,7 +91,7 @@ TEST(SortedDataInterface, KeyFormatStringInsertDuplicates) {
     auto ksSeek = makeKeyStringForSeek(sorted.get(), key1, true, true);
     {
         auto cursor = sorted->newCursor(opCtx.get());
-        auto entry = cursor->seek(ksSeek);
+        auto entry = cursor->seek(ksSeek.finishAndGetBuffer());
         ASSERT(entry);
         ASSERT_EQ(*entry, IndexKeyEntry(key1, rid1));
 
@@ -93,7 +106,7 @@ TEST(SortedDataInterface, KeyFormatStringInsertDuplicates) {
 
     {
         auto cursor = sorted->newCursor(opCtx.get());
-        auto entry = cursor->seekForKeyString(ksSeek);
+        auto entry = cursor->seekForKeyString(ksSeek.finishAndGetBuffer());
         ASSERT(entry);
         ASSERT_EQ(entry->loc, rid1);
         auto ks1 = makeKeyString(sorted.get(), key1, rid1);
@@ -113,15 +126,99 @@ TEST(SortedDataInterface, KeyFormatStringInsertDuplicates) {
     }
 }
 
+TEST(SortedDataInterface, KeyFormatStringUniqueInsertRemoveDuplicates) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
+        /*unique=*/true, /*partial=*/false, KeyFormat::String));
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+    ASSERT(sorted->isEmpty(opCtx.get()));
+
+    std::string buf1(12, 0);
+    std::string buf2(12, 1);
+    std::string buf3(12, '\xff');
+
+    RecordId rid1(buf1.c_str(), 12);
+    RecordId rid2(buf2.c_str(), 12);
+    RecordId rid3(buf3.c_str(), 12);
+
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key1, rid1),
+                                 /*dupsAllowed*/ true));
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key1, rid1),
+                                 /*dupsAllowed*/ false));
+        auto status = sorted->insert(opCtx.get(),
+                                     makeKeyString(sorted.get(), key1, rid2),
+                                     /*dupsAllowed*/ false);
+        ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
+
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key1, rid3),
+                                 /*dupsAllowed*/ true));
+        uow.commit();
+    }
+
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key1, rid1),
+                        /*dupsAllowed*/ true);
+
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key2, rid1),
+                                 /*dupsAllowed*/ true));
+        uow.commit();
+    }
+
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+
+    auto ksSeek = makeKeyStringForSeek(sorted.get(), key1, true, true);
+    {
+        auto cursor = sorted->newCursor(opCtx.get());
+        auto entry = cursor->seek(ksSeek.finishAndGetBuffer());
+        ASSERT(entry);
+        ASSERT_EQ(*entry, IndexKeyEntry(key1, rid3));
+
+        entry = cursor->next();
+        ASSERT(entry);
+        ASSERT_EQ(*entry, IndexKeyEntry(key2, rid1));
+
+        entry = cursor->next();
+        ASSERT_FALSE(entry);
+    }
+
+    {
+        auto cursor = sorted->newCursor(opCtx.get());
+        auto entry = cursor->seekForKeyString(ksSeek.finishAndGetBuffer());
+        ASSERT(entry);
+        ASSERT_EQ(entry->loc, rid3);
+        auto ks1 = makeKeyString(sorted.get(), key1, rid3);
+        ASSERT_EQ(entry->keyString, ks1);
+
+        entry = cursor->nextKeyString();
+        ASSERT(entry);
+        ASSERT_EQ(entry->loc, rid1);
+        auto ks2 = makeKeyString(sorted.get(), key2, rid1);
+        ASSERT_EQ(entry->keyString, ks2);
+
+        entry = cursor->nextKeyString();
+        ASSERT_FALSE(entry);
+    }
+}
+
 TEST(SortedDataInterface, KeyFormatStringSetEndPosition) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
         /*unique=*/false, /*partial=*/false, KeyFormat::String));
-    if (!sorted) {
-        // Not supported by this storage engine.
-        return;
-    }
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     ASSERT(sorted->isEmpty(opCtx.get()));
 
     char buf1[12];
@@ -155,7 +252,7 @@ TEST(SortedDataInterface, KeyFormatStringSetEndPosition) {
         auto ksSeek = makeKeyStringForSeek(sorted.get(), key1, true, true);
         auto cursor = sorted->newCursor(opCtx.get());
         cursor->setEndPosition(key1, true /* inclusive */);
-        auto entry = cursor->seek(ksSeek);
+        auto entry = cursor->seek(ksSeek.finishAndGetBuffer());
         ASSERT(entry);
         ASSERT_EQ(*entry, IndexKeyEntry(key1, rid1));
         ASSERT_FALSE(cursor->next());
@@ -166,7 +263,7 @@ TEST(SortedDataInterface, KeyFormatStringSetEndPosition) {
         auto ksSeek = makeKeyStringForSeek(sorted.get(), key1, true, true);
         auto cursor = sorted->newCursor(opCtx.get());
         cursor->setEndPosition(key2, true /* inclusive */);
-        auto entry = cursor->seek(ksSeek);
+        auto entry = cursor->seek(ksSeek.finishAndGetBuffer());
         ASSERT(entry);
         entry = cursor->next();
         ASSERT(entry);
@@ -179,51 +276,10 @@ TEST(SortedDataInterface, KeyFormatStringSetEndPosition) {
         auto ksSeek = makeKeyStringForSeek(sorted.get(), key2, true, true);
         auto cursor = sorted->newCursor(opCtx.get());
         cursor->setEndPosition(key3, false /* inclusive */);
-        auto entry = cursor->seek(ksSeek);
+        auto entry = cursor->seek(ksSeek.finishAndGetBuffer());
         ASSERT(entry);
         ASSERT_EQ(*entry, IndexKeyEntry(key2, rid2));
         ASSERT_FALSE(cursor->next());
-    }
-}
-
-TEST(SortedDataInterface, KeyFormatStringInsertReserved) {
-    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
-        /*unique=*/false, /*partial=*/false, KeyFormat::String));
-    if (!sorted) {
-        // Not supported by this storage engine.
-        return;
-    }
-    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-    ASSERT(sorted->isEmpty(opCtx.get()));
-
-    RecordId reservedLoc(
-        RecordId::reservedIdFor<OID>(RecordId::Reservation::kWildcardMultikeyMetadataId));
-    invariant(RecordId::isReserved<OID>(reservedLoc));
-    {
-        WriteUnitOfWork uow(opCtx.get());
-        ASSERT_OK(sorted->insert(opCtx.get(),
-                                 makeKeyString(sorted.get(), key1, reservedLoc),
-                                 /*dupsAllowed*/ true));
-        uow.commit();
-    }
-    ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
-
-    auto ksSeek = makeKeyStringForSeek(sorted.get(), key1, true, true);
-    {
-        auto cursor = sorted->newCursor(opCtx.get());
-        auto entry = cursor->seek(ksSeek);
-        ASSERT(entry);
-        ASSERT_EQ(*entry, IndexKeyEntry(key1, reservedLoc));
-    }
-
-    {
-        auto cursor = sorted->newCursor(opCtx.get());
-        auto entry = cursor->seekForKeyString(ksSeek);
-        ASSERT(entry);
-        ASSERT_EQ(entry->loc, reservedLoc);
-        auto ks1 = makeKeyString(sorted.get(), key1, reservedLoc);
-        ASSERT_EQ(entry->keyString, ks1);
     }
 }
 
@@ -231,11 +287,9 @@ TEST(SortedDataInterface, KeyFormatStringUnindex) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
         /*unique=*/false, /*partial=*/false, KeyFormat::String));
-    if (!sorted) {
-        // Not supported by this storage engine.
-        return;
-    }
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     ASSERT(sorted->isEmpty(opCtx.get()));
 
     char buf1[12];
@@ -279,5 +333,109 @@ TEST(SortedDataInterface, KeyFormatStringUnindex) {
     }
     ASSERT_EQUALS(0, sorted->numEntries(opCtx.get()));
 }
+
+TEST(SortedDataInterface, KeyFormatStringUniqueUnindex) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
+        /*unique=*/true, /*partial=*/false, KeyFormat::String));
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+    ASSERT(sorted->isEmpty(opCtx.get()));
+
+    std::string buf1(12, 0);
+    std::string buf2(12, 1);
+    std::string buf3(12, '\xff');
+
+    RecordId rid1(buf1.c_str(), 12);
+    RecordId rid2(buf2.c_str(), 12);
+    RecordId rid3(buf3.c_str(), 12);
+
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key1, rid1),
+                                 /*dupsAllowed*/ false));
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key2, rid2),
+                                 /*dupsAllowed*/ false));
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key3, rid3),
+                                 /*dupsAllowed*/ false));
+        uow.commit();
+    }
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
+
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        // Does not exist, does nothing.
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key1, rid3),
+                        /*dupsAllowed*/ false);
+
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key1, rid1),
+                        /*dupsAllowed*/ false);
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key2, rid2),
+                        /*dupsAllowed*/ false);
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key3, rid3),
+                        /*dupsAllowed*/ false);
+
+        uow.commit();
+    }
+    ASSERT_EQUALS(0, sorted->numEntries(opCtx.get()));
+}
+
+TEST(SortedDataInterface, InsertReservedRecordIdStr) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
+        /*unique=*/false, /*partial=*/false, KeyFormat::String));
+    const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+    ASSERT(sorted->isEmpty(opCtx.get()));
+    WriteUnitOfWork uow(opCtx.get());
+    RecordId reservedLoc(record_id_helpers::reservedIdFor(
+        record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::String));
+    invariant(record_id_helpers::isReserved(reservedLoc));
+    ASSERT_OK(sorted->insert(opCtx.get(),
+                             makeKeyString(sorted.get(), key1, reservedLoc),
+                             /*dupsAllowed*/ true));
+    uow.commit();
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+}
+
+TEST(SortedDataInterface, BuilderAddKeyWithReservedRecordIdStr) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
+        /*unique=*/false, /*partial=*/false, KeyFormat::String));
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
+
+        RecordId reservedLoc(record_id_helpers::reservedIdFor(
+            record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::String));
+        ASSERT(record_id_helpers::isReserved(reservedLoc));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, reservedLoc)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
 }  // namespace
 }  // namespace mongo

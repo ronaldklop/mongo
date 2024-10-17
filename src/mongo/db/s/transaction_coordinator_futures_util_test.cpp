@@ -27,14 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <numeric>
+#include <set>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace txn {
@@ -274,7 +301,7 @@ protected:
         }
     }
 
-    void assertCommandSentAndRespondWith(const StringData& commandName,
+    void assertCommandSentAndRespondWith(StringData commandName,
                                          const StatusWith<BSONObj>& response,
                                          boost::optional<BSONObj> expectedWriteConcern) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
@@ -299,7 +326,9 @@ protected:
             StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : makeThreeShardIdsList()) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(
@@ -421,7 +450,7 @@ TEST_F(AsyncWorkSchedulerTest, ScheduledRemoteCommandRespondsOK) {
         kShardIds[1], ReadPreferenceSetting{ReadPreference::PrimaryOnly}, BSON("TestCommand" << 1));
     ASSERT(!future.isReady());
 
-    const auto objResponse = BSON("ok" << 1 << "responseData" << 2);
+    auto objResponse = BSON("ok" << 1 << "responseData" << 2);
     onCommand([&](const executor::RemoteCommandRequest& request) {
         ASSERT_BSONOBJ_EQ(BSON("TestCommand" << 1), request.cmdObj);
         return objResponse;
@@ -439,7 +468,7 @@ TEST_F(AsyncWorkSchedulerTest, ScheduledRemoteCommandRespondsNotOK) {
         kShardIds[1], ReadPreferenceSetting{ReadPreference::PrimaryOnly}, BSON("TestCommand" << 2));
     ASSERT(!future.isReady());
 
-    const auto objResponse = BSON("ok" << 0 << "responseData" << 3);
+    auto objResponse = BSON("ok" << 0 << "responseData" << 3);
     onCommand([&](const executor::RemoteCommandRequest& request) {
         ASSERT_BSONOBJ_EQ(BSON("TestCommand" << 2), request.cmdObj);
         return objResponse;
@@ -514,6 +543,7 @@ TEST_F(AsyncWorkSchedulerTest, ShutdownInterruptsNotYetScheduledTasks) {
 
     async.shutdown({ErrorCodes::InternalError, "Test internal error"});
     ASSERT_EQ(0, numInvocations.load());
+    executor::NetworkInterfaceMock::InNetworkGuard(network())->runReadyNetworkOperations();
 
     ASSERT_THROWS_CODE(future1.get(), AssertionException, ErrorCodes::InternalError);
     ASSERT_THROWS_CODE(future2.get(), AssertionException, ErrorCodes::InternalError);
@@ -729,13 +759,14 @@ TEST_F(DoWhileTest, LoopBodyExecutesAtLeastOnceWithBackoff) {
     AsyncWorkScheduler async(getServiceContext());
 
     int numLoops = 0;
-    auto future = doWhile(async,
-                          Backoff(Seconds(1), Milliseconds::max()),
-                          [](const StatusWith<int>& status) {
-                              uassertStatusOK(status);
-                              return false;
-                          },
-                          [&numLoops] { return Future<int>::makeReady(++numLoops); });
+    auto future = doWhile(
+        async,
+        Backoff(Seconds(1), Milliseconds::max()),
+        [](const StatusWith<int>& status) {
+            uassertStatusOK(status);
+            return false;
+        },
+        [&numLoops] { return Future<int>::makeReady(++numLoops); });
 
     ASSERT(future.isReady());
     ASSERT_EQ(1, numLoops);
@@ -746,13 +777,14 @@ TEST_F(DoWhileTest, LoopBodyExecutesManyIterationsWithoutBackoff) {
     AsyncWorkScheduler async(getServiceContext());
 
     int remainingLoops = 1000;
-    auto future = doWhile(async,
-                          boost::none,
-                          [&remainingLoops](const StatusWith<int>& status) {
-                              uassertStatusOK(status);
-                              return remainingLoops > 0;
-                          },
-                          [&remainingLoops] { return Future<int>::makeReady(--remainingLoops); });
+    auto future = doWhile(
+        async,
+        boost::none,
+        [&remainingLoops](const StatusWith<int>& status) {
+            uassertStatusOK(status);
+            return remainingLoops > 0;
+        },
+        [&remainingLoops] { return Future<int>::makeReady(--remainingLoops); });
 
     ASSERT_EQ(0, future.get());
     ASSERT_EQ(0, remainingLoops);
@@ -762,10 +794,11 @@ TEST_F(DoWhileTest, LoopObeysBackoff) {
     AsyncWorkScheduler async(getServiceContext());
 
     int numLoops = 0;
-    auto future = doWhile(async,
-                          Backoff(Seconds(1), Milliseconds::max()),
-                          [](const StatusWith<int>& status) { return uassertStatusOK(status) < 3; },
-                          [&numLoops] { return Future<int>::makeReady(++numLoops); });
+    auto future = doWhile(
+        async,
+        Backoff(Seconds(1), Milliseconds::max()),
+        [](const StatusWith<int>& status) { return uassertStatusOK(status) < 3; },
+        [&numLoops] { return Future<int>::makeReady(++numLoops); });
 
     // The loop body needs to execute at least once
     ASSERT(!future.isReady());
@@ -802,11 +835,11 @@ TEST_F(DoWhileTest, LoopObeysShutdown) {
     AsyncWorkScheduler async(getServiceContext());
 
     int numLoops = 0;
-    auto future =
-        doWhile(async,
-                boost::none,
-                [](const StatusWith<int>& status) { return status != ErrorCodes::InternalError; },
-                [&numLoops] { return Future<int>::makeReady(++numLoops); });
+    auto future = doWhile(
+        async,
+        boost::none,
+        [](const StatusWith<int>& status) { return status != ErrorCodes::InternalError; },
+        [&numLoops] { return Future<int>::makeReady(++numLoops); });
 
     // Wait for at least one loop
     while (numLoops == 0)

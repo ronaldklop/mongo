@@ -29,16 +29,36 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
+/**
+ * Evaluates a set of expressions and stores the results into corresponding output slots. This is
+ * unrelated to projections in MQL. The set of (slot, expression) pairs are passed in the 'projects'
+ * slot map.
+ *
+ * Debug string representation:
+ *
+ *  project [slot_1 = expr_1, ..., slot_n = expr_n] childStage
+ */
 class ProjectStage final : public PlanStage {
 public:
     ProjectStage(std::unique_ptr<PlanStage> input,
-                 value::SlotMap<std::unique_ptr<EExpression>> projects,
-                 PlanNodeId nodeId);
+                 SlotExprPairVector projects,
+                 PlanNodeId planNodeId,
+                 bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -51,9 +71,16 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    void doSaveState(bool relinquishCursor) final;
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
 
 private:
-    const value::SlotMap<std::unique_ptr<EExpression>> _projects;
+    const SlotExprPairVector _projects;
     value::SlotMap<std::pair<std::unique_ptr<vm::CodeFragment>, value::OwnedValueAccessor>> _fields;
 
     vm::ByteCode _bytecode;
@@ -63,6 +90,7 @@ private:
 
 template <typename... Ts>
 inline auto makeProjectStage(std::unique_ptr<PlanStage> input, PlanNodeId nodeId, Ts&&... pack) {
-    return makeS<ProjectStage>(std::move(input), makeEM(std::forward<Ts>(pack)...), nodeId);
+    return makeS<ProjectStage>(
+        std::move(input), makeSlotExprPairVec(std::forward<Ts>(pack)...), nodeId);
 }
 }  // namespace mongo::sbe

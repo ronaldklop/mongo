@@ -1,9 +1,9 @@
 /**
  * Tests where/function can be interrupted through maxTimeMS and query knob.
+ * @tags: [
+ *   requires_scripting
+ * ]
  */
-(function() {
-"use strict";
-
 const mongodOptions = {};
 const conn = MongoRunner.runMongod(mongodOptions);
 
@@ -79,4 +79,3 @@ tests.forEach(function(testCase) {
 });
 
 MongoRunner.stopMongod(conn);
-})();

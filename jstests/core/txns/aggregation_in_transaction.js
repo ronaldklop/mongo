@@ -1,13 +1,9 @@
 // Tests that aggregation is supported in transactions.
-// @tags: [uses_transactions, uses_snapshot_read_concern]
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For isSharded.
-
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
-// For withTxnAndAutoRetryOnMongos.
-load('jstests/libs/auto_retry_transaction_in_sharding.js');
+// @tags: [uses_transactions, uses_snapshot_read_concern, references_foreign_collection]
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
+import {
+    withTxnAndAutoRetryOnMongos
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";  // For isSharded.
 
 const session = db.getMongo().startSession({causalConsistency: false});
 const testDB = session.getDatabase("test");
@@ -32,8 +28,6 @@ const foreignDoc = {
     val: 9
 };
 assert.commandWorked(foreignColl.insert(foreignDoc, {writeConcern: {w: "majority"}}));
-
-const isForeignSharded = FixtureHelpers.isSharded(foreignColl);
 
 const txnOptions = {
     readConcern: {level: "snapshot"}
@@ -71,10 +65,10 @@ withTxnAndAutoRetryOnMongos(session, () => {
     assert(!cursor.hasNext());
 
     // Perform aggregations that look at other collections.
-    // TODO: SERVER-39162 Sharded $lookup is not supported in transactions.
-    if (!isForeignSharded) {
-        const lookupDoc = Object.merge(testDoc, {lookup: [foreignDoc]});
-        cursor = coll.aggregate({
+    jsTestLog("Testing $lookup within a transaction.");
+
+    const lookupDoc = Object.merge(testDoc, {lookup: [foreignDoc]});
+    cursor = coll.aggregate({
                 $lookup: {
                     from: foreignColl.getName(),
                     localField: "foreignKey",
@@ -82,10 +76,12 @@ withTxnAndAutoRetryOnMongos(session, () => {
                     as: "lookup",
                 }
             });
-        assert.docEq(cursor.next(), lookupDoc);
-        assert(!cursor.hasNext());
+    assert.docEq(lookupDoc, cursor.next());
+    assert(!cursor.hasNext());
 
-        cursor = coll.aggregate({
+    jsTestLog("Testing $graphLookup within a transaction.");
+
+    cursor = coll.aggregate({
                 $graphLookup: {
                     from: foreignColl.getName(),
                     startWith: "$foreignKey",
@@ -94,12 +90,8 @@ withTxnAndAutoRetryOnMongos(session, () => {
                     as: "lookup"
                 }
             });
-        assert.docEq(cursor.next(), lookupDoc);
-        assert(!cursor.hasNext());
-    } else {
-        // TODO SERVER-39048: Test that $lookup on sharded collection is banned
-        // within a transaction.
-    }
+    assert.docEq(lookupDoc, cursor.next());
+    assert(!cursor.hasNext());
 
     jsTestLog("Testing $count within a transaction.");
 
@@ -137,4 +129,3 @@ assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.N
 session.startTransaction({readConcern: {level: "snapshot"}});
 assert.throws(() => coll.aggregate({$indexStats: {}}).next());
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
-}());

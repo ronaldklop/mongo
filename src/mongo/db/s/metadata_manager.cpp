@@ -27,30 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/metadata_manager.h"
 
-#include "mongo/base/string_data.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/db/range_arithmetic.h"
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/range_deletion_util.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/time_support.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/chunk_manager.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
-
-using TaskExecutor = executor::TaskExecutor;
-using CallbackArgs = TaskExecutor::CallbackArgs;
 
 /**
  * Returns whether the given metadata object has a chunk owned by this shard that overlaps the
@@ -67,7 +62,7 @@ bool metadataOverlapsRange(const boost::optional<CollectionMetadata>& metadata,
     if (!metadata) {
         return false;
     }
-    return metadataOverlapsRange(metadata.get(), range);
+    return metadataOverlapsRange(metadata.value(), range);
 }
 
 }  // namespace
@@ -83,8 +78,8 @@ public:
         ++_metadataTracker->usageCounter;
     }
 
-    ~RangePreserver() {
-        stdx::lock_guard<Latch> managerLock(_metadataManager->_managerLock);
+    ~RangePreserver() override {
+        stdx::lock_guard<stdx::mutex> managerLock(_metadataManager->_managerLock);
 
         invariant(_metadataTracker->usageCounter != 0);
         if (--_metadataTracker->usageCounter == 0) {
@@ -101,9 +96,9 @@ public:
 
     // This will only ever refer to the active metadata, so CollectionMetadata should never be
     // boost::none
-    const CollectionMetadata& get() {
+    const CollectionMetadata& get() override {
         invariant(_metadataTracker->metadata);
-        return _metadataTracker->metadata.get();
+        return _metadataTracker->metadata.value();
     }
 
 private:
@@ -113,28 +108,19 @@ private:
 
 MetadataManager::MetadataManager(ServiceContext* serviceContext,
                                  NamespaceString nss,
-                                 std::shared_ptr<TaskExecutor> executor,
                                  CollectionMetadata initialMetadata)
     : _serviceContext(serviceContext),
       _nss(std::move(nss)),
-      _collectionUuid(*initialMetadata.getChunkManager()->getUUID()),
-      _executor(std::move(executor)) {
+      _collectionUuid(initialMetadata.getChunkManager()->getUUID()) {
     _metadata.emplace_back(std::make_shared<CollectionMetadataTracker>(std::move(initialMetadata)));
 }
 
 std::shared_ptr<ScopedCollectionDescription::Impl> MetadataManager::getActiveMetadata(
-    const boost::optional<LogicalTime>& atClusterTime) {
-    stdx::lock_guard<Latch> lg(_managerLock);
+    const boost::optional<LogicalTime>& atClusterTime, bool preserveRange) {
+    stdx::lock_guard<stdx::mutex> lg(_managerLock);
 
     auto activeMetadataTracker = _metadata.back();
     const auto& activeMetadata = activeMetadataTracker->metadata;
-
-    // We don't keep routing history for unsharded collections, so if the collection is unsharded
-    // just return the active metadata
-    if (!atClusterTime || !activeMetadata->isSharded()) {
-        return std::make_shared<RangePreserver>(
-            lg, shared_from_this(), std::move(activeMetadataTracker));
-    }
 
     class MetadataAtTimestamp : public ScopedCollectionDescription::Impl {
     public:
@@ -148,19 +134,30 @@ std::shared_ptr<ScopedCollectionDescription::Impl> MetadataManager::getActiveMet
         CollectionMetadata _metadata;
     };
 
+    // We don't keep routing history for unsharded collections, so if the collection is unsharded
+    // just return the active metadata
+    if (!atClusterTime || !activeMetadata->isSharded()) {
+        if (preserveRange) {
+            return std::make_shared<RangePreserver>(
+                lg, shared_from_this(), std::move(activeMetadataTracker));
+        } else {
+            return std::make_shared<MetadataAtTimestamp>(*activeMetadata);
+        }
+    }
+
     return std::make_shared<MetadataAtTimestamp>(CollectionMetadata(
         ChunkManager::makeAtTime(*activeMetadata->getChunkManager(), atClusterTime->asTimestamp()),
         activeMetadata->shardId()));
 }
 
 size_t MetadataManager::numberOfMetadataSnapshots() const {
-    stdx::lock_guard<Latch> lg(_managerLock);
+    stdx::lock_guard<stdx::mutex> lg(_managerLock);
     invariant(!_metadata.empty());
     return _metadata.size() - 1;
 }
 
 int MetadataManager::numberOfEmptyMetadataSnapshots() const {
-    stdx::lock_guard<Latch> lg(_managerLock);
+    stdx::lock_guard<stdx::mutex> lg(_managerLock);
 
     int emptyMetadataSnapshots = 0;
     for (const auto& collMetadataTracker : _metadata) {
@@ -172,33 +169,30 @@ int MetadataManager::numberOfEmptyMetadataSnapshots() const {
 }
 
 void MetadataManager::setFilteringMetadata(CollectionMetadata remoteMetadata) {
-    stdx::lock_guard<Latch> lg(_managerLock);
+    stdx::lock_guard<stdx::mutex> lg(_managerLock);
     invariant(!_metadata.empty());
     // The active metadata should always be available (not boost::none)
     invariant(_metadata.back()->metadata);
-    const auto& activeMetadata = _metadata.back()->metadata.get();
+    const auto& activeMetadata = _metadata.back()->metadata.value();
 
-    // We already have the same or newer version
-    if (remoteMetadata.getCollVersion().isOlderOrEqualThan(activeMetadata.getCollVersion())) {
+    const auto remoteCollPlacementVersion = remoteMetadata.getCollPlacementVersion();
+    const auto activeCollPlacementVersion = activeMetadata.getCollPlacementVersion();
+    // Do nothing if the remote version is older than or equal to the current active one
+    if (remoteCollPlacementVersion.isOlderOrEqualThan(activeCollPlacementVersion)) {
         LOGV2_DEBUG(21984,
                     1,
-                    "Ignoring incoming metadata update {activeMetadata} for {namespace} because "
-                    "the active (current) metadata {remoteMetadata} has the same or a newer "
-                    "collection version",
                     "Ignoring incoming metadata update for this namespace because the active "
-                    "(current) metadata has the same or a newer collection version",
-                    "namespace"_attr = _nss.ns(),
+                    "(current) metadata has the same or a newer collection placement version",
+                    logAttrs(_nss),
                     "activeMetadata"_attr = activeMetadata.toStringBasic(),
                     "remoteMetadata"_attr = remoteMetadata.toStringBasic());
         return;
     }
 
     LOGV2(21985,
-          "Updating metadata {activeMetadata} for {namespace} because the remote metadata "
-          "{remoteMetadata} has a newer collection version",
           "Updating metadata for this namespace because the remote metadata has a newer "
-          "collection version",
-          "namespace"_attr = _nss.ns(),
+          "collection placement version",
+          logAttrs(_nss),
           "activeMetadata"_attr = activeMetadata.toStringBasic(),
           "remoteMetadata"_attr = remoteMetadata.toStringBasic());
 
@@ -234,123 +228,21 @@ void MetadataManager::_retireExpiredMetadata(WithLock) {
     }
 }
 
-void MetadataManager::append(BSONObjBuilder* builder) const {
-    stdx::lock_guard<Latch> lg(_managerLock);
+SharedSemiFuture<void> MetadataManager::getOngoingQueriesCompletionFuture(ChunkRange const& range) {
+    stdx::lock_guard<stdx::mutex> lg(_managerLock);
 
-    BSONArrayBuilder arr(builder->subarrayStart("rangesToClean"));
-    for (auto const& [range, _] : _rangesScheduledForDeletion) {
-        BSONObjBuilder obj;
-        range.append(&obj);
-        arr.append(obj.done());
-    }
-
-    invariant(!_metadata.empty());
-
-    BSONArrayBuilder amrArr(builder->subarrayStart("activeMetadataRanges"));
-    for (const auto& entry : _metadata.back()->metadata->getChunks()) {
-        BSONObjBuilder obj;
-        ChunkRange r = ChunkRange(entry.first, entry.second);
-        r.append(&obj);
-        amrArr.append(obj.done());
-    }
-    amrArr.done();
-}
-
-SharedSemiFuture<void> MetadataManager::cleanUpRange(ChunkRange const& range,
-                                                     boost::optional<UUID> migrationId,
-                                                     bool shouldDelayBeforeDeletion) {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    invariant(!_metadata.empty());
-
-    auto* const activeMetadata = _metadata.back().get();
     auto* const overlapMetadata = _findNewestOverlappingMetadata(lg, range);
-
-    if (overlapMetadata == activeMetadata) {
-        return Status{ErrorCodes::RangeOverlapConflict,
-                      str::stream() << "Requested deletion range overlaps a live shard chunk"};
+    if (!overlapMetadata) {
+        return SemiFuture<void>::makeReady().share();
     }
-
-    auto delayForActiveQueriesOnSecondariesToComplete =
-        shouldDelayBeforeDeletion ? Seconds(orphanCleanupDelaySecs.load()) : Seconds(0);
-
-    if (overlapMetadata) {
-        LOGV2_OPTIONS(21989,
-                      {logv2::LogComponent::kShardingMigration},
-                      "Deletion of {namespace} range {range} will be scheduled after all possibly "
-                      "dependent queries finish",
-                      "Deletion of the collection's specified range will be scheduled after all "
-                      "possibly dependent queries finish",
-                      "namespace"_attr = _nss.ns(),
-                      "range"_attr = redact(range.toString()));
-        ++overlapMetadata->numContingentRangeDeletionTasks;
-        // Schedule the range for deletion once the overlapping metadata object is destroyed
-        // (meaning no more queries can be using the range) and obtain a future which will be
-        // signaled when deletion is complete.
-        return _submitRangeForDeletion(lg,
-                                       overlapMetadata->onDestructionPromise.getFuture().semi(),
-                                       range,
-                                       std::move(migrationId),
-                                       delayForActiveQueriesOnSecondariesToComplete);
-    } else {
-        // No running queries can depend on this range, so queue it for deletion immediately.
-        LOGV2_OPTIONS(21990,
-                      {logv2::LogComponent::kShardingMigration},
-                      "Scheduling deletion of {namespace} range {range}",
-                      "Scheduling deletion of the collection's specified range",
-                      "namespace"_attr = _nss.ns(),
-                      "range"_attr = redact(range.toString()));
-
-        return _submitRangeForDeletion(lg,
-                                       SemiFuture<void>::makeReady(),
-                                       range,
-                                       std::move(migrationId),
-                                       delayForActiveQueriesOnSecondariesToComplete);
-    }
-}
-
-size_t MetadataManager::numberOfRangesToCleanStillInUse() const {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    size_t count = 0;
-    for (auto& tracker : _metadata) {
-        count += tracker->numContingentRangeDeletionTasks;
-    }
-    return count;
-}
-
-size_t MetadataManager::numberOfRangesToClean() const {
-    auto rangesToCleanInUse = numberOfRangesToCleanStillInUse();
-    stdx::lock_guard<Latch> lg(_managerLock);
-    return _rangesScheduledForDeletion.size() - rangesToCleanInUse;
-}
-
-size_t MetadataManager::numberOfRangesScheduledForDeletion() const {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    return _rangesScheduledForDeletion.size();
-}
-
-boost::optional<SharedSemiFuture<void>> MetadataManager::trackOrphanedDataCleanup(
-    ChunkRange const& range) const {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    for (const auto& [orphanRange, deletionComplete] : _rangesScheduledForDeletion) {
-        if (orphanRange.overlapWith(range)) {
-            return deletionComplete;
-        }
-    }
-
-    return boost::none;
+    return overlapMetadata->onDestructionPromise.getFuture();
 }
 
 auto MetadataManager::_findNewestOverlappingMetadata(WithLock, ChunkRange const& range)
     -> CollectionMetadataTracker* {
     invariant(!_metadata.empty());
 
-    auto it = _metadata.rbegin();
-    if (metadataOverlapsRange((*it)->metadata, range)) {
-        return (*it).get();
-    }
-
-    ++it;
-    for (; it != _metadata.rend(); ++it) {
+    for (auto it = _metadata.rbegin(); it != _metadata.rend(); ++it) {
         auto& tracker = *it;
         if (tracker->usageCounter && metadataOverlapsRange(tracker->metadata, range)) {
             return tracker.get();
@@ -358,48 +250,6 @@ auto MetadataManager::_findNewestOverlappingMetadata(WithLock, ChunkRange const&
     }
 
     return nullptr;
-}
-
-bool MetadataManager::_overlapsInUseChunk(WithLock lk, ChunkRange const& range) {
-    auto* cm = _findNewestOverlappingMetadata(lk, range);
-    return (cm != nullptr);
-}
-
-SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
-    const WithLock&,
-    SemiFuture<void> waitForActiveQueriesToComplete,
-    const ChunkRange& range,
-    boost::optional<UUID> migrationId,
-    Seconds delayForActiveQueriesOnSecondariesToComplete) {
-
-    int maxToDelete = rangeDeleterBatchSize.load();
-    if (maxToDelete <= 0) {
-        maxToDelete = kRangeDeleterBatchSizeDefault;
-    }
-
-    auto cleanupComplete =
-        removeDocumentsInRange(_executor,
-                               std::move(waitForActiveQueriesToComplete),
-                               _nss,
-                               *_metadata.back()->metadata->getChunkManager()->getUUID(),
-                               _metadata.back()->metadata->getKeyPattern().getOwned(),
-                               range,
-                               std::move(migrationId),
-                               maxToDelete,
-                               delayForActiveQueriesOnSecondariesToComplete,
-                               Milliseconds(rangeDeleterBatchDelayMS.load()));
-
-    _rangesScheduledForDeletion.emplace_front(range, cleanupComplete);
-    // Attach a continuation so that once the range has been deleted, we will remove the deletion
-    // from the _rangesScheduledForDeletion.  std::list iterators are never invalidated, which
-    // allows us to save the iterator pointing to the newly added element for use later when
-    // deleting it.
-    cleanupComplete.thenRunOn(_executor).getAsync(
-        [self = shared_from_this(), it = _rangesScheduledForDeletion.begin()](Status s) {
-            stdx::lock_guard<Latch> lg(self->_managerLock);
-            self->_rangesScheduledForDeletion.erase(it);
-        });
-    return cleanupComplete;
 }
 
 }  // namespace mongo

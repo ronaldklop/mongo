@@ -27,19 +27,49 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
+#include <mutex>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/client.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/all_database_cloner.h"
+#include "mongo/db/repl/member_data.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+
 namespace mongo {
 namespace repl {
 
@@ -59,16 +89,17 @@ BaseCloner::ClonerStages AllDatabaseCloner::getStages() {
 }
 
 Status AllDatabaseCloner::ensurePrimaryOrSecondary(
-    const executor::RemoteCommandResponse& isMasterReply) {
-    if (!isMasterReply.isOK()) {
-        LOGV2(21054, "Cannot reconnect because isMaster command failed");
-        return isMasterReply.status;
+    const executor::RemoteCommandResponse& helloReply) {
+    if (!helloReply.isOK()) {
+        LOGV2(21054, "Cannot reconnect because 'hello' command failed");
+        return helloReply.status;
     }
-    if (isMasterReply.data["ismaster"].trueValue() || isMasterReply.data["secondary"].trueValue())
+    if (helloReply.data["isWritablePrimary"].trueValue() ||
+        helloReply.data["secondary"].trueValue())
         return Status::OK();
 
     // There is a window during startup where a node has an invalid configuration and will have
-    // an isMaster response the same as a removed node.  So we must check to see if the node is
+    // an "hello" response the same as a removed node.  So we must check to see if the node is
     // removed by checking local configuration.
     auto memberData = ReplicationCoordinator::get(getGlobalServiceContext())->getMemberData();
     auto syncSourceIter = std::find_if(
@@ -109,12 +140,12 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::connectStage() {
     // handle the reconnect itself. This is necessary to get correct backoff behavior.
     if (client->getServerHostAndPort() != getSource()) {
         client->setHandshakeValidationHook(
-            [this](const executor::RemoteCommandResponse& isMasterReply) {
-                return ensurePrimaryOrSecondary(isMasterReply);
+            [this](const executor::RemoteCommandResponse& helloReply) {
+                return ensurePrimaryOrSecondary(helloReply);
             });
-        uassertStatusOK(client->connect(getSource(), StringData(), boost::none));
+        client->connect(getSource(), StringData(), boost::none);
     } else {
-        client->checkConnection();
+        client->ensureConnection();
     }
     uassertStatusOK(replAuthenticate(client).withContext(
         str::stream() << "Failed to authenticate to " << getSource()));
@@ -122,22 +153,13 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::connectStage() {
 }
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
-    auto wireVersion = static_cast<WireVersion>(getClient()->getMaxWireVersion());
-    {
-        stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
-        getSharedData()->setSyncSourceWireVersion(lk, wireVersion);
-    }
-
-    // Wire versions prior to resumable initial sync don't have a sync source id.
-    if (wireVersion < WireVersion::RESUMABLE_INITIAL_SYNC)
-        return kContinueNormally;
-    auto initialSyncId = getClient()->findOne(
-        ReplicationConsistencyMarkersImpl::kDefaultInitialSyncIdNamespace.toString(), Query());
+    auto initialSyncId =
+        getClient()->findOne(NamespaceString::kDefaultInitialSyncIdNamespace, BSONObj{});
     uassert(ErrorCodes::InitialSyncFailure,
             "Cannot retrieve sync source initial sync ID",
             !initialSyncId.isEmpty());
     InitialSyncIdDocument initialSyncIdDoc =
-        InitialSyncIdDocument::parse(IDLParserErrorContext("initialSyncId"), initialSyncId);
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), initialSyncId);
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         getSharedData()->setInitialSyncSourceId(lk, initialSyncIdDoc.get_id());
@@ -146,40 +168,76 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
 }
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
-    auto databasesArray = getClient()->getDatabaseInfos(BSONObj(), true /* nameOnly */);
+    std::vector<mongo::BSONObj> databasesArray;
+    const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+    const bool multiTenancyAndRequireTenantIdEnabled = gMultitenancySupport &&
+        fcvSnapshot.isVersionInitialized() && gFeatureFlagRequireTenantID.isEnabled(fcvSnapshot);
+
+    databasesArray = getClient()->getDatabaseInfos(
+        BSONObj(),
+        true /* nameOnly */,
+        false /*authorizedDatabases*/,
+        multiTenancyAndRequireTenantIdEnabled /*useListDatabsesForAllTenants*/);
+
+    size_t idxToInsertNextAdmin = 0;
     for (const auto& dbBSON : databasesArray) {
         if (!dbBSON.hasField("name")) {
             LOGV2_DEBUG(21055,
                         1,
                         "Excluding database due to the 'listDatabases' response not containing a "
-                        "'name' field for this entry: {db}",
-                        "Excluding database due to the 'listDatabases' response not containing a "
                         "'name' field for this entry",
                         "db"_attr = dbBSON);
             continue;
         }
-        const auto& dbName = dbBSON["name"].str();
-        if (dbName == "local") {
+
+        boost::optional<TenantId> tenantId = dbBSON.hasField("tenantId")
+            ? boost::make_optional<TenantId>(TenantId::parseFromBSON(dbBSON["tenantId"]))
+            : boost::none;
+        const DatabaseName dbName = DatabaseNameUtil::deserialize(
+            tenantId, dbBSON["name"].str(), SerializationContext::stateDefault());
+
+        if (dbName.isLocalDB()) {
             LOGV2_DEBUG(21056,
                         1,
-                        "Excluding database from the 'listDatabases' response: {db}",
                         "Excluding database from the 'listDatabases' response",
                         "db"_attr = dbBSON);
             continue;
         } else {
             _databases.emplace_back(dbName);
-            // Make sure "admin" comes first.
-            if (dbName == "admin" && _databases.size() > 1) {
-                std::swap(_databases.front(), _databases.back());
+
+            // Put admin dbs in the front of the vector.
+            if (dbName.isAdminDB()) {
+                if (_databases.size() > 1) {
+                    std::iter_swap(_databases.begin() + idxToInsertNextAdmin, _databases.end() - 1);
+                }
+                // Index to track where the last admin db is in the list. If the first db returned
+                // is an admin db, we still must bump this.
+                idxToInsertNextAdmin++;
             }
         }
     }
+
+    // Ensure the global admin comes first. We inserted all admin dbs at the front of '_databases',
+    // find the global admin and move it to the front.
+    for (auto i = _databases.begin(); size_t(i - _databases.begin()) != idxToInsertNextAdmin; ++i) {
+        if (!(*i).tenantId()) {
+            std::iter_swap(_databases.begin(), i);
+            break;
+        }
+    }
+
+
     return kContinueNormally;
+}
+
+void AllDatabaseCloner::handleAdminDbNotValid(const Status& errorStatus) {
+    LOGV2_DEBUG(21059, 1, "Validation failed on 'admin' db", "error"_attr = errorStatus);
+    setSyncFailedStatus(errorStatus);
 }
 
 void AllDatabaseCloner::postStage() {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _stats.databasesCloned = 0;
         _stats.databasesToClone = _databases.size();
         _stats.databaseStats.reserve(_databases.size());
@@ -187,8 +245,12 @@ void AllDatabaseCloner::postStage() {
             _stats.databaseStats.emplace_back();
             _stats.databaseStats.back().dbname = dbName;
 
+            BSONObj cmdObj = BSON("dbStats" << 1);
+            BSONObjBuilder b(cmdObj);
+
             BSONObj res;
-            getClient()->runCommand(dbName, BSON("dbStats" << 1), res);
+            getClient()->runCommand(dbName, b.obj(), res);
+
             // It is possible for the call to 'dbStats' to fail if the sync source contains invalid
             // views. We should not fail initial sync in this case due to the situation where the
             // replica set may have lost majority availability and therefore have no access to a
@@ -201,14 +263,15 @@ void AllDatabaseCloner::postStage() {
                             1,
                             "Skipping the recording of initial sync data size metrics due "
                             "to failure in the 'dbStats' command",
-                            "db"_attr = dbName,
+                            logAttrs(dbName),
                             "status"_attr = status);
             }
         }
     }
+
     for (const auto& dbName : _databases) {
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _currentDatabaseCloner = std::make_unique<DatabaseCloner>(dbName,
                                                                       getSharedData(),
                                                                       getSource(),
@@ -220,14 +283,11 @@ void AllDatabaseCloner::postStage() {
         if (dbStatus.isOK()) {
             LOGV2_DEBUG(21057,
                         1,
-                        "Database clone for '{dbName}' finished: {status}",
                         "Database clone finished",
                         "dbName"_attr = dbName,
                         "status"_attr = dbStatus);
         } else {
             LOGV2_WARNING(21060,
-                          "database '{dbName}' ({dbNumber} of {totalDbs}) "
-                          "clone failed due to {error}",
                           "Database clone failed",
                           "dbName"_attr = dbName,
                           "dbNumber"_attr = (_stats.databasesCloned + 1),
@@ -236,31 +296,8 @@ void AllDatabaseCloner::postStage() {
             setSyncFailedStatus(dbStatus);
             return;
         }
-        if (StringData(dbName).equalCaseInsensitive("admin")) {
-            LOGV2_DEBUG(21058, 1, "Finished the 'admin' db, now validating it");
-            // Do special checks for the admin database because of auth. collections.
-            auto adminStatus = Status(ErrorCodes::NotYetInitialized, "");
-            {
-                OperationContext* opCtx = cc().getOperationContext();
-                ServiceContext::UniqueOperationContext opCtxPtr;
-                if (!opCtx) {
-                    opCtxPtr = cc().makeOperationContext();
-                    opCtx = opCtxPtr.get();
-                }
-                adminStatus = getStorageInterface()->isAdminDbValid(opCtx);
-            }
-            if (!adminStatus.isOK()) {
-                LOGV2_DEBUG(21059,
-                            1,
-                            "Validation failed on 'admin' db due to {error}",
-                            "Validation failed on 'admin' db",
-                            "error"_attr = adminStatus);
-                setSyncFailedStatus(adminStatus);
-                return;
-            }
-        }
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
             _currentDatabaseCloner = nullptr;
             _stats.databasesCloned++;
@@ -270,7 +307,7 @@ void AllDatabaseCloner::postStage() {
 }
 
 AllDatabaseCloner::Stats AllDatabaseCloner::getStats() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     AllDatabaseCloner::Stats stats = _stats;
     if (_currentDatabaseCloner) {
         stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
@@ -279,16 +316,12 @@ AllDatabaseCloner::Stats AllDatabaseCloner::getStats() const {
 }
 
 std::string AllDatabaseCloner::toString() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return str::stream() << "initial sync --"
                          << " active:" << isActive(lk) << " status:" << getStatus(lk).toString()
                          << " source:" << getSource()
                          << " db cloners remaining:" << _stats.databasesToClone
                          << " db cloners completed:" << _stats.databasesCloned;
-}
-
-std::string AllDatabaseCloner::Stats::toString() const {
-    return toBSON().toString();
 }
 
 BSONObj AllDatabaseCloner::Stats::toBSON() const {
@@ -301,7 +334,8 @@ void AllDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
     builder->appendNumber("databasesToClone", static_cast<long long>(databasesToClone));
     builder->appendNumber("databasesCloned", static_cast<long long>(databasesCloned));
     for (auto&& db : databaseStats) {
-        BSONObjBuilder dbBuilder(builder->subobjStart(db.dbname));
+        BSONObjBuilder dbBuilder(builder->subobjStart(
+            DatabaseNameUtil::serialize(db.dbname, SerializationContext::stateDefault())));
         db.append(&dbBuilder);
         dbBuilder.doneFast();
     }

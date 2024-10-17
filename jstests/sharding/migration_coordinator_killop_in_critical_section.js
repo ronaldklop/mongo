@@ -6,11 +6,9 @@
  * range deletion tasks, and migration coordinator state are deleted despite the killOps.
  */
 
-(function() {
-'use strict';
-
-load('jstests/libs/parallel_shell_helpers.js');
-load('jstests/libs/fail_point_util.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function getNewNs(dbName) {
     if (typeof getNewNs.counter == 'undefined') {
@@ -30,8 +28,8 @@ const recipientShard = st.shard1;
 const numDocs = 1000;
 const middle = numDocs / 2;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: donorShard.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: donorShard.shardName}));
 
 function testKillOpAfterFailPoint(failPointName, opToKillThreadName) {
     const [collName, ns] = getNewNs(dbName);
@@ -90,27 +88,26 @@ function testKillOpAfterFailPoint(failPointName, opToKillThreadName) {
     // Allow the moveChunk to finish:
     commitFailpoint.off();
     jsTest.log("Make sure the recovery is executed");
-    assert.eq(st.s0.getDB(dbName).getCollection(collName).countDocuments({}), 1000);
+    assert.soon(function() {
+        try {
+            return (st.s0.getDB(dbName).getCollection(collName).countDocuments({}) == 1000);
+        } catch (e) {
+            if (e.code == ErrorCodes.Interrupted) {
+                // Expected as the request may have joined the filtering metadata refresh that
+                // the killOp above interrupted.
+                return false;
+            }
+            throw e;
+        }
+    });
 }
 
-// After SERVER-47982 all the failpoints are hit on the migration recovery, which is performed on
-// another thread which operation context is RecoverRefreshThread. To run this test on a
-// multiversion suite we have to also search for the previous name.
-//
-// TODO (SERVER-47265): operation context name should be RecoverRefreshThread once SERVER-32198 is
-// backported to 4.4
 testKillOpAfterFailPoint("hangInEnsureChunkVersionIsGreaterThanInterruptible",
-                         "(ensureChunkVersionIsGreaterThan)|(RecoverRefreshThread)");
-testKillOpAfterFailPoint("hangInRefreshFilteringMetadataUntilSuccessInterruptible",
-                         "(refreshFilteringMetadataUntilSuccess)|(RecoverRefreshThread)");
-testKillOpAfterFailPoint("hangInPersistMigrateCommitDecisionInterruptible",
-                         "(persist migrate commit decision)|(RecoverRefreshThread)");
+                         "RecoverRefreshThread");
+testKillOpAfterFailPoint("hangInPersistMigrateCommitDecisionInterruptible", "RecoverRefreshThread");
 testKillOpAfterFailPoint("hangInDeleteRangeDeletionOnRecipientInterruptible",
-                         "(cancel range deletion on recipient)|(RecoverRefreshThread)");
-testKillOpAfterFailPoint("hangInReadyRangeDeletionLocallyInterruptible",
-                         "(ready local range deletion)|(RecoverRefreshThread)");
-testKillOpAfterFailPoint("hangInAdvanceTxnNumInterruptible",
-                         "(advance migration txn number)|(RecoverRefreshThread)");
+                         "RecoverRefreshThread");
+testKillOpAfterFailPoint("hangInReadyRangeDeletionLocallyInterruptible", "RecoverRefreshThread");
+testKillOpAfterFailPoint("hangInAdvanceTxnNumInterruptible", "RecoverRefreshThread");
 
 st.stop();
-})();

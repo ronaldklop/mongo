@@ -5,10 +5,7 @@ Import("env")
 env = env.Clone()
 
 env.CppUnitTest(
-    target='db_catalog_util_test',
-    source=[
-        'partitioned_test.cpp'
-    ],
-    LIBDEPS=[
-    ]
+    target="db_catalog_util_test",
+    source=["partitioned_test.cpp"],
+    LIBDEPS=[],
 )

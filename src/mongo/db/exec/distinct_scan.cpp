@@ -30,33 +30,48 @@
 #include "mongo/db/exec/distinct_scan.h"
 
 #include <memory>
+#include <vector>
 
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/exec/filter.h"
-#include "mongo/db/exec/scoped_timer.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* DistinctScan::kStageType = "DISTINCT_SCAN";
 
 DistinctScan::DistinctScan(ExpressionContext* expCtx,
-                           const CollectionPtr& collection,
+                           VariantCollectionPtrOrAcquisition collection,
                            DistinctParams params,
-                           WorkingSet* workingSet)
+                           WorkingSet* workingSet,
+                           std::unique_ptr<ShardFiltererImpl> shardFilterer,
+                           bool needsFetch)
     : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
       _scanDirection(params.scanDirection),
       _bounds(std::move(params.bounds)),
       _fieldNo(params.fieldNo),
-      _checker(&_bounds, _keyPattern, _scanDirection) {
+      _checker(&_bounds, _keyPattern, _scanDirection),
+      _shardFilterer(std::move(shardFilterer)),
+      _needsFetch(needsFetch) {
     _specificStats.keyPattern = _keyPattern;
     _specificStats.indexName = params.name;
     _specificStats.indexVersion = static_cast<int>(params.indexDescriptor->version());
@@ -69,9 +84,48 @@ DistinctScan::DistinctScan(ExpressionContext* expCtx,
     _specificStats.collation = params.indexDescriptor->infoObj()
                                    .getObjectField(IndexDescriptor::kCollationFieldName)
                                    .getOwned();
+    _specificStats.isShardFiltering = _shardFilterer != nullptr;
+    _specificStats.isFetching = _needsFetch;
 
     // Set up our initial seek. If there is no valid data, just mark as EOF.
     _commonStats.isEOF = !_checker.getStartSeekPoint(&_seekPoint);
+}
+
+PlanStage::StageState DistinctScan::doFetch(WorkingSetMember* member,
+                                            WorkingSetID id,
+                                            WorkingSetID* out) {
+    if (_idRetrying != WorkingSet::INVALID_ID) {
+        id = _idRetrying;
+        _idRetrying = WorkingSet::INVALID_ID;
+    }
+
+    return handlePlanStageYield(
+        expCtx(),
+        "DistinctScan",
+        [&] {
+            if (!_fetchCursor) {
+                _fetchCursor = collectionPtr()->getCursor(opCtx());
+            }
+
+            if (!WorkingSetCommon::fetch(opCtx(),
+                                         _workingSet,
+                                         id,
+                                         _fetchCursor.get(),
+                                         collectionPtr(),
+                                         collectionPtr()->ns())) {
+                _workingSet->free(id);
+                return NEED_TIME;
+            }
+
+            return ADVANCED;
+        },
+        [&] {
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may be
+            // freed when we yield.
+            member->makeObjOwnedIfNeeded();
+            _idRetrying = id;
+            *out = WorkingSet::INVALID_ID;
+        } /* yieldHandler */);
 }
 
 PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
@@ -79,18 +133,36 @@ PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
         return PlanStage::IS_EOF;
 
     boost::optional<IndexKeyEntry> kv;
-    try {
-        if (!_cursor)
-            _cursor = indexAccessMethod()->newCursor(opCtx(), _scanDirection == 1);
-        kv = _cursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
-            _seekPoint,
-            indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
-            indexAccessMethod()->getSortedDataInterface()->getOrdering(),
-            _scanDirection == 1));
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "DistinctScan",
+        [&] {
+            if (!_cursor) {
+                _cursor = indexAccessMethod()->newCursor(opCtx(), _scanDirection == 1);
+            } else if (_needsFetch && _idRetrying != WorkingSet::INVALID_ID) {
+                // We're retrying a fetch! Don't call seek() or next().
+                return PlanStage::ADVANCED;
+            }
 
-    } catch (const WriteConflictException&) {
-        *out = WorkingSet::INVALID_ID;
-        return PlanStage::NEED_YIELD;
+            if (_needsSequentialScan) {
+                kv = _cursor->next();
+                _needsSequentialScan = false;
+                return PlanStage::ADVANCED;
+            }
+
+            key_string::Builder builder(
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering());
+            kv = _cursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                _seekPoint, _scanDirection == 1, builder));
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            *out = WorkingSet::INVALID_ID;
+        } /* yieldHandler */);
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     if (!kv) {
@@ -101,40 +173,82 @@ PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
     ++_specificStats.keysExamined;
 
     switch (_checker.checkKey(kv->key, &_seekPoint)) {
-        case IndexBoundsChecker::MUST_ADVANCE:
+        case IndexBoundsChecker::MUST_ADVANCE: {
             // Try again next time. The checker has adjusted the _seekPoint.
             return PlanStage::NEED_TIME;
-
-        case IndexBoundsChecker::DONE:
+        }
+        case IndexBoundsChecker::DONE: {
             // There won't be a next time.
             _commonStats.isEOF = true;
             _cursor.reset();
             return IS_EOF;
-
-        case IndexBoundsChecker::VALID:
-            // Return this key. Adjust the _seekPoint so that it is exclusive on the field we
-            // are using.
-
+        }
+        case IndexBoundsChecker::VALID: {
             if (!kv->key.isOwned())
                 kv->key = kv->key.getOwned();
-            _seekPoint.keyPrefix = kv->key;
-            _seekPoint.prefixLen = _fieldNo + 1;
-            _seekPoint.prefixExclusive = true;
 
             // Package up the result for the caller.
             WorkingSetID id = _workingSet->allocate();
             WorkingSetMember* member = _workingSet->get(id);
             member->recordId = kv->loc;
-            member->keyData.push_back(IndexKeyDatum(_keyPattern,
-                                                    kv->key,
-                                                    workingSetIndexId(),
-                                                    opCtx()->recoveryUnit()->getSnapshotId()));
+            member->keyData.push_back(
+                IndexKeyDatum(_keyPattern,
+                              kv->key,
+                              workingSetIndexId(),
+                              shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId()));
             _workingSet->transitionToRecordIdAndIdx(id);
 
-            *out = id;
-            return PlanStage::ADVANCED;
+            if (_needsFetch) {
+                const auto fetchRet = doFetch(member, id, out);
+                if (fetchRet != PlanStage::ADVANCED) {
+                    return fetchRet;
+                }
+            }
+
+            // We need one last check before we can return the key if we've been initialized with a
+            // shard filter. If this document is an orphan, we need to try the next one; otherwise,
+            // we can proceed.
+            const auto belongs = _shardFilterer ? _shardFilterer->documentBelongsToMe(*member)
+                                                : ShardFilterer::DocumentBelongsResult::kBelongs;
+
+            switch (belongs) {
+                case ShardFilterer::DocumentBelongsResult::kBelongs: {
+                    // Adjust the _seekPoint so that it is exclusive on the field we are using.
+                    _seekPoint.keyPrefix = kv->key;
+                    _seekPoint.prefixLen = _fieldNo + 1;
+                    _seekPoint.firstExclusive = _fieldNo;
+
+                    // Return the current entry.
+                    *out = id;
+                    return PlanStage::ADVANCED;
+                }
+                case ShardFilterer::DocumentBelongsResult::kNoShardKey: {
+                    tassert(9245300, "Covering index failed to provide shard key", _needsFetch);
+
+                    // Skip this working set member with a warning - no shard key should not be
+                    // possible unless manually inserting data into a shard.
+                    tassert(9245400, "Expected document to be fetched", member->hasObj());
+                    LOGV2_WARNING(
+                        9245401,
+                        "No shard key found in document, it may have been inserted manually "
+                        "into shard",
+                        "document"_attr = redact(member->doc.value().toBson()),
+                        "keyPattern"_attr = _shardFilterer->getKeyPattern());
+                    [[fallthrough]];
+                }
+                case ShardFilterer::DocumentBelongsResult::kDoesNotBelong: {
+                    // We found an orphan; we need to try the next entry in the index in case its
+                    // not an orphan.
+                    _needsSequentialScan = true;
+                    _workingSet->free(id);
+                    return PlanStage::NEED_TIME;
+                }
+                default:
+                    MONGO_UNREACHABLE_TASSERT(9245301);
+            }
+        }
     }
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(9245303);
 }
 
 bool DistinctScan::isEOF() {
@@ -167,7 +281,7 @@ unique_ptr<PlanStageStats> DistinctScan::getStats() {
     // the constructor in order to avoid the expensive serialization operation unless the distinct
     // command is being explained.
     if (_specificStats.indexBounds.isEmpty()) {
-        _specificStats.indexBounds = _bounds.toBSON();
+        _specificStats.indexBounds = _bounds.toBSON(!_specificStats.collation.isEmpty());
     }
 
     unique_ptr<PlanStageStats> ret =

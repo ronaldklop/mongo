@@ -27,17 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <limits>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/persistent_task_store.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss{"test.foo"};
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 
 struct TestTask {
     std::string key;
@@ -52,7 +58,7 @@ struct TestTask {
           min(bson.getField("min").Int()),
           max(bson.getField("max").Int()) {}
 
-    static TestTask parse(IDLParserErrorContext, BSONObj bson) {
+    static TestTask parse(IDLParserContext, BSONObj bson) {
         return TestTask{bson};
     }
 
@@ -74,7 +80,7 @@ class PersistentTaskStoreTest : public CatalogTestFixture {
         CatalogTestFixture::setUp();
         auto opCtx = operationContext();
 
-        AutoGetDb autoDb(opCtx, kNss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, kNss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, kNss, MODE_IX);
     }
 };
@@ -105,8 +111,8 @@ TEST_F(PersistentTaskStoreTest, TestForEach) {
     // No match.
     int count = 0;
     store.forEach(opCtx,
-                  QUERY("key"
-                        << "four"),
+                  BSON("key"
+                       << "four"),
                   [&count](const TestTask& t) {
                       ++count;
                       return true;
@@ -115,7 +121,7 @@ TEST_F(PersistentTaskStoreTest, TestForEach) {
 
     // Multiple matches.
     count = 0;
-    store.forEach(opCtx, QUERY("min" << GTE << 10), [&count](const TestTask& t) {
+    store.forEach(opCtx, BSON("min" << GTE << 10), [&count](const TestTask& t) {
         ++count;
         return true;
     });
@@ -123,7 +129,7 @@ TEST_F(PersistentTaskStoreTest, TestForEach) {
 
     // Multiple matches, only take one.
     count = 0;
-    store.forEach(opCtx, QUERY("min" << GTE << 10), [&count](const TestTask& t) {
+    store.forEach(opCtx, BSON("min" << GTE << 10), [&count](const TestTask& t) {
         ++count;
         return count < 1;
     });
@@ -132,8 +138,8 @@ TEST_F(PersistentTaskStoreTest, TestForEach) {
     // Single match.
     count = 0;
     store.forEach(opCtx,
-                  QUERY("key"
-                        << "one"),
+                  BSON("key"
+                       << "one"),
                   [&count](const TestTask& t) {
                       ++count;
                       return true;
@@ -153,8 +159,8 @@ TEST_F(PersistentTaskStoreTest, TestRemove) {
     ASSERT_EQ(store.count(opCtx), 3);
 
     store.remove(opCtx,
-                 QUERY("key"
-                       << "one"));
+                 BSON("key"
+                      << "one"));
 
     ASSERT_EQ(store.count(opCtx), 2);
 }
@@ -171,7 +177,7 @@ TEST_F(PersistentTaskStoreTest, TestRemoveMultiple) {
     ASSERT_EQ(store.count(opCtx), 3);
 
     // Remove multipe overlapping ranges.
-    store.remove(opCtx, QUERY("min" << GTE << 10));
+    store.remove(opCtx, BSON("min" << GTE << 10));
 
     ASSERT_EQ(store.count(opCtx), 1);
 }
@@ -189,13 +195,13 @@ TEST_F(PersistentTaskStoreTest, TestUpdate) {
     ASSERT_EQ(store.count(opCtx), 3);
 
     store.update(opCtx,
-                 QUERY("key"
-                       << "one"),
+                 BSON("key"
+                      << "one"),
                  BSON("$inc" << BSON("min" << 1)));
 
     store.forEach(opCtx,
-                  QUERY("key"
-                        << "one"),
+                  BSON("key"
+                       << "one"),
                   [&](const TestTask& task) {
                       ASSERT_EQ(task.min, expectedUpdatedMin);
                       return false;
@@ -214,9 +220,9 @@ TEST_F(PersistentTaskStoreTest, TestUpdateOnlyUpdatesOneMatchingDocument) {
     store.add(opCtx, TestTask{"three", 40, 50});
 
     // Update query will match two documents but should only update one of them.
-    store.update(opCtx, QUERY("key" << keyToMatch), BSON("$inc" << BSON("min" << 1)));
+    store.update(opCtx, BSON("key" << keyToMatch), BSON("$inc" << BSON("min" << 1)));
 
-    ASSERT_EQ(store.count(opCtx, QUERY("key" << keyToMatch << "min" << expectedUpdatedMin)), 1);
+    ASSERT_EQ(store.count(opCtx, BSON("key" << keyToMatch << "min" << expectedUpdatedMin)), 1);
 }
 
 TEST_F(PersistentTaskStoreTest, TestUpsert) {
@@ -225,7 +231,7 @@ TEST_F(PersistentTaskStoreTest, TestUpsert) {
     PersistentTaskStore<TestTask> store(kNss);
 
     std::string keyToMatch = "foo";
-    auto query = QUERY("key" << keyToMatch);
+    auto query = BSON("key" << keyToMatch);
 
     TestTask task(keyToMatch, 0, 0);
     BSONObj taskBson = task.toBSON();
@@ -233,12 +239,13 @@ TEST_F(PersistentTaskStoreTest, TestUpsert) {
     ASSERT_EQ(store.count(opCtx, query), 0);
 
     // Test that an attempt to upsert from the update command throws an error.
-    ASSERT_THROWS_CODE(store.update(opCtx, query, taskBson, WriteConcerns::kMajorityWriteConcern),
-                       DBException,
-                       ErrorCodes::NoMatchingDocument);
+    ASSERT_THROWS_CODE(
+        store.update(opCtx, query, taskBson, WriteConcerns::kMajorityWriteConcernShardingTimeout),
+        DBException,
+        ErrorCodes::NoMatchingDocument);
 
     // Test that the document is created when upserted.
-    store.upsert(opCtx, query, taskBson, WriteConcerns::kMajorityWriteConcern);
+    store.upsert(opCtx, query, taskBson, WriteConcerns::kMajorityWriteConcernShardingTimeout);
 
     ASSERT_EQ(store.count(opCtx, query), 1);
 
@@ -249,15 +256,19 @@ TEST_F(PersistentTaskStoreTest, TestUpsert) {
     });
 
     // Verify that updates happen as expected with upsert and update
-    store.upsert(
-        opCtx, query, BSON("$inc" << BSON("min" << 1)), WriteConcerns::kMajorityWriteConcern);
+    store.upsert(opCtx,
+                 query,
+                 BSON("$inc" << BSON("min" << 1)),
+                 WriteConcerns::kMajorityWriteConcernShardingTimeout);
     store.forEach(opCtx, query, [&](const TestTask& t) {
         ASSERT_EQ(t.min, 1);
         return true;
     });
 
-    store.update(
-        opCtx, query, BSON("$inc" << BSON("min" << 1)), WriteConcerns::kMajorityWriteConcern);
+    store.update(opCtx,
+                 query,
+                 BSON("$inc" << BSON("min" << 1)),
+                 WriteConcerns::kMajorityWriteConcernShardingTimeout);
     store.forEach(opCtx, query, [&](const TestTask& t) {
         ASSERT_EQ(t.min, 2);
         return true;
@@ -281,15 +292,15 @@ TEST_F(PersistentTaskStoreTest, TestWritesPersistAcrossInstances) {
         PersistentTaskStore<TestTask> store(kNss);
         ASSERT_EQ(store.count(opCtx), 3);
 
-        auto count = store.count(opCtx, QUERY("min" << GTE << 10));
+        auto count = store.count(opCtx, BSON("min" << GTE << 10));
         ASSERT_EQ(count, 2);
 
         store.remove(opCtx,
-                     QUERY("key"
-                           << "two"));
+                     BSON("key"
+                          << "two"));
         ASSERT_EQ(store.count(opCtx), 2);
 
-        count = store.count(opCtx, QUERY("min" << GTE << 10));
+        count = store.count(opCtx, BSON("min" << GTE << 10));
         ASSERT_EQ(count, 1);
     }
 
@@ -297,7 +308,7 @@ TEST_F(PersistentTaskStoreTest, TestWritesPersistAcrossInstances) {
         PersistentTaskStore<TestTask> store(kNss);
         ASSERT_EQ(store.count(opCtx), 2);
 
-        auto count = store.count(opCtx, QUERY("min" << GTE << 10));
+        auto count = store.count(opCtx, BSON("min" << GTE << 10));
         ASSERT_EQ(count, 1);
     }
 }
@@ -312,16 +323,16 @@ TEST_F(PersistentTaskStoreTest, TestCountWithQuery) {
     store.add(opCtx, TestTask{"two", 40, 50});
 
     ASSERT_EQ(store.count(opCtx,
-                          QUERY("key"
-                                << "two")),
+                          BSON("key"
+                               << "two")),
               2);
 
     // Remove multipe overlapping ranges.
-    store.remove(opCtx, QUERY("min" << 10));
+    store.remove(opCtx, BSON("min" << 10));
 
     ASSERT_EQ(store.count(opCtx,
-                          QUERY("key"
-                                << "two")),
+                          BSON("key"
+                               << "two")),
               1);
 }
 

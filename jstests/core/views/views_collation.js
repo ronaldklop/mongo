@@ -2,15 +2,15 @@
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_non_retryable_commands,
+//   # Explain of a resolved view must be executed by mongos.
+//   directly_against_shardsvrs_incompatible,
+//   references_foreign_collection,
 // ]
 
 /**
  * Tests the behavior of operations when interacting with a view's default collation.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");
+import {getAggPlanStage, getAllNodeExplains} from "jstests/libs/query/analyze_plan.js";
 
 let viewsDB = db.getSiblingDB("views_collation");
 assert.commandWorked(viewsDB.dropDatabase());
@@ -217,6 +217,12 @@ assert.commandFailedWithCode(viewsDB.runCommand({
     collation: {locale: "en"}
 }),
                              ErrorCodes.OptionNotSupportedOnView);
+
+// Insert a document on "simpleCollection" because on sharded deployments, if the the outer
+// collection and the inner collection are on 2 different shards, $lookup will never even attempt to
+// read from the view if the outer collection has no document.
+assert.commandWorked(viewsDB["simpleCollection"].insert({x: 1}));
+
 assert.commandFailedWithCode(viewsDB.runCommand({
     aggregate: "simpleCollection",
     pipeline: [nestedLookupSimpleView],
@@ -314,6 +320,12 @@ assert.commandFailedWithCode(viewsDB.runCommand({
     collation: {locale: "zh"}
 }),
                              ErrorCodes.OptionNotSupportedOnView);
+
+// Insert a document on "filCollection" because on sharded deployments, if the the outer collection
+// and the inner collection are on 2 different shards, $lookup will never even attempt to read from
+// the view if the outer collection has no document.
+assert.commandWorked(viewsDB["filCollection"].insert({x: 1}));
+
 assert.commandFailedWithCode(viewsDB.runCommand({
     aggregate: "filCollection",
     pipeline: [makeNestedLookupFilView("filCollection")],
@@ -476,43 +488,53 @@ assert.commandWorked(viewsDB.case_sensitive_coll.insert({f: "case"}));
 assert.commandWorked(viewsDB.case_sensitive_coll.insert({f: "Case"}));
 assert.commandWorked(viewsDB.case_sensitive_coll.insert({f: "CASE"}));
 
-let explain, cursorStage;
+let explains, cursorStage;
 
 // Test that aggregate against a view with a default collation correctly uses the collation.
 // We expect the pipeline to be optimized away, so there should be no pipeline stages in
 // the explain.
 assert.eq(1, viewsDB.case_sensitive_coll.aggregate([{$match: {f: "case"}}]).itcount());
 assert.eq(3, viewsDB.case_insensitive_view.aggregate([{$match: {f: "case"}}]).itcount());
-explain = viewsDB.case_insensitive_view.explain().aggregate([{$match: {f: "case"}}]);
-assert.neq(null, explain.queryPlanner, tojson(explain));
-assert.eq(1, explain.queryPlanner.collation.strength, tojson(explain));
+explains =
+    getAllNodeExplains(viewsDB.case_insensitive_view.explain().aggregate([{$match: {f: "case"}}]));
+explains.forEach((explain) => {
+    assert.neq(null, explain.queryPlanner, tojson(explain));
+    assert.eq(1, explain.queryPlanner.collation.strength, tojson(explain));
+});
 
 // Test that count against a view with a default collation correctly uses the collation.
 assert.eq(1, viewsDB.case_sensitive_coll.count({f: "case"}));
 assert.eq(3, viewsDB.case_insensitive_view.count({f: "case"}));
-explain = viewsDB.case_insensitive_view.explain().count({f: "case"});
-cursorStage = getAggPlanStage(explain, "$cursor");
-assert.neq(null, cursorStage, tojson(explain));
-assert.eq(1, cursorStage.$cursor.queryPlanner.collation.strength, tojson(cursorStage));
+explains = getAllNodeExplains(viewsDB.case_insensitive_view.explain().count({f: "case"}));
+explains.forEach((explain) => {
+    cursorStage = getAggPlanStage(explain, "$cursor");
+    if (cursorStage) {
+        assert.eq(1, cursorStage.$cursor.queryPlanner.collation.strength, tojson(explain));
+    } else {
+        // When the pipeline planner optimizes the $match to run in SBE, there is no "$cursor"
+        // stage, and the explain plan has the collation info at the 'queryPlanner' level.
+        assert.eq(1, explain.queryPlanner.collation.strength, tojson(cursorStage));
+    }
+});
 
 // Test that distinct against a view with a default collation correctly uses the collation.
 assert.eq(3, viewsDB.case_sensitive_coll.distinct("f").length);
 assert.eq(1, viewsDB.case_insensitive_view.distinct("f").length);
-explain = viewsDB.case_insensitive_view.explain().distinct("f");
-cursorStage = getAggPlanStage(explain, "$cursor");
-assert.neq(null, cursorStage, tojson(explain));
-assert.eq(1, cursorStage.$cursor.queryPlanner.collation.strength, tojson(cursorStage));
+explains = getAllNodeExplains(viewsDB.case_insensitive_view.explain().distinct("f"));
+explains.forEach((explain) => {
+    cursorStage = getAggPlanStage(explain, "$cursor");
+    assert.neq(null, cursorStage, tojson(explain));
+    assert.eq(1, cursorStage.$cursor.queryPlanner.collation.strength, tojson(cursorStage));
+});
 
 // Test that find against a view with a default collation correctly uses the collation.
 // We expect the pipeline to be optimized away, so there should be no pipeline stages in
 // the explain output.
-let findRes = viewsDB.runCommand({find: "case_sensitive_coll", filter: {f: "case"}});
-assert.commandWorked(findRes);
-assert.eq(1, findRes.cursor.firstBatch.length);
-findRes = viewsDB.runCommand({find: "case_insensitive_view", filter: {f: "case"}});
-assert.commandWorked(findRes);
-assert.eq(3, findRes.cursor.firstBatch.length);
-explain = viewsDB.runCommand({explain: {find: "case_insensitive_view", filter: {f: "case"}}});
-assert.neq(null, explain.queryPlanner, tojson(explain));
-assert.eq(1, explain.queryPlanner.collation.strength, tojson(explain));
-}());
+assert.eq(1, viewsDB.case_sensitive_coll.find({f: "case"}).itcount());
+assert.eq(3, viewsDB.case_insensitive_view.find({f: "case"}).itcount());
+explains = getAllNodeExplains(
+    viewsDB.runCommand({explain: {find: "case_insensitive_view", filter: {f: "case"}}}));
+explains.forEach((explain) => {
+    assert.neq(null, explain.queryPlanner, tojson(explain));
+    assert.eq(1, explain.queryPlanner.collation.strength, tojson(explain));
+});

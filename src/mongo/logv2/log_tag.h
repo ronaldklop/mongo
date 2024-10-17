@@ -29,10 +29,10 @@
 
 #pragma once
 
-#include "mongo/bson/bsonobj.h"
-
 #include <cstdint>
 #include <string>
+
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo::logv2 {
 
@@ -49,6 +49,9 @@ public:
 
         // allow logging while the shell is waiting for user input
         kAllowDuringPromptingShell = 1 << 2,
+
+        // log to the backtrace log file
+        kBacktraceLog = 1 << 3,
     };
 
     friend Value operator|(Value a, Value b) {

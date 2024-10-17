@@ -29,14 +29,24 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <memory>
 #include <set>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sort_executor.h"
 #include "mongo/db/exec/sort_key_comparator.h"
 #include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
@@ -85,7 +95,7 @@ public:
 
     StageState doWork(WorkingSetID* out) final;
 
-    std::unique_ptr<PlanStageStats> getStats() override final;
+    std::unique_ptr<PlanStageStats> getStats() final;
 
 protected:
     // Not owned by us.
@@ -114,11 +124,11 @@ public:
                      bool addSortKeyMetadata,
                      std::unique_ptr<PlanStage> child);
 
-    void spool(WorkingSetID wsid) override final;
+    void spool(WorkingSetID wsid) final;
 
-    void loadingDone() override final;
+    void loadingDone() final;
 
-    StageState unspool(WorkingSetID* out) override final;
+    StageState unspool(WorkingSetID* out) final;
 
     StageType stageType() const final {
         return STAGE_SORT_DEFAULT;
@@ -155,11 +165,11 @@ public:
                     bool addSortKeyMetadata,
                     std::unique_ptr<PlanStage> child);
 
-    virtual void spool(WorkingSetID wsid) override final;
+    void spool(WorkingSetID wsid) final;
 
-    void loadingDone() override final;
+    void loadingDone() final;
 
-    virtual StageState unspool(WorkingSetID* out) override final;
+    StageState unspool(WorkingSetID* out) final;
 
     StageType stageType() const final {
         return STAGE_SORT_SIMPLE;

@@ -1,15 +1,7 @@
 /**
  * Verify the KMS support handles a buggy Key Store
  */
-
-load("jstests/client_encrypt/lib/mock_kms.js");
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-"use strict";
-
-const mock_kms = new MockKMSServerAWS();
-mock_kms.start();
+import {CA_CERT, SERVER_CERT} from "jstests/ssl/libs/ssl_helpers.js";
 
 const x509_options = {
     sslMode: "requireSSL",
@@ -21,12 +13,6 @@ const conn = MongoRunner.runMongod(x509_options);
 const test = conn.getDB("test");
 const collection = test.coll;
 
-const awsKMS = {
-    accessKeyId: "access",
-    secretAccessKey: "secret",
-    url: mock_kms.getURL(),
-};
-
 var localKMS = {
     key: BinData(
         0,
@@ -35,7 +21,6 @@ var localKMS = {
 
 const clientSideFLEOptions = {
     kmsProviders: {
-        aws: awsKMS,
         local: localKMS,
     },
     keyVaultNamespace: "test.coll",
@@ -55,7 +40,7 @@ function testFault(kmsType, func) {
 }
 
 function testFaults(func) {
-    const kmsTypes = ["aws", "local"];
+    const kmsTypes = ["local"];
 
     for (const kmsType of kmsTypes) {
         testFault(kmsType, func);
@@ -68,7 +53,7 @@ testFaults((keyId, shell) => {
 
     const str = "mongo";
     assert.throws(() => {
-        const encStr = shell.getClientEncryption().encrypt(keyId, str);
+        shell.getClientEncryption().encrypt(keyId, str);
     });
 });
 
@@ -78,7 +63,7 @@ testFaults((keyId, shell) => {
 
     const str = "mongo";
     assert.throws(() => {
-        const encStr = shell.getClientEncryption().encrypt(keyId, str);
+        shell.getClientEncryption().encrypt(keyId, str);
     });
 });
 
@@ -88,10 +73,8 @@ testFaults((keyId, shell) => {
 
     const str = "mongo";
     assert.throws(() => {
-        const encStr = shell.getClientEncryption().encrypt(keyId, str);
+        shell.getClientEncryption().encrypt(keyId, str);
     });
 });
 
 MongoRunner.stopMongod(conn);
-mock_kms.stop();
-}());

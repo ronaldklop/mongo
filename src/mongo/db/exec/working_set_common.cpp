@@ -27,23 +27,61 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/working_set_common.h"
-
+#include <algorithm>
 #include <boost/iterator/transform_iterator.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/bson/simple_bsonobj_comparator.h"
+#include <boost/container/flat_set.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/health_log_gen.h"
+#include "mongo/db/catalog/health_log_interface.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/query/canonical_query.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/storage/execution_context.h"
 #include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/shared_buffer_fragment.h"
+#include "mongo/util/stacktrace.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -69,7 +107,8 @@ std::string indexKeyVectorDebugString(const std::vector<IndexKeyDatum>& keyData)
 bool WorkingSetCommon::fetch(OperationContext* opCtx,
                              WorkingSet* workingSet,
                              WorkingSetID id,
-                             unowned_ptr<SeekableRecordCursor> cursor,
+                             SeekableRecordCursor* cursor,
+                             const CollectionPtr& collection,
                              const NamespaceString& ns) {
     WorkingSetMember* member = workingSet->get(id);
 
@@ -88,14 +127,14 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
         // not ignoring prepare conflicts, then this definitely indicates an error.
         std::vector<IndexKeyDatum>::iterator keyDataIt;
         if (member->getState() == WorkingSetMember::RID_AND_IDX &&
-            opCtx->recoveryUnit()->getPrepareConflictBehavior() ==
+            shard_role_details::getRecoveryUnit(opCtx)->getPrepareConflictBehavior() ==
                 PrepareConflictBehavior::kEnforce &&
-            (keyDataIt = std::find_if(member->keyData.begin(),
-                                      member->keyData.end(),
-                                      [currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId()](
-                                          const auto& keyDatum) {
-                                          return keyDatum.snapshotId == currentSnapshotId;
-                                      })) != member->keyData.end()) {
+            (keyDataIt = std::find_if(
+                 member->keyData.begin(),
+                 member->keyData.end(),
+                 [currentSnapshotId = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId()](
+                     const auto& keyDatum) { return keyDatum.snapshotId == currentSnapshotId; })) !=
+                member->keyData.end()) {
             auto indexKeyEntryToObjFn = [](const IndexKeyDatum& ikd) {
                 BSONObjBuilder builder;
                 // Rehydrate the index key fields to prevent duplicate "" fields from being logged.
@@ -105,22 +144,53 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                 builder.append("pattern"_sd, ikd.indexKeyPattern);
                 return builder.obj();
             };
+
+            HealthLogEntry entry;
+            entry.setNss(ns);
+            entry.setTimestamp(Date_t::now());
+            entry.setSeverity(SeverityEnum::Error);
+            entry.setScope(ScopeEnum::Index);
+            entry.setOperation("Index scan");
+            entry.setMsg("Erroneous index key found with reference to non-existent record id");
+
+            BSONObjBuilder bob;
+            bob.append("recordId", member->recordId.toString());
+
+            const BSONArray indexKeyData =
+                logv2::seqLog(
+                    boost::make_transform_iterator(member->keyData.begin(), indexKeyEntryToObjFn),
+                    boost::make_transform_iterator(member->keyData.end(), indexKeyEntryToObjFn))
+                    .toBSONArray();
+            bob.append("indexKeyData", indexKeyData);
+
+            bob.appendElements(getStackTrace().getBSONRepresentation());
+            entry.setData(bob.obj());
+
+            HealthLogInterface::get(opCtx)->log(entry);
+
+            auto options = [&] {
+                if (shard_role_details::getRecoveryUnit(opCtx)->getDataCorruptionDetectionMode() ==
+                    DataCorruptionDetectionMode::kThrow) {
+                    return logv2::LogOptions{
+                        logv2::UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)};
+                } else {
+                    return logv2::LogOptions(logv2::LogComponent::kAutomaticDetermination);
+                }
+            }();
             LOGV2_ERROR_OPTIONS(
                 4615603,
-                {logv2::UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)},
+                options,
                 "Erroneous index key found with reference to non-existent record id. Consider "
                 "dropping and then re-creating the index and then running the validate command "
                 "on the collection.",
-                "namespace"_attr = ns,
+                logAttrs(ns),
                 "recordId"_attr = member->recordId,
-                "indexKeyData"_attr = logv2::seqLog(
-                    boost::make_transform_iterator(member->keyData.begin(), indexKeyEntryToObjFn),
-                    boost::make_transform_iterator(member->keyData.end(), indexKeyEntryToObjFn)));
+                "indexKeyData"_attr = indexKeyData);
         }
         return false;
     }
 
-    auto currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
+    auto currentSnapshotId = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId();
     member->resetDocument(currentSnapshotId, record->data.releaseToBson());
 
     // Make sure that all of the keyData is still valid for this copy of the document.  This ensures
@@ -139,24 +209,32 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
             }
 
             auto keys = executionCtx.keys();
+            SharedBufferFragmentBuilder pool(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
             // There's no need to compute the prefixes of the indexed fields that cause the
             // index to be multikey when ensuring the keyData is still valid.
             KeyStringSet* multikeyMetadataKeys = nullptr;
             MultikeyPaths* multikeyPaths = nullptr;
-            auto* iam = workingSet->retrieveIndexAccessMethod(memberKey.indexId);
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            const StringData indexIdent = workingSet->retrieveIndexIdent(memberKey.indexId);
+            auto desc = collection->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
+            invariant(desc,
+                      str::stream() << "Index entry not found for index with ident " << indexIdent
+                                    << " on collection " << collection->ns().toStringForErrorMsg());
+            auto* iam = desc->getEntry()->accessMethod()->asSortedData();
+            iam->getKeys(opCtx,
+                         collection,
+                         desc->getEntry(),
+                         pool,
                          member->doc.value().toBson(),
-                         IndexAccessMethod::GetKeysMode::kEnforceConstraints,
-                         IndexAccessMethod::GetKeysContext::kValidatingKeys,
+                         InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
+                         SortedDataIndexAccessMethod::GetKeysContext::kValidatingKeys,
                          keys.get(),
                          multikeyMetadataKeys,
                          multikeyPaths,
-                         member->recordId,
-                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
-            KeyString::HeapBuilder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
-                                             memberKey.keyData,
-                                             iam->getSortedDataInterface()->getOrdering(),
-                                             member->recordId);
+                         member->recordId);
+            key_string::HeapBuilder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
+                                              memberKey.keyData,
+                                              iam->getSortedDataInterface()->getOrdering(),
+                                              member->recordId);
             if (!keys->count(keyString.release())) {
                 // document would no longer be at this position in the index.
                 return false;

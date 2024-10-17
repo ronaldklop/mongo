@@ -29,18 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr.hpp>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/db/repl/repl_sync_shared_data.h"
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -144,7 +155,7 @@ protected:
 
         ClonerStage(std::string name, T* cloner, ClonerRunFn stageFunc)
             : BaseClonerStage(name), _cloner(cloner), _stageFunc(stageFunc) {}
-        virtual AfterStageBehavior run() {
+        AfterStageBehavior run() override {
             return (_cloner->*_stageFunc)();
         }
 
@@ -160,9 +171,9 @@ protected:
 
     typedef std::vector<BaseClonerStage*> ClonerStages;
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH(_clonerName + "::_mutex"_sd);
+    mutable stdx::mutex _mutex;
 
-    const StringData getClonerName() const {
+    StringData getClonerName() const {
         return _clonerName;
     }
 
@@ -188,6 +199,11 @@ protected:
 
     Status getStatus(WithLock) const {
         return _status;
+    }
+
+    void setStatus(WithLock, Status status) {
+        invariant(!status.isOK());
+        _status = status;
     }
 
     const HostAndPort& getSource() const {

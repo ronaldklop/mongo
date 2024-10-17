@@ -1,6 +1,9 @@
 // Tests tracking of latestOptime and earliestOptime in serverStatus.oplog
 // Also tests tracking of wall clock times in replSetGetStatus
 
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 function timestampCompare(o1, o2) {
     if (o1.t < o2.t) {
         return -1;
@@ -28,22 +31,34 @@ function wallTimeCompare(d1, d2) {
 }
 
 function optimesAndWallTimesAreEqual(replTest, isPersistent) {
+    const reduceMajorityWriteLatency =
+        FeatureFlagUtil.isPresentAndEnabled(replTest.getPrimary(), "ReduceMajorityWriteLatency");
     let prevReplStatus = replTest.nodes[0].getDB('admin').runCommand({replSetGetStatus: 1});
     let prevOptime = prevReplStatus.optimes.appliedOpTime.ts;
     let prevAppliedWallTime = prevReplStatus.optimes.lastAppliedWallTime;
     let prevDurableWallTime = prevReplStatus.optimes.lastDurableWallTime;
+    let prevWrittenWallTime =
+        (reduceMajorityWriteLatency) ? prevReplStatus.optimes.lastWrittenWallTime : null;
     for (var i = 1; i < replTest.nodes.length; i++) {
         let currentReplStatus = replTest.nodes[i].getDB('admin').runCommand({replSetGetStatus: 1});
         let currOptime = currentReplStatus.optimes.appliedOpTime.ts;
         let currAppliedWallTime = currentReplStatus.optimes.lastAppliedWallTime;
         let currDurableWallTime = currentReplStatus.optimes.lastDurableWallTime;
+        let currWrittenWallTime =
+            (reduceMajorityWriteLatency) ? currentReplStatus.optimes.lastWrittenWallTime : null;
         if (timestampCompare(prevOptime, currOptime) != 0 ||
             wallTimeCompare(prevAppliedWallTime, currAppliedWallTime) != 0 ||
+            // If ReduceMajorityWriteLatency is set, the prevWrittenWallTime and
+            // currWrittenWallTime will not be null, so they'll be truthy.
+            (prevWrittenWallTime && currWrittenWallTime &&
+             wallTimeCompare(prevWrittenWallTime, currWrittenWallTime) != 0) ||
             (isPersistent && wallTimeCompare(prevDurableWallTime, currDurableWallTime) != 0)) {
             jsTest.log("optimesAndWallTimesAreEqual returning false match, prevOptime: " +
                        tojson(prevOptime) + " latestOptime: " + tojson(currOptime) +
                        " prevAppliedWallTime: " + tojson(prevAppliedWallTime) +
-                       " latestWallTime: " + tojson(currAppliedWallTime) +
+                       " latestAppliedWallTime: " + tojson(currAppliedWallTime) +
+                       " prevWrittenAppliedWallTime: " + tojson(prevWrittenWallTime) +
+                       " latestWrittenWallTime: " + tojson(currWrittenWallTime) +
                        " prevDurableWallTime: " + tojson(prevDurableWallTime) +
                        " latestDurableWallTime: " + tojson(currDurableWallTime));
             replTest.dumpOplog(replTest.nodes[i], {}, 20);
@@ -62,8 +77,11 @@ var replTest = new ReplSetTest(
 
 const nodes = replTest.startSet();
 
-// Tests that serverStatus oplog returns an error if the oplog collection doesn't exist.
-assert.commandFailedWithCode(nodes[0].getDB('admin').serverStatus({oplog: true}), 17347);
+// Tests that serverStatus oplog returns null timestamps if the oplog collection doesn't exist.
+const zeroTs = new Timestamp(0, 0);
+const oplogStatus = nodes[0].getDB('admin').serverStatus({oplog: true}).oplog;
+assert.eq(oplogStatus.earliestOptime, zeroTs);
+assert.eq(oplogStatus.latestOptime, zeroTs);
 
 replTest.initiate();
 var primary = replTest.getPrimary();
@@ -104,16 +122,6 @@ const dumpInfoFn = function() {
 };
 
 assert.gt(timestampCompare(info.latestOptime, initialInfo.latestOptime), 0, dumpInfoFn);
-assert.gt(wallTimeCompare(replStatusInfo.optimes.lastAppliedWallTime,
-                          initialReplStatusInfo.optimes.lastAppliedWallTime),
-          0,
-          dumpInfoFn);
-if (isPersistent) {
-    assert.gt(wallTimeCompare(replStatusInfo.optimes.lastDurableWallTime,
-                              initialReplStatusInfo.optimes.lastDurableWallTime),
-              0,
-              dumpInfoFn);
-}
 assert.eq(timestampCompare(info.earliestOptime, initialInfo.earliestOptime), 0, dumpInfoFn);
 
 // Insert some large documents to force the oplog to roll over
@@ -135,11 +143,6 @@ assert.soon(function() {
                "; looking for it to be different from " + tojson(initialInfo.earliestOptime));
     replStatusInfo = primary.getDB('admin').runCommand({replSetGetStatus: 1});
     return timestampCompare(info.latestOptime, initialInfo.latestOptime) > 0 &&
-        wallTimeCompare(replStatusInfo.optimes.lastAppliedWallTime,
-                        initialReplStatusInfo.optimes.lastAppliedWallTime) > 0 &&
-        (!isPersistent ||
-         wallTimeCompare(replStatusInfo.optimes.lastDurableWallTime,
-                         initialReplStatusInfo.optimes.lastDurableWallTime) > 0) &&
         timestampCompare(info.earliestOptime, initialInfo.earliestOptime) > 0;
 });
 

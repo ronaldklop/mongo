@@ -29,9 +29,33 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
+/**
+ * Returns the elements of an array and the associated array index one-by-one. The array to unwind
+ * is read from the 'inField' slot. The resulting array elements are put into the 'outField' slot
+ * with the corresponding array indices available in 'outIndex'.
+ *
+ * Generally, if 'inField' contains a non-array value it is skipped. However, if
+ * 'preserveNullAndEmptyArrays' is true then, as the name implies, null or empty arrays are
+ * preserved (i.e. these values are put into the 'outField' slot and the stage returns 'ADVANCED').
+ *
+ * Debug string representation:
+ *
+ *   unwind outputValueSlot outputIndexSlot inputSlot preserveNullAndEmptyArrays childStage
+ */
 class UnwindStage final : public PlanStage {
 public:
     UnwindStage(std::unique_ptr<PlanStage> input,
@@ -39,7 +63,9 @@ public:
                 value::SlotId outField,
                 value::SlotId outIndex,
                 bool preserveNullAndEmptyArrays,
-                PlanNodeId planNodeId);
+                PlanNodeId planNodeId,
+                PlanYieldPolicy* yieldPolicy = nullptr,
+                bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -52,6 +78,11 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    void doSaveState(bool relinquishCursor) final;
+    void doRestoreState(bool relinquishCursor) final;
 
 private:
     const value::SlotId _inField;
@@ -60,8 +91,8 @@ private:
     const bool _preserveNullAndEmptyArrays;
 
     value::SlotAccessor* _inFieldAccessor{nullptr};
-    std::unique_ptr<value::ViewOfValueAccessor> _outFieldOutputAccessor;
-    std::unique_ptr<value::ViewOfValueAccessor> _outIndexOutputAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _outFieldOutputAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _outIndexOutputAccessor;
 
     value::ArrayAccessor _inArrayAccessor;
 

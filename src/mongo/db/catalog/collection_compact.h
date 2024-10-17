@@ -29,7 +29,11 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/record_store.h"
 
 namespace mongo {
@@ -41,6 +45,7 @@ namespace mongo {
  * size decreased, the return value is positive. Otherwise, the return value is negative.
  */
 StatusWith<int64_t> compactCollection(OperationContext* opCtx,
-                                      const NamespaceString& collectionNss);
+                                      const CompactOptions& options,
+                                      const CollectionPtr& collection);
 
 }  // namespace mongo

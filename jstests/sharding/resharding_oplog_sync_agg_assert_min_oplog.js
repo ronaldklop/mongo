@@ -1,10 +1,10 @@
 /**
  * Tests that the resharding operation will fail if a recipient shard would have missed oplog
  * entries from a donor shard.
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     // Set the syncdelay to 1s to speed up checkpointing.
@@ -42,7 +42,17 @@ assert.soon(() => {
     // keep inserting documents until the oplog truncates
     assert.commandWorked(testColl.insert({_id: id, longString: longString}));
     id++;
-    return timestampCmp(localDb.oplog.rs.findOne().ts, oplogEntry.ts) == 1;
+    let doc;
+    try {
+        doc = localDb.oplog.rs.findOne();
+    } catch (e) {
+        if (e.code == ErrorCodes.CappedPositionLost) {
+            // Oplog truncation occurred concurrently with the find command above.
+            return false;
+        }
+        throw e;
+    }
+    return timestampCmp(doc.ts, oplogEntry.ts) == 1;
 }, "Timeout waiting for oplog to roll over on primary");
 
 assert.commandFailedWithCode(localDb.runCommand({
@@ -74,4 +84,3 @@ assert.commandFailedWithCode(localDb.runCommand({
 jsTest.log("End of test");
 
 rst.stopSet();
-})();

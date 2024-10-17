@@ -33,10 +33,12 @@ global:
     cpp_includes:
         - "mongo/db/namespace_string.h"
         - "mongo/db/pipeline/document_source_merge_spec.h"
+        - "mongo/s/chunk_version.h"
 
 imports:
     - "mongo/db/pipeline/document_source_merge_modes.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/namespace_spec.idl"
     - "mongo/s/chunk_version.idl"
 
 types:
@@ -47,6 +49,9 @@ types:
         cpp_type: mongo::NamespaceString
         serializer: "::mongo::mergeTargetNssSerializeToBSON"
         deserializer: "::mongo::mergeTargetNssParseFromBSON"
+        deserialize_with_tenant: true
+        # NamespaceString is not a view.
+        is_view: false
 
     MergeOnFields:
         bson_serialization_type: any
@@ -54,6 +59,8 @@ types:
         cpp_type: std::vector<std::string>
         serializer: "::mongo::mergeOnFieldsSerializeToBSON"
         deserializer: "::mongo::mergeOnFieldsParseFromBSON"
+        # std::vector<std::string> is not a view.
+        is_view: false
 
     MergeWhenMatchedPolicy:
         bson_serialization_type: any
@@ -63,34 +70,26 @@ types:
         cpp_type: "::mongo::MergeWhenMatchedPolicy"
         serializer: "::mongo::mergeWhenMatchedSerializeToBSON"
         deserializer: "::mongo::mergeWhenMatchedParseFromBSON"
+        # Deserializer uses getOwned.
+        is_view: false
 
 structs:
-    NamespaceSpec:
-        description: A document used to specify a namespace.
-        strict: true
-        fields:
-            db:
-                type: string
-                optional: true
-                description: The database field for this namespace.
-            coll:
-                type: string
-                optional: true
-                description: The collection field for this namespace.
-
     DocumentSourceMergeSpec:
         description: A document used to specify the $merge stage of an aggregation pipeline.
         strict: true
+        query_shape_component: true
         fields:
             into:
                 cpp_name: targetNss
                 type: MergeTargetNss
                 description: Target namespace to merge documents from an aggregation pipeline into.
+                query_shape: custom
 
             on:
                 type: MergeOnFields
                 optional: true
                 description: A single field or array of fields that uniquely identify a document.
+                query_shape: custom
 
             let:
                 type: object
@@ -98,18 +97,21 @@ structs:
                 description: Specifies variables to use in the update pipeline defined in
                              MergeWhenMatchedPolicy when the 'whenMatched' mode is a custom
                              pipeline.
+                query_shape: custom
 
             whenMatched:
                 type: MergeWhenMatchedPolicy
                 optional: true
                 description: The merge mode for the merge operation when source and target elements
                              match.
+                query_shape: parameter
 
             whenNotMatched:
                 type: MergeWhenNotMatchedMode
                 optional: true
                 description: The merge mode for the merge operation when source and target elements
                              do not match.
+                query_shape: parameter
 
             targetCollectionVersion:
                 type: ChunkVersion
@@ -119,3 +121,11 @@ structs:
                              in which case the shard key may have changed, or had its shard key
                              refined. This also can be used to detect if the collection has gone
                              from unsharded to sharded, and thus now has a shard key.
+                query_shape: parameter
+
+            allowMergeOnNullishValues:
+                type: optionalBool
+                description: If set to true, allow values of "on" fields in $merge to include
+                             missing or null values. This fields should only be used by mongos when
+                             passing split pipeline to mongod.
+                query_shape: parameter

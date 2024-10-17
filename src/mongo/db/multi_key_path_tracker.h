@@ -29,18 +29,22 @@
 
 #pragma once
 
-#include <string>
-
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
+#include <vector>
 
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 struct MultikeyPathInfo {
     NamespaceString nss;
+    UUID collectionUUID;
     std::string indexName;
     KeyStringSet multikeyMetadataKeys;
     MultikeyPaths multikeyPaths;
@@ -81,6 +85,12 @@ public:
     void addMultikeyPathInfo(MultikeyPathInfo info);
 
     /**
+     * Clears out any multikey path information that has been appended.
+     * Must call stopTrackingMultikeyPathInfo() first if tracking was previously started.
+     */
+    void clear();
+
+    /**
      * Returns the multikey path information that has been saved.
      */
     const WorkerMultikeyPathInfo& getMultikeyPathInfo() const;
@@ -88,8 +98,8 @@ public:
     /**
      * Returns the multikey path information for the given inputs, or boost::none if none exist.
      */
-    const boost::optional<MultikeyPaths> getMultikeyPathInfo(const NamespaceString& nss,
-                                                             const std::string& indexName);
+    boost::optional<MultikeyPaths> getMultikeyPathInfo(const NamespaceString& nss,
+                                                       const std::string& indexName);
 
     /**
      * Specifies that we should track multikey path information on this MultikeyPathTracker. This is
@@ -109,6 +119,12 @@ public:
      * stopTrackingMultikeyPathInfo().
      */
     bool isTrackingMultikeyPathInfo() const;
+
+    /**
+     * Returns a boolean representing whether or not any multikey path information
+     * has been appended to the list of indexes to set as multikey.
+     */
+    bool isEmpty() const;
 
 
 private:

@@ -1,14 +1,8 @@
 /**
  * Test that a change stream on the primary node survives stepdown.
- *
- * Change streams are only supported on WiredTiger.
- * @tags: [requires_wiredtiger]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");  // for [stop|restart]ServerReplication.
-load("jstests/libs/parallel_shell_helpers.js");
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "change_stream_stepdown";
 const replTest = new ReplSetTest({name: name, nodes: [{}, {}]});
@@ -91,7 +85,8 @@ jsTestLog("Testing that changestream waiting on old primary sees docs inserted o
 
 replTest.awaitReplication();  // Ensure secondary is up to date and can win an election.
 
-function shellFn(dbName, collName, changeStreamComment, stepUpFn) {
+async function shellFn(dbName, collName, changeStreamComment, stepUpFn) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
     // Wait for the getMore to be in progress.
     const primary = db.getMongo();
     assert.soon(() => primary.getDB("admin")
@@ -133,4 +128,3 @@ assert.eq(changes[0]["operationType"], "insert");
 waitForShell();
 
 replTest.stopSet();
-})();

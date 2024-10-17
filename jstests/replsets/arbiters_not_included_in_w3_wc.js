@@ -9,8 +9,7 @@
  * *not* get picked in its place and the w:3 write times out instead.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "arbiters_not_included_in_w3_wc";
 const rst = new ReplSetTest({name: name, nodes: 4});
@@ -47,4 +46,3 @@ assert.commandFailedWithCode(testColl.insert({"b": 2}, {writeConcern: {w: 3, wti
                              ErrorCodes.WriteConcernFailed);
 
 rst.stopSet();
-})();

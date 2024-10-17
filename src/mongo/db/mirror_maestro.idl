@@ -31,7 +31,7 @@ global:
   - "mongo/db/mirror_maestro.h"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
 
 structs:
   MirroredReadsParameters:
@@ -41,7 +41,7 @@ structs:
       samplingRate:
         description: >-
             A floating-point value within [0.0,1.0] specifying what fraction of reads to sample
-        type: double
+        type: safeDouble
         default: 0.01
         validator:
           gte: 0.0
@@ -49,7 +49,7 @@ structs:
       maxTimeMS:
         description: >-
             The maxTimeMS to apply to mirrored reads
-        type: int
+        type: safeInt
         default: 1000
         validator:
           gt: 0
@@ -62,3 +62,4 @@ server_parameters:
         name: "MirroredReadsServerParameter"
         data: "synchronized_value<MirroredReadsParameters>"
         override_set: true
+    redact: false

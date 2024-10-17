@@ -27,15 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
-
+#include <string>
 #include <zstd.h>
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_zstd.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -73,6 +77,11 @@ StatusWith<std::size_t> ZstdMessageCompressor::decompressData(ConstDataRange inp
 
     counterHitDecompress(input.length(), ret);
     return {ret};
+}
+
+std::size_t ZstdMessageCompressor::getMaxDecompressedSize(const void* src, size_t srcSize) {
+    auto maxDecompressedSize = ZSTD_getFrameContentSize(src, srcSize);
+    return static_cast<size_t>(maxDecompressedSize);
 }
 
 

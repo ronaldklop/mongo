@@ -5,8 +5,7 @@
  * secondary.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "opcounters_repl";
 const dbName = testName;
@@ -41,6 +40,10 @@ function getOpCountersDiff(cmdFn) {
     // Get the counters after running cmdFn().
     const primaryOpCountersAfter = getOpCounters(primary);
     const secondaryOpCountersReplAfter = getOpCountersRepl(secondary);
+
+    assert(!primaryOpCountersAfter.hasOwnProperty("constraintsRelaxed"), primaryOpCountersAfter);
+    assert(!secondaryOpCountersReplAfter.hasOwnProperty("constraintsRelaxed"),
+           secondaryOpCountersReplAfter);
 
     // Calculate the diff
     let primaryDiff = {};
@@ -85,7 +88,7 @@ diff = getOpCountersDiff(() => {
 assert.eq(diff.primary.delete, 1);
 assert.eq(diff.secondary.delete, 1);
 
-// 5. Atomic insert operation via applyOps cmd.
+// 5. Insert operation via applyOps cmd.
 diff = getOpCountersDiff(() => {
     assert.commandWorked(primaryColl.runCommand(
         {applyOps: [{op: "i", ns: collNs, o: {_id: 1}}], writeConcern: {w: 2}}));
@@ -98,4 +101,3 @@ assert.eq(diff.primary.insert, 1);
 assert.eq(diff.secondary.insert, 1);
 
 rst.stopSet();
-})();

@@ -25,8 +25,6 @@ import re
 import subprocess
 import winreg
 
-import SCons
-
 
 def exists(env):
     result = "msvc" in env["TOOLS"]
@@ -118,7 +116,6 @@ def generate(env):
     # On VS2015 the merge modules are in the program files directory,
     # not under the VS install dir.
     if msvc_minor == "0":
-
         if not programfilesx86:
             programfilesx86 = _get_programfiles()
             if not programfilesx86:
@@ -128,8 +125,7 @@ def generate(env):
         if os.path.isdir(mergemodulepath):
             env["MSVS"]["VCREDISTMERGEMODULEPATH"] = mergemodulepath
 
-    if not "VSINSTALLDIR" in env["MSVS"]:
-
+    if "VSINSTALLDIR" not in env["MSVS"]:
         # Compute a VS version based on the VC version. VC 14.0 is VS 2015, VC
         # 14.1 is VS 2017. Also compute the next theoretical version by
         # incrementing the major version by 1. Then form a range from this
@@ -178,13 +174,13 @@ def generate(env):
     try:
         # TOOO: This x64 needs to be abstracted away. Is it the host
         # arch, or the target arch? My guess is host.
-        vsruntime_key_name = "SOFTWARE\\Microsoft\\VisualStudio\\{msvc_major}.0\\VC\\Runtimes\\x64".format(
-            msvc_major=msvc_major
+        vsruntime_key_name = (
+            "SOFTWARE\\Microsoft\\VisualStudio\\{msvc_major}.0\\VC\\Runtimes\\x64".format(
+                msvc_major=msvc_major
+            )
         )
         vsruntime_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, vsruntime_key_name)
-        vslib_version, vslib_version_type = winreg.QueryValueEx(
-            vsruntime_key, "Version"
-        )
+        vslib_version, vslib_version_type = winreg.QueryValueEx(vsruntime_key, "Version")
     except WindowsError:
         return
 
@@ -228,9 +224,7 @@ def generate(env):
     if not expansion:
         return
 
-    vcredist_candidates = [
-        c.format(expansion) for c in vcredist_search_template_sequence
-    ]
+    vcredist_candidates = [c.format(expansion) for c in vcredist_search_template_sequence]
     for candidate in vcredist_candidates:
         candidate = os.path.join(redist_path, candidate)
         if os.path.isfile(candidate):

@@ -37,6 +37,8 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/import_options.h"
+#include "mongo/db/storage/compact_options.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -63,7 +65,18 @@ public:
      * When all of the storage startup tasks are completed as a whole, then this function is called
      * by the external force managing the startup process.
      */
-    virtual void notifyStartupComplete() {}
+    virtual void notifyStorageStartupRecoveryComplete() {}
+
+    /**
+     * Perform any operations in the storage layer that are unblocked now that the server has exited
+     * recovery and considers itself stable.
+     *
+     * This will be called during a node's transition to steady state replication.
+     *
+     * This function may race with shutdown. As a result, any steps within this function that should
+     * not race with shutdown should obtain the global lock.
+     */
+    virtual void notifyReplStartupRecoveryComplete(OperationContext* opCtx) {}
 
     virtual RecoveryUnit* newRecoveryUnit() = 0;
 
@@ -77,12 +90,23 @@ public:
      * @param ident Will be created if it does not already exist.
      */
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
-                                                        StringData ns,
+                                                        const NamespaceString& nss,
                                                         StringData ident,
                                                         const CollectionOptions& options) = 0;
 
+    /**
+     * Opens an existing ident as a temporary record store. Must be used for record stores created
+     * with `makeTemporaryRecordStore`. Using `getRecordStore` would cause the record store to use
+     * the same settings as a regular collection, and would differ in behaviour as when it was
+     * originally created with `makeTemporaryRecordStore`.
+     */
+    virtual std::unique_ptr<RecordStore> getTemporaryRecordStore(OperationContext* opCtx,
+                                                                 StringData ident,
+                                                                 KeyFormat keyFormat) = 0;
+
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
+        const NamespaceString& nss,
         const CollectionOptions& collOptions,
         StringData ident,
         const IndexDescriptor* desc) = 0;
@@ -95,12 +119,18 @@ public:
      * back and it is safe to immediately reclaim storage.
      */
     virtual Status createRecordStore(OperationContext* opCtx,
-                                     StringData ns,
+                                     const NamespaceString& nss,
                                      StringData ident,
-                                     const CollectionOptions& options) = 0;
+                                     const CollectionOptions& options,
+                                     KeyFormat keyFormat = KeyFormat::Long) = 0;
 
+    /**
+     * RecordStores initially created with `makeTemporaryRecordStore` must be opened with
+     * `getTemporaryRecordStore`.
+     */
     virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
-                                                                  StringData ident) = 0;
+                                                                  StringData ident,
+                                                                  KeyFormat keyFormat) = 0;
 
     /**
      * Similar to createRecordStore but this imports from an existing table with the provided ident
@@ -108,11 +138,62 @@ public:
      */
     virtual Status importRecordStore(OperationContext* opCtx,
                                      StringData ident,
-                                     const BSONObj& storageMetadata) {
+                                     const BSONObj& storageMetadata,
+                                     const ImportOptions& importOptions) {
         MONGO_UNREACHABLE;
     }
 
+    /**
+     * When we write to an oplog, we call this so that that the storage engine can manage the
+     * visibility of oplog entries to ensure they are ordered.
+     *
+     * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
+     * illegal to acquire any LockManager locks inside of this function.
+     *
+     * If `orderedCommit` is true, the storage engine can assume the input `opTime` has become
+     * visible in the oplog. Otherwise the storage engine must continue to maintain its own
+     * visibility management. Calls with `orderedCommit` true will not be concurrent with calls of
+     * `orderedCommit` false.
+     */
+    virtual Status oplogDiskLocRegister(OperationContext* opCtx,
+                                        RecordStore* oplogRecordStore,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit) = 0;
+
+    /**
+     * Waits for all writes that completed before this call to be visible to forward scans.
+     * See the comment on RecordCursor for more details about the visibility rules.
+     *
+     * It is only legal to call this on an oplog. It is illegal to call this inside a
+     * WriteUnitOfWork.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                         RecordStore* oplogRecordStore) const = 0;
+
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * the engine is non-ephemeral. This cannot be called from inside a unit of work, and should
+     * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
+     */
+    virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
+
+    /**
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint or 'stableCheckpoint'=false, this method call will
+     * turn into an unstable checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
+                                                   bool stableCheckpoint) = 0;
+
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const NamespaceString& nss,
                                              const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) = 0;
@@ -123,7 +204,8 @@ public:
      */
     virtual Status importSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const BSONObj& storageMetadata) {
+                                             const BSONObj& storageMetadata,
+                                             const ImportOptions& importOptions) {
         MONGO_UNREACHABLE;
     }
 
@@ -145,7 +227,7 @@ public:
      */
     virtual Status dropIdent(RecoveryUnit* ru,
                              StringData ident,
-                             StorageEngine::DropIdentCallback&& onDrop = nullptr) = 0;
+                             const StorageEngine::DropIdentCallback& onDrop = nullptr) = 0;
 
     /**
      * Removes any knowledge of the ident from the storage engines metadata without removing the
@@ -167,12 +249,17 @@ public:
                                         const NamespaceString& nss,
                                         StringData ident,
                                         const CollectionOptions& options) {
-        auto status = createRecordStore(opCtx, nss.ns(), ident, options);
+        auto status = createRecordStore(opCtx, nss, ident, options);
         if (status.isOK()) {
             return {ErrorCodes::DataModifiedByRepair, "Orphan recovery created a new record store"};
         }
         return status;
     }
+
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc,
+                                    bool isForceUpdateMetadata) {}
 
     /**
      * See StorageEngine::flushAllFiles for details
@@ -208,14 +295,28 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) {
+    virtual StatusWith<std::deque<std::string>> extendBackupCursor(OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
 
+    /**
+     * Returns whether the KVEngine supports checkpoints.
+     */
+    virtual bool supportsCheckpoints() const {
+        return false;
+    }
+
     virtual void checkpoint() {}
 
-    virtual bool isDurable() const = 0;
+    virtual StorageEngine::CheckpointIteration getCheckpointIteration() const {
+        return StorageEngine::CheckpointIteration{0};
+    }
+
+    virtual bool hasDataBeenCheckpointed(
+        StorageEngine::CheckpointIteration checkpointIteration) const {
+        MONGO_UNREACHABLE;
+    }
 
     /**
      * Returns true if the KVEngine is ephemeral -- that is, it is NOT persistent and all data is
@@ -231,27 +332,11 @@ public:
     }
 
     /**
-     * Returns true if the storage engine supports collections clustered on _id. That is,
-     * collections will use _id values as their RecordId and do not need a separate _id index.
-     */
-    virtual bool supportsClusteredIdIndex() const {
-        return false;
-    }
-
-    /**
      * Returns true if storage engine supports --directoryperdb.
      * See:
      *     http://docs.mongodb.org/manual/reference/program/mongod/#cmdoption--directoryperdb
      */
     virtual bool supportsDirectoryPerDB() const = 0;
-
-    virtual Status okToRename(OperationContext* opCtx,
-                              StringData fromNS,
-                              StringData toNS,
-                              StringData ident,
-                              const RecordStore* originalRecordStore) const {
-        return Status::OK();
-    }
 
     virtual bool hasIdent(OperationContext* opCtx, StringData ident) const = 0;
 
@@ -366,14 +451,10 @@ public:
         return false;
     }
 
-    virtual bool supportsReadConcernMajority() const {
-        return false;
-    }
-
     /**
-     * See `StorageEngine::supportsOplogStones`
+     * See `StorageEngine::supportsOplogTruncateMarkers`
      */
-    virtual bool supportsOplogStones() const {
+    virtual bool supportsOplogTruncateMarkers() const {
         return false;
     }
 
@@ -381,13 +462,15 @@ public:
      * Methods to access the storage engine's timestamps.
      */
     virtual Timestamp getCheckpointTimestamp() const {
-        MONGO_UNREACHABLE;
+        return Timestamp();
     }
 
-    virtual Timestamp getOldestTimestamp() const = 0;
+    virtual Timestamp getOldestTimestamp() const {
+        return Timestamp();
+    }
 
     virtual Timestamp getStableTimestamp() const {
-        MONGO_UNREACHABLE;
+        return Timestamp();
     }
 
     virtual StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
@@ -399,6 +482,63 @@ public:
 
     virtual void unpinOldestTimestamp(const std::string& requestingServiceName) {
         MONGO_UNREACHABLE
+    }
+
+    /**
+     * See `StorageEngine::setPinnedOplogTimestamp`
+     */
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
+
+    /**
+     * See `StorageEngine::dump`
+     */
+    virtual void dump() const = 0;
+
+    /**
+     * Instructs the KVEngine to (re-)configure any internal logging
+     * capabilities. Returns Status::OK() if the logging subsystem was successfully
+     * configured (or if defaulting to the virtual implementation).
+     */
+    virtual Status reconfigureLogging() {
+        return Status::OK();
+    }
+
+    virtual StatusWith<BSONObj> getStorageMetadata(StringData ident) const {
+        return BSONObj{};
+    };
+
+    /**
+     * Returns the 'KeyFormat' tied to 'ident'.
+     */
+    virtual KeyFormat getKeyFormat(OperationContext* opCtx, StringData ident) const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns the cache size in MB.
+     */
+    virtual size_t getCacheSizeMB() const {
+        return 0;
+    }
+
+    /**
+     * Returns the input storage engine options, sanitized to remove options that may not apply to
+     * this node, such as encryption. Might be called for both collection and index options. See
+     * SERVER-68122.
+     *
+     * TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
+     */
+    virtual BSONObj getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const {
+        return options;
+    }
+
+    /**
+     * See StorageEngine::autoCompact for details
+     */
+    virtual Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support auto compact");
     }
 
     /**

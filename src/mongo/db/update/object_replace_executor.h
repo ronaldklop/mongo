@@ -35,6 +35,8 @@
 #include <utility>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/update/update_executor.h"
 
 namespace mongo {
@@ -51,18 +53,25 @@ public:
      * If 'replacementDocContainsIdField' is false then the _id field from the original document
      * will be preserved.
      *
+     * If 'allowTopLevelDollarPrefixedFields' is true, top-level dollar-prefixed fields will be
+     * permitted in document updates. This is only set to true in pipeline-style updates, when we
+     * can be sure that there are no collisions between '$'-prefixed fieldnames and update modifiers
+     * like $set.
+     *
      * This function will ignore the log mode provided in 'applyParams'. The 'oplogEntry' field
      * of the returned ApplyResult is always empty.
      */
     static ApplyResult applyReplacementUpdate(ApplyParams applyParams,
                                               const BSONObj& replacementDoc,
-                                              bool replacementDocContainsIdField);
+                                              bool replacementDocContainsIdField,
+                                              bool allowTopLevelDollarPrefixedFields = false);
 
     /**
-     * Initializes the node with the document to replace with. Any zero-valued timestamps (except
-     * for the _id) are updated to the current time.
+     * Initializes the node with the document to replace with. If 'bypassEmptyTsReplacement' is
+     * false, any zero-valued timestamps (except for the _id) will be replaced with the current
+     * time.
      */
-    explicit ObjectReplaceExecutor(BSONObj replacement);
+    explicit ObjectReplaceExecutor(BSONObj replacement, bool bypassEmptyTsReplacement = false);
 
     /**
      * Replaces the document that 'applyParams.element' belongs to with 'val'. If 'val' does not
@@ -89,6 +98,8 @@ private:
 
     // True if '_replacementDoc' contains an _id.
     bool _containsId;
+
+    bool _bypassEmptyTsReplacement = false;
 };
 
 }  // namespace mongo

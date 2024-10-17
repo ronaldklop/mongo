@@ -35,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <utility>
 
 namespace mongo {
 
@@ -117,8 +118,18 @@ public:
     }
 
     /** A number uniformly distributed over all possible values. */
+    uint32_t nextUInt32() {
+        return _nextAny<uint32_t>();
+    }
+
+    /** A number uniformly distributed over all possible values. */
     int64_t nextInt64() {
         return _nextAny<int64_t>();
+    }
+
+    /** A number uniformly distributed over all possible values. */
+    uint64_t nextUInt64() {
+        return _nextAny<uint64_t>();
     }
 
     /** A number in the half-open interval [0, max) */
@@ -129,6 +140,16 @@ public:
     /** A number in the half-open interval [0, max) */
     int64_t nextInt64(int64_t max) {
         return std::uniform_int_distribution<int64_t>(0, max - 1)(_urbg);
+    }
+
+    /**
+     A number uniformly distributed over all possible values that can be safely represented as
+     double without loosing precision.
+    */
+    int64_t nextInt64SafeDoubleRepresentable() {
+        const int64_t maxRepresentableLimit =
+            static_cast<int64_t>(std::ldexp(1, std::numeric_limits<double>::digits)) + 1;
+        return nextInt64(maxRepresentableLimit);
     }
 
     /** Fill array `buf` with `n` random bytes. */

@@ -3,11 +3,9 @@
  * majority.
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 var replTest = new ReplSetTest({
     nodes: [
@@ -46,7 +44,6 @@ assert.soon(() => isConfigCommitted(primary));
 // Subsequent reconfig should now succeed.
 config.version++;
 assert.commandWorked(primary.getDB("admin").runCommand({replSetReconfig: config}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 
 replTest.stopSet();
-}());

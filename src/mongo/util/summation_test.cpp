@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
-#include "mongo/unittest/unittest.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/summation.h"
 
 namespace mongo {
@@ -120,7 +121,7 @@ TEST(Summation, AddLongs) {
                 ASSERT(sum.isInteger());
 
                 if (!sum.fitsLong()) {
-                    ASSERT(std::abs(sum.getDouble()) >= limits::max());
+                    ASSERT(std::abs(sum.getDouble()) >= static_cast<double>(limits::max()));
                     // Reduce sum to fit in a 64-bit integer.
                     while (!sum.fitsLong()) {
                         sum.addDouble(sum.getDouble() < 0 ? std::ldexp(1, 64) : -std::ldexp(1, 64));

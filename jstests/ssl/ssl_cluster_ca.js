@@ -1,8 +1,7 @@
 // Verify certificates and CAs between intra-cluster
 // and client->server communication using different CAs.
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function testRS(opts, succeed) {
     const origSkipCheck = TestData.skipCheckDBHashes;
@@ -17,6 +16,13 @@ function testRS(opts, succeed) {
         rs.initiate();
         assert.commandWorked(rs.getPrimary().getDB('admin').runCommand({hello: 1}));
     } else {
+        // By default, rs.initiate takes a very long time to timeout. We should shorten this
+        // period, because we expect it to fail. ReplSetTest has both a static and local copy
+        // of kDefaultTimeOutMS, so we must override both.
+        const oldTimeout = ReplSetTest.kDefaultTimeoutMS;
+        const shortTimeout = 2 * 60 * 1000;
+        ReplSetTest.kDefaultTimeoutMS = shortTimeout;
+        rs.kDefaultTimeoutMS = shortTimeout;
         // The rs.initiate will fail in an assert.soon, which would ordinarily trigger the hang
         // analyzer.  We don't want that to happen, so we disable it here.
         MongoRunner.runHangAnalyzer.disable();
@@ -25,6 +31,7 @@ function testRS(opts, succeed) {
                 rs.initiate();
             });
         } finally {
+            ReplSetTest.kDefaultTimeoutMS = oldTimeout;
             MongoRunner.runHangAnalyzer.enable();
         }
         TestData.skipCheckDBHashes = true;
@@ -86,4 +93,3 @@ testConnect('jstests/libs/client.pem', true);
 testConnect('jstests/libs/trusted-client.pem', false);
 
 MongoRunner.stopMongod(mongod);
-}());

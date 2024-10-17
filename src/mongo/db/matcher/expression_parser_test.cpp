@@ -27,20 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/unittest/unittest.h"
+#include <boost/move/utility_core.hpp>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
-#include "mongo/db/matcher/expression_parser.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/expression_type.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
+
 
 TEST(MatchExpressionParserTest, SimpleEQ1) {
     BSONObj query = BSON("x" << 2);
@@ -367,6 +386,63 @@ TEST(MatchExpressionParserTest, ExprParsesSuccessfullyWithinTopLevelAnd) {
             .getStatus());
 }
 
+TEST(MatchExpressionParserTest, ExprParseFailsWithEmptyAnd) {
+    auto query = fromjson("{$and: []}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument must be a non-empty array");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithNotArrayAnd) {
+    auto query = fromjson("{$and: 'dummy string'}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument must be an array");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithNotObjectInArrayAnd) {
+    auto query = fromjson("{$and: ['dummy string']}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument's entries must be objects");
+}
+
+TEST(MatchExpressionParserTest, ExprFailsToParseWithTopLevelNot) {
+    auto query = fromjson("{$not: {x: 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_TRUE(
+        result.getStatus().reason() ==
+        "unknown top level operator: $not. If you are trying to negate an entire expression, "
+        "use $nor.");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithStringNot) {
+    auto query = fromjson("{ a: {$not: 'dummy string'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$not argument must be a regex or an object");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithEmptyNot) {
+    auto query = fromjson("{ a: {$not: {}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$not argument must be a non-empty object");
+}
+
 TEST(MatchExpressionParserTest, ExprFailsToParseWithinElemMatch) {
     auto query = fromjson("{a: {$elemMatch: {$expr: {$eq: ['$foo', '$bar']}}}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -415,13 +491,13 @@ TEST(MatchExpressionParserTest, InternalExprEqParsesCorrectly) {
     ASSERT_FALSE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: 6}}")));
 }
 
-TEST(MatchesExpressionParserTest, InternalExprEqComparisonToArrayDoesNotParse) {
+TEST(MatchExpressionParserTest, InternalExprEqComparisonToArrayDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = fromjson("{'a.b': {$_internalExprEq: [5]}}");
     ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);
 }
 
-TEST(MatchesExpressionParserTest, InternalExprEqComparisonToUndefinedDoesNotParse) {
+TEST(MatchExpressionParserTest, InternalExprEqComparisonToUndefinedDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = fromjson("{'a.b': {$_internalExprEq: undefined}}");
     ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);
@@ -507,6 +583,64 @@ TEST(MatchExpressionParserTest, SampleRateFailureCases) {
     ASSERT_NOT_OK(result.getStatus());
 }
 
+TEST(MatchExpressionParserTest, BitwiseOperators) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::vector<std::string> bitwiseOperators{
+        "$bitsAllClear", "$bitsAllSet", "$bitsAnyClear", "$bitsAnySet"};
+    for (auto& bitwiseOperator : bitwiseOperators) {
+        // Test accepting valid type coercion
+        auto result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(1))), expCtx);
+        ASSERT_TRUE(result.isOK());
+        result = MatchExpressionParser::parse(BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(1LL))),
+                                              expCtx);
+        ASSERT_TRUE(result.isOK());
+        result = MatchExpressionParser::parse(BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(1.0))),
+                                              expCtx);
+        ASSERT_TRUE(result.isOK());
+
+        // Test rejecting overflow values.
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(std::numeric_limits<long long>::min()))),
+            expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(std::numeric_limits<long long>::max()))),
+            expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(1e30))), expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(-1e30))), expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+
+        // Test rejecting non-integral values.
+        result = MatchExpressionParser::parse(BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(1.5))),
+                                              expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+
+        // Test rejecting negative values.
+        result = MatchExpressionParser::parse(BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(-1))),
+                                              expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(-1LL))), expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(-1.0))), expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+
+        // Test rejecting non-numeric values.
+        result = MatchExpressionParser::parse(
+            BSON("x" << BSON(bitwiseOperator << BSON_ARRAY("string"))), expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+        result = MatchExpressionParser::parse(BSON("x" << BSON(bitwiseOperator << BSON_ARRAY(NAN))),
+                                              expCtx);
+        ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    }
+}
+
 TEST(InternalBinDataSubTypeMatchExpressionTest, SubTypeParsesCorrectly) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = BSON("a" << BSON("$_internalSchemaBinDataSubType" << BinDataType::bdtCustom));
@@ -564,7 +698,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesSingleType
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kDeterministic);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::String;
 
@@ -580,7 +714,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesSingleType
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kDeterministic);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::String;
 
@@ -597,7 +731,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesOneOfTypes
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kDeterministic);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::String;
 
@@ -613,7 +747,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatchSingl
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kDeterministic);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::NumberInt;
 
@@ -630,7 +764,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatchTypeA
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kDeterministic);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::NumberInt;
 
@@ -684,7 +818,7 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, IntentToEncryptFleBlobDoe
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
 
     FleBlobHeader blob;
-    blob.fleBlobSubtype = FleBlobSubtype::IntentToEncrypt;
+    blob.fleBlobSubtype = static_cast<int8_t>(EncryptedBinDataType::kPlaceholder);
     memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
     blob.originalBsonType = BSONType::String;
     BSONObj notMatch = BSON("a" << BSONBinData(reinterpret_cast<const void*>(&blob),

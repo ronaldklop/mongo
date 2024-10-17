@@ -47,21 +47,25 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/connection_pool_stats.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/alarm.h"
 #include "mongo/util/alarm_runner_background_thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/net/http_client_options.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/strong_weak_finish_line.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo {
 
@@ -108,18 +112,8 @@ public:
     }
 
     Status initialize() {
-        auto status = _initializeGlobal();
-        if (!status.isOK()) {
-            return status;
-        }
-
-        return Status::OK();
-    }
-
-private:
-    Status _initializeGlobal() {
         if (_initialized) {
-            return Status::OK();
+            return {ErrorCodes::AlreadyInitialized, "CurlLibraryManager already initialized."};
         }
 
         CURLcode ret = curl_global_init(CURL_GLOBAL_ALL);
@@ -135,6 +129,10 @@ private:
 
         _initialized = true;
         return Status::OK();
+    }
+
+    bool isInitialized() const {
+        return _initialized;
     }
 
 private:
@@ -165,18 +163,38 @@ size_t WriteMemoryCallback(void* ptr, size_t size, size_t nmemb, void* data) {
  */
 size_t ReadMemoryCallback(char* buffer, size_t size, size_t nitems, void* instream) {
 
-    auto* cdrc = reinterpret_cast<ConstDataRangeCursor*>(instream);
+    auto* bufReader = reinterpret_cast<BufReader*>(instream);
 
     size_t ret = 0;
 
-    if (cdrc->length() > 0) {
-        size_t readSize = std::min(size * nitems, cdrc->length());
-        memcpy(buffer, cdrc->data(), readSize);
-        invariant(cdrc->advanceNoThrow(readSize).isOK());
+    if (bufReader->remaining() > 0) {
+        size_t readSize =
+            std::min(size * nitems, static_cast<unsigned long>(bufReader->remaining()));
+        auto buf = bufReader->readBytes(readSize);
+        memcpy(buffer, buf.rawData(), readSize);
         ret = readSize;
     }
 
     return ret;
+}
+
+/**
+ * Seek into for data to the remote side
+ */
+size_t SeekMemoryCallback(void* clientp, curl_off_t offset, int origin) {
+
+    // Curl will call this in readrewind but only to reset the stream to the beginning
+    // In other protocols (like FTP, SSH) or HTTP resumption they may ask for partial buffers which
+    // we do not support.
+    if (offset != 0 || origin != SEEK_SET) {
+        return CURL_SEEKFUNC_CANTSEEK;
+    }
+
+    auto* bufReader = reinterpret_cast<BufReader*>(clientp);
+
+    bufReader->rewindToStart();
+
+    return CURL_SEEKFUNC_OK;
 }
 
 struct CurlEasyCleanup {
@@ -200,6 +218,47 @@ using CurlSlist = std::unique_ptr<curl_slist, CurlSlistFreeAll>;
 
 long longSeconds(Seconds tm) {
     return static_cast<long>(durationCount<Seconds>(tm));
+}
+
+
+StringData enumToString(curl_infotype type) {
+    switch (type) {
+        case CURLINFO_TEXT:
+            return "TEXT"_sd;
+        case CURLINFO_HEADER_IN:
+            return "HEADER_IN"_sd;
+        case CURLINFO_HEADER_OUT:
+            return "HEADER_OUT"_sd;
+        case CURLINFO_DATA_IN:
+            return "DATA_IN"_sd;
+        case CURLINFO_DATA_OUT:
+            return "DATA_OUT"_sd;
+        case CURLINFO_SSL_DATA_IN:
+            return "SSL_DATA_IN"_sd;
+        case CURLINFO_SSL_DATA_OUT:
+            return "SSL_DATA_OUT"_sd;
+        default:
+            return "unknown"_sd;
+    }
+}
+
+int curlDebugCallback(CURL* handle, curl_infotype type, char* data, size_t size, void* clientp) {
+    switch (type) {
+        case CURLINFO_TEXT:
+        case CURLINFO_HEADER_IN:
+        case CURLINFO_HEADER_OUT:
+        case CURLINFO_DATA_IN:
+        case CURLINFO_DATA_OUT:
+            LOGV2_DEBUG(7661901,
+                        1,
+                        "Curl",
+                        "type"_attr = enumToString(type),
+                        "message"_attr = StringData(data, size));
+            [[fallthrough]];
+
+        default:
+            return 0;
+    }
 }
 
 CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
@@ -232,9 +291,10 @@ CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
     }
 
     // TODO: CURLOPT_EXPECT_100_TIMEOUT_MS?
-    // TODO: consider making this configurable, defaults to stderr
-    // curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
-    // curl_easy_setopt(_handle.get(), CURLOPT_DEBUGFUNCTION , ???);
+    if (httpClientOptions.verboseLogging.loadRelaxed()) {
+        curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
+        curl_easy_setopt(handle.get(), CURLOPT_DEBUGFUNCTION, curlDebugCallback);
+    }
 
     return handle;
 }
@@ -256,7 +316,7 @@ public:
     explicit CurlHandleTimer(ClockSource* clockSource, std::shared_ptr<AlarmScheduler> scheduler)
         : _clockSource(clockSource), _scheduler(std::move(scheduler)), _handle(nullptr) {}
 
-    virtual ~CurlHandleTimer() {
+    ~CurlHandleTimer() override {
         if (_handle) {
             _handle->cancel().ignore();
         }
@@ -385,7 +445,7 @@ public:
           _protocol(protocol) {}
 
 
-    virtual ~PooledCurlHandle() = default;
+    ~PooledCurlHandle() override = default;
 
     const HostAndPort& getHostAndPort() const final {
         return _target;
@@ -419,7 +479,7 @@ public:
     }
 
 private:
-    void setup(Milliseconds timeout, SetupCallback cb) final;
+    void setup(Milliseconds timeout, SetupCallback cb, std::string) final;
 
     void refresh(Milliseconds timeout, RefreshCallback cb) final;
 
@@ -433,7 +493,7 @@ private:
     CurlEasyHandle _handle;
 };
 
-void PooledCurlHandle::setup(Milliseconds timeout, SetupCallback cb) {
+void PooledCurlHandle::setup(Milliseconds timeout, SetupCallback cb, std::string) {
     auto anchor = shared_from_this();
     _executor->schedule([this, anchor, cb = std::move(cb)](auto execStatus) {
         if (!execStatus.isOK()) {
@@ -488,8 +548,10 @@ public:
     CurlHandle(executor::ConnectionPool::ConnectionHandle handle, CURL* curlHandle)
         : _poolHandle(std::move(handle)), _handle(curlHandle) {}
 
+    CurlHandle(CurlHandle&& other) = default;
+
     ~CurlHandle() {
-        if (!_success) {
+        if (!_finished && _poolHandle.get() != nullptr) {
             _poolHandle->indicateFailure(
                 Status(ErrorCodes::HostUnreachable, "unknown curl handle failure"));
         }
@@ -507,12 +569,20 @@ public:
         // use it.
         _poolHandle->indicateUsed();
 
-        _success = true;
+        _finished = true;
+    }
+
+    void indicateFailure(const Status& status) {
+        if (_poolHandle.get() != nullptr) {
+            _poolHandle->indicateFailure(status);
+        }
+
+        _finished = true;
     }
 
 private:
     executor::ConnectionPool::ConnectionHandle _poolHandle;
-    bool _success = false;
+    bool _finished = false;
 
     // Owned by _poolHandle
     CURL* _handle;
@@ -528,25 +598,27 @@ public:
           _pool(std::make_shared<executor::ConnectionPool>(
               _typeFactory, "Curl", makePoolOptions(Seconds(60)))) {}
 
-    CurlHandle get(HostAndPort server, Protocols protocol);
+    StatusWith<CurlHandle> get(HostAndPort server, Protocols protocol);
 
 private:
     std::shared_ptr<CurlHandleTypeFactory> _typeFactory;
     std::shared_ptr<executor::ConnectionPool> _pool;
 };
 
-CurlHandle CurlPool::get(HostAndPort server, Protocols protocol) {
+StatusWith<CurlHandle> CurlPool::get(HostAndPort server, Protocols protocol) {
 
     auto sslMode = mapProtocolToSSLMode(protocol);
 
     auto semi = _pool->get(server, sslMode, Seconds(60));
 
     StatusWith<executor::ConnectionPool::ConnectionHandle> swHandle = std::move(semi).getNoThrow();
-    invariant(swHandle.isOK());
+    if (!swHandle.isOK()) {
+        return swHandle.getStatus();
+    }
 
     auto curlHandle = static_cast<PooledCurlHandle*>(swHandle.getValue().get())->get();
 
-    return CurlHandle(std::move(swHandle.getValue()), curlHandle);
+    return {CurlHandle(std::move(swHandle.getValue()), curlHandle)};
 }
 
 HostAndPort exactHostAndPortFromUrl(StringData url) {
@@ -598,14 +670,6 @@ public:
         _headers = headers;
     }
 
-    void setTimeout(Seconds timeout) final {
-        _timeout = timeout;
-    }
-
-    void setConnectTimeout(Seconds timeout) final {
-        _connectTimeout = timeout;
-    }
-
     HttpReply request(HttpMethod method,
                       StringData url,
                       ConstDataRange cdr = {nullptr, 0}) const final {
@@ -615,13 +679,18 @@ public:
 
             auto server = exactHostAndPortFromUrl(url);
 
-            CurlHandle handle(factory.get(server, protocol));
-            auto reply = request(handle.get(), method, url, cdr);
+            auto swHandle(factory.get(server, protocol));
+            uassertStatusOK(swHandle.getStatus());
 
-            // indidicateFailure will be called if indicateSuccess is not called.
-            handle.indicateSuccess();
-            return reply;
-
+            CurlHandle handle(std::move(swHandle.getValue()));
+            try {
+                auto reply = request(handle.get(), method, url, cdr);
+                handle.indicateSuccess();
+                return reply;
+            } catch (DBException& e) {
+                handle.indicateFailure(e.toStatus());
+                throw;
+            }
         } else {
             // Make a request with a non-pooled handle. This is needed during server startup when
             // thread spawning is not allowed which is required by the thread pool.
@@ -631,6 +700,14 @@ public:
     }
 
 private:
+    void updateHandleForBufferData(CURL* handle, BufReader* bufReader) const {
+        curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
+        curl_easy_setopt(handle, CURLOPT_READDATA, bufReader);
+
+        curl_easy_setopt(handle, CURLOPT_SEEKFUNCTION, SeekMemoryCallback);
+        curl_easy_setopt(handle, CURLOPT_SEEKDATA, bufReader);
+    }
+
     HttpReply request(CURL* handle, HttpMethod method, StringData url, ConstDataRange cdr) const {
         uassert(ErrorCodes::InternalError, "Curl initialization failed", handle);
 
@@ -638,31 +715,41 @@ private:
 
         curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, longSeconds(_connectTimeout));
 
-        ConstDataRangeCursor cdrc(cdr);
+        BufReader bufReader(cdr.data(), cdr.length());
         switch (method) {
             case HttpMethod::kGET:
                 uassert(ErrorCodes::BadValue,
                         "Request body not permitted with GET requests",
                         cdr.length() == 0);
-                // Per https://curl.se/libcurl/c/CURLOPT_POST.html
-                // We need to reset the type of request we want to make when reusing the request
+                // Per https://curl.se/libcurl/c/CURLOPT_CUSTOMREQUEST.html
+                // We need to explicitly unset CURLOPT_CUSTOMREQUEST when reusing the request
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_HTTPGET, 1);
                 break;
             case HttpMethod::kPOST:
-                curl_easy_setopt(handle, CURLOPT_PUT, 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_POST, 1);
-
-                curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)cdrc.length());
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)bufReader.remaining());
                 break;
             case HttpMethod::kPUT:
-                curl_easy_setopt(handle, CURLOPT_POST, 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_PUT, 1);
-
-                curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)cdrc.length());
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)bufReader.remaining());
+                break;
+            case HttpMethod::kPATCH:
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "PATCH");
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)bufReader.remaining());
+                break;
+            case HttpMethod::kDELETE:
+                uassert(ErrorCodes::BadValue,
+                        "Request body not permitted with DELETE requests",
+                        cdr.length() == 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "DELETE");
                 break;
             default:
                 MONGO_UNREACHABLE;
@@ -705,8 +792,6 @@ private:
     HttpConnectionPool _pool;
 
     bool _allowInsecure{false};
-    Seconds _timeout;
-    Seconds _connectTimeout;
 };
 
 class HttpClientProviderImpl : public HttpClientProvider {
@@ -716,17 +801,17 @@ public:
     }
 
     std::unique_ptr<HttpClient> create() final {
-        uassertStatusOK(curlLibraryManager.initialize());
+        invariant(curlLibraryManager.isInitialized());
         return std::make_unique<CurlHttpClient>(HttpConnectionPool::kUse);
     }
 
     std::unique_ptr<HttpClient> createWithoutConnectionPool() final {
-        uassertStatusOK(curlLibraryManager.initialize());
+        invariant(curlLibraryManager.isInitialized());
         return std::make_unique<CurlHttpClient>(HttpConnectionPool::kDoNotUse);
     }
 
     BSONObj getServerStatus() final {
-
+        invariant(curlLibraryManager.isInitialized());
         BSONObjBuilder info;
         info.append("type", "curl");
 
@@ -751,10 +836,11 @@ public:
 
 }  // namespace
 
-// Transitional API used by blockstore to trigger libcurl init
-// until it's been migrated to use the HTTPClient API.
-Status curlLibraryManager_initialize() {
-    return curlLibraryManager.initialize();
+MONGO_INITIALIZER_GENERAL(CurlLibraryManager,
+                          (),
+                          ("BeginStartupOptionParsing", "NativeSaslClientContext"))
+(InitializerContext* context) {
+    uassertStatusOK(curlLibraryManager.initialize());
 }
 
 

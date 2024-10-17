@@ -9,12 +9,11 @@
  * @tags: [requires_persistence]
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // The UUID consistency check uses connections to shards cached on the ShardingTest object, but this
 // test restarts a shard, so the cached connection is not usable.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
-
-(function() {
-'use strict';
 
 var st = new ShardingTest(
     {shards: 2, other: {keyFile: 'jstests/libs/key1', useHostname: true, chunkSize: 1}});
@@ -27,8 +26,7 @@ adminDB.createUser({user: 'admin', pwd: 'password', roles: jsTest.adminUserRoles
 
 adminDB.auth('admin', 'password');
 
-adminDB.runCommand({enableSharding: "test"});
-st.ensurePrimaryShard('test', st.shard1.shardName);
+adminDB.runCommand({enableSharding: "test", primaryShard: st.shard1.shardName});
 adminDB.runCommand({shardCollection: "test.foo", key: {x: 1}});
 
 for (var i = 0; i < 100; i++) {
@@ -56,4 +54,3 @@ printjson(db.foo.findOne({x: 25}));
 printjson(db.foo.findOne({x: 75}));
 
 st.stop();
-})();

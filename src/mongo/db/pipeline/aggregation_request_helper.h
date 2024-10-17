@@ -29,19 +29,32 @@
 
 #pragma once
 
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/idl/basic_types_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/serialization_context.h"
 
 namespace mongo {
 
@@ -67,39 +80,20 @@ static constexpr long long kDefaultBatchSize = 101;
  * If we are parsing a request for an explained aggregation with an explain verbosity provided,
  * then 'explainVerbosity' contains this information. In this case, 'cmdObj' may not itself
  * contain the explain specifier. Otherwise, 'explainVerbosity' should be boost::none.
+ *
+ * Callers must provide the validated tenancy scope (if any) to ensure that any namespaces
+ * deserialized from the aggregation request properly account for the tenant ID.
  */
-AggregateCommandRequest parseFromBSON(NamespaceString nss,
-                                      const BSONObj& cmdObj,
-                                      boost::optional<ExplainOptions::Verbosity> explainVerbosity,
-                                      bool apiStrict);
+AggregateCommandRequest parseFromBSON(
+    const BSONObj& cmdObj,
+    const boost::optional<auth::ValidatedTenancyScope>& vts,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity,
+    const SerializationContext& serializationContext = SerializationContext());
 
 StatusWith<AggregateCommandRequest> parseFromBSONForTests(
-    NamespaceString nss,
     const BSONObj& cmdObj,
-    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none,
-    bool apiStrict = false);
-
-/**
- * Convenience overload which constructs the request's NamespaceString from the given database
- * name and command object.
- */
-AggregateCommandRequest parseFromBSON(const std::string& dbName,
-                                      const BSONObj& cmdObj,
-                                      boost::optional<ExplainOptions::Verbosity> explainVerbosity,
-                                      bool apiStrict);
-
-StatusWith<AggregateCommandRequest> parseFromBSONForTests(
-    const std::string& dbName,
-    const BSONObj& cmdObj,
-    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none,
-    bool apiStrict = false);
-
-/*
- * The first field in 'cmdObj' must be a string representing a valid collection name, or the
- * number 1. In the latter case, returns a reserved namespace that does not represent a user
- * collection. See 'NamespaceString::makeCollectionlessAggregateNSS()'.
- */
-NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
+    const boost::optional<auth::ValidatedTenancyScope>& vts = boost::none,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
 
 /**
  * Serializes the options to a Document. Note that this serialization includes the original
@@ -109,8 +103,11 @@ NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
  * The explain option is not serialized. The preferred way to send an explain is with the explain
  * command, like: {explain: {aggregate: ...}, ...}, explain options are not part of the aggregate
  * command object.
+ *
+ * In case query settings are attached to 'expCtx', they will be serialized to the command document.
  */
-Document serializeToCommandDoc(const AggregateCommandRequest& request);
+Document serializeToCommandDoc(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                               const AggregateCommandRequest& request);
 
 BSONObj serializeToCommandObj(const AggregateCommandRequest& request);
 
@@ -120,6 +117,11 @@ BSONObj serializeToCommandObj(const AggregateCommandRequest& request);
  */
 void validateRequestForAPIVersion(const OperationContext* opCtx,
                                   const AggregateCommandRequest& request);
+/**
+ * Validates if 'AggregateCommandRequest' sets the "isClusterQueryWithoutShardKeyCmd" field then the
+ * request must have been fromMongos.
+ */
+void validateRequestFromClusterQueryWithoutShardKey(const AggregateCommandRequest& request);
 
 /**
  * Returns the type of resumable scan required by this aggregation, if applicable. Otherwise returns
@@ -131,23 +133,40 @@ PlanExecutorPipeline::ResumableScanType getResumableScanType(const AggregateComm
 
 /**
  * Custom serializers/deserializers for AggregateCommandRequest.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
-
 boost::optional<mongo::ExplainOptions::Verbosity> parseExplainModeFromBSON(
     const BSONElement& explainElem);
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void serializeExplainToBSON(const mongo::ExplainOptions::Verbosity& explain,
                             StringData fieldName,
                             BSONObjBuilder* builder);
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 mongo::SimpleCursorOptions parseAggregateCursorFromBSON(const BSONElement& cursorElem);
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void serializeAggregateCursorToBSON(const SimpleCursorOptions& cursor,
                                     StringData fieldName,
                                     BSONObjBuilder* builder);
 
 /**
  * Parse an aggregation pipeline definition from 'pipelineElem'.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 static std::vector<BSONObj> parsePipelineFromBSON(const BSONElement& pipelineElem) {
     std::vector<BSONObj> pipeline;

@@ -1,10 +1,7 @@
 // This test verifies readConcern behavior on a standalone mongod or embedded
 // @tags: [requires_majority_read_concern]
-(function() {
-'use strict';
-
 // For isWiredTiger.
-load("jstests/concurrency/fsm_workload_helpers/server_types.js");
+import {isEphemeral, isWiredTiger} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
 
 var t = db.read_concern;
 t.drop();
@@ -20,7 +17,7 @@ assert.commandWorked(t.runCommand({find: "read_concern", readConcern: {level: "a
                      "expected available readConcern to succeed on standalone mongod");
 
 var majority_result = t.runCommand({find: "read_concern", readConcern: {level: "majority"}});
-if (isWiredTiger(db) || (isEphemeral(db) && !isEphemeralForTest(db))) {
+if (isWiredTiger(db) || isEphemeral(db)) {
     // Majority readConcern succeed.
     assert.commandWorked(majority_result,
                          "expected majority readConcern to succeed on standalone mongod");
@@ -43,4 +40,3 @@ assert.commandFailedWithCode(
         {find: "read_concern", readConcern: {level: "local", afterClusterTime: Timestamp(0, 1)}}),
     [ErrorCodes.IllegalOperation, ErrorCodes.NotImplemented],
     "expected afterClusterTime read to fail on standalone mongod");
-})();

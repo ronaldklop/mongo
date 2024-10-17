@@ -33,7 +33,8 @@
 #include <string>
 
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 /**
@@ -79,9 +80,22 @@ public:
      */
     void clearStateBeforeRecovery();
 
+    /**
+     * Informs the SizeRecoveryState that record stores should always check their size information.
+     */
+    void setRecordStoresShouldAlwaysCheckSize(bool);
+
+    /**
+     * Returns whether record stores should always check their size information. This can either be
+     * due to setRecordStoresShouldAlwaysCheckSize being called or due to being in replication
+     * recovery.
+     */
+    bool shouldRecordStoresAlwaysCheckSize() const;
+
 private:
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("SizeRecoveryState::_mutex");
+    mutable stdx::mutex _mutex;
     StringSet _collectionsAlwaysNeedingSizeAdjustment;
+    bool _recordStoresShouldAlwayCheckSize = false;
 };
 
 /**
@@ -90,8 +104,9 @@ private:
 SizeRecoveryState& sizeRecoveryState(ServiceContext* serviceCtx);
 
 /**
- * Returns a mutable reference to a boolean decoration on 'serviceCtx', which indicates whether or
- * not the server is currently undergoing replication recovery.
+ * Returns a mutable reference to an atomic boolean decoration on 'serviceCtx', which indicates
+ * whether or not the server is currently undergoing replication recovery. Callers must explicitly
+ * call 'load' and 'store' on this reference to get/set the underlying boolean.
  */
-bool& inReplicationRecovery(ServiceContext* serviceCtx);
+AtomicWord<bool>& inReplicationRecovery(ServiceContext* serviceCtx);
 }  // namespace mongo

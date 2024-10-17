@@ -27,11 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/storage/storage_options.h"
-
-#include "mongo/platform/compiler.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -46,22 +51,35 @@ void StorageGlobalParams::reset() {
     dbpath = kDefaultDbPath;
     upgrade = false;
     repair = false;
-
-    // The intention here is to enable the journal by default if we are running on a 64 bit system.
-    dur = (sizeof(void*) == 8);
+    validate = false;
+    restore = false;
+    magicRestore = false;
 
     noTableScan.store(false);
     directoryperdb = false;
     syncdelay = 60.0;
-    readOnly = false;
+    queryableBackupMode = false;
     groupCollections = false;
     oplogMinRetentionHours.store(0.0);
     allowOplogTruncation = true;
-    disableLockFreeReads = true;
-    checkpointDelaySecs = 0;
+    disableLockFreeReads = false;
+    forceDisableTableLogging = false;
 }
 
 StorageGlobalParams storageGlobalParams;
+
+Status StorageDirectoryPerDbParameter::setFromString(StringData, const boost::optional<TenantId>&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter"};
+};
+
+void StorageDirectoryPerDbParameter::append(OperationContext* opCtx,
+                                            BSONObjBuilder* builder,
+                                            StringData name,
+                                            const boost::optional<TenantId>&) {
+    builder->append(name, storageGlobalParams.directoryperdb);
+}
+
 
 /**
  * The directory where the mongod instance stores its data.

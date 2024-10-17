@@ -26,20 +26,34 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
+#include <memory>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/dns_query.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/dns_query.h"
 
 using namespace std::literals::string_literals;
 
 namespace {
 std::string getFirstARecord(const std::string& service) {
-    auto res = mongo::dns::lookupARecords(service);
+    auto resPair = mongo::dns::lookupARecords(service);
+    auto res = resPair.front().first;
     if (res.empty())
         return "";
-    return res.front();
+    return res;
 }
 
 TEST(MongoDnsQuery, basic) {
@@ -104,7 +118,8 @@ TEST(MongoDnsQuery, basic) {
 
     // As long as enough tests pass, we're okay -- this means that a single DNS name server drift
     // won't cause a BF -- when enough fail, then we can rebuild the list in one pass.
-    const std::size_t kPassingRate = sizeof(tests) / sizeof(tests[0]) * kPassingPercentage;
+    const std::size_t kPassingRate =
+        static_cast<std::size_t>(sizeof(tests) / sizeof(tests[0])) * kPassingPercentage;
     ASSERT_GTE(resolution_count, kPassingRate);
 }
 
@@ -150,7 +165,15 @@ TEST(MongoDnsQuery, srvRecords) {
             continue;
         }
 
-        auto witness = mongo::dns::lookupSRVRecords(kMongodbSRVPrefix + test.query);
+        auto witnessPairs = mongo::dns::lookupSRVRecords(kMongodbSRVPrefix + test.query);
+        std::vector<mongo::dns::SRVHostEntry> witness;
+        witness.reserve(witnessPairs.size());
+        std::transform(witnessPairs.begin(),
+                       witnessPairs.end(),
+                       std::back_inserter(witness),
+                       [](const auto& p) { return p.first; });
+        // std::transform(witnessPairs.begin(), witnessPairs.end(), std::back_inserter(witness),
+        // [](std::pair<mongo::dns::SRVHostEntry, mongo::Seconds> &p) { return p.first;});
         std::sort(begin(witness), end(witness));
 
         for (const auto& entry : witness) {

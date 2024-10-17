@@ -29,18 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/resource_yielder.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/future.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/producer_consumer_queue.h"
@@ -89,13 +100,16 @@ public:
      * Defines a request to a remote shard that can be run by the ARS.
      */
     struct Request {
-        Request(ShardId shardId, BSONObj cmdObj);
+        Request(ShardId shardId, BSONObj cmdObj, std::shared_ptr<Shard> shard = nullptr);
 
         // ShardId of the shard to which the command will be sent.
         const ShardId shardId;
 
         // The command object to send to the remote host.
         const BSONObj cmdObj;
+
+        // Optional. The shard registry type to send the request to. Cleared for retries.
+        const std::shared_ptr<Shard> shard;
     };
 
     /**
@@ -124,18 +138,30 @@ public:
         // The exact host on which the remote command was run. Is unset if the shard could not be
         // found or no shard hosts matching the readPreference could be found.
         boost::optional<HostAndPort> shardHostAndPort;
+
+        /**
+         * Returns the effective status of the response sent by the server.
+         */
+        static Status getEffectiveStatus(const AsyncRequestsSender::Response& response);
     };
+
+    typedef stdx::unordered_map<ShardId, HostAndPort> ShardHostMap;
 
     /**
      * Constructs a new AsyncRequestsSender. The OperationContext* and TaskExecutor* must remain
      * valid for the lifetime of the ARS.
+     *
+     * The designatedHostsMap overrides the read preference for the shards specified, and requires
+     * those shards target only the host in the map.
      */
     AsyncRequestsSender(OperationContext* opCtx,
                         std::shared_ptr<executor::TaskExecutor> executor,
-                        StringData dbName,
+                        const DatabaseName& dbName,
                         const std::vector<AsyncRequestsSender::Request>& requests,
                         const ReadPreferenceSetting& readPreference,
-                        Shard::RetryPolicy retryPolicy);
+                        Shard::RetryPolicy retryPolicy,
+                        std::unique_ptr<ResourceYielder> resourceYielder,
+                        const ShardHostMap& designatedHostsMap);
 
     /**
      * Returns true if responses for all requests have been returned via next().
@@ -168,18 +194,27 @@ private:
      */
     class RemoteData {
     public:
-        using RemoteCommandOnAnyCallbackArgs =
-            executor::TaskExecutor::RemoteCommandOnAnyCallbackArgs;
+        using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
 
         /**
          * Creates a new uninitialized remote state with a command to send.
          */
-        RemoteData(AsyncRequestsSender* ars, ShardId shardId, BSONObj cmdObj);
+        RemoteData(AsyncRequestsSender* ars,
+                   ShardId shardId,
+                   BSONObj cmdObj,
+                   HostAndPort designatedHost,
+                   std::shared_ptr<Shard> shard = nullptr);
 
         /**
-         * Returns the Shard object associated with this remote.
+         * Returns a SemiFuture containing a shard object associated with this remote.
+         *
+         * This will return a SemiFuture with a ShardNotFound error status in case the shard is not
+         * found.
+         *
+         * Additionally this call can trigger a refresh of the ShardRegistry so it could possibly
+         * return other network error status related to the refresh.
          */
-        std::shared_ptr<Shard> getShard();
+        SemiFuture<std::shared_ptr<Shard>> getShard() noexcept;
 
         /**
          * Returns true if we've already queued a response from the remote.
@@ -213,7 +248,7 @@ private:
          *
          * for the given shard.
          */
-        SemiFuture<RemoteCommandOnAnyCallbackArgs> scheduleRequest();
+        SemiFuture<RemoteCommandCallbackArgs> scheduleRequest();
 
         /**
          * Given a read preference, selects a lists of hosts on which the command can run.
@@ -224,14 +259,13 @@ private:
         /**
          * Schedules the remote command on the ARS's TaskExecutor
          */
-        SemiFuture<RemoteCommandOnAnyCallbackArgs> scheduleRemoteCommand(
+        SemiFuture<RemoteCommandCallbackArgs> scheduleRemoteCommand(
             std::vector<HostAndPort>&& hostAndPort);
 
         /**
          * Handles the remote response
          */
-        SemiFuture<RemoteCommandOnAnyCallbackArgs> handleResponse(
-            RemoteCommandOnAnyCallbackArgs&& rcr);
+        SemiFuture<RemoteCommandCallbackArgs> handleResponse(RemoteCommandCallbackArgs&& rcr);
 
     private:
         bool _done = false;
@@ -243,6 +277,12 @@ private:
 
         // The command object to send to the remote host.
         BSONObj _cmdObj;
+
+        // The designated host and port to send the command to, if provided.  Otherwise is empty().
+        HostAndPort _designatedHostAndPort;
+
+        // Optional shard from shard registry for given shard id.
+        std::shared_ptr<Shard> _shard;
 
         // The exact host on which the remote command was run. Is unset until a request has been
         // sent.
@@ -259,7 +299,7 @@ private:
     BSONObj _metadataObj;
 
     // The database against which the commands are run.
-    const std::string _db;
+    const DatabaseName _db;
 
     // The readPreference to use for all requests.
     ReadPreferenceSetting _readPreference;
@@ -284,6 +324,9 @@ private:
 
     Status _interruptStatus = Status::OK();
 
+    // Set to true if unyielding fails, even after a successful remote response.
+    bool _failedUnyield = false;
+
     // NOTE: it's important that these two members go last in this class.  That ensures that we:
     // 1. cancel/ensure no more callbacks run which touch the ARS
     // 2. cancel any outstanding work in the task executor
@@ -294,6 +337,10 @@ private:
     // Scoped baton holder which ensures any callbacks which touch this ARS are called with a
     // not-okay status (or not run, in the case of ExecutorFuture continuations).
     Baton::SubBatonHolder _subBaton;
+
+    // Interface for yielding and unyielding resources while waiting on results from the network.
+    // Null if yielding isn't necessary.
+    std::unique_ptr<ResourceYielder> _resourceYielder;
 };
 
 }  // namespace mongo

@@ -27,23 +27,71 @@
  *    it in the license file.
  */
 
+
+#include <absl/container/node_hash_set.h>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/tuple/tuple.hpp>
+#include <functional>
+#include <mutex>
+#include <tuple>
+#include <type_traits>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/authenticate.h"
+#include "mongo/client/internal_auth.h"
+#include "mongo/client/sasl_client_session.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/executor/connection_pool_tl.h"
+#include "mongo/executor/network_interface_tl_gen.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/executor/connection_pool_tl.h"
-
-#include "mongo/client/authenticate.h"
-#include "mongo/config.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace executor {
 namespace connection_pool_tl {
 namespace {
-const auto kMaxTimerDuration = Milliseconds::max();
+MONGO_FAIL_POINT_DEFINE(triggerConnectionSetupHandshakeTimeout);
 
+const auto kMaxTimerDuration = Milliseconds::max();
 struct TimeoutHandler {
     AtomicWord<bool> done;
     Promise<void> promise;
@@ -51,13 +99,39 @@ struct TimeoutHandler {
     explicit TimeoutHandler(Promise<void> p) : promise(std::move(p)) {}
 };
 
+auto makeSeveritySuppressor() {
+    return std::make_unique<logv2::KeyedSeveritySuppressor<HostAndPort>>(
+        Seconds{1}, logv2::LogSeverity::Log(), logv2::LogSeverity::Debug(2));
+}
+
+bool connHealthMetricsLoggingEnabled() {
+    return gEnableDetailedConnectionHealthMetricLogLines.load();
+}
+
+void logSlowConnection(const HostAndPort& peer, const ConnectionMetrics& connMetrics) {
+    static auto& severitySuppressor = *makeSeveritySuppressor().release();
+    LOGV2_DEBUG(6496400,
+                severitySuppressor(peer).toInt(),
+                "Slow connection establishment",
+                "hostAndPort"_attr = peer,
+                "dnsResolutionTime"_attr = connMetrics.dnsResolution(),
+                "tcpConnectionTime"_attr = connMetrics.tcpConnection(),
+                "tlsHandshakeTime"_attr = connMetrics.tlsHandshake(),
+                "authTime"_attr = connMetrics.auth(),
+                "hookTime"_attr = connMetrics.connectionHook(),
+                "totalTime"_attr = connMetrics.total());
+}
+
+auto& totalConnectionEstablishmentTime =
+    *MetricBuilder<Counter64>("network.totalEgressConnectionEstablishmentTimeMillis");
+
 }  // namespace
 
 void TLTypeFactory::shutdown() {
     // Stop any attempt to schedule timers in the future
     _inShutdown.store(true);
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     LOGV2(22582, "Killing all outstanding egress activity.");
     for (auto collar : _collars) {
@@ -66,12 +140,12 @@ void TLTypeFactory::shutdown() {
 }
 
 void TLTypeFactory::fasten(Type* type) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _collars.insert(type);
 }
 
 void TLTypeFactory::release(Type* type) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _collars.erase(type);
 
     type->_wasReleased = true;
@@ -171,26 +245,27 @@ public:
     explicit TLConnectionSetupHook(executor::NetworkConnectionHook* hookToWrap, bool x509AuthOnly)
         : _wrappedHook(hookToWrap), _x509AuthOnly(x509AuthOnly) {}
 
-    BSONObj augmentIsMasterRequest(BSONObj cmdObj) override {
+    BSONObj augmentHelloRequest(const HostAndPort& remoteHost, BSONObj cmdObj) override {
         BSONObjBuilder bob(std::move(cmdObj));
         bob.append("hangUpOnStepDown", false);
-        if (internalSecurity.user) {
-            bob.append("saslSupportedMechs", internalSecurity.user->getName().getUnambiguousName());
+        auto systemUser = internalSecurity.getUser();
+        if (systemUser && *systemUser) {
+            bob.append("saslSupportedMechs", (*systemUser)->getName().getUnambiguousName());
         }
 
         if (_x509AuthOnly) {
             _speculativeAuthType = auth::SpeculativeAuthType::kAuthenticate;
         } else {
-            _speculativeAuthType = auth::speculateInternalAuth(&bob, &_session);
+            _speculativeAuthType = auth::speculateInternalAuth(remoteHost, &bob, &_session);
         }
 
         return bob.obj();
     }
 
     Status validateHost(const HostAndPort& remoteHost,
-                        const BSONObj& isMasterRequest,
-                        const RemoteCommandResponse& isMasterReply) override try {
-        const auto& reply = isMasterReply.data;
+                        const BSONObj& helloRequest,
+                        const RemoteCommandResponse& helloReply) override try {
+        const auto& reply = helloReply.data;
 
         // X.509 auth only means we only want to use a single mechanism regards of what hello says
         if (_x509AuthOnly) {
@@ -214,7 +289,7 @@ public:
         if (!_wrappedHook) {
             return Status::OK();
         } else {
-            return _wrappedHook->validateHost(remoteHost, isMasterRequest, isMasterReply);
+            return _wrappedHook->validateHost(remoteHost, helloRequest, helloReply);
         }
     } catch (const DBException& e) {
         return e.toStatus();
@@ -269,7 +344,7 @@ public:
         const std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext)
         : _transientSSLContext(transientSSLContext) {}
 
-    ~TransientInternalAuthParametersProvider() = default;
+    ~TransientInternalAuthParametersProvider() override = default;
 
     BSONObj get(size_t index, StringData mechanism) final {
         if (_transientSSLContext) {
@@ -292,13 +367,27 @@ private:
 
 }  // namespace
 
-void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
+void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string instanceName) {
     auto anchor = shared_from_this();
+
+    // Create a shared_ptr to _connMetrics that shares the ownership information with the
+    // anchor. We want to keep this TLConnection instance alive as long as the shared_ptr
+    // to _connMetrics is in use.
+    std::shared_ptr<ConnectionMetrics> connMetricsAnchor{anchor, &_connMetrics};
 
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
     std::move(pf.future).thenRunOn(_reactor).getAsync(
         [this, cb = std::move(cb), anchor](Status status) { cb(this, std::move(status)); });
+
+    if (MONGO_unlikely(triggerConnectionSetupHandshakeTimeout.shouldFail())) {
+        triggerConnectionSetupHandshakeTimeout.executeIf(
+            [&](const BSONObj& data) { timeout = Milliseconds(0); },
+            [&](const BSONObj& data) {
+                std::string nameToTimeout = data["instance"].String();
+                return instanceName.substr(0, nameToTimeout.size()) == nameToTimeout;
+            });
+    }
 
     setTimeout(timeout, [this, handler, timeout] {
         if (handler->done.swap(true)) {
@@ -306,12 +395,9 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
         }
         std::string reason = str::stream()
             << "Timed out connecting to " << _peer << " after " << timeout;
-        handler->promise.setError(
-            Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, std::move(reason)));
+        handler->promise.setError(Status(ErrorCodes::HostUnreachable, std::move(reason)));
 
-        if (_client) {
-            _client->cancel();
-        }
+        cancel();
     });
 
 #ifdef MONGO_CONFIG_SSL
@@ -325,39 +411,55 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
 #endif
 
     // For transient connections, only use X.509 auth.
-    auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook, x509AuthOnly);
+    auto helloHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook, x509AuthOnly);
 
-    AsyncDBClient::connect(
-        _peer, _sslMode, _serviceContext, _reactor, timeout, _transientSSLContext)
+    AsyncDBClient::connect(_peer,
+                           _sslMode,
+                           _serviceContext,
+                           _reactor,
+                           timeout,
+                           connMetricsAnchor,
+                           _transientSSLContext)
         .thenRunOn(_reactor)
-        .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
-            return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
+        .onError([](StatusWith<std::shared_ptr<AsyncDBClient>> swc)
+                     -> StatusWith<std::shared_ptr<AsyncDBClient>> {
+            if (const Status& status = swc.getStatus();
+                status.code() == ErrorCodes::ConnectionError) {
+                return status;
+            } else {
+                return Status(ErrorCodes::HostUnreachable, status.reason());
+            }
         })
-        .then([this, isMasterHook](AsyncDBClient::Handle client) {
-            _client = std::move(client);
-            return _client->initWireVersion("NetworkInterfaceTL", isMasterHook.get());
+        .then([this, helloHook, instanceName = std::move(instanceName)](
+                  std::shared_ptr<AsyncDBClient> client) {
+            {
+                stdx::lock_guard lk(_clientMutex);
+                _client = std::move(client);
+            }
+            return _client->initWireVersion(instanceName, helloHook.get());
         })
-        .then([this, isMasterHook]() -> Future<bool> {
+        .then([this, helloHook]() -> Future<bool> {
             if (_skipAuth) {
                 return false;
             }
 
-            return _client->completeSpeculativeAuth(isMasterHook->getSession(),
+            return _client->completeSpeculativeAuth(helloHook->getSession(),
                                                     auth::getInternalAuthDB(),
-                                                    isMasterHook->getSpeculativeAuthenticateReply(),
-                                                    isMasterHook->getSpeculativeAuthType());
+                                                    helloHook->getSpeculativeAuthenticateReply(),
+                                                    helloHook->getSpeculativeAuthType());
         })
-        .then([this, isMasterHook, authParametersProvider](bool authenticatedDuringConnect) {
+        .then([this, helloHook, authParametersProvider](bool authenticatedDuringConnect) {
             if (_skipAuth || authenticatedDuringConnect) {
                 return Future<void>::makeReady();
             }
 
             boost::optional<std::string> mechanism;
-            if (!isMasterHook->saslMechsForInternalAuth().empty())
-                mechanism = isMasterHook->saslMechsForInternalAuth().front();
+            if (!helloHook->saslMechsForInternalAuth().empty())
+                mechanism = helloHook->saslMechsForInternalAuth().front();
             return _client->authenticateInternal(std::move(mechanism), authParametersProvider);
         })
         .then([this] {
+            _connMetrics.onAuthFinished();
             if (!_onConnectHook) {
                 return Future<void>::makeReady();
             }
@@ -367,7 +469,9 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             }
             return _client->runCommandRequest(*connectHookRequest)
                 .then([this](RemoteCommandResponse response) {
-                    return _onConnectHook->handleReply(_peer, std::move(response));
+                    auto status = _onConnectHook->handleReply(_peer, std::move(response));
+                    _connMetrics.onConnectionHookFinished();
+                    return status;
                 });
         })
         .getAsync([this, handler, anchor](Status status) {
@@ -378,11 +482,19 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             cancelTimeout();
 
             if (status.isOK()) {
+                totalConnectionEstablishmentTime.increment(_connMetrics.total().count());
+                if (connHealthMetricsLoggingEnabled() &&
+                    _connMetrics.total() >= Milliseconds(gSlowConnectionThresholdMillis.load())) {
+                    logSlowConnection(_peer, _connMetrics);
+                }
                 handler->promise.emplaceValue();
             } else {
+                if (ErrorCodes::isNetworkTimeoutError(status) &&
+                    connHealthMetricsLoggingEnabled()) {
+                    logSlowConnection(_peer, _connMetrics);
+                }
                 LOGV2_DEBUG(22584,
                             2,
-                            "Failed to connect to {hostAndPort} - {error}",
                             "Failed to connect",
                             "hostAndPort"_attr = _peer,
                             "error"_attr = redact(status));
@@ -412,8 +524,7 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
     });
 
     _client
-        ->runCommandRequest(
-            {_peer, std::string("admin"), BSON("isMaster" << 1), BSONObj(), nullptr})
+        ->runCommandRequest({_peer, DatabaseName::kAdmin, BSON("hello" << 1), BSONObj(), nullptr})
         .then([](executor::RemoteCommandResponse response) {
             return Future<void>::makeReady(response.status);
         })
@@ -438,9 +549,36 @@ Date_t TLConnection::now() {
     return _reactor->now();
 }
 
-void TLConnection::cancelAsync() {
-    if (_client)
-        _client->cancel();
+void TLConnection::cancel(bool endClient) {
+    auto client = [&] {
+        stdx::lock_guard lk(_clientMutex);
+        return _client;
+    }();
+
+    if (!client) {
+        return;
+    }
+
+    if (endClient) {
+        // This prevents any future operations from running, but in-progress ones may continue until
+        // we cancel.
+        _reactor->schedule([client](Status s) {
+            if (!s.isOK()) {
+                return;
+            }
+            client->end();
+        });
+    }
+    client->cancel();
+}
+
+void TLConnection::startConnAcquiredTimer() {
+    _connMetrics.startConnAcquiredTimer();
+}
+
+std::shared_ptr<Timer> TLConnection::getConnAcquiredTimer() {
+    auto anchor = shared_from_this();
+    return std::shared_ptr<Timer>{anchor, _connMetrics.getConnAcquiredTimer()};
 }
 
 auto TLTypeFactory::reactor() {

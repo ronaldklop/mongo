@@ -1,9 +1,8 @@
 // Tests the output of db.getReplicationInfo(), db.printSlaveReplicationInfo(), and the latter's
 // alias, db.printSecondaryReplicationInfo().
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var name = "getReplicationInfo";
 const replSet = new ReplSetTest({name: name, nodes: 2, oplogSize: 50});
@@ -89,4 +88,3 @@ mongo();
 assert(rawMongoProgramOutput().match("behind the freshest"));
 
 replSet.stopSet();
-})();

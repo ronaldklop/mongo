@@ -2,13 +2,9 @@
  * Tests that the election metric for average number of catchup ops is being set correctly. We test
  * this by electing a node to be primary twice and forcing it to catch up each time.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/logv2_helpers.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/election_metrics.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication} from "jstests/libs/write_concern_util.js";
+import {stopReplicationAndEnforceNewPrimaryToCatchUp} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest(
@@ -17,6 +13,10 @@ const rst = new ReplSetTest(
 rst.startSet();
 rst.initiateWithHighElectionTimeout();
 rst.awaitSecondaryNodes();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 rst.awaitReplication();
 
 const testNode = rst.getSecondaries()[0];
@@ -26,11 +26,7 @@ restartServerReplication(stepUpResults.oldSecondaries);
 // Block until the primary finishes drain mode.
 assert.eq(stepUpResults.newPrimary, rst.getPrimary());
 // Wait until the new primary completes the transition to primary and writes a no-op.
-if (isJsonLog(stepUpResults.newPrimary)) {
-    checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
-} else {
-    checkLog.contains(stepUpResults.newPrimary, "transition to primary complete");
-}
+checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
 
 let testNodeReplSetGetStatus =
     assert.commandWorked(stepUpResults.newPrimary.adminCommand({replSetGetStatus: 1}));
@@ -58,11 +54,7 @@ rst.awaitReplication();
 stepUpResults = stopReplicationAndEnforceNewPrimaryToCatchUp(rst, testNode);
 restartServerReplication(stepUpResults.oldSecondaries);
 assert.eq(stepUpResults.newPrimary, rst.getPrimary());
-if (isJsonLog(stepUpResults.newPrimary)) {
-    checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
-} else {
-    checkLog.contains(stepUpResults.newPrimary, "transition to primary complete");
-}
+checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
 rst.awaitReplication();
 
 testNodeServerStatus =
@@ -76,4 +68,3 @@ assert.eq(testNodeServerStatus.electionMetrics.numCatchUps, 2);
 assert.eq(testNodeServerStatus.electionMetrics.averageCatchUpOps, 3.5);
 
 rst.stopSet();
-})();

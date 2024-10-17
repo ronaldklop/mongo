@@ -9,6 +9,8 @@
 // run on ephemeral storage engines.
 // @tags: [requires_persistence]
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 function runRollbackDirectoryTest(shouldCreateRollbackFiles) {
     jsTestLog("Testing createRollbackDataFiles = " + shouldCreateRollbackFiles);
     var testName = "rollback_creates_rollback_directory";
@@ -42,7 +44,7 @@ function runRollbackDirectoryTest(shouldCreateRollbackFiles) {
 
     // Make sure we have an arbiter
     assert.soon(function() {
-        res = conns[2].getDB("admin").runCommand({replSetGetStatus: 1});
+        let res = conns[2].getDB("admin").runCommand({replSetGetStatus: 1});
         return res.myState == 7;
     }, "Arbiter failed to initialize.");
 

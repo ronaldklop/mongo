@@ -29,22 +29,44 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+
+#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/s/catalog_cache_loader_mock.h"
+#include "mongo/s/catalog_cache_mock.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
 /**
  * Test fixture for shard components, as opposed to config or mongos components. Provides a mock
- * network and ephemeral storage engine via ShardingMongodTestFixture. Additionally sets up mock
- * dist lock catalog and manager with a real catalog client.
+ * network via ShardingMongoDTestFixture.
  */
-class ShardServerTestFixture : public ShardingMongodTestFixture {
+class ShardServerTestFixture : public ShardingMongoDTestFixture {
 protected:
-    ShardServerTestFixture();
-    ~ShardServerTestFixture();
+    ShardServerTestFixture(Options options = {}, bool setUpMajorityReads = true);
+    ~ShardServerTestFixture() override;
 
     void setUp() override;
-    void tearDown() override;
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override;
+
+    /**
+     * Sets the catalog cache loader for mocking. This must be called before the setUp function is
+     * invoked.
+     */
+    void setCatalogCacheLoader(std::shared_ptr<CatalogCacheLoader> loader);
+
+    /**
+     * Sets the catalog cache for mocking. This must be called before the setUp function is invoked.
+     */
+    void setCatalogCache(std::unique_ptr<CatalogCache> cache);
 
     /**
      * Returns the mock targeter for the config server. Useful to use like so,
@@ -57,16 +79,33 @@ protected:
      */
     std::shared_ptr<RemoteCommandTargeterMock> configTargeterMock();
 
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override;
+    const HostAndPort kConfigHostAndPort{"dummy", 123};
+    const ShardId kMyShardName{"myShardName"};
 
-    void setCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> loader);
+    service_context_test::ShardRoleOverride _shardRole;
 
-    static const HostAndPort kConfigHostAndPort;
+    std::shared_ptr<CatalogCacheLoader> _catalogCacheLoader;
+    std::unique_ptr<CatalogCache> _catalogCache;
+};
 
-    const ShardId _myShardName{"myShardName"};
-    OID _clusterId;
+class ShardServerTestFixtureWithCatalogCacheMock : public ShardServerTestFixture {
+protected:
+    void setUp() override;
+    CatalogCacheMock* getCatalogCacheMock();
+    std::shared_ptr<CatalogCacheLoaderMock> getCatalogCacheLoaderMock();
 
-    std::unique_ptr<CatalogCacheLoader> _catalogCacheLoader;
+private:
+    std::shared_ptr<CatalogCacheLoaderMock> _cacheLoaderMock;
+};
+
+class ShardServerTestFixtureWithCatalogCacheLoaderMock : public ShardServerTestFixture {
+protected:
+    void setUp() override;
+    CatalogCacheMock* getCatalogCacheMock();
+    std::shared_ptr<CatalogCacheLoaderMock> getCatalogCacheLoaderMock();
+
+private:
+    std::shared_ptr<CatalogCacheLoaderMock> _cacheLoaderMock;
 };
 
 }  // namespace mongo

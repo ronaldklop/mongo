@@ -29,12 +29,22 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 
 namespace mongo {
 
@@ -46,12 +56,22 @@ class ResolvedView final : public ErrorExtraInfo {
 public:
     ResolvedView(const NamespaceString& collectionNs,
                  std::vector<BSONObj> pipeline,
-                 BSONObj defaultCollation)
+                 BSONObj defaultCollation,
+                 boost::optional<TimeseriesOptions> timeseriesOptions = boost::none,
+                 boost::optional<bool> timeseriesMayContainMixedData = boost::none,
+                 boost::optional<bool> timeseriesUsesExtendedRange = boost::none,
+                 boost::optional<bool> timeseriesfixedBuckets = boost::none)
         : _namespace(collectionNs),
           _pipeline(std::move(pipeline)),
-          _defaultCollation(std::move(defaultCollation)) {}
+          _defaultCollation(std::move(defaultCollation)),
+          _timeseriesOptions(timeseriesOptions),
+          _timeseriesMayContainMixedData(timeseriesMayContainMixedData),
+          _timeseriesUsesExtendedRange(timeseriesUsesExtendedRange),
+          _timeseriesfixedBuckets(timeseriesfixedBuckets) {}
 
     static ResolvedView fromBSON(const BSONObj& commandResponseObj);
+
+    void handleTimeseriesRewrites(std::vector<BSONObj>* resolvedPipeline) const;
 
     /**
      * Convert an aggregation command on a view to the equivalent command against the view's
@@ -72,8 +92,17 @@ public:
         return _defaultCollation;
     }
 
+    bool timeseries() const {
+        return _timeseriesOptions.has_value();
+    }
+
     // ErrorExtraInfo API
     static constexpr auto code = ErrorCodes::CommandOnShardedViewNotSupportedOnMongod;
+    static constexpr StringData kTimeseriesMayContainMixedData = "timeseriesMayContainMixedData"_sd;
+    static constexpr StringData kTimeseriesOptions = "timeseriesOptions"_sd;
+    static constexpr StringData kTimeseriesUsesExtendedRange = "timeseriesUsesExtendedRange"_sd;
+    static constexpr StringData kTimeseriesfixedBuckets = "timeseriesfixedBuckets"_sd;
+
     void serialize(BSONObjBuilder* bob) const final;
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
 
@@ -81,13 +110,18 @@ private:
     NamespaceString _namespace;
     std::vector<BSONObj> _pipeline;
 
-    // The default collation associated with this view. An empty object means that the default is
-    // the simple collation.
+    // The default collation associated with this view. An empty object means that the default
+    // is the simple collation.
     //
     // Currently all operations which run over a view must use the default collation. This means
-    // that operations on the view which do not specify a collation inherit the default. Operations
-    // on the view which specify any other collation fail with a user error.
+    // that operations on the view which do not specify a collation inherit the default.
+    // Operations on the view which specify any other collation fail with a user error.
     BSONObj _defaultCollation;
+
+    boost::optional<TimeseriesOptions> _timeseriesOptions;
+    boost::optional<bool> _timeseriesMayContainMixedData;
+    boost::optional<bool> _timeseriesUsesExtendedRange;
+    boost::optional<bool> _timeseriesfixedBuckets;
 };
 
 }  // namespace mongo

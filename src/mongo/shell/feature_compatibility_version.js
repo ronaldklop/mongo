@@ -10,13 +10,15 @@
  * multiple times.
  */
 
-var latestFCV = "4.9";
-var lastContinuousFCV = "4.8";
-var lastLTSFCV = "4.4";
+var fcvConstants = getFCVConstants();
+
+var latestFCV = fcvConstants.latest;
+var lastContinuousFCV = fcvConstants.lastContinuous;
+var lastLTSFCV = fcvConstants.lastLTS;
 // The number of versions since the last-lts version. When numVersionsSinceLastLTS = 1,
 // lastContinuousFCV is equal to lastLTSFCV. This is used to calculate the expected minWireVersion
-// in jstests that use the lastLTSFCV. This should be updated on each release.
-var numVersionsSinceLastLTS = 3;
+// in jstests that use the lastLTSFCV.
+var numVersionsSinceLastLTS = fcvConstants.numSinceLastLTS;
 
 /**
  * Returns the FCV associated with a binary version.
@@ -36,20 +38,34 @@ function binVersionToFCV(binVersion) {
  * of the form {featureCompatibilityVersion: {version: <required>, targetVersion: <optional>,
  * previousVersion: <optional>}, ok: 1}.
  */
-function checkFCV(adminDB, version, targetVersion) {
-    let res = adminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1});
-    assert.commandWorked(res);
-    assert.eq(res.featureCompatibilityVersion.version, version, tojson(res));
-    assert.eq(res.featureCompatibilityVersion.targetVersion, targetVersion, tojson(res));
+function checkFCV(adminDB, version, targetVersion, isCleaningServerMetadata) {
     // When both version and targetVersion are equal to lastContinuousFCV or lastLTSFCV, downgrade
     // is in progress. This tests that previousVersion is always equal to latestFCV in downgrading
     // states or undefined otherwise.
     const isDowngrading = (version === lastLTSFCV && targetVersion === lastLTSFCV) ||
         (version === lastContinuousFCV && targetVersion === lastContinuousFCV);
-    if (isDowngrading) {
-        assert.eq(res.featureCompatibilityVersion.previousVersion, latestFCV, tojson(res));
-    } else {
-        assert.eq(res.featureCompatibilityVersion.previousVersion, undefined, tojson(res));
+
+    const isMongod = !adminDB.getMongo().isMongos();
+    if (isMongod) {
+        let res = adminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1});
+        assert.commandWorked(res);
+        assert.eq(res.featureCompatibilityVersion.version,
+                  version,
+                  "FCV server parameter 'version' field does not match: " + tojson(res));
+        assert.eq(res.featureCompatibilityVersion.targetVersion,
+                  targetVersion,
+                  "FCV server parameter 'targetVersion' field does not match: " + tojson(res));
+        if (isDowngrading) {
+            assert.eq(
+                res.featureCompatibilityVersion.previousVersion,
+                latestFCV,
+                "FCV server parameter 'previousVersion' field does not match: " + tojson(res));
+        } else {
+            assert.eq(
+                res.featureCompatibilityVersion.previousVersion,
+                undefined,
+                "FCV server parameter 'previousVersion' field does not match: " + tojson(res));
+        }
     }
 
     // This query specifies an explicit readConcern because some FCV tests pass a connection that
@@ -59,13 +75,42 @@ function checkFCV(adminDB, version, targetVersion) {
                   .limit(1)
                   .readConcern("local")
                   .next();
-    assert.eq(doc.version, version, tojson(doc));
-    assert.eq(doc.targetVersion, targetVersion, tojson(doc));
+    assert.eq(doc.version, version, "FCV document 'version' field does not match: " + tojson(doc));
+    assert.eq(doc.targetVersion,
+              targetVersion,
+              "FCV document 'targetVersion' field does not match: " + tojson(doc));
     if (isDowngrading) {
-        assert.eq(doc.previousVersion, latestFCV, tojson(doc));
+        assert.eq(doc.previousVersion,
+                  latestFCV,
+                  "FCV document 'previousVersion' field does not match: " + tojson(doc));
     } else {
-        assert.eq(doc.previousVersion, undefined, tojson(doc));
+        assert.eq(doc.previousVersion,
+                  undefined,
+                  "FCV document 'previousVersion' field does not match: " + tojson(doc));
     }
+    if (isCleaningServerMetadata) {
+        assert.eq(doc.isCleaningServerMetadata,
+                  true,
+                  "FCV document 'isCleaningServerMetadata' field should be true: " + tojson(doc));
+    } else {
+        assert.eq(doc.isCleaningServerMetadata,
+                  undefined,
+                  "FCV document 'isCleaningServerMetadata' field should not exist, but did: " +
+                      tojson(doc));
+    }
+}
+
+/**
+ * Returns true if checkFCV runs successfully.
+ */
+function isFCVEqual(adminDB, version, targetVersion) {
+    try {
+        checkFCV(adminDB, version, targetVersion);
+    } catch (e) {
+        jsTestLog("checkFCV failed with error: " + tojson(e));
+        return false;
+    }
+    return true;
 }
 
 /**

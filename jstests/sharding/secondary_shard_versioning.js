@@ -1,17 +1,19 @@
 /**
  * Tests that secondaries participate in the shard versioning protocol.
+ * @tags: [
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/profiler.js');  // for profilerHasSingleMatchingEntryOrThrow()
+import {profilerHasSingleMatchingEntryOrThrow} from "jstests/libs/profiler.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
 let rsOpts = {nodes: [{}, {rsConfig: {priority: 0}}]};
 let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}});
 
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.foo', key: {x: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: 'test.foo', middle: {x: 0}}));
@@ -96,4 +98,3 @@ profilerHasSingleMatchingEntryOrThrow({
 });
 
 st.stop();
-})();

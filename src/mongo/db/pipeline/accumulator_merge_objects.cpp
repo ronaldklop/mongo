@@ -27,13 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -43,11 +51,7 @@ using boost::intrusive_ptr;
 
 REGISTER_ACCUMULATOR(mergeObjects,
                      genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
-REGISTER_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
-
-const char* AccumulatorMergeObjects::getOpName() const {
-    return "$mergeObjects";
-}
+REGISTER_STABLE_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
 
 intrusive_ptr<AccumulatorState> AccumulatorMergeObjects::create(ExpressionContext* const expCtx) {
     return new AccumulatorMergeObjects(expCtx);
@@ -55,11 +59,11 @@ intrusive_ptr<AccumulatorState> AccumulatorMergeObjects::create(ExpressionContex
 
 AccumulatorMergeObjects::AccumulatorMergeObjects(ExpressionContext* const expCtx)
     : AccumulatorState(expCtx) {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorMergeObjects::reset() {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _output.reset();
 }
 
@@ -80,9 +84,9 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
         if (pair.second.missing())
             continue;
 
-        _output.setField(pair.first, pair.second);
+        _output.setField(pair.first, std::move(pair.second));
     }
-    _memUsageBytes = sizeof(*this) + _output.getApproximateSize();
+    _memUsageTracker.set(sizeof(*this));
 }
 
 Value AccumulatorMergeObjects::getValue(bool toBeMerged) {

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/ssl_options.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace executor {
@@ -58,9 +60,11 @@ public:
         NetworkInterfaceIntegrationFixture::setUp();
 
         // Setup an internal user so that we can use it for external auth
-        UserHandle user(User(UserName("__system", "local")));
+        std::unique_ptr<UserRequest> systemLocal =
+            std::make_unique<UserRequestGeneral>(UserName("__system"_sd, "local"_sd), boost::none);
+        auto user = std::make_shared<UserHandle>(User(std::move(systemLocal)));
 
-        internalSecurity.user = user;
+        internalSecurity.setUser(user);
 
         sslGlobalParams.sslCAFile = "jstests/libs/ca.pem";
         // Set a client cert that should be ignored if we use the transient cert correctly.
@@ -72,9 +76,11 @@ public:
 
         ConnectionPool::Options options;
         options.transientSSLParams.emplace([] {
-            TransientSSLParams params;
-            params.sslClusterPEMPayload = loadFile("jstests/libs/server.pem");
-            params.targetedClusterConnectionString = ConnectionString::forLocal();
+            ClusterConnection clusterConnection;
+            clusterConnection.targetedClusterConnectionString = ConnectionString::forLocal();
+            clusterConnection.sslClusterPEMPayload = loadFile("jstests/libs/server.pem");
+
+            TransientSSLParams params(clusterConnection);
             return params;
         }());
         LOGV2(5181101, "Initializing the test connection with transient SSL params");
@@ -89,8 +95,10 @@ public:
 };
 
 TEST_F(NetworkInterfaceSSLFixture, Ping) {
-    assertCommandOK(
-        "admin", BSON("ping" << 1), RemoteCommandRequest::kNoTimeout, transport::kEnableSSL);
+    assertCommandOK(DatabaseName::kAdmin,
+                    BSON("ping" << 1),
+                    RemoteCommandRequest::kNoTimeout,
+                    transport::kEnableSSL);
 }
 
 }  // namespace

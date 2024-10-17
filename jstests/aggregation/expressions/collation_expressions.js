@@ -4,11 +4,7 @@
 // ]
 
 // Test that expressions which make can make string comparisons respect the collation.
-(function() {
-"use strict";
-
-// For testExpression() and testExpressionWithCollation().
-load("jstests/aggregation/extras/utils.js");
+import {testExpression, testExpressionWithCollation} from "jstests/aggregation/extras/utils.js";
 
 var coll = db.collation_expressions;
 coll.drop();
@@ -85,6 +81,19 @@ results = coll.aggregate([{$project: {out: {$setUnion: [["a", "B", "c"], ["d", "
               .toArray();
 assert.eq(1, results.length);
 assert.eq(4, results[0].out.length);
+
+// Test that $setUnion is not commutative when a collation is set. A non-const value is required for
+// reordering to occur.
+assert(coll.drop);
+coll.drop();
+assert.commandWorked(coll.insert({_id: 1, upper: "A", lower: "a"}));
+var results1 = coll.aggregate([{$project: {out: {$setUnion: [["$upper"], ["a"]]}}}],
+                              {collation: caseInsensitive})
+                   .toArray();
+var results2 = coll.aggregate([{$project: {out: {$setUnion: [["A"], ["$lower"]]}}}],
+                              {collation: caseInsensitive})
+                   .toArray();
+assert.eq(results1, results2);
 
 // Test that $setDifference respects the collation.
 testExpressionWithCollation(coll, {$setDifference: [["a", "B"], ["b", "A"]]}, [], caseInsensitive);
@@ -249,4 +258,3 @@ results = coll.aggregate([{
               .toArray();
 assert.eq(1, results.length);
 assert.eq([[0, 1], [2, 3], [4, 5]], results[0].out);
-})();

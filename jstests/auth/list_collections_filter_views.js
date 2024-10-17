@@ -6,10 +6,7 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-const dbName = "list_collections_filter_views";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTestOnConnection(conn) {
     const admin = conn.getDB("admin");
@@ -61,4 +58,3 @@ const st = new ShardingTest({
 });
 runTestOnConnection(st.s0);
 st.stop();
-}());

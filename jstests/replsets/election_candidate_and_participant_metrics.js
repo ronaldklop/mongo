@@ -4,16 +4,13 @@
  * checking the 'electionCandidateMetrics' and 'electionParticipantMetrics' fields of replSetStatus
  * after each handoff.
  */
-
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/election_handoff.js");
-load("jstests/replsets/rslib.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ElectionHandoffTest} from "jstests/replsets/libs/election_handoff.js";
 
 const testName = jsTestName();
 const numNodes = 2;
-const rst = ReplSetTest({name: testName, nodes: numNodes});
+const rst = new ReplSetTest({name: testName, nodes: numNodes});
 rst.startSet();
 
 // Make sure there are no election timeouts firing for the duration of the test. This helps
@@ -47,6 +44,13 @@ assert(
     () =>
         "Response should have an 'electionCandidateMetrics.lastCommittedOpTimeAtElection' field: " +
         tojson(originalPrimaryElectionCandidateMetrics));
+if (FeatureFlagUtil.isPresentAndEnabled(originalPrimary, "ReduceMajorityWriteLatency")) {
+    assert(
+        originalPrimaryElectionCandidateMetrics.lastSeenWrittenOpTimeAtElection,
+        () =>
+            "Response should have an 'electionCandidateMetrics.lastSeenWrittenOpTimeAtElection' field: " +
+            tojson(originalPrimaryElectionCandidateMetrics));
+}
 assert(originalPrimaryElectionCandidateMetrics.lastSeenOpTimeAtElection,
        () => "Response should have an 'electionCandidateMetrics.lastSeenOpTimeAtElection' field: " +
            tojson(originalPrimaryElectionCandidateMetrics));
@@ -149,6 +153,17 @@ assert.eq(originalPrimaryElectionParticipantMetrics.electionCandidateMemberId, 1
 // Since the node voted for the new primary, we directly assert that its voteReason is equal to
 // empty string.
 assert.eq(originalPrimaryElectionParticipantMetrics.voteReason, "");
+if (FeatureFlagUtil.isPresentAndEnabled(originalPrimary, "ReduceMajorityWriteLatency")) {
+    assert(
+        originalPrimaryElectionParticipantMetrics.lastWrittenOpTimeAtElection,
+        () =>
+            "Response should have an 'electionParticipantMetrics.lastWrittenOpTimeAtElection' field: " +
+            tojson(originalPrimaryElectionParticipantMetrics));
+    assert(
+        originalPrimaryElectionParticipantMetrics.maxWrittenOpTimeInSet,
+        () => "Response should have an 'electionParticipantMetrics.maxWrittenOpTimeInSet' field: " +
+            tojson(originalPrimaryElectionParticipantMetrics));
+}
 assert(
     originalPrimaryElectionParticipantMetrics.lastAppliedOpTimeAtElection,
     () =>
@@ -168,7 +183,7 @@ originalPrimaryElectionCandidateMetrics = originalPrimaryReplSetGetStatus.electi
 // candidate in this election.
 assert(!originalPrimaryElectionCandidateMetrics,
        () => "Response should not have an 'electionCandidateMetrics' field: " +
-           tojson(originalPrimaryCandidateMetrics));
+           tojson(originalPrimaryElectionCandidateMetrics));
 
 // testElectionHandoff steps down the primary with a non-zero step down period, so we need to
 // unfreeze the node to allow it to initiate an election again.
@@ -244,4 +259,3 @@ assert.eq(
 assert.eq(originalPrimaryElectionParticipantMetrics.priorityAtElection, 1);
 
 rst.stopSet();
-})();

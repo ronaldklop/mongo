@@ -26,15 +26,55 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/db/s/transaction_coordinator_worker_curop_info.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/shim.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/transaction_coordinator_worker_curop_repository.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+namespace {
+
+class TransactionCoordinatorWorkerCurOpInfo {
+public:
+    using CoordinatorAction = TransactionCoordinatorWorkerCurOpRepository::CoordinatorAction;
+
+    TransactionCoordinatorWorkerCurOpInfo(LogicalSessionId lsid,
+                                          TxnNumberAndRetryCounter txnNumberAndRetryCounter,
+                                          Date_t startTime,
+                                          CoordinatorAction action);
+
+    TransactionCoordinatorWorkerCurOpInfo() = delete;
+
+    void reportState(BSONObjBuilder* parent) const;
+
+private:
+    static std::string toString(CoordinatorAction action);
+
+    LogicalSessionId _lsid;
+    TxnNumberAndRetryCounter _txnNumberAndRetryCounter;
+    Date_t _startTime;
+    CoordinatorAction _action;
+};
+
 const auto getTransactionCoordinatorWorkerCurOpInfo =
     OperationContext::declareDecoration<boost::optional<TransactionCoordinatorWorkerCurOpInfo>>();
-
-namespace {
 
 class MongoDTransactionCoordinatorWorkerCurOpRepository final
     : public TransactionCoordinatorWorkerCurOpRepository {
@@ -43,12 +83,13 @@ public:
 
     void set(OperationContext* opCtx,
              const LogicalSessionId& lsid,
-             const TxnNumber txnNumber,
+             const TxnNumberAndRetryCounter txnNumberAndRetryCounter,
              const CoordinatorAction action) override {
         auto startTime = opCtx->getServiceContext()->getPreciseClockSource()->now();
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         getTransactionCoordinatorWorkerCurOpInfo(opCtx).emplace(
-            TransactionCoordinatorWorkerCurOpInfo(lsid, txnNumber, startTime, action));
+            TransactionCoordinatorWorkerCurOpInfo(
+                lsid, txnNumberAndRetryCounter, startTime, action));
     }
 
     /**
@@ -73,14 +114,18 @@ auto getTransactionCoordinatorWorkerCurOpRepositoryRegistration =
     MONGO_WEAK_FUNCTION_REGISTRATION(getTransactionCoordinatorWorkerCurOpRepository,
                                      getTransactionCoordinatorWorkerCurOpRepositoryImpl);
 
-}  // namespace
-
 TransactionCoordinatorWorkerCurOpInfo::TransactionCoordinatorWorkerCurOpInfo(
-    LogicalSessionId lsid, TxnNumber txnNumber, Date_t startTime, CoordinatorAction action)
-    : _lsid(lsid), _txnNumber(txnNumber), _startTime(startTime), _action(action) {}
+    LogicalSessionId lsid,
+    TxnNumberAndRetryCounter txnNumberAndRetryCounter,
+    Date_t startTime,
+    CoordinatorAction action)
+    : _lsid(lsid),
+      _txnNumberAndRetryCounter(txnNumberAndRetryCounter),
+      _startTime(startTime),
+      _action(action) {}
 
 
-const std::string TransactionCoordinatorWorkerCurOpInfo::toString(CoordinatorAction action) {
+std::string TransactionCoordinatorWorkerCurOpInfo::toString(CoordinatorAction action) {
     switch (action) {
         case CoordinatorAction::kSendingPrepare:
             return "sendingPrepare";
@@ -92,11 +137,12 @@ const std::string TransactionCoordinatorWorkerCurOpInfo::toString(CoordinatorAct
             return "writingParticipantList";
         case CoordinatorAction::kWritingDecision:
             return "writingDecision";
+        case CoordinatorAction::kWritingEndOfTransaction:
+            return "writingEndOfTransaction";
         case CoordinatorAction::kDeletingCoordinatorDoc:
             return "deletingCoordinatorDoc";
-        default:
-            MONGO_UNREACHABLE
     }
+    MONGO_UNREACHABLE;
 }
 
 void TransactionCoordinatorWorkerCurOpInfo::reportState(BSONObjBuilder* parent) const {
@@ -105,9 +151,13 @@ void TransactionCoordinatorWorkerCurOpInfo::reportState(BSONObjBuilder* parent) 
     BSONObjBuilder lsidBuilder(twoPhaseCoordinatorBuilder.subobjStart("lsid"));
     _lsid.serialize(&lsidBuilder);
     lsidBuilder.doneFast();
-    twoPhaseCoordinatorBuilder.append("txnNumber", _txnNumber);
+    twoPhaseCoordinatorBuilder.append("txnNumber", _txnNumberAndRetryCounter.getTxnNumber());
+    twoPhaseCoordinatorBuilder.append("txnRetryCounter",
+                                      *_txnNumberAndRetryCounter.getTxnRetryCounter());
     twoPhaseCoordinatorBuilder.append("action", toString(_action));
     twoPhaseCoordinatorBuilder.append("startTime", dateToISOStringUTC(_startTime));
     parent->append("twoPhaseCommitCoordinator", twoPhaseCoordinatorBuilder.obj());
 }
+
+}  // namespace
 }  // namespace mongo

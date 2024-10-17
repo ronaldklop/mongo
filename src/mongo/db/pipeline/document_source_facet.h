@@ -30,14 +30,40 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/tee_buffer.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -59,6 +85,7 @@ class NamespaceString;
 class DocumentSourceFacet final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$facet"_sd;
+    static constexpr StringData kTeeConsumerStageName = "$internalFacetTeeConsumer"_sd;
     struct FacetPipeline {
         FacetPipeline(std::string name, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
             : name(std::move(name)), pipeline(std::move(pipeline)) {}
@@ -77,15 +104,9 @@ public:
                   std::move(parseTimeName), boost::none, std::move(pipelines)) {}
 
         PrivilegeVector requiredPrivileges(bool isMongos,
-                                           bool bypassDocumentValidation) const override final {
-            PrivilegeVector requiredPrivileges;
-            for (auto&& pipeline : _pipelines) {
-                Privilege::addPrivilegesToPrivilegeVector(
-                    &requiredPrivileges,
-                    pipeline.requiredPrivileges(isMongos, bypassDocumentValidation));
-            }
-            return requiredPrivileges;
-        }
+                                           bool bypassDocumentValidation) const final {
+            return requiredPrivilegesBasic(isMongos, bypassDocumentValidation);
+        };
     };
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -106,9 +127,14 @@ public:
      * Takes a union of all sub-pipelines, and adds them to 'deps'.
      */
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     const char* getSourceName() const final {
         return DocumentSourceFacet::kStageName.rawData();
+    }
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kFacet;
     }
 
     /**
@@ -139,8 +165,12 @@ public:
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* involvedNssSet) const final;
     void detachFromOperationContext() final;
     void reattachToOperationContext(OperationContext* opCtx) final;
+    bool validateOperationContext(const OperationContext* opCtx) const final;
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
     bool usedDisk() final;
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
 
 protected:
     /**
@@ -155,7 +185,7 @@ private:
                         size_t bufferSizeBytes,
                         size_t maxOutputDocBytes);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     boost::intrusive_ptr<TeeBuffer> _teeBuffer;
     std::vector<FacetPipeline> _facets;
@@ -163,5 +193,7 @@ private:
     const size_t _maxOutputDocSizeBytes;
 
     bool _done = false;
+
+    DocumentSourceFacetStats _stats;
 };
 }  // namespace mongo

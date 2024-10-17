@@ -29,33 +29,110 @@
 
 #include "mongo/db/catalog/validate_results.h"
 
+#include <cstddef>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/util/namespace_string_util.h"
+
 namespace mongo {
 
-void ValidateResults::appendToResultObj(BSONObjBuilder* resultObj, bool debugging) const {
-    resultObj->appendBool("valid", valid);
-    resultObj->appendBool("repaired", repaired);
-    if (readTimestamp) {
-        resultObj->append("readTimestamp", readTimestamp.get());
+void ValidateResults::appendToResultObj(BSONObjBuilder* resultObj,
+                                        bool debugging,
+                                        const SerializationContext& sc) const {
+    resultObj->appendBool("valid", isValid());
+    resultObj->appendBool("repaired", getRepaired());
+    if (getReadTimestamp()) {
+        resultObj->append("readTimestamp", getReadTimestamp().value());
     }
-    resultObj->append("warnings", warnings);
-    resultObj->append("errors", errors);
-    resultObj->append("extraIndexEntries", extraIndexEntries);
-    resultObj->append("missingIndexEntries", missingIndexEntries);
+    if (_nss.has_value()) {
+        resultObj->append("ns", NamespaceStringUtil::serialize(_nss.value(), sc));
+    }
+    if (_uuid.has_value()) {
+        _uuid->appendToBuilder(resultObj, "uuid");
+    }
 
-    // Need to convert RecordId to the appropriate type.
+    static constexpr std::size_t kMaxErrorWarningSizeBytes = 2 * 1024 * 1024;
+    auto appendRangeSizeLimited = [&](StringData fieldName, auto valueGetter) {
+        std::size_t usedSize = 0;
+        BSONArrayBuilder arr(resultObj->subarrayStart(fieldName));
+        for (const auto& value : valueGetter(*this)) {
+            if (usedSize >= kMaxErrorWarningSizeBytes) {
+                return;
+            }
+            arr.append(value);
+            usedSize += value.size();
+        }
+        for (const auto& idxDetails : getIndexResultsMap()) {
+            if (usedSize >= kMaxErrorWarningSizeBytes) {
+                return;
+            }
+            if (valueGetter(idxDetails.second).empty()) {
+                continue;
+            }
+            std::string message = str::stream()
+                << "Found " << fieldName << " in " << idxDetails.first;
+            usedSize += message.size();
+            arr.append(std::move(message));
+        }
+    };
+
+    appendRangeSizeLimited("warnings"_sd,
+                           [](const auto& results) { return results.getWarnings(); });
+    appendRangeSizeLimited("errors"_sd, [](const auto& results) { return results.getErrors(); });
+
+    resultObj->append("extraIndexEntries", getExtraIndexEntries());
+    resultObj->append("missingIndexEntries", getMissingIndexEntries());
+    if (_numInvalidDocuments.has_value()) {
+        resultObj->appendNumber("nInvalidDocuments", _numInvalidDocuments.value());
+    }
+    if (_numNonCompliantDocuments.has_value()) {
+        resultObj->appendNumber("nNonCompliantDocuments", _numNonCompliantDocuments.value());
+    }
+    if (_numRecords.has_value()) {
+        resultObj->appendNumber("nrecords", _numRecords.value());
+    }
+
+    // Need to convert RecordId to a printable type.
     BSONArrayBuilder builder;
-    for (const RecordId& corruptRecord : corruptRecords) {
-        corruptRecord.withFormat(
-            [&](RecordId::Null n) { builder.append("null"); },
-            [&](const int64_t rid) { builder.append(rid); },
-            [&](const char* str, int size) { builder.append(OID::from(str)); });
+    for (const RecordId& corruptRecord : getCorruptRecords()) {
+        BSONObjBuilder objBuilder;
+        corruptRecord.serializeToken("", &objBuilder);
+        builder.append(objBuilder.done().firstElement());
     }
     resultObj->append("corruptRecords", builder.arr());
 
-    if (repaired || debugging) {
-        resultObj->appendNumber("numRemovedCorruptRecords", numRemovedCorruptRecords);
-        resultObj->appendNumber("numRemovedExtraIndexEntries", numRemovedExtraIndexEntries);
-        resultObj->appendNumber("numInsertedMissingIndexEntries", numInsertedMissingIndexEntries);
+    // Report detailed index validation results for validated indexes.
+    BSONObjBuilder keysPerIndex;
+    BSONObjBuilder indexDetails;
+    int nIndexes = getIndexResultsMap().size();
+    for (auto& [indexName, ivr] : getIndexResultsMap()) {
+        BSONObjBuilder bob(indexDetails.subobjStart(indexName));
+        bob.appendBool("valid", ivr.isValid());
+
+        if (!ivr.getWarnings().empty()) {
+            bob.append("warnings", ivr.getWarnings());
+        }
+
+        if (!ivr.getErrors().empty()) {
+            bob.append("errors", ivr.getErrors());
+        }
+
+        keysPerIndex.appendNumber(indexName, static_cast<long long>(ivr.getKeysTraversed()));
+    }
+    resultObj->append("nIndexes", nIndexes);
+    resultObj->append("keysPerIndex", keysPerIndex.done());
+    resultObj->append("indexDetails", indexDetails.done());
+
+    if (getRepaired() || debugging) {
+        resultObj->appendNumber("numRemovedCorruptRecords", getNumRemovedCorruptRecords());
+        resultObj->appendNumber("numRemovedExtraIndexEntries", getNumRemovedExtraIndexEntries());
+        resultObj->appendNumber("numInsertedMissingIndexEntries",
+                                getNumInsertedMissingIndexEntries());
+        resultObj->appendNumber("numDocumentsMovedToLostAndFound",
+                                getNumDocumentsMovedToLostAndFound());
+        resultObj->appendNumber("numOutdatedMissingIndexEntry", getNumOutdatedMissingIndexEntry());
     }
 }
 }  // namespace mongo

@@ -1,10 +1,10 @@
 // Helper functions for testing index builds.
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallel_shell_helpers.js");
-load("jstests/libs/uuid_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
 
-var IndexBuildTest = class {
+export var IndexBuildTest = class {
     /**
      * Starts an index build in a separate mongo shell process with given options.
      * Ensures the index build worked or failed with one of the expected failures.
@@ -141,19 +141,15 @@ var IndexBuildTest = class {
     }
 
     /**
-     * Returns true if the passed in collection is clustered.
+     * Returns true if `listIndexes` returns the '_id_' index for the collection
      */
-    static isCollectionClustered(coll) {
-        const res = assert.commandWorked(
-            coll.getDB().runCommand({listCollections: 1, filter: {name: coll.getName()}}));
-        assert.eq(1, res.cursor.firstBatch.length);
-
-        const collInfo = res.cursor.firstBatch[0];
-        return collInfo.options.hasOwnProperty("clusteredIndex");
+    static listIndexesIncludesId(coll) {
+        const res = assert.commandWorked(coll.getDB().runCommand({listIndexes: coll.getName()}));
+        return 1 == res.cursor.firstBatch.filter(i => i.name == "_id_" || i.clustered).length;
     }
 
     static assertIndexesIdHelper(coll, numIndexes, readyIndexes, notReadyIndexes, options) {
-        if (!IndexBuildTest.isCollectionClustered(coll)) {
+        if (IndexBuildTest.listIndexesIncludesId(coll)) {
             numIndexes++;
             readyIndexes.concat("_id_");
         }
@@ -184,6 +180,8 @@ var IndexBuildTest = class {
         const indexMap = res.cursor.firstBatch.reduce((m, spec) => {
             if (spec.hasOwnProperty('buildUUID')) {
                 m[spec.spec.name] = spec;
+            } else if (options.includeIndexBuildInfo) {
+                m[spec.spec.name] = spec;
             } else {
                 m[spec.name] = spec;
             }
@@ -197,6 +195,8 @@ var IndexBuildTest = class {
             const spec = indexMap[name];
             assert(!spec.hasOwnProperty('buildUUID'),
                    'unexpected buildUUID field in ' + name + ' index spec: ' + tojson(spec));
+            assert(!spec.hasOwnProperty('indexBuildInfo'),
+                   'unexpected indexBuildInfo field in ' + name + ' index spec: ' + tojson(spec));
         }
 
         // Check indexes that are not ready.
@@ -210,12 +210,29 @@ var IndexBuildTest = class {
                        'expected spec field in ' + name + ': ' + tojson(spec));
                 assert(spec.hasOwnProperty('buildUUID'),
                        'expected buildUUID field in ' + name + ': ' + tojson(spec));
+            } else if (options.includeIndexBuildInfo) {
+                assert(spec.hasOwnProperty('spec'),
+                       'expected spec field in ' + name + ': ' + tojson(spec));
+                assert(spec.hasOwnProperty('indexBuildInfo'),
+                       'expected indexBuildInfo field in ' + name + ': ' + tojson(spec));
+                assert(spec.indexBuildInfo.hasOwnProperty('buildUUID'),
+                       'expected indexBuildInfo.buildUUID field in ' + name + ': ' + tojson(spec));
             } else {
                 assert(!spec.hasOwnProperty('buildUUID'),
                        'unexpected buildUUID field in ' + name + ' index spec: ' + tojson(spec));
             }
         }
 
+        return indexMap;
+    }
+
+    static assertIndexesSoon(coll, numIndexes, readyIndexes, notReadyIndexes, options) {
+        var indexMap;
+        assert.soonNoExcept(function() {
+            indexMap = IndexBuildTest.assertIndexes(
+                coll, numIndexes, readyIndexes, notReadyIndexes, options);
+            return true;
+        });
         return indexMap;
     }
 
@@ -234,18 +251,36 @@ var IndexBuildTest = class {
         assert.commandWorked(
             conn.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'}));
     }
+
+    /**
+     * Restarts the node in standalone mode to build the index in a rolling fashion.
+     */
+    static buildIndexOnNodeAsStandalone(rst, node, port, dbName, collName, indexSpec, indexName) {
+        jsTestLog('Restarting as standalone: ' + node.host);
+        rst.stop(node, /*signal=*/ null, /*opts=*/ null, {forRestart: true, waitpid: true});
+        const standalone = MongoRunner.runMongod({
+            restart: true,
+            dbpath: node.dbpath,
+            port: port,
+            setParameter: {
+                disableLogicalSessionCacheRefresh: true,
+                ttlMonitorEnabled: false,
+            },
+        });
+
+        jsTestLog('Building index on standalone: ' + standalone.host);
+        const standaloneDB = standalone.getDB(dbName);
+        const standaloneColl = standaloneDB.getCollection(collName);
+        assert.commandWorked(standaloneColl.createIndex(indexSpec, {name: indexName}));
+
+        jsTestLog('Restarting as replica set node: ' + node.host);
+        MongoRunner.stopMongod(standalone);
+        rst.restart(node);
+        rst.awaitReplication();
+    }
 };
 
-const ResumableIndexBuildTest = class {
-    /**
-     * Returns whether resumable index builds are supported.
-     */
-    static resumableIndexBuildsEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, enableResumableIndexBuilds: 1}))
-            .enableResumableIndexBuilds;
-    }
-
+export const ResumableIndexBuildTest = class {
     /**
      * Returns a version of the given array that has been flattened into one dimension.
      */
@@ -323,7 +358,7 @@ const ResumableIndexBuildTest = class {
                 for (const buildUUID of failPoint.data.buildUUIDs) {
                     checkLog.containsJson(conn, failPoint.logIdWithBuildUUID, {
                         buildUUID: function(uuid) {
-                            return uuid["uuid"]["$uuid"] === buildUUID;
+                            return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                         }
                     });
                 }
@@ -360,8 +395,8 @@ const ResumableIndexBuildTest = class {
     }
 
     /**
-     * Runs createIndexFn in a parellel shell to create indexes, inserting the documents specified
-     * by sideWrites into the side writes table.
+     * Runs createIndexFn in a parellel shell to create indexes, modifying the collection with the
+     * side writes table.
      *
      * 'createIndexFn' should take three parameters: collection name, index specifications, and
      *   index names.
@@ -369,6 +404,10 @@ const ResumableIndexBuildTest = class {
      * 'indexNames' should follow the exact same format as 'indexSpecs'. For example, if indexSpecs
      *   is [[{a: 1}, {b: 1}], [{c: 1}]], a valid indexNames would look like
      *   [["index_1", "index_2"], ["index_3"]].
+     *
+     * 'sideWrites' can be an array specifying documents to be inserted into the side writes table,
+     * or a function that performs any series of operations (inserts, deletes, or updates) with the
+     * side writes table
      *
      * If {hangBeforeBuildingIndex: true}, returns with the hangBeforeBuildingIndex failpoint
      * enabled and the index builds hanging at this point.
@@ -407,13 +446,18 @@ const ResumableIndexBuildTest = class {
         for (const indexName of indexNamesFlat) {
             checkLog.containsJson(primary, 4940900, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] ===
+                    return uuid &&
+                        uuid["uuid"]["$uuid"] ===
                         extractUUIDFromObject(indexes[indexName].buildUUID);
                 }
             });
         }
 
-        assert.commandWorked(coll.insert(sideWrites));
+        if (Array.isArray(sideWrites)) {
+            assert.commandWorked(coll.insert(sideWrites));
+        } else {
+            sideWrites(coll);
+        }
 
         // Before building the index, wait for the the last op to be committed so that establishing
         // the majority read cursor does not race with step down.
@@ -449,7 +493,7 @@ const ResumableIndexBuildTest = class {
         for (const buildUUID of buildUUIDs) {
             checkLog.containsJson(conn, 20663, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] === buildUUID;
+                    return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                 },
                 namespace: coll.getFullName()
             });
@@ -462,16 +506,17 @@ const ResumableIndexBuildTest = class {
      * shutdown and are completed upon startup. Returns the build UUIDs of the index builds that
      * were resumed.
      */
-    static restart(rst,
-                   conn,
-                   coll,
-                   indexNames,
-                   failPoints,
-                   failPointsIteration,
-                   shouldComplete = true,
-                   failPointAfterStartup,
-                   runBeforeStartup,
-                   options) {
+    static restartWithUpgrade(rst,
+                              upg,
+                              conn,
+                              coll,
+                              indexNames,
+                              failPoints,
+                              failPointsIteration,
+                              shouldComplete = true,
+                              failPointAfterStartup,
+                              runBeforeStartup,
+                              options) {
         clearRawMongoProgramOutput();
 
         const buildUUIDs = ResumableIndexBuildTest.generateFailPointsData(
@@ -481,9 +526,11 @@ const ResumableIndexBuildTest = class {
         const shutdownFpTimesEntered = configureFailPoint(conn, "hangBeforeShutdown").timesEntered;
 
         const awaitContinueShutdown = startParallelShell(
-            funWithArgs(function(failPoints, shutdownFpTimesEntered) {
-                load("jstests/libs/fail_point_util.js");
-                load("jstests/noPassthrough/libs/index_build.js");
+            funWithArgs(async function(failPoints, shutdownFpTimesEntered) {
+                const {ResumableIndexBuildTest} =
+                    await import("jstests/noPassthrough/libs/index_build.js");
+                const {configureFailPoint, kDefaultWaitForFailPointTimeout} =
+                    await import("jstests/libs/fail_point_util.js");
 
                 // Wait until we hang before shutdown to ensure that we do not move the index builds
                 // forward before the step down process is complete.
@@ -532,7 +579,7 @@ const ResumableIndexBuildTest = class {
             });
         }
         const defaultOptions = {noCleanData: true, setParameter: setParameter};
-        rst.start(conn, Object.assign(defaultOptions, options || {}));
+        upg.start(conn, Object.assign(defaultOptions, options || {}));
 
         if (shouldComplete) {
             // Ensure that the index builds were completed upon the node starting back up.
@@ -545,6 +592,29 @@ const ResumableIndexBuildTest = class {
         }
 
         return buildUUIDs;
+    }
+
+    static restart(rst,
+                   conn,
+                   coll,
+                   indexNames,
+                   failPoints,
+                   failPointsIteration,
+                   shouldComplete = true,
+                   failPointAfterStartup,
+                   runBeforeStartup,
+                   options) {
+        return ResumableIndexBuildTest.restartWithUpgrade(rst,
+                                                          rst,
+                                                          conn,
+                                                          coll,
+                                                          indexNames,
+                                                          failPoints,
+                                                          failPointsIteration,
+                                                          shouldComplete,
+                                                          failPointAfterStartup,
+                                                          runBeforeStartup,
+                                                          options);
     }
 
     /**
@@ -574,7 +644,7 @@ const ResumableIndexBuildTest = class {
             // Ensure that the resume info contains the correct phase to resume from.
             checkLog.containsJson(conn, 4841700, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] === buildUUIDs[i];
+                    return uuid && uuid["uuid"]["$uuid"] === buildUUIDs[i];
                 },
                 details: function(details) {
                     return details.phase ===
@@ -584,33 +654,35 @@ const ResumableIndexBuildTest = class {
 
             const resumeCheck = resumeChecks[resumeChecks.length === 1 ? 0 : i];
 
-            if (resumeCheck.numScannedAferResume) {
+            if (resumeCheck.numScannedAfterResume) {
                 // Ensure that the resumed index build resumed the collection scan from the correct
                 // location.
                 checkLog.containsJson(conn, 20391, {
                     buildUUID: function(uuid) {
-                        return uuid["uuid"]["$uuid"] === buildUUIDs[i];
+                        return uuid && uuid["uuid"]["$uuid"] === buildUUIDs[i];
                     },
-                    totalRecords: resumeCheck.numScannedAferResume
+                    totalRecords: resumeCheck.numScannedAfterResume
                 });
             } else if (resumeCheck.skippedPhaseLogID) {
                 // Ensure that the resumed index build does not perform a phase that it already
                 // completed before being interrupted for shutdown.
                 assert(!checkLog.checkContainsOnceJson(conn, resumeCheck.skippedPhaseLogID, {
                     buildUUID: function(uuid) {
-                        return uuid["uuid"]["$uuid"] === buildUUIDs[i];
+                        return uuid && uuid["uuid"]["$uuid"] === buildUUIDs[i];
                     }
                 }),
                        "Found log " + resumeCheck.skippedPhaseLogID + " for index build " +
                            buildUUIDs[i] + " when this phase should not have run after resuming");
             } else {
-                assert(false, "Must specify one of numScannedAferResume and skippedPhaseLogID");
+                assert(false, "Must specify one of numScannedAfterResume and skippedPhaseLogID");
             }
         }
     }
 
     /**
-     * Runs a resumable index build test on the provided replica set and namespace.
+     * Runs a resumable index build test on the specified namespace, starting it on the 'rst'
+     * replica set and resuming it in the 'upg' replica set, which could be a different binary
+     * version.
      *
      * 'indexSpecs' is a 2d array that specifies all indexes that should be built. The first
      *   dimension indicates separate calls to the createIndexes command, while the second
@@ -631,18 +703,68 @@ const ResumableIndexBuildTest = class {
      *   case all index builds will be expected to resume from that phase, or it must be exactly
      *   the length of 'indexSpecs'.
      *
-     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAferResume' and
+     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAfterResume' and
      *   'skippedPhaseLogID'. The former is used to verify that the index build scanned the
      *   expected number of documents in the collection scan after resuming. The latter is used for
      *   phases which do not perform a collection scan after resuming, to verify that the index
      *   index build did not resume from an earlier phase than expected. The log message must
      *   contain the buildUUID attribute.
      *
-     * 'sideWries' is an array of documents inserted during the initialization phase so that they
+     * 'sideWrites' is an array of documents inserted during the initialization phase so that they
      *   are inserted into the side writes table and processed during the drain writes phase.
      *
      * 'postIndexBuildInserts' is an array of documents inserted after the index builds have
      *   completed.
+     */
+    static runAndUpgrade(rst,
+                         upg,
+                         dbName,
+                         collName,
+                         indexSpecs,
+                         failPoints,
+                         failPointsIteration,
+                         expectedResumePhases,
+                         resumeChecks,
+                         sideWrites = [],
+                         postIndexBuildInserts = [],
+                         restartOptions) {
+        const primary = rst.getPrimary();
+        const coll = primary.getDB(dbName).getCollection(collName);
+        const indexNames = ResumableIndexBuildTest.generateIndexNames(indexSpecs);
+
+        const awaitCreateIndexes = ResumableIndexBuildTest.createIndexesWithSideWrites(
+            rst, async function(collName, indexSpecs, indexNames) {
+                const {ResumableIndexBuildTest} =
+                    await import("jstests/noPassthrough/libs/index_build.js");
+                ResumableIndexBuildTest.createIndexesFails(db, collName, indexSpecs, indexNames);
+            }, coll, indexSpecs, indexNames, sideWrites, {hangBeforeBuildingIndex: true});
+
+        const buildUUIDs = ResumableIndexBuildTest.restartWithUpgrade(rst,
+                                                                      upg,
+                                                                      primary,
+                                                                      coll,
+                                                                      indexNames,
+                                                                      failPoints,
+                                                                      failPointsIteration,
+                                                                      true,
+                                                                      undefined,
+                                                                      undefined,
+                                                                      restartOptions);
+
+        for (const awaitCreateIndex of awaitCreateIndexes) {
+            awaitCreateIndex();
+        }
+
+        ResumableIndexBuildTest.checkResume(
+            primary, buildUUIDs, expectedResumePhases, resumeChecks);
+
+        ResumableIndexBuildTest.checkIndexes(
+            rst, dbName, collName, indexNames, postIndexBuildInserts);
+    }
+
+    /**
+     *  Runs a resumable index build test on the specified namespace and replica set. See
+     * `runAndUpgrade' for paremeters documentation.
      */
     static run(rst,
                dbName,
@@ -655,42 +777,18 @@ const ResumableIndexBuildTest = class {
                sideWrites = [],
                postIndexBuildInserts = [],
                restartOptions) {
-        const primary = rst.getPrimary();
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(primary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
-        const coll = primary.getDB(dbName).getCollection(collName);
-        const indexNames = ResumableIndexBuildTest.generateIndexNames(indexSpecs);
-
-        const awaitCreateIndexes = ResumableIndexBuildTest.createIndexesWithSideWrites(
-            rst, function(collName, indexSpecs, indexNames) {
-                load("jstests/noPassthrough/libs/index_build.js");
-                ResumableIndexBuildTest.createIndexesFails(db, collName, indexSpecs, indexNames);
-            }, coll, indexSpecs, indexNames, sideWrites, {hangBeforeBuildingIndex: true});
-
-        const buildUUIDs = ResumableIndexBuildTest.restart(rst,
-                                                           primary,
-                                                           coll,
-                                                           indexNames,
-                                                           failPoints,
-                                                           failPointsIteration,
-                                                           true,
-                                                           undefined,
-                                                           undefined,
-                                                           restartOptions);
-
-        for (const awaitCreateIndex of awaitCreateIndexes) {
-            awaitCreateIndex();
-        }
-
-        ResumableIndexBuildTest.checkResume(
-            primary, buildUUIDs, expectedResumePhases, resumeChecks);
-
-        ResumableIndexBuildTest.checkIndexes(
-            rst, dbName, collName, indexNames, postIndexBuildInserts);
+        this.runAndUpgrade(rst,
+                           rst,
+                           dbName,
+                           collName,
+                           indexSpecs,
+                           failPoints,
+                           failPointsIteration,
+                           expectedResumePhases,
+                           resumeChecks,
+                           sideWrites,
+                           postIndexBuildInserts,
+                           restartOptions);
     }
 
     /**
@@ -710,12 +808,6 @@ const ResumableIndexBuildTest = class {
                                           postIndexBuildInserts = []) {
         const resumeNode = rst.getPrimary();
         const resumeDB = resumeNode.getDB(dbName);
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(resumeNode)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
         const secondary = rst.getSecondary();
         const coll = resumeDB.getCollection(collName);
         const indexName = "resumable_index_build";
@@ -887,7 +979,7 @@ const ResumableIndexBuildTest = class {
         } else {
             checkLog.containsJson(primary, 4841701, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] === buildUUID;
+                    return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                 }
             });
         }
@@ -970,7 +1062,7 @@ const ResumableIndexBuildTest = class {
 
         // Ensure that the resume info contains the correct phase to resume from.
         const equalsBuildUUID = function(uuid) {
-            return uuid["uuid"]["$uuid"] === buildUUID;
+            return uuid && uuid["uuid"]["$uuid"] === buildUUID;
         };
         checkLog.containsJson(primary, 4841700, {
             buildUUID: equalsBuildUUID,

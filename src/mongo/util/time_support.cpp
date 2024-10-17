@@ -27,31 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/time_support.h"
-
-#include <cstdint>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <fmt/compile.h>
+#include <fmt/format.h>
+#include <sys/types.h>
+// IWYU pragma: no_include "bits/types/struct_tm.h"
 #include <cstdio>
-#include <iostream>
+#include <cstring>
 #include <string>
 
-#include <fmt/compile.h>
-
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/parse_number.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 #if defined(_WIN32)
-#include "mongo/util/concurrency/mutex.h"
+#include <mmsystem.h>
+
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/timer.h"
-#include <mmsystem.h>
 #elif defined(__linux__)
-#include <time.h>
+#include <ctime>
 #elif defined(__APPLE__)
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -59,12 +62,6 @@
 
 #if !defined(_WIN32)
 #include <sys/time.h>
-#endif
-
-#ifdef __sun
-// Some versions of Solaris do not have timegm defined, so fall back to our implementation when
-// building on Solaris.  See SERVER-13446.
-extern "C" time_t timegm(struct tm* const tmp);
 #endif
 
 namespace mongo {
@@ -116,26 +113,47 @@ long long jsTime_virtual_skew = 0;
 thread_local long long jsTime_virtual_thread_skew = 0;
 
 void time_t_to_Struct(time_t t, struct tm* buf, bool local) {
+    bool itWorked;
 #if defined(_WIN32)
     if (local)
-        localtime_s(buf, &t);
+        itWorked = localtime_s(buf, &t) == 0;
     else
-        gmtime_s(buf, &t);
+        itWorked = gmtime_s(buf, &t) == 0;
 #else
     if (local)
-        localtime_r(&t, buf);
+        itWorked = localtime_r(&t, buf) != nullptr;
     else
-        gmtime_r(&t, buf);
+        itWorked = gmtime_r(&t, buf) != nullptr;
 #endif
+
+    if (!itWorked) {
+        if (t < 0) {
+            // Windows docs say it doesn't support these, but empirically it seems to work
+            uasserted(1125400, "gmtime failed - your system doesn't support dates before 1970");
+        } else {
+            uasserted(1125401, str::stream() << "gmtime failed to convert time_t of " << t);
+        }
+    }
 }
 
 std::string time_t_to_String_short(time_t t) {
     char buf[64];
+    bool itWorked;
 #if defined(_WIN32)
-    ctime_s(buf, sizeof(buf), &t);
+    itWorked = ctime_s(buf, sizeof(buf), &t) == 0;
 #else
-    ctime_r(&t, buf);
+    itWorked = ctime_r(&t, buf) != nullptr;
 #endif
+
+    if (!itWorked) {
+        if (t < 0) {
+            // Windows docs say it doesn't support these, but empirically it seems to work
+            uasserted(1125402, "ctime failed - your system doesn't support dates before 1970");
+        } else {
+            uasserted(1125403, str::stream() << "ctime failed to convert time_t of " << t);
+        }
+    }
+
     buf[19] = 0;
     if (buf[0] && buf[1] && buf[2] && buf[3])
         return buf + 4;  // skip day of week
@@ -175,9 +193,7 @@ DateStringBuffer& DateStringBuffer::iso8601(Date_t date, bool local) {
     }
 
     {
-        static const auto& fmt_str_millis = *new auto(fmt::compile<int32_t>(".{:03}"));
-        auto res = fmt::format_to_n(
-            cur, end - cur, fmt_str_millis, static_cast<int32_t>(date.asInt64() % 1000));
+        auto res = fmt::format_to_n(cur, end - cur, FMT_COMPILE(".{:03}"), date.asInt64() % 1000);
         cur = res.out;
         dassert(cur < end && res.size > 0);
     }
@@ -192,7 +208,10 @@ DateStringBuffer& DateStringBuffer::iso8601(Date_t date, bool local) {
         // savings time.  We can do no better without completely reimplementing localtime_s and
         // related time library functions.
         long msTimeZone;
-        _get_timezone(&msTimeZone);
+        int ret = _get_timezone(&msTimeZone);
+        if (ret != 0) {
+            uasserted(1125404, str::stream() << "_get_timezone failed with errno: " << ret);
+        }
         if (t.tm_isdst)
             msTimeZone -= 3600;
         const bool tzIsWestOfUTC = msTimeZone > 0;
@@ -201,10 +220,9 @@ DateStringBuffer& DateStringBuffer::iso8601(Date_t date, bool local) {
         const long tzOffsetMinutesPart = (tzOffsetSeconds / 60) % 60;
 
         // "+hh:mm"
-        static const auto& fmtStrTime = *new auto(fmt::compile<char, long, long>("{}{:02}:{:02}"));
         cur = fmt::format_to_n(cur,
                                localTzSubstrLen + 1,
-                               fmtStrTime,
+                               FMT_COMPILE("{}{:02}:{:02}"),
                                tzIsWestOfUTC ? '-' : '+',
                                tzOffsetHoursPart,
                                tzOffsetMinutesPart)
@@ -233,11 +251,21 @@ DateStringBuffer& DateStringBuffer::ctime(Date_t date) {
     // "Wed Jun 30 21:49:08.996"    // append millis
     //  12345678901234567890123456
     time_t t = date.toTimeT();
+    bool itWorked;
 #if defined(_WIN32)
-    ctime_s(_data.data(), _data.size(), &t);
+    itWorked = ctime_s(_data.data(), _data.size(), &t) == 0;
 #else
-    ctime_r(&t, _data.data());
+    itWorked = ctime_r(&t, _data.data()) != nullptr;
 #endif
+
+    if (!itWorked) {
+        if (t < 0) {
+            // Windows docs say it doesn't support these, but empirically it seems to work
+            uasserted(1125405, "ctime failed - your system doesn't support dates before 1970");
+        } else {
+            uasserted(1125406, str::stream() << "ctime failed to convert time_t of " << t);
+        }
+    }
 
     static constexpr size_t ctimeSubstrLen = 19;
     static constexpr size_t millisSubstrLen = 4;
@@ -698,7 +726,12 @@ StatusWith<Date_t> dateFromISOString(StringData dateString) {
     dateStruct.tm_wday = 0;
     dateStruct.tm_yday = 0;
 
-    resultMillis = (1000 * static_cast<unsigned long long>(timegm(&dateStruct))) + millis;
+    time_t calendarTime = timegm(&dateStruct);
+    if (calendarTime == -1) {
+        uasserted(1125407, str::stream() << "timegm failed with errno: " << errno);
+    }
+
+    resultMillis = (1000 * static_cast<unsigned long long>(calendarTime)) + millis;
 #endif
 
     resultMillis += (tzAdjSecs * 1000);
@@ -719,8 +752,8 @@ std::string Date_t::toString() const {
 
 time_t Date_t::toTimeT() const {
     const auto secs = millis / 1000;
-    verify(secs >= std::numeric_limits<time_t>::min());
-    verify(secs <= std::numeric_limits<time_t>::max());
+    MONGO_verify(secs >= std::numeric_limits<time_t>::min());
+    MONGO_verify(secs <= std::numeric_limits<time_t>::max());
     return secs;
 }
 
@@ -814,7 +847,10 @@ unsigned long long curTimeMicros64() {
 #else
 unsigned long long curTimeMillis64() {
     timeval tv;
-    gettimeofday(&tv, nullptr);
+    int ret = gettimeofday(&tv, nullptr);
+    if (ret == -1) {
+        uasserted(1125408, str::stream() << "gettimeofday failed with errno " << errno);
+    }
     return ((unsigned long long)tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
@@ -847,7 +883,10 @@ Nanoseconds getMinimumTimerResolution() {
     Nanoseconds minTimerResolution;
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
     struct timespec tp;
-    clock_getres(CLOCK_REALTIME, &tp);
+    int ret = clock_getres(CLOCK_REALTIME, &tp);
+    if (ret == -1) {
+        uasserted(1125409, str::stream() << "clock_getres failed with errno: " << errno);
+    }
     minTimerResolution = Nanoseconds{tp.tv_nsec};
 #elif defined(_WIN32)
     // see https://msdn.microsoft.com/en-us/library/windows/desktop/dd743626(v=vs.85).aspx

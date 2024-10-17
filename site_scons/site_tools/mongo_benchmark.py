@@ -19,20 +19,18 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
-
 """
 Pseudo-builders for building and registering benchmarks.
 """
-from SCons.Script import Action
 
 from site_scons.mongo import insort_wrapper
+
 
 def exists(env):
     return True
 
 
 def build_benchmark(env, target, source, **kwargs):
-
     bmEnv = env.Clone()
     bmEnv.InjectThirdParty(libraries=["benchmark"])
 
@@ -59,7 +57,15 @@ def build_benchmark(env, target, source, **kwargs):
         )
 
     kwargs["AIB_COMPONENTS_EXTRA"] = list(benchmark_test_components)
-
+    if (
+        env.GetOption("consolidated-test-bins") == "on"
+        and "CONSOLIDATED_TARGET" in kwargs
+        and kwargs["CONSOLIDATED_TARGET"]
+    ):
+        kwargs["AIB_COMPONENTS_EXTRA"] += ["consolidated-benchmarks"]
+        return bmEnv.AddToConsolidatedTarget(
+            target, source, kwargs, "$BENCHMARK_ALIAS", "$BENCHMARK_LIST"
+        )
     result = bmEnv.Program(target, source, **kwargs)
     bmEnv.RegisterTest("$BENCHMARK_LIST", result[0])
     bmEnv.Alias("$BENCHMARK_ALIAS", result)

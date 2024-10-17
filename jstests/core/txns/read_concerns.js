@@ -1,8 +1,13 @@
 // Verifies which read concern levels transactions support, with and without afterClusterTime.
 //
-// @tags: [uses_transactions, uses_snapshot_read_concern, requires_majority_read_concern]
-(function() {
-"use strict";
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions,
+//   uses_snapshot_read_concern,
+//   requires_majority_read_concern,
+// ]
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
 const dbName = "test";
 const collName = "supported_read_concern_levels";
@@ -20,19 +25,17 @@ function runTest(level, sessionOptions, supported) {
     // Set up the collection.
     assert.commandWorked(sessionColl.insert({_id: 0}, {writeConcern: {w: "majority"}}));
 
-    if (level) {
-        session.startTransaction({readConcern: {level: level}});
-    } else {
-        session.startTransaction();
-    }
+    const txnOpts = (level ? {readConcern: {level: level}} : {});
 
-    const res = sessionDB.runCommand({find: collName});
     if (supported) {
-        assert.commandWorked(res,
-                             "expected success, read concern level: " + level +
-                                 ", sessionOptions: " + tojson(sessionOptions));
-        assert.commandWorked(session.commitTransaction_forTesting());
+        withTxnAndAutoRetryOnMongos(session, () => {
+            assert.commandWorked(sessionDB.runCommand({find: collName}),
+                                 "expected success, read concern level: " + level +
+                                     ", sessionOptions: " + tojson(sessionOptions));
+        }, txnOpts);
     } else {
+        session.startTransaction(txnOpts);
+        const res = sessionDB.runCommand({find: collName});
         assert.commandFailedWithCode(res,
                                      ErrorCodes.InvalidOptions,
                                      "expected failure, read concern level: " + level +
@@ -59,4 +62,3 @@ for (let level of kUnsupportedLevels) {
     runTest(level, {causalConsistency: false}, false /*supported*/);
     runTest(level, {causalConsistency: true}, false /*supported*/);
 }
-}());

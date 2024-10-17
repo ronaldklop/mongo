@@ -1,7 +1,10 @@
 // Tests that killing a cursor created in a transaction does not abort the transaction.
-// @tags: [uses_transactions]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession, killCursors.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
 const dbName = "test";
 const collName = "kill_txn_cursor";
@@ -61,4 +64,3 @@ assert.sameMembers([{_id: 0}, {_id: 1}, {_id: 2}, {_id: 3}, {_id: 4}],
                    sessionColl.find().toArray());
 
 session.endSession();
-}());

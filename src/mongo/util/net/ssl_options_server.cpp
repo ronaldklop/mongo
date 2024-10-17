@@ -27,8 +27,8 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
+#include "mongo/base/error_codes.h"
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_options.h"
@@ -38,6 +38,7 @@
 #include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/auth_options_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
@@ -47,6 +48,9 @@
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/ssl.h>
 #endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace moe = mongo::optionenvironment;
 using std::string;
@@ -190,15 +194,28 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
     }
 #endif
 
-    const int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    const auto clusterAuthMode = serverGlobalParams.startupClusterAuthMode;
     if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying a tlsClusterCAFile requires a tlsCAFile also be specified. See  "
+                "https://dochub.mongodb.org/core/mongod"
+                "#std-option-mongod.--tlsClusterCAFile for details.",
+                sslGlobalParams.sslClusterCAFile.empty() || !sslGlobalParams.sslCAFile.empty());
+        uassert(ErrorCodes::InvalidOptions,
+                "The use of both a CA File and the System Certificate store is not supported.",
+                !sslGlobalParams.sslUseSystemCA || sslGlobalParams.sslCAFile.empty());
+        uassert(ErrorCodes::InvalidOptions,
+                "The use of TLS without specifying a chain of trust is no longer supported. See "
+                "https://jira.mongodb.org/browse/SERVER-72839 for details.",
+                sslGlobalParams.sslUseSystemCA || !sslGlobalParams.sslCAFile.empty());
+        if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
+            uasserted(ErrorCodes::BadValue,
+                      "Specifying a tlsCRLFile requires a tlsCAFile also be specified.");
+        }
         bool usingCertifiateSelectors = params.count("net.tls.certificateSelector");
         if (sslGlobalParams.sslPEMKeyFile.size() == 0 && !usingCertifiateSelectors) {
             uasserted(ErrorCodes::BadValue,
                       "need tlsCertificateKeyFile or certificateSelector when TLS is enabled");
-        }
-        if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
-            uasserted(ErrorCodes::BadValue, "need tlsCAFile with tlsCRLFile");
         }
 
         std::string sslCANotFoundError(
@@ -209,7 +226,7 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
         // When using cetificate selectors, we use the local system certificate store for verifying
         // X.509 certificates for auth instead of relying on a CA file.
         if (sslGlobalParams.sslCAFile.empty() && !usingCertifiateSelectors &&
-            clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
+            clusterAuthMode.allowsX509()) {
             uasserted(ErrorCodes::BadValue, sslCANotFoundError);
         }
     } else if (sslGlobalParams.sslPEMKeyFile.size() || sslGlobalParams.sslPEMKeyPassword.size() ||
@@ -227,9 +244,7 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
                   "using TLS configuration parameters");
     }
 
-    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendKeyFile ||
-        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
-        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
+    if (clusterAuthMode.allowsX509()) {
         if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_disabled) {
             uasserted(ErrorCodes::BadValue, "need to enable TLS via the tlsMode flag");
         }
@@ -241,11 +256,26 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
         }
     }
 
+    if (params.count("net.tls.clusterAuthX509.extensionValue")) {
+        uassert(ErrorCodes::BadValue,
+                "net.tls.clusterAuthX509.extensionValue requires "
+                "a clusterAuthMode which allows for usage of X509",
+                clusterAuthMode.allowsX509());
+        sslGlobalParams.clusterAuthX509ExtensionValue =
+            params["net.tls.clusterAuthX509.extensionValue"].as<std::string>();
+    }
+
+    if (params.count("net.tls.clusterAuthX509.attributes")) {
+        uassert(ErrorCodes::BadValue,
+                "Cannot set clusterAuthX509.attributes when clusterAuthMode does not allow X.509",
+                clusterAuthMode.allowsX509());
+        sslGlobalParams.clusterAuthX509Attributes =
+            params["net.tls.clusterAuthX509.attributes"].as<std::string>();
+    }
+
     if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_allowSSL) {
         // allowSSL and x509 is valid only when we are transitioning to auth.
-        if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
-            (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 &&
-             !serverGlobalParams.transitionToAuth)) {
+        if (clusterAuthMode.sendsX509() && !serverGlobalParams.transitionToAuth) {
             uasserted(ErrorCodes::BadValue,
                       "cannot have x.509 cluster authentication in allowTLS mode");
         }

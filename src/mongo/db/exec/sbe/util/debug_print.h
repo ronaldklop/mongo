@@ -29,9 +29,11 @@
 
 #pragma once
 
+#include <iterator>
 #include <string>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/util/str.h"
@@ -42,6 +44,9 @@ class PlanStage;
 
 class DebugPrinter {
 public:
+    // Keyword to identify optional slots that are missing.
+    static constexpr StringData kNoneKeyword = "none"_sd;
+
     struct Block {
         enum Command {
             cmdIncIndent,

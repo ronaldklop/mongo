@@ -3,14 +3,10 @@
  * shards.
  *
  * @tags: [
- *   requires_fcv_49,
- *   uses_atclustertime,
+ *   uses_atclustertime
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest({numDonors: 3, numRecipients: 3, reshardInPlace: true});
 
@@ -72,4 +68,3 @@ assert.commandFailedWithCode(execRetryableInsert(lsidList[2], {oldKey: 100, newK
                              ErrorCodes.IncompleteTransactionHistory);
 
 reshardingTest.teardown();
-})();

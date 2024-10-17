@@ -27,11 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <mutex>
 
-#include "mongo/db/curop_failpoint_helpers.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/time_support.h"
 
 
 namespace mongo {
@@ -40,7 +52,7 @@ std::string CurOpFailpointHelpers::updateCurOpFailPointMsg(OperationContext* opC
                                                            const std::string& newMsg) {
     stdx::lock_guard<Client> lk(*opCtx->getClient());
     auto oldMsg = CurOp::get(opCtx)->getFailPointMessage();
-    CurOp::get(opCtx)->setFailPointMessage_inlock(newMsg.c_str());
+    CurOp::get(opCtx)->setFailPointMessage(lk, newMsg.c_str());
     return oldMsg;
 }
 
@@ -48,7 +60,7 @@ void CurOpFailpointHelpers::waitWhileFailPointEnabled(FailPoint* failPoint,
                                                       OperationContext* opCtx,
                                                       const std::string& failpointMsg,
                                                       const std::function<void()>& whileWaiting,
-                                                      boost::optional<NamespaceString> nss) {
+                                                      const NamespaceString& nss) {
     invariant(failPoint);
     failPoint->executeIf(
         [&](const BSONObj& data) {
@@ -78,11 +90,8 @@ void CurOpFailpointHelpers::waitWhileFailPointEnabled(FailPoint* failPoint,
             updateCurOpFailPointMsg(opCtx, origCurOpFailpointMsg);
         },
         [&](const BSONObj& data) {
-            StringData fpNss = data.getStringField("nss");
-            if (nss && !fpNss.empty() && fpNss != nss.get().toString()) {
-                return false;
-            }
-            return true;
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
+            return nss.isEmpty() || fpNss.isEmpty() || fpNss == nss;
         });
 }
 }  // namespace mongo

@@ -3,11 +3,9 @@
 // data (member3), then puts 50 more ops in member3's buffer and makes sure that member3 doesn't try
 // to sync from member2.
 
-(function() {
-"use strict";
-
-load('jstests/libs/write_concern_util.js');
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {syncFrom} from "jstests/replsets/rslib.js";
 
 // helper to ensure two nodes are at the same place in the oplog
 var waitForSameOplogPosition = function(db1, db2, errmsg) {
@@ -41,6 +39,10 @@ replSet.nodes[2].setSecondaryOk();
 var member2 = replSet.nodes[1].getDB("admin");
 var member3 = replSet.nodes[2].getDB("admin");
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Do an initial write
 primary.getDB("foo").bar.insert({x: 1});
 replSet.awaitReplication();
@@ -52,6 +54,8 @@ syncFrom(replSet.nodes[2], primary, replSet);
 
 jsTest.log("Stop 2's replication");
 member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
+checkLog.contains(member2,
+                  "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
 jsTest.log("Do a few writes");
 for (var i = 0; i < 25; i++) {
@@ -64,6 +68,8 @@ waitForSameOplogPosition(primaryDB, member3, "node 3 failed to catch up to the p
 
 jsTest.log("Stop 3's replication");
 member3.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
+checkLog.contains(member3,
+                  "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 // logLevel 3 will allow us to see each op the secondary pulls from the primary so that we can
 // determine whether or not all ops are actually being pulled
 member3.runCommand({setParameter: 1, logLevel: 3});
@@ -82,6 +88,8 @@ waitForSameOplogPosition(primaryDB, member2, "node 2 failed to catch up to the p
 
 jsTest.log("Stop 2's replication");
 member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
+checkLog.contains(member2,
+                  "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
 jsTest.log("Do some writes - 2 & 3 should have up to write #75 in their buffers, but unapplied");
 for (var i = 50; i < 75; i++) {
@@ -141,4 +149,3 @@ while ((new Date()).getTime() < end) {
 assert.commandWorked(member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'}));
 
 replSet.stopSet();
-}());

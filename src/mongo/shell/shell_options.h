@@ -34,7 +34,8 @@
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/rpc/protocol.h"
+#include "mongo/base/string_data.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -44,6 +45,27 @@ class Environment;
 }  // namespace optionenvironment
 
 namespace moe = mongo::optionenvironment;
+
+/**
+ * The sole purpose of this class is to avoid compilation errors with the definition of 'nokillop'
+ * field in shell_options.idl which the generated option parser requires assignment operator for the
+ * field to work but AtomicWord<T> does not support assignment operator(s).
+ */
+class AssignableAtomicBool : public AtomicWord<bool> {
+public:
+    AssignableAtomicBool() = default;
+    explicit AssignableAtomicBool(bool value) : AtomicWord<bool>(value) {}
+
+    AssignableAtomicBool(const AssignableAtomicBool&) = delete;
+    AssignableAtomicBool& operator=(const AssignableAtomicBool&) = delete;
+    AssignableAtomicBool(AssignableAtomicBool&&) = delete;
+    AssignableAtomicBool& operator=(AssignableAtomicBool&&) = delete;
+
+    AssignableAtomicBool& operator=(bool value) {
+        store(value);
+        return *this;
+    }
+};
 
 struct ShellGlobalParams {
     std::string url;
@@ -73,18 +95,19 @@ struct ShellGlobalParams {
     bool apiDeprecationErrors;
 
     bool autoKillOp = false;
-    bool useWriteCommandsDefault = true;
 
-    std::string writeMode = "commands";
-    std::string readMode = "compatibility";
     bool shouldRetryWrites = false;
     bool shouldUseImplicitSessions = true;
 
-    boost::optional<rpc::ProtocolSet> rpcProtocols = boost::none;
-
     int jsHeapLimitMB = 0;
-    bool nokillop = false;
+    AssignableAtomicBool nokillop{false};
     Seconds idleSessionTimeout = Seconds{0};
+
+// TODO: SERVER-80343 Remove this ifdef once gRPC is compiled on all variants
+#ifdef MONGO_CONFIG_GRPC
+    bool gRPC = false;
+    boost::optional<std::string> gRPCAuthToken;
+#endif
 };
 
 extern ShellGlobalParams shellGlobalParams;

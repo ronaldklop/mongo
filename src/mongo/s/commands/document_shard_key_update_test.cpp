@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
-#include <string>
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
-#include "mongo/unittest/unittest.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 
 namespace mongo {
@@ -50,7 +54,7 @@ public:
 };
 
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
-    NamespaceString nss("test.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.foo");
     BSONObj updatePreImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
 
     auto deleteCmdObj = constructShardKeyDeleteCmdObj(nss, updatePreImage);
@@ -66,10 +70,10 @@ TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
 }
 
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyInsertCmdObj) {
-    NamespaceString nss("test.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.foo");
     BSONObj updatePostImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
 
-    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage);
+    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage, false);
 
     auto insertsObj = insertCmdObj["documents"].Array();
     ASSERT_EQ(insertsObj.size(), 1U);

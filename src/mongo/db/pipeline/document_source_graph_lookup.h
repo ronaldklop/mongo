@@ -29,11 +29,50 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -51,16 +90,33 @@ public:
                                                  const BSONElement& spec);
 
 
-        bool allowShardedForeignCollection(NamespaceString nss) const override {
-            return _foreignNss != nss;
+        Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                              bool inMultiDocumentTransaction) const override {
+            const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+            if (!inMultiDocumentTransaction || _foreignNss != nss ||
+                gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot)) {
+                return Status::OK();
+            }
+
+            return Status(
+                ErrorCodes::NamespaceCannotBeSharded,
+                "Sharded $graphLookup is not allowed within a multi-document transaction");
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override {
             return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), ActionType::find)};
         }
     };
 
+    DocumentSourceGraphLookUp(const DocumentSourceGraphLookUp&,
+                              const boost::intrusive_ptr<ExpressionContext>&);
+
     const char* getSourceName() const final;
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kGraphLookup;
+    }
 
     const FieldPath& getConnectFromField() const {
         return _connectFromField;
@@ -74,6 +130,29 @@ public:
         return _startWith.get();
     }
 
+    const boost::intrusive_ptr<DocumentSourceUnwind>& getUnwindSource() const {
+        return *_unwind;
+    }
+
+    /*
+     * Indicates whether this $graphLookup stage has absorbed an immediately following $unwind stage
+     * that unwinds the lookup result array.
+     */
+    bool hasUnwindSource() const {
+        return _unwind.has_value();
+    }
+
+    /*
+     * Returns a ref to '_startWith' that can be swapped out with a new expression.
+     */
+    boost::intrusive_ptr<Expression>& getMutableStartWithField() {
+        return _startWith;
+    }
+
+    void setStartWithField(boost::intrusive_ptr<Expression> startWith) {
+        _startWith.swap(startWith);
+    }
+
     boost::optional<BSONObj> getAdditionalFilter() const {
         return _additionalFilter;
     };
@@ -82,44 +161,45 @@ public:
         _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
     };
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void serializeToArray(std::vector<Value>& array,
+                          const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Returns the 'as' path, and possibly the fields modified by an absorbed $unwind.
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        StageConstraints constraints(StreamType::kStreaming,
-                                     PositionRequirement::kNone,
-                                     HostTypeRequirement::kPrimaryShard,
-                                     DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed,
-                                     UnionRequirement::kAllowed);
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
-        constraints.canSwapWithMatch = true;
-        return constraints;
-    }
-
-    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
-        // {shardsStage, mergingStage, sortPattern}
-        return DistributedPlanLogic{nullptr, this, boost::none};
-    }
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
-        _startWith->addDependencies(deps);
+        expression::addDependencies(_startWith.get(), deps);
         return DepsTracker::State::SEE_NEXT;
     };
 
+    size_t getFrontierUsageBytes_forTest() const {
+        return _frontierUsageBytes;
+    }
+
+    void frontierInsertWithMemoryTracking_forTest(Value value);
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        expression::addVariableRefs(_startWith.get(), refs);
+        if (_additionalFilter) {
+            match_expression::addVariableRefs(
+                uassertStatusOK(MatchExpressionParser::parse(*_additionalFilter, _fromExpCtx))
+                    .get(),
+                refs);
+        }
+    }
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
 
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
     static boost::intrusive_ptr<DocumentSourceGraphLookUp> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -136,9 +216,13 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
+
 protected:
     GetNextResult doGetNext() final;
     void doDispose() final;
+    boost::optional<ShardId> computeMergeShardId() const final;
 
     /**
      * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwind' field.
@@ -159,9 +243,9 @@ private:
         boost::optional<long long> maxDepth,
         boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final {
         // Should not be called; use serializeToArray instead.
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(7484306);
     }
 
     /**
@@ -197,7 +281,7 @@ private:
      * Updates '_cache' with 'result' appropriately, given that 'result' was retrieved when querying
      * for 'queried'.
      */
-    void addToCache(const Document& result, const ValueUnorderedSet& queried);
+    void addToCache(const Document& result, const ValueFlatUnorderedSet& queried);
 
     /**
      * Assert that '_visited' and '_frontier' have not exceeded the maximum meory usage, and then
@@ -212,6 +296,16 @@ private:
      * Returns whether '_visited' was updated, and thus, whether the search should recurse.
      */
     bool addToVisitedAndFrontier(Document result, long long depth);
+
+    /**
+     * Insert into 'frontier' and update '_frontierUsageBytes.'
+     */
+    inline void frontierInsertWithMemoryTracking(Value value);
+
+    /**
+     * Returns true if we are not in a transaction.
+     */
+    bool foreignShardedGraphLookupAllowed() const;
 
     // $graphLookup options.
     NamespaceString _from;
@@ -237,7 +331,7 @@ private:
     size_t _frontierUsageBytes = 0;
 
     // Only used during the breadth-first search, tracks the set of values on the current frontier.
-    ValueUnorderedSet _frontier;
+    ValueFlatUnorderedSet _frontier;
 
     // Tracks nodes that have been discovered for a given input. Keys are the '_id' value of the
     // document from the foreign collection, value is the document itself.  The keys are compared
@@ -257,7 +351,7 @@ private:
 
     // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
     // field, tracking how many results we've returned so far for the current input document.
-    long long _outputIndex;
+    long long _outputIndex = 0;
 
     // Holds variables defined both in this stage and in parent pipelines. These are copied to the
     // '_fromExpCtx' ExpressionContext's 'variables' and 'variablesParseState' for use in the

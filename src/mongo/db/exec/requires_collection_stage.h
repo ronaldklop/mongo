@@ -29,11 +29,17 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/restore_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -51,14 +57,15 @@ class RequiresCollectionStage : public PlanStage {
 public:
     RequiresCollectionStage(const char* stageType,
                             ExpressionContext* expCtx,
-                            const CollectionPtr& coll)
+                            VariantCollectionPtrOrAcquisition coll)
         : PlanStage(stageType, expCtx),
-          _collection(&coll),
-          _collectionUUID(coll->uuid()),
+          _collection(coll),
+          _collectionPtr(&coll.getCollectionPtr()),
+          _collectionUUID(coll.getCollectionPtr()->uuid()),
           _catalogEpoch(getCatalogEpoch()),
-          _nss(coll->ns()) {}
+          _nss(coll.getCollectionPtr()->ns()) {}
 
-    virtual ~RequiresCollectionStage() = default;
+    ~RequiresCollectionStage() override = default;
 
 protected:
     void doSaveState() final;
@@ -75,8 +82,12 @@ protected:
      */
     virtual void doRestoreStateRequiresCollection() = 0;
 
-    const CollectionPtr& collection() const {
-        return *_collection;
+    const VariantCollectionPtrOrAcquisition& collection() const {
+        return _collection;
+    }
+
+    const CollectionPtr& collectionPtr() const {
+        return *_collectionPtr;
     }
 
     UUID uuid() const {
@@ -93,7 +104,8 @@ private:
     // helper. It needs to stay valid until the PlanExecutor saves its state. To avoid this pointer
     // from dangling it needs to be reset when doRestoreState() is called and it is reset to a
     // different CollectionPtr.
-    const CollectionPtr* _collection;
+    VariantCollectionPtrOrAcquisition _collection;
+    const CollectionPtr* _collectionPtr;
     const UUID _collectionUUID;
     const uint64_t _catalogEpoch;
 
@@ -103,6 +115,19 @@ private:
 };
 
 // Type alias for use by PlanStages that write to a Collection.
-using RequiresMutableCollectionStage = RequiresCollectionStage;
+class RequiresWritableCollectionStage : public RequiresCollectionStage {
+public:
+    RequiresWritableCollectionStage(const char* stageType,
+                                    ExpressionContext* expCtx,
+                                    CollectionAcquisition coll)
+        : RequiresCollectionStage(stageType, expCtx, coll), _collectionAcquisition(coll) {}
+
+    const CollectionAcquisition& collectionAcquisition() const {
+        return _collectionAcquisition;
+    }
+
+private:
+    const CollectionAcquisition _collectionAcquisition;
+};
 
 }  // namespace mongo

@@ -29,11 +29,20 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
 #include <queue>
+#include <vector>
 
-#include "mongo/db/exec/sbe/stages/stages.h"
-
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/sorted_stream_merger.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
@@ -53,7 +62,7 @@ public:
      *  be propagated.
      * -outputVals: Slots where the output should be stored.
      */
-    SortedMergeStage(std::vector<std::unique_ptr<PlanStage>> inputStages,
+    SortedMergeStage(PlanStage::Vector inputStages,
                      // Each element of 'inputKeys' must be the same size as 'dirs'.
                      std::vector<value::SlotVector> inputKeys,
                      // Sort directions. Used to interpret each input key.
@@ -61,7 +70,8 @@ public:
                      // Each element of 'inputVals' must be the same size as 'outputVals'.
                      std::vector<value::SlotVector> inputVals,
                      value::SlotVector outputVals,
-                     PlanNodeId planNodeId);
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -74,6 +84,7 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
 
 private:
     const std::vector<value::SlotVector> _inputKeys;
@@ -82,7 +93,7 @@ private:
     const std::vector<value::SlotVector> _inputVals;
     const value::SlotVector _outputVals;
 
-    std::vector<value::ViewOfValueAccessor> _outAccessors;
+    std::vector<value::SwitchAccessor> _outAccessors;
 
     // Maintains state about merging the results in order. Initialized during prepare().
     boost::optional<SortedStreamMerger<PlanStage>> _merger;

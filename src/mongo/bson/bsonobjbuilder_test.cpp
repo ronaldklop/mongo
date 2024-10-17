@@ -27,13 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <initializer_list>
+#include <limits>
+#include <list>
+#include <ostream>
+#include <set>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/unittest/unittest.h"
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo {
 namespace {
@@ -232,6 +257,56 @@ TEST(BSONObjBuilderTest, MovingAnOwningBSONObjBuilderWorks) {
     ASSERT_BSONOBJ_EQ(bob.obj(), BSON("a" << 1 << "b" << 2 << "c" << 3));
 }
 
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendSet) {
+    BSONObjBuilder initial;
+    std::set<int> testSet = {10, 20, 30};
+
+    initial.append("a", testSet);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendList) {
+    BSONObjBuilder initial;
+    std::list<int> testList = {10, 20, 30};
+
+    initial.append("a", testList);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendVector) {
+    BSONObjBuilder initial;
+    std::vector<int> vect = {10, 20, 30};
+
+    initial.append("a", vect);
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendVectorIterator) {
+    BSONObjBuilder initial;
+    std::vector<int> vect = {10, 20, 30};
+
+    initial.append("a", vect.begin(), vect.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendSetIterator) {
+    BSONObjBuilder initial;
+
+    std::set<int> testSet = {30, 20, 10};
+
+    initial.append("a", testSet.begin(), testSet.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONObjBuilderAppendBoostVectorIterator) {
+    BSONObjBuilder initial;
+
+    auto vect = boost::container::small_vector<int, 3>{10, 20, 30};
+
+    initial.append("a", vect.begin(), vect.end());
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
 TEST(BSONObjBuilderTest, MovingANonOwningBSONObjBuilderWorks) {
     BSONObjBuilder outer;
     {
@@ -264,6 +339,66 @@ TEST(BSONArrayBuilderTest, MovingABSONArrayBuilderWorks) {
     moved.done();
 
     ASSERT_BSONOBJ_EQ(bob.obj(), BSON("a" << 1 << "array" << BSON_ARRAY(1 << "2" << 3 << "4")));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendSet) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::set<int> testSet = {10, 20, 30};
+        arr.append(testSet);
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendList) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::list<int> testList = {10, 20, 30};
+        arr.append(testList);
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendVectorIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::vector<int> vect = {10, 20, 30};
+        arr.append(vect.begin(), vect.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONArrayBuilderTest, BSONArrayBuilderAppendSetIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        std::set<int> testSet = {10, 20, 30};
+        arr.append(testSet.begin(), testSet.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
+}
+
+TEST(BSONObjBuilderTest, BSONArrayBuilderAppendBoostVectorIterator) {
+    BSONObjBuilder initial;
+
+    {
+        BSONArrayBuilder arr(initial.subarrayStart("a"));
+        auto vect = boost::container::small_vector<int, 3>{10, 20, 30};
+        arr.append(vect.begin(), vect.end());
+    }
+
+    ASSERT_BSONOBJ_EQ(initial.obj(), BSON("a" << BSON_ARRAY(10 << 20 << 30)));
 }
 
 TEST(BSONObjBuilderTest, SeedingBSONObjBuilderWithRootedUnsharedOwnedBsonWorks) {
@@ -392,7 +527,7 @@ TEST(BSONObjBuilderTest, SizeChecks) {
 
     // But a size is in fact being enforced.
     {
-        auto largeBuffer = generateBuffer(40 * 1024 * 1024);
+        auto largeBuffer = generateBuffer(50 * 1024 * 1024);
         BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
         BSONObjBuilder builder;
         ASSERT_THROWS(

@@ -29,11 +29,28 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/matcher/copyable_match_expression.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 /**
@@ -70,11 +87,15 @@ public:
             preImage.getDocument(), postImage.getDocument(), *_matchExpr, _path)};
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
     }
 
-    Value serialize(bool explain) const final {
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    Value serialize(const SerializationOptions& options) const final {
         MONGO_UNREACHABLE;
     }
 
@@ -86,8 +107,8 @@ public:
     }
 
     boost::intrusive_ptr<Expression> optimize() final {
-        for (const auto& child : _children) {
-            child->optimize();
+        for (auto& child : _children) {
+            child = child->optimize();
         }
         // SERVER-43740: ideally we'd want to optimize '_matchExpr' here as well. However, given
         // that the match expression is stored as a shared copyable expression in this class, and
@@ -100,13 +121,8 @@ public:
         return this;
     }
 
-protected:
-    void _doAddDependencies(DepsTracker* deps) const final {
-        for (const auto& child : _children) {
-            child->addDependencies(deps);
-        }
-        _matchExpr->addDependencies(deps);
-        deps->needWholeDocument = true;
+    const CopyableMatchExpression& getMatchExpr() const {
+        return _matchExpr;
     }
 
 private:
@@ -141,11 +157,15 @@ public:
             postImage.getDocument(), _path, _skip, _limit)};
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
     }
 
-    Value serialize(bool explain) const final {
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    Value serialize(const SerializationOptions& options) const final {
         MONGO_UNREACHABLE;
     }
 
@@ -159,22 +179,17 @@ public:
     boost::intrusive_ptr<Expression> optimize() final {
         invariant(_children.size() == 1ul);
 
-        _children[0]->optimize();
+        _children[0] = _children[0]->optimize();
         return this;
-    }
-
-protected:
-    void _doAddDependencies(DepsTracker* deps) const final {
-        invariant(_children.size() == 1ul);
-
-        _children[0]->addDependencies(deps);
-        deps->needWholeDocument = true;
     }
 
 private:
     const FieldPath _path;
     const boost::optional<int> _skip;
     const int _limit;
+
+    template <typename H>
+    friend class ExpressionHashVisitor;
 };
 
 /**
@@ -198,18 +213,22 @@ public:
             input.getDocument(), *_matchExpr, _path);
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
     }
 
-    Value serialize(bool explain) const final {
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    Value serialize(const SerializationOptions& options) const final {
         MONGO_UNREACHABLE;
     }
 
     boost::intrusive_ptr<Expression> optimize() final {
         invariant(_children.size() == 1ul);
 
-        _children[0]->optimize();
+        _children[0] = _children[0]->optimize();
         // SERVER-43740: ideally we'd want to optimize '_matchExpr' here as well. However, given
         // that the match expression is stored as a shared copyable expression in this class, and
         // 'MatchExpression::optimize()' takes and returns a unique pointer on a match expression,
@@ -221,13 +240,8 @@ public:
         return this;
     }
 
-protected:
-    void _doAddDependencies(DepsTracker* deps) const final {
-        invariant(_children.size() == 1ul);
-
-        _children[0]->addDependencies(deps);
-        _matchExpr->addDependencies(deps);
-        deps->needWholeDocument = true;
+    const CopyableMatchExpression& getMatchExpr() const {
+        return _matchExpr;
     }
 
 private:

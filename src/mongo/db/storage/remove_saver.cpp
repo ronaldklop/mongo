@@ -27,21 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/remove_saver.h"
 
 #include <boost/filesystem/operations.hpp>
-#include <fstream>
-#include <ios>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>  // IWYU pragma: keep
+#include <utility>
 
+#include <boost/filesystem/path.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 
 using std::ios_base;
@@ -63,7 +73,7 @@ RemoveSaver::RemoveSaver(const string& a,
         _root /= a;
     if (b.size())
         _root /= b;
-    verify(a.size() || b.size());
+    MONGO_verify(a.size() || b.size());
 
     _file = _root;
 
@@ -90,35 +100,29 @@ RemoveSaver::~RemoveSaver() {
         Status status = _protector->finalize(protectedBuffer.get(), protectedSizeMax, &resultLen);
         if (!status.isOK()) {
             LOGV2_FATAL(34350,
-                        "Unable to finalize DataProtector while closing RemoveSaver: {error}",
                         "Unable to finalize DataProtector while closing RemoveSaver",
                         "error"_attr = redact(status));
         }
 
         _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
         if (_out->fail()) {
+            auto ec = lastSystemError();
             LOGV2_FATAL(34351,
-                        "Couldn't write finalized DataProtector data to: {file} for remove "
-                        "saving: {error}",
                         "Couldn't write finalized DataProtector for remove saving",
                         "file"_attr = _file.generic_string(),
-                        "error"_attr = redact(errnoWithDescription()));
+                        "error"_attr = redact(errorMessage(ec)));
         }
 
         protectedBuffer.reset(new uint8_t[protectedSizeMax]);
         status = _protector->finalizeTag(protectedBuffer.get(), protectedSizeMax, &resultLen);
         if (!status.isOK()) {
-            LOGV2_FATAL(
-                34352,
-                "Unable to get finalizeTag from DataProtector while closing RemoveSaver: {error}",
-                "Unable to get finalizeTag from DataProtector while closing RemoveSaver",
-                "error"_attr = redact(status));
+            LOGV2_FATAL(34352,
+                        "Unable to get finalizeTag from DataProtector while closing RemoveSaver",
+                        "error"_attr = redact(status));
         }
 
         if (resultLen != _protector->getNumberOfBytesReservedForTag()) {
             LOGV2_FATAL(34353,
-                        "Attempted to write tag of size {sizeBytes} when DataProtector only "
-                        "reserved {reservedBytes} bytes",
                         "Attempted to write tag of larger size than DataProtector reserved size",
                         "sizeBytes"_attr = resultLen,
                         "reservedBytes"_attr = _protector->getNumberOfBytesReservedForTag());
@@ -128,12 +132,11 @@ RemoveSaver::~RemoveSaver() {
         _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
 
         if (_out->fail()) {
+            auto ec = lastSystemError();
             LOGV2_FATAL(34354,
-                        "Couldn't write finalizeTag from DataProtector to: {file} for "
-                        "remove saving: {error}",
                         "Couldn't write finalizeTag from DataProtector for remove saving",
                         "file"_attr = _file.generic_string(),
-                        "error"_attr = redact(errnoWithDescription()));
+                        "error"_attr = redact(errorMessage(ec)));
         }
 
         _storage->dumpBuffer();
@@ -145,12 +148,13 @@ Status RemoveSaver::goingToDelete(const BSONObj& o) {
         _out = _storage->makeOstream(_file, _root);
 
         if (_out->fail()) {
+            auto ec = lastSystemError();
             string msg = str::stream() << "couldn't create file: " << _file.string()
-                                       << " for remove saving: " << redact(errnoWithDescription());
+                                       << " for remove saving: " << redact(errorMessage(ec));
             LOGV2_ERROR(23734,
                         "Failed to create file for remove saving",
                         "file"_attr = _file.generic_string(),
-                        "error"_attr = redact(errnoWithDescription()));
+                        "error"_attr = redact(errorMessage(ec)));
             _out.reset();
             _out = nullptr;
             return Status(ErrorCodes::FileNotOpen, msg);
@@ -183,7 +187,7 @@ Status RemoveSaver::goingToDelete(const BSONObj& o) {
     _out->write(reinterpret_cast<const char*>(data), dataSize);
 
     if (_out->fail()) {
-        auto errorStr = redact(errnoWithDescription());
+        auto errorStr = redact(errorMessage(lastSystemError()));
         string msg = str::stream() << "couldn't write document to file: " << _file.string()
                                    << " for remove saving: " << errorStr;
         LOGV2_ERROR(23735,

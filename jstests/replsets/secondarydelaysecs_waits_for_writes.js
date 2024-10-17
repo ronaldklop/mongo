@@ -8,27 +8,32 @@
 // 3. Finally, we perform a reconfig to reduce the fourth node's delay from 30 seconds
 // to 15 seconds, and test that the delay behavior is the same as before.
 //
-// @tags: [requires_fcv_49]
-load("jstests/replsets/rslib.js");
+// @tags: [
+// ]
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig, waitForAllMembers} from "jstests/replsets/rslib.js";
 
-doTest = function(signal) {
+let doTest = function(signal) {
     var name = "secondaryDelaySecs";
     var host = getHostName();
 
     var replTest = new ReplSetTest({name: name, nodes: 3});
 
     var nodes = replTest.startSet();
-    // If featureFlagUseSecondaryDelaySecs is enabled, we must use the 'secondaryDelaySecs' field
-    // name in our config. Otherwise, we use 'slaveDelay'.
-    const delayFieldName = selectDelayFieldName(replTest);
     /* set secondaryDelaySecs to 30 seconds */
     var config = replTest.getReplSetConfig();
     config.members[2].priority = 0;
-    config.members[2][delayFieldName] = 30;
+    config.members[2].secondaryDelaySecs = 30;
 
     replTest.initiate(config);
 
     var primary = replTest.getPrimary().getDB(name);
+
+    // The default WC is majority and this test can't satisfy majority writes.
+    assert.commandWorked(primary.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+    replTest.awaitReplication();
+
     var secondaryConns = replTest.getSecondaries();
     var secondaries = [];
     for (var i in secondaryConns) {
@@ -63,7 +68,7 @@ doTest = function(signal) {
     /************* Part 2 *******************/
 
     // how about if we add a new server?  will it sync correctly?
-    conn = replTest.add();
+    let conn = replTest.add();
 
     config = primary.getSiblingDB("local").system.replset.findOne();
     printjson(config);
@@ -72,7 +77,7 @@ doTest = function(signal) {
         _id: 3,
         host: host + ":" + replTest.ports[replTest.ports.length - 1],
         priority: 0,
-        [delayFieldName]: 30
+        secondaryDelaySecs: 30
     });
 
     primary = reconfig(replTest, config);
@@ -96,7 +101,7 @@ doTest = function(signal) {
     print("reconfigure the delay field");
 
     config.version++;
-    config.members[3][delayFieldName] = 15;
+    config.members[3].secondaryDelaySecs = 15;
 
     reconfig(replTest, config);
     primary = replTest.getPrimary().getDB(name);

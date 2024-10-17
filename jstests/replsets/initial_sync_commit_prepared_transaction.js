@@ -3,14 +3,15 @@
  * test this, we have to pause collection cloning and run commitTransaction so that the oplog entry
  * is applied during the oplog application phase of initial sync.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -25,6 +26,10 @@ replTest.initiate(config);
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "initial_sync_commit_prepared_transaction";
@@ -98,7 +103,7 @@ jsTestLog("Initial sync completed");
 
 // Make sure the transaction committed properly and is reflected after the initial sync.
 let res = secondary.getDB(dbName).getCollection(collName).findOne({_id: 2});
-assert.docEq(res, {_id: 2}, res);
+assert.docEq({_id: 2}, res);
 
 // Step up the secondary after initial sync is done and make sure we can successfully run
 // another transaction.
@@ -113,7 +118,6 @@ assert.commandWorked(sessionColl2.insert({_id: 4}));
 let prepareTimestamp2 = PrepareHelpers.prepareTransaction(session2);
 assert.commandWorked(PrepareHelpers.commitTransaction(session2, prepareTimestamp2));
 res = newPrimary.getDB(dbName).getCollection(collName).findOne({_id: 4});
-assert.docEq(res, {_id: 4}, res);
+assert.docEq({_id: 4}, res);
 
 replTest.stopSet();
-})();

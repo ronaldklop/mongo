@@ -27,40 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/bsonelement.h"
 
-#include <boost/functional/hash.hpp>
-#include <cmath>
+#include <boost/move/utility_core.hpp>
 #include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cmath>
+#include <ostream>
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/parse_number.h"
-#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/string_data_comparator.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/generator_extended_canonical_2_0_0.h"
 #include "mongo/bson/generator_extended_relaxed_2_0_0.h"
 #include "mongo/bson/generator_legacy_strict.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/strnlen.h"
-#include "mongo/util/base64.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/decimal_counter.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
-#include "mongo/util/string_map.h"
-#include "mongo/util/uuid.h"
 
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
-using std::dec;
-using std::hex;
 using std::string;
 
 const double BSONElement::kLongLongMaxPlusOneAsDouble =
@@ -132,10 +130,10 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
 
     switch (type()) {
         case mongo::String:
-            g.writeString(buffer, StringData(valuestr(), valuestrsize() - 1));
+            g.writeString(buffer, valueStringData());
             break;
         case Symbol:
-            g.writeSymbol(buffer, StringData(valuestr(), valuestrsize() - 1));
+            g.writeSymbol(buffer, valueStringData());
             break;
         case NumberLong:
             g.writeInt64(buffer, _numberLong());
@@ -182,9 +180,7 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
         }
         case DBRef:
             // valuestrsize() returns the size including the null terminator
-            g.writeDBRef(buffer,
-                         StringData(valuestr(), valuestrsize() - 1),
-                         OID::from(valuestr() + valuestrsize()));
+            g.writeDBRef(buffer, valueStringData(), OID::from(valuestr() + valuestrsize()));
             break;
         case jstOID:
             g.writeOID(buffer, __oid());
@@ -211,6 +207,7 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
                 break;
             }
             // fall through if scope is empty
+            [[fallthrough]];
         }
         case Code:
             g.writeCode(buffer, _asCode());
@@ -277,7 +274,7 @@ int compareElementStringValues(const BSONElement& leftStr, const BSONElement& ri
     int lsz = leftStr.valuestrsize();
     int rsz = rightStr.valuestrsize();
     int common = std::min(lsz, rsz);
-    int res = memcmp(leftStr.valuestr(), rightStr.valuestr(), common);
+    int res = memcmp((leftStr.value() + 4), (rightStr.value() + 4), common);
     if (res)
         return res;
     // longer std::string is the greater one
@@ -289,7 +286,7 @@ int compareElementStringValues(const BSONElement& leftStr, const BSONElement& ri
 int BSONElement::compareElements(const BSONElement& l,
                                  const BSONElement& r,
                                  ComparisonRulesSet rules,
-                                 const StringData::ComparatorInterface* comparator) {
+                                 const StringDataComparator* comparator) {
     switch (l.type()) {
         case BSONType::EOO:
         case BSONType::Undefined:  // EOO and Undefined are same canonicalType
@@ -440,35 +437,27 @@ int BSONElement::compareElements(const BSONElement& l,
     MONGO_UNREACHABLE;
 }
 
-/** transform a BSON array into a vector of BSONElements.
-    we match array # positions with their vector position, and ignore
-    any fields with non-numeric field names.
-    */
 std::vector<BSONElement> BSONElement::Array() const {
     chk(mongo::Array);
-    std::vector<BSONElement> v;
-    BSONObjIterator i(Obj());
-    while (i.more()) {
-        BSONElement e = i.next();
-        const char* f = e.fieldName();
 
-        unsigned u;
-        Status status = NumberParser{}(f, &u);
-        if (status.isOK()) {
-            verify(u < 1000000);
-            if (u >= v.size())
-                v.resize(u + 1);
-            v[u] = e;
-        } else {
-            // ignore?
-        }
+    std::vector<BSONElement> v;
+    DecimalCounter<std::uint32_t> counter(0);
+    for (auto element : Obj()) {
+        auto fieldName = element.fieldNameStringData();
+        uassert(ErrorCodes::BadValue,
+                fmt::format("Invalid array index field name: \"{}\", expected \"{}\"",
+                            fieldName,
+                            static_cast<StringData>(counter)),
+                fieldName == counter);
+        counter++;
+        v.push_back(element);
     }
     return v;
 }
 
 int BSONElement::woCompare(const BSONElement& elem,
                            ComparisonRulesSet rules,
-                           const StringData::ComparatorInterface* comparator) const {
+                           const StringDataComparator* comparator) const {
     if (type() != elem.type()) {
         int lt = (int)canonicalType();
         int rt = (int)elem.canonicalType();
@@ -489,7 +478,7 @@ bool BSONElement::binaryEqual(const BSONElement& rhs) const {
         return false;
     }
 
-    return (elemSize == 0) || (memcmp(data, rhs.rawdata(), elemSize) == 0);
+    return (elemSize == 0) || (memcmp(_data, rhs.rawdata(), elemSize) == 0);
 }
 
 bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
@@ -515,7 +504,8 @@ StatusWith<long long> BSONElement::parseIntegerElementToNonNegativeLong() const 
 
     if (number.getValue() < 0) {
         return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Expected a positive number in: " << toString(true, true));
+                      str::stream()
+                          << "Expected a non-negative number in: " << toString(true, true));
     }
 
     return number;
@@ -585,6 +575,21 @@ StatusWith<int> BSONElement::parseIntegerElementToInt() const {
     return static_cast<int>(valueLong);
 }
 
+StatusWith<int> BSONElement::parseIntegerElementToNonNegativeInt() const {
+    auto number = parseIntegerElementToInt();
+    if (!number.isOK()) {
+        return number;
+    }
+
+    if (number.getValue() < 0) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "Expected a non-negative number in: " << toString(true, true));
+    }
+
+    return number;
+}
+
 BSONObj BSONElement::embeddedObjectUserCheck() const {
     if (MONGO_likely(isABSONObj()))
         return BSONObj(value(), BSONObj::LargeSizeTrait{});
@@ -595,12 +600,12 @@ BSONObj BSONElement::embeddedObjectUserCheck() const {
 }
 
 BSONObj BSONElement::embeddedObject() const {
-    verify(isABSONObj());
+    MONGO_verify(isABSONObj());
     return BSONObj(value(), BSONObj::LargeSizeTrait{});
 }
 
 BSONObj BSONElement::codeWScopeObject() const {
-    verify(type() == CodeWScope);
+    MONGO_verify(type() == CodeWScope);
     int strSizeWNull = ConstDataView(value() + 4).read<LittleEndian<int>>();
     return BSONObj(value() + 4 + 4 + strSizeWNull);
 }
@@ -634,8 +639,8 @@ BSONElement BSONElement::operator[](StringData field) const {
 namespace {
 MONGO_COMPILER_NOINLINE void msgAssertedBadType [[noreturn]] (const char* data) {
     // We intentionally read memory that may be out of the allocated memory's boundary, so do not
-    // do this when the adress sanitizer is enabled. We do this in an attempt to log as much context
-    // about the failure, even if that risks undefined behavior or a segmentation fault.
+    // do this when the address sanitizer is enabled. We do this in an attempt to log as much
+    // context about the failure, even if that risks undefined behavior or a segmentation fault.
 #if !__has_feature(address_sanitizer)
     bool logMemory = true;
 #else
@@ -646,12 +651,12 @@ MONGO_COMPILER_NOINLINE void msgAssertedBadType [[noreturn]] (const char* data) 
     if (!logMemory) {
         output << fmt::format("BSONElement: bad type {0:d} @ {1:p}", *data, data);
     } else {
-        // To reduce the risk of a segmentation fault, only print the bytes in the 32-bit aligned
+        // To reduce the risk of a segmentation fault, only print the bytes in the 32-byte aligned
         // block in which the address is located (i.e. round down to the lowest multiple of 32). The
         // hope is that it's safe to read memory that may fall within the same cache line. Generate
         // a mask to zero-out the last bits for a block-aligned address.
         // Ex: Inverse of 0x1F (32 - 1) looks like 0xFFFFFFE0, and ANDed with the pointer, zeroes
-        // the lowest 5 bits, giving the starting address of a 32-bit block.
+        // the lowest 5 bits, giving the starting address of a 32-byte block.
         const size_t blockSize = 32;
         const size_t mask = ~(blockSize - 1);
         const char* startAddr =
@@ -667,75 +672,16 @@ MONGO_COMPILER_NOINLINE void msgAssertedBadType [[noreturn]] (const char* data) 
     }
     msgasserted(10320, output);
 }
+
+
 }  // namespace
 
-int BSONElement::computeSize(int8_t type, const char* elem, int fieldNameSize) {
-    enum SizeStyle : uint8_t {
-        kFixed,         // Total size is a fixed amount + key length.
-        kIntPlusFixed,  // Like Fixed, but also add in the int32 immediately following the key.
-        kSpecial,       // Handled specially: RegEx, MinKey, MaxKey.
-    };
-    struct SizeInfo {
-        uint8_t style : 2;
-        uint8_t bytes : 6;  // Includes type byte. Excludes field name and variable lengths.
-    };
-    MONGO_STATIC_ASSERT(sizeof(SizeInfo) == 1);
-
-    // This table should take 32 bytes. Align to that size to avoid splitting across cache lines
-    // unnecessarily.
-    static constexpr SizeInfo kSizeInfoTable alignas(32)[] = {
-        {SizeStyle::kFixed, 1},          // EOO
-        {SizeStyle::kFixed, 9},          // NumberDouble
-        {SizeStyle::kIntPlusFixed, 5},   // String
-        {SizeStyle::kIntPlusFixed, 1},   // Object
-        {SizeStyle::kIntPlusFixed, 1},   // Array
-        {SizeStyle::kIntPlusFixed, 6},   // BinData
-        {SizeStyle::kFixed, 1},          // Undefined
-        {SizeStyle::kFixed, 13},         // OID
-        {SizeStyle::kFixed, 2},          // Bool
-        {SizeStyle::kFixed, 9},          // Date
-        {SizeStyle::kFixed, 1},          // Null
-        {SizeStyle::kSpecial},           // Regex
-        {SizeStyle::kIntPlusFixed, 17},  // DBRef
-        {SizeStyle::kIntPlusFixed, 5},   // Code
-        {SizeStyle::kIntPlusFixed, 5},   // Symbol
-        {SizeStyle::kIntPlusFixed, 1},   // CodeWScope
-        {SizeStyle::kFixed, 5},          // Int
-        {SizeStyle::kFixed, 9},          // Timestamp
-        {SizeStyle::kFixed, 9},          // Long
-        {SizeStyle::kFixed, 17},         // Decimal
-        {SizeStyle::kSpecial},           // reserved 20
-        {SizeStyle::kSpecial},           // reserved 21
-        {SizeStyle::kSpecial},           // reserved 22
-        {SizeStyle::kSpecial},           // reserved 23
-        {SizeStyle::kSpecial},           // reserved 24
-        {SizeStyle::kSpecial},           // reserved 25
-        {SizeStyle::kSpecial},           // reserved 26
-        {SizeStyle::kSpecial},           // reserved 27
-        {SizeStyle::kSpecial},           // reserved 28
-        {SizeStyle::kSpecial},           // reserved 29
-        {SizeStyle::kSpecial},           // reserved 30
-        {SizeStyle::kSpecial},           // MinKey,  MaxKey
-    };
-    MONGO_STATIC_ASSERT(sizeof(kSizeInfoTable) == 32);
-
-    // This function attempts to push complex handling of unlikely events out-of-line to ensure that
-    // the common cases never need to spill any registers, which reduces the function call overhead.
-    // Most invalid types have type != sizeInfoIndex and fall through to the cold path, as do RegEx,
-    // MinKey, MaxKey and the remaining invalid types mapping to SizeStyle::kSpecial.
-    int sizeInfoIndex = type % sizeof(kSizeInfoTable);
-    const auto sizeInfo = kSizeInfoTable[sizeInfoIndex];
-    if (MONGO_likely(type == sizeInfoIndex)) {
-        if (sizeInfo.style == SizeStyle::kFixed)
-            return sizeInfo.bytes + fieldNameSize;
-        if (MONGO_likely(sizeInfo.style == SizeStyle::kIntPlusFixed))
-            return sizeInfo.bytes + fieldNameSize +
-                ConstDataView(elem + fieldNameSize + 1).read<LittleEndian<int32_t>>();
-    }
-
+int BSONElement::computeRegexSize(const char* elem, int fieldNameSize) {
+    int8_t type = *elem;
     // The following code handles all special cases: MinKey, MaxKey, RegEx and invalid types.
     if (type == MaxKey || type == MinKey)
         return fieldNameSize + 1;
+
     if (type != BSONType::RegEx)
         msgAssertedBadType(elem);
 
@@ -892,7 +838,7 @@ std::string BSONElement::_asCode() const {
     switch (type()) {
         case mongo::String:
         case Code:
-            return std::string(valuestr(), valuestrsize() - 1);
+            return valueStringData().toString();
         case CodeWScope:
             return std::string(codeWScopeCode(),
                                ConstDataView(valuestr()).read<LittleEndian<int>>() - 1);
@@ -974,7 +920,7 @@ bool BSONObj::coerceVector(std::vector<T>* out) const {
 /**
  * Types used to represent BSONElement memory in the Visual Studio debugger
  */
-#if defined(_MSC_VER) && defined(_DEBUG)
+#if defined(_MSC_VER)
 struct BSONElementData {
     char type;
     char name;
@@ -990,6 +936,6 @@ struct BSONElementDBRefType {
 } bsonElementDBPointerType;
 struct BSONElementCodeWithScopeType {
 } bsonElementCodeWithScopeType;
-#endif  // defined(_MSC_VER) && defined(_DEBUG)
+#endif  // defined(_MSC_VER)
 
 }  // namespace mongo

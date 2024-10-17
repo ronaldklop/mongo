@@ -4,13 +4,21 @@
  * convert it up to majority WC),
  * 2) Issuing a metadata command directly to a config server with non-majority write concern fails.
  */
-(function() {
-'use strict';
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
+
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 const newShardName = "newShard";
+let newShard;
 
 // Commands sent directly to the config server should fail with WC < majority.
 const unacceptableWCsForConfig = [
@@ -50,7 +58,7 @@ const setupFuncs = {
         assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
     },
     addShard: function() {
-        assert.commandWorked(st.s.adminCommand({addShard: newShard.name, name: newShardName}));
+        assert.commandWorked(st.s.adminCommand({addShard: newShard.getURL(), name: newShardName}));
     },
 };
 
@@ -66,9 +74,7 @@ const cleanupFuncs = {
         }
         assert.commandWorked(res);
         assert.eq('started', res.state);
-        res = st.s.adminCommand({removeShard: newShardName});
-        assert.commandWorked(res);
-        assert.eq('completed', res.state);
+        removeShard(st, newShardName);
     },
 };
 
@@ -125,41 +131,56 @@ function checkCommandConfigSvr(command, setupFunc, cleanupFunc) {
                  cleanupFunc);
 }
 
-var st = new ShardingTest({shards: 1});
+let st = new ShardingTest({shards: 1});
 
 // enableSharding
 checkCommandMongos({enableSharding: dbName}, setupFuncs.noop, cleanupFuncs.dropDatabase);
-checkCommandConfigSvr(
-    {_configsvrEnableSharding: dbName}, setupFuncs.noop, cleanupFuncs.dropDatabase);
 
-// movePrimary
-checkCommandMongos({movePrimary: dbName, to: st.shard0.name},
-                   setupFuncs.createDatabase,
-                   cleanupFuncs.dropDatabase);
-checkCommandConfigSvr({_configsvrMovePrimary: dbName, to: st.shard0.name},
-                      setupFuncs.createDatabase,
-                      cleanupFuncs.dropDatabase);
+newShard = new ReplSetTest({nodes: 1});
+newShard.startSet({shardsvr: ''});
+newShard.initiate();
+
+// TODO SERVER-77915: remove once 8.0 becomes last-lts
+if (FeatureFlagUtil.isPresentAndEnabled(st.s, "TrackUnshardedCollectionsUponCreation")) {
+    // changePrimary
+    checkCommandMongos({changePrimary: dbName, to: st.shard0.shardName},
+                       function() {
+                           setupFuncs.addShard();
+                           setupFuncs.createDatabase();
+                       },
+                       function() {
+                           cleanupFuncs.dropDatabase();
+                           cleanupFuncs.removeShardIfExists();
+                       });
+} else {
+    // movePrimary
+    checkCommandMongos({movePrimary: dbName, to: st.shard0.shardName},
+                       function() {
+                           setupFuncs.addShard();
+                           setupFuncs.createDatabase();
+                       },
+                       function() {
+                           cleanupFuncs.dropDatabase();
+                           cleanupFuncs.removeShardIfExists();
+                       });
+}
 
 // shardCollection
 checkCommandMongos(
     {shardCollection: ns, key: {_id: 1}}, setupFuncs.enableSharding, cleanupFuncs.dropDatabase);
-checkCommandConfigSvr({_configsvrShardCollection: ns, key: {_id: 1}},
-                      setupFuncs.enableSharding,
-                      cleanupFuncs.dropDatabase);
 
 // createDatabase
 // Don't check createDatabase against mongos: there is no createDatabase command exposed on
 // mongos; a database is created implicitly when a collection in it is created.
-checkCommandConfigSvr({_configsvrCreateDatabase: dbName, to: st.shard0.name},
+checkCommandConfigSvr({_configsvrCreateDatabase: dbName, to: st.shard0.shardName},
                       setupFuncs.noop,
                       cleanupFuncs.dropDatabase);
 
 // addShard
-var newShard = MongoRunner.runMongod({shardsvr: ""});
-checkCommandMongos({addShard: newShard.name, name: newShardName},
+checkCommandMongos({addShard: newShard.getURL(), name: newShardName},
                    setupFuncs.noop,
                    cleanupFuncs.removeShardIfExists);
-checkCommandConfigSvr({_configsvrAddShard: newShard.name, name: newShardName},
+checkCommandConfigSvr({_configsvrAddShard: newShard.getURL(), name: newShardName},
                       setupFuncs.noop,
                       cleanupFuncs.removeShardIfExists);
 
@@ -178,11 +199,8 @@ checkCommand(st.s.getDB(dbName),
              false,
              setupFuncs.createDatabase,
              cleanupFuncs.dropDatabase);
-checkCommandConfigSvr(
-    {_configsvrDropCollection: ns}, setupFuncs.createDatabase, cleanupFuncs.dropDatabase);
 
 // dropDatabase
-
 // We can't use the checkCommandMongos wrapper because we need a connection to the test
 // database.
 checkCommand(st.s.getDB(dbName),
@@ -192,9 +210,6 @@ checkCommand(st.s.getDB(dbName),
              false,
              setupFuncs.createDatabase,
              cleanupFuncs.dropDatabase);
-checkCommandConfigSvr(
-    {_configsvrDropDatabase: dbName}, setupFuncs.createDatabase, cleanupFuncs.dropDatabase);
 
-MongoRunner.stopMongos(newShard);
+newShard.stopSet();
 st.stop();
-})();

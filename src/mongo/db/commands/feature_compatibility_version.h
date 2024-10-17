@@ -29,12 +29,19 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/commands/set_feature_compatibility_version_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 
@@ -56,13 +63,26 @@ public:
     static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
+     * Adds a transition that allows users to downgrade from latest FCV to last continuous FCV.
+     * This function should only be called if the 'disableTransitionFromLatestToLastContinuous'
+     * server parameter is set to 'false'. That parameter is test-only and defaulted to 'true'.
+     */
+    static void addTransitionFromLatestToLastContinuous();
+
+    /**
+     * Returns the on-disk feature compatibility version document if it can be found.
+     * If there was an error finding the document, returns the error reason.
+     */
+    static StatusWith<BSONObj> findFeatureCompatibilityVersionDocument(OperationContext* opCtx);
+
+    /**
      * uassert that a transition from fromVersion to newVersion is permitted. Different rules apply
      * if the request is from a config server.
      */
     static void validateSetFeatureCompatibilityVersionRequest(
-        ServerGlobalParams::FeatureCompatibility::Version fromVersion,
-        ServerGlobalParams::FeatureCompatibility::Version newVersion,
-        bool isFromConfigServer);
+        OperationContext* opCtx,
+        const SetFeatureCompatibilityVersion& setFCVRequest,
+        multiversion::FeatureCompatibilityVersion fromVersion);
 
     /**
      * Updates the on-disk feature compatibility version document for the transition fromVersion ->
@@ -70,30 +90,32 @@ public:
      */
     static void updateFeatureCompatibilityVersionDocument(
         OperationContext* opCtx,
-        ServerGlobalParams::FeatureCompatibility::Version fromVersion,
-        ServerGlobalParams::FeatureCompatibility::Version newVersion,
+        multiversion::FeatureCompatibilityVersion fromVersion,
+        multiversion::FeatureCompatibilityVersion newVersion,
         bool isFromConfigServer,
-        bool setTargetVersion);
+        boost::optional<Timestamp> timestamp,
+        bool setTargetVersion,
+        boost::optional<bool> setIsCleaningServerMetadata);
 
     /**
-     * If there are no non-local databases, store the featureCompatibilityVersion document. If we
-     * are not running with --shardsvr, set the version to be the upgrade value. If we are running
-     * with --shardsvr, set the version to be the downgrade value.
+     * If we are in clean startup (the server has no replicated collections), store the
+     * featureCompatibilityVersion document. If we are not running with --shardsvr, set the version
+     * to be the upgrade value. If we are running with --shardsvr, set the version to be the
+     * downgrade value.
      */
     static void setIfCleanStartup(OperationContext* opCtx,
                                   repl::StorageInterface* storageInterface);
 
     /**
-     * Returns true if the server is on a clean startup. A clean startup means there are no
-     * databases on disk besides the local database.
+     * Returns true if the server has no replicated collections.
      */
-    static bool isCleanStartUp();
+    static bool hasNoReplicatedCollections(OperationContext* opCtx);
 
     /**
      * Sets the server's outgoing and incomingInternalClient minWireVersions according to the
      * current featureCompatibilityVersion value.
      */
-    static void updateMinWireVersion();
+    static void updateMinWireVersion(OperationContext* opCtx);
 
     /**
      * Returns a scoped object, which holds the 'fcvLock' in exclusive mode for the given scope. It
@@ -101,21 +123,42 @@ public:
      * concurrent 'FixedFCVRegions'.
      */
     static Lock::ExclusiveLock enterFCVChangeRegion(OperationContext* opCtx);
+
+    /**
+     * Used by the FCV OpObserver to set the timestamp of the last opTime where the FCV was updated.
+     * We use this to ensure the user does not see a non-transitional FCV that is not in the
+     * majority snapshot, since upgrading or downgrading will not work in that circumstance.
+     */
+    static void advanceLastFCVUpdateTimestamp(Timestamp fcvUpdateTimestamp);
+
+    /**
+     * Used by the FCV OpObserver at rollback time.  The rollback FCV is always in the
+     * majority snapshot, so it is safe to clear the lastFCVUpdateTimestamp then.
+     *
+     * Also used in rare cases when the replication coordinator majority snapshot is cleared.
+     */
+    static void clearLastFCVUpdateTimestamp();
 };
 
 /**
- * Utility class to prevent the FCV from changing while the FixedFCVRegion is in scope.
+ * Utility class to prevent the on-disk FCV from changing while the FixedFCVRegion is in scope.
+ *
+ * Note that this does not prevent the in-memory FCV from changing (which for example could be reset
+ * during initial sync). The operator* and operator-> functions return a MutableFCV, which could
+ * change at different points in time, so if you wanted to get a consistent snapshot of the
+ * in-memory FCV, you should still use the ServerGlobalParams::MutableFCV's acquireFCVSnapshot()
+ * function.
  */
 class FixedFCVRegion {
 public:
     explicit FixedFCVRegion(OperationContext* opCtx);
     ~FixedFCVRegion();
 
-    bool operator==(const ServerGlobalParams::FeatureCompatibility::Version& other) const;
-    bool operator!=(const ServerGlobalParams::FeatureCompatibility::Version& other) const;
+    bool operator==(const multiversion::FeatureCompatibilityVersion& other) const;
+    bool operator!=(const multiversion::FeatureCompatibilityVersion& other) const;
 
-    const ServerGlobalParams::FeatureCompatibility& operator*() const;
-    const ServerGlobalParams::FeatureCompatibility* operator->() const;
+    const ServerGlobalParams::MutableFCV& operator*() const;
+    const ServerGlobalParams::MutableFCV* operator->() const;
 
 private:
     Lock::SharedLock _lk;

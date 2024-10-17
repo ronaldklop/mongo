@@ -27,20 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
 
 #include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <type_traits>
 #include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -80,7 +91,7 @@ void DropPendingCollectionReaper::addDropPendingNamespace(
     const OpTime& dropOpTime,
     const NamespaceString& dropPendingNamespace) {
     invariant(dropPendingNamespace.isDropPendingNamespace());
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     const auto equalRange = _dropPendingNamespaces.equal_range(dropOpTime);
     const auto& lowerBound = equalRange.first;
     const auto& upperBound = equalRange.second;
@@ -91,34 +102,33 @@ void DropPendingCollectionReaper::addDropPendingNamespace(
     if (std::find_if(lowerBound, upperBound, matcher) != upperBound) {
         LOGV2_FATAL_NOTRACE(
             40448,
-            "Failed to add drop-pending collection {dropPendingNamespace} with drop optime "
-            "{dropOpTime}: duplicate optime and namespace pair.",
             "Failed to add drop-pending collection: duplicate optime and namespace pair",
             "dropPendingNamespace"_attr = dropPendingNamespace,
             "dropOpTime"_attr = dropOpTime);
     }
 
     _dropPendingNamespaces.insert(std::make_pair(dropOpTime, dropPendingNamespace));
-    if (opCtx->lockState()->inAWriteUnitOfWork()) {
-        opCtx->recoveryUnit()->onRollback([this, dropPendingNamespace, dropOpTime]() {
-            stdx::lock_guard<Latch> lock(_mutex);
+    if (shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork()) {
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [this, dropPendingNamespace, dropOpTime](OperationContext*) {
+                stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-            const auto equalRange = _dropPendingNamespaces.equal_range(dropOpTime);
-            const auto& lowerBound = equalRange.first;
-            const auto& upperBound = equalRange.second;
-            auto matcher = [&dropPendingNamespace](const auto& pair) {
-                return pair.second == dropPendingNamespace;
-            };
+                const auto equalRange = _dropPendingNamespaces.equal_range(dropOpTime);
+                const auto& lowerBound = equalRange.first;
+                const auto& upperBound = equalRange.second;
+                auto matcher = [&dropPendingNamespace](const auto& pair) {
+                    return pair.second == dropPendingNamespace;
+                };
 
-            auto it = std::find_if(lowerBound, upperBound, matcher);
-            invariant(it != upperBound);
-            _dropPendingNamespaces.erase(it);
-        });
+                auto it = std::find_if(lowerBound, upperBound, matcher);
+                invariant(it != upperBound);
+                _dropPendingNamespaces.erase(it);
+            });
     }
 }
 
 boost::optional<OpTime> DropPendingCollectionReaper::getEarliestDropOpTime() {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto it = _dropPendingNamespaces.cbegin();
     if (it == _dropPendingNamespaces.cend()) {
         return boost::none;
@@ -133,19 +143,19 @@ bool DropPendingCollectionReaper::rollBackDropPendingCollection(
 
     const auto pendingNss = collectionNamespace.makeDropPendingNamespace(opTime);
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         const auto equalRange = _dropPendingNamespaces.equal_range(opTime);
         const auto& lowerBound = equalRange.first;
         const auto& upperBound = equalRange.second;
-        auto matcher = [&pendingNss](const auto& pair) { return pair.second == pendingNss; };
+        auto matcher = [&pendingNss](const auto& pair) {
+            return pair.second == pendingNss;
+        };
         auto it = std::find_if(lowerBound, upperBound, matcher);
         if (it == upperBound) {
             LOGV2_WARNING(21154,
-                          "Cannot find drop-pending namespace at OpTime {opTime} for collection "
-                          "{namespace} to roll back.",
                           "Cannot find drop-pending namespace to roll back",
                           "opTime"_attr = opTime,
-                          "namespace"_attr = collectionNamespace);
+                          logAttrs(collectionNamespace));
             return false;
         }
 
@@ -153,13 +163,10 @@ bool DropPendingCollectionReaper::rollBackDropPendingCollection(
     }
 
     LOGV2(21152,
-          "Rolling back collection drop for {pendingNamespace} with drop OpTime {dropOpTime} to "
-          "namespace "
-          "{namespace}",
           "Rolling back collection drop",
           "pendingNamespace"_attr = pendingNss,
           "dropOpTime"_attr = opTime,
-          "namespace"_attr = collectionNamespace);
+          logAttrs(collectionNamespace));
 
     return true;
 }
@@ -168,7 +175,7 @@ void DropPendingCollectionReaper::dropCollectionsOlderThan(OperationContext* opC
                                                            const OpTime& opTime) {
     DropPendingNamespaces toDrop;
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         for (auto it = _dropPendingNamespaces.cbegin();
              it != _dropPendingNamespaces.cend() && it->first <= opTime;
              ++it) {
@@ -189,10 +196,8 @@ void DropPendingCollectionReaper::dropCollectionsOlderThan(OperationContext* opC
             const auto& dropOpTime = opTimeAndNamespace.first;
             const auto& nss = opTimeAndNamespace.second;
             LOGV2(21153,
-                  "Completing collection drop for {namespace} with drop optime {dropOpTime} "
-                  "(notification optime: {notificationOpTime})",
                   "Completing collection drop",
-                  "namespace"_attr = nss,
+                  logAttrs(nss),
                   "dropOpTime"_attr = dropOpTime,
                   "notificationOpTime"_attr = opTime);
             Status status = Status::OK();
@@ -203,15 +208,12 @@ void DropPendingCollectionReaper::dropCollectionsOlderThan(OperationContext* opC
                 status = exceptionToStatus();
             }
             if (!status.isOK()) {
-                LOGV2_WARNING(
-                    21155,
-                    "Failed to remove drop-pending collection {namespace} with drop optime "
-                    "{dropOpTime} (notification optime: {notificationOpTime}): {error}",
-                    "Failed to remove drop-pending collection ",
-                    "namespace"_attr = nss,
-                    "dropOpTime"_attr = dropOpTime,
-                    "notificationOpTime"_attr = opTime,
-                    "error"_attr = status);
+                LOGV2_WARNING(21155,
+                              "Failed to remove drop-pending collection ",
+                              logAttrs(nss),
+                              "dropOpTime"_attr = dropOpTime,
+                              "notificationOpTime"_attr = opTime,
+                              "error"_attr = status);
             }
         }
     }
@@ -219,7 +221,7 @@ void DropPendingCollectionReaper::dropCollectionsOlderThan(OperationContext* opC
     {
         // Entries must be removed AFTER drops are completed, so that getEarliestDropOpTime()
         // returns appropriate results.
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         auto it = _dropPendingNamespaces.cbegin();
         while (it != _dropPendingNamespaces.cend() && it->first <= opTime) {
             if (toDrop.find(it->first) != toDrop.cend()) {

@@ -4,18 +4,6 @@
 #
 # PLEASE DO NOT REMOVE ANYTHING, unless a build variant no longer runs in any Evergreen project.
 
-
-evergreen_projects:
-  - mongodb-mongo-master
-  - mongodb-mongo-v4.8
-  - mongodb-mongo-v4.7
-  - mongodb-mongo-v4.4
-  - mongodb-mongo-v4.2
-  - mongodb-mongo-v4.0
-  - mongodb-mongo-v3.6
-  - mongodb-mongo-v3.4
-
-
 evergreen_buildvariants:
   - name: ubuntu1604
     edition: targeted
@@ -112,24 +100,24 @@ evergreen_buildvariants:
     platform: rhel62
     architecture: x86_64
 
-  - name: rhel70
+  - name: rhel79
     edition: targeted
-    platform: rhel70
+    platform: rhel79
     architecture: x86_64
 
-  - name: enterprise-rhel-70-64-bit
+  - name: enterprise-rhel-79-64-bit
     edition: enterprise
-    platform: rhel70
+    platform: rhel79
     architecture: x86_64
 
-  - name: rhel80
+  - name: rhel8
     edition: targeted
-    platform: rhel80
+    platform: rhel8
     architecture: x86_64
 
-  - name: enterprise-rhel-80-64-bit
+  - name: enterprise-rhel-8-64-bit
     edition: enterprise
-    platform: rhel80
+    platform: rhel8
     architecture: x86_64
 
   - name: rhel-82-arm64
@@ -140,6 +128,16 @@ evergreen_buildvariants:
   - name: enterprise-rhel-82-arm64
     edition: enterprise
     platform: rhel82
+    architecture: arm64
+
+  - name: rhel-8-arm64
+    edition: targeted
+    platform: rhel8
+    architecture: arm64
+
+  - name: enterprise-rhel-8-arm64
+    edition: enterprise
+    platform: rhel8
     architecture: arm64
 
   - name: enterprise-rhel-71-ppc64le
@@ -202,16 +200,6 @@ evergreen_buildvariants:
     platform: suse15
     architecture: x86_64
 
-  - name: debian92
-    edition: targeted
-    platform: debian92
-    architecture: x86_64
-
-  - name: enterprise-debian92-64
-    edition: enterprise
-    platform: debian92
-    architecture: x86_64
-
   - name: debian10
     edition: targeted
     platform: debian10
@@ -220,6 +208,26 @@ evergreen_buildvariants:
   - name: enterprise-debian10-64
     edition: enterprise
     platform: debian10
+    architecture: x86_64
+
+  - name: debian11
+    edition: targeted
+    platform: debian11
+    architecture: x86_64
+
+  - name: debian12
+    edition: targeted
+    platform: debian12
+    architecture: x86_64
+
+  - name: enterprise-debian11-64
+    edition: enterprise
+    platform: debian11
+    architecture: x86_64
+
+  - name: enterprise-debian12-64
+    edition: enterprise
+    platform: debian12
     architecture: x86_64
 
   - name: windows
@@ -237,7 +245,7 @@ evergreen_buildvariants:
     edition: base
     platform: windows_x86_64-2008plus-ssl
     architecture: x86_64
-    versions: ["3.4", "3.6", "4.0"]
+    versions: ["4.0"]
 
   - name: enterprise-windows
     edition: enterprise
@@ -248,13 +256,7 @@ evergreen_buildvariants:
     edition: enterprise
     platform: windows
     architecture: x86_64
-    versions: ["3.6", "4.0", "4.2"]
-
-  - name: enterprise-windows-64
-    edition: enterprise
-    platform: windows
-    architecture: x86_64
-    versions: ["3.4"]
+    versions: ["4.0", "4.2"]
 
   - name: macos
     edition: base
@@ -267,18 +269,6 @@ evergreen_buildvariants:
     architecture: x86_64
     versions: ["4.0"]
 
-  - name: osx-1010-ssl
-    edition: base
-    platform: osx-ssl
-    architecture: x86_64
-    versions: ["3.6"]
-
-  - name: osx-108-ssl
-    edition: base
-    platform: osx-ssl
-    architecture: x86_64
-    versions: ["3.4"]
-
   - name: enterprise-macos
     edition: enterprise
     platform: osx
@@ -288,16 +278,10 @@ evergreen_buildvariants:
     edition: enterprise
     platform: osx
     architecture: x86_64
-    versions: ["3.6", "4.0"]
-
-  - name: enterprise-osx-108
-    edition: enterprise
-    platform: osx
-    architecture: x86_64
-    versions: ["3.4"]
+    versions: ["4.0"]
 
   - name: linux-64
     edition: base
     platform: linux_x86_64
     architecture: x86_64
-    versions: ["3.4", "3.6", "4.0"]
+    versions: ["4.0"]

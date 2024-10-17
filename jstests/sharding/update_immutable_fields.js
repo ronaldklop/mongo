@@ -1,6 +1,5 @@
 // Tests that save style updates correctly change immutable fields
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2, mongos: 1});
 
@@ -8,9 +7,11 @@ var mongos = st.s;
 var config = mongos.getDB("config");
 var coll = mongos.getCollection(jsTestName() + ".coll1");
 
-assert.commandWorked(config.adminCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard0.shardName);
+assert.commandWorked(
+    config.adminCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard0.shardName}));
 assert.commandWorked(config.adminCommand({shardCollection: "" + coll, key: {a: 1}}));
+
+assert.commandWorked(st.shard0.adminCommand({_flushRoutingTableCacheUpdates: coll.getFullName()}));
 
 const shard0Coll = st.shard0.getCollection(coll.getFullName());
 
@@ -32,4 +33,3 @@ assert.commandWorked(shard0Coll.update({_id: 1}, {a: 1}));
 assert.commandWorked(shard0Coll.update({_id: 1}, {$set: {a: 1}}));
 
 st.stop();
-})();

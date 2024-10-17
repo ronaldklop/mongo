@@ -26,11 +26,13 @@
 # it in the license file.
 #
 """Validate that mongocryptd push tasks are correct in etc/evergreen.yml."""
+
 from __future__ import absolute_import, print_function, unicode_literals
 
 import argparse
 import os
 import sys
+
 import yaml
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
@@ -39,6 +41,7 @@ if __name__ == "__main__" and __package__ is None:
 
 # pylint: disable=wrong-import-position
 from buildscripts.ciconfig.evergreen import parse_evergreen_file
+
 # pylint: enable=wrong-import-position
 
 # Name of map to search for in the variables map in evergreen.yml
@@ -75,7 +78,7 @@ def read_variable_from_yml(filename, variable_name):
     :param variable_name: Variable to read from file.
     :return: Value of variable or None.
     """
-    with open(filename, 'r') as fh:
+    with open(filename, "r") as fh:
         nodes = yaml.safe_load(fh)
 
     variables = nodes["variables"]
@@ -90,17 +93,19 @@ def main():
     # type: () -> None
     """Execute Main Entry point."""
 
-    parser = argparse.ArgumentParser(description='MongoDB CryptD Check Tool.')
+    parser = argparse.ArgumentParser(description="MongoDB CryptD Check Tool.")
 
-    parser.add_argument('file', type=str, help="etc/evergreen.yml file")
-    parser.add_argument('--variant', type=str, help="Build variant to check for")
+    parser.add_argument("file", type=str, help="etc/evergreen.yml file")
+    parser.add_argument("--variant", type=str, help="Build variant to check for")
 
     args = parser.parse_args()
 
     expected_variants = read_variable_from_yml(args.file, MONGOCRYPTD_VARIANTS)
     if not expected_variants:
-        print("ERROR: Could not find node %s in file '%s'" % (MONGOCRYPTD_VARIANTS, args.file),
-              file=sys.stderr)
+        print(
+            "ERROR: Could not find node %s in file '%s'" % (MONGOCRYPTD_VARIANTS, args.file),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     evg_config = parse_evergreen_file(args.file)
@@ -109,15 +114,19 @@ def main():
         sys.exit(0)
 
     if args.variant not in expected_variants:
-        print("ERROR: Expected to find variant %s in list %s" % (args.variant, expected_variants),
-              file=sys.stderr)
         print(
-            "ERROR:  Please add the build variant %s to the %s list in '%s'" %
-            (args.variant, MONGOCRYPTD_VARIANTS, args.file), file=sys.stderr)
+            "ERROR: Expected to find variant %s in list %s" % (args.variant, expected_variants),
+            file=sys.stderr,
+        )
+        print(
+            "ERROR:  Please add the build variant %s to the %s list in '%s'"
+            % (args.variant, MONGOCRYPTD_VARIANTS, args.file),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     sys.exit(0)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

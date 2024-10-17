@@ -2,11 +2,10 @@
  * Tests that unconditional step down terminates writes, but not reads. And, doesn't disconnect
  * the connections if primary is stepping down to secondary.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
-load("jstests/libs/fail_point_util.js");
+import {waitForCurOpByFailPoint} from "jstests/libs/curop_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 const testName = "txnsDuringStepDown";
 const dbName = testName;
@@ -53,17 +52,10 @@ function runStepDownTest({testMsg, stepDownFn, toRemovedState}) {
 
     jsTestLog("Enable fail point for namespace '" + collNss + "'");
     // Find command.
-    assert.commandWorked(primary.adminCommand({
-        configureFailPoint: readFailPoint,
-        data: {nss: collNss, shouldCheckForInterrupt: true},
-        mode: "alwaysOn"
-    }));
+    configureFailPoint(primary, readFailPoint, {nss: collNss, shouldCheckForInterrupt: true});
     // Insert command.
-    assert.commandWorked(primary.adminCommand({
-        configureFailPoint: writeFailPoint,
-        data: {nss: collNss, shouldCheckForInterrupt: true},
-        mode: "alwaysOn"
-    }));
+    const writeFp =
+        configureFailPoint(primary, writeFailPoint, {nss: collNss, shouldCheckForInterrupt: true});
 
     var startSafeParallelShell = (func, port) => {
         TestData.func = func;
@@ -96,9 +88,10 @@ function runStepDownTest({testMsg, stepDownFn, toRemovedState}) {
         checkLog.contains(db, "Starting to kill user operations");
 
         jsTestLog("Unblock step down");
-        // Turn off fail point on find cmd to allow step down to continue.
+        // Turn off fail point on find cmd to allow step down to continue. Hardcode the use of the
+        // shard failpoint here since we are in a parallel shell.
         assert.commandWorked(
-            db.adminCommand({configureFailPoint: TestData.readFailPoint, mode: "off"}));
+            db.adminCommand({configureFailPoint: "shardWaitInFindBeforeMakingBatch", mode: "off"}));
     }, primary.port);
 
     jsTestLog("Wait for find cmd to reach the fail point");
@@ -127,7 +120,7 @@ function runStepDownTest({testMsg, stepDownFn, toRemovedState}) {
     waitForState(primary,
                  (toRemovedState) ? ReplSetTest.State.REMOVED : ReplSetTest.State.SECONDARY);
 
-    assert.commandWorked(primary.adminCommand({configureFailPoint: writeFailPoint, mode: "off"}));
+    writeFp.off();
 
     // Check that the 'electionCandidateMetrics' section of the replSetGetStatus response has been
     // cleared, since the node is no longer primary.
@@ -158,7 +151,6 @@ function runStepsDowntoRemoved(params) {
 runStepDownTest({
     testMsg: "reconfig command",
     stepDownFn: () => {
-        load("./jstests/replsets/rslib.js");
         var newConfig = rst.getReplSetConfigFromNode();
 
         var oldMasterId = rst.getNodeId(primary);
@@ -176,7 +168,6 @@ runStepDownTest({
 runStepDownTest({
     testMsg: "reconfig via heartbeat",
     stepDownFn: () => {
-        load("./jstests/replsets/rslib.js");
         var newConfig = rst.getReplSetConfigFromNode();
 
         var oldMasterId = rst.getNodeId(primary);
@@ -194,7 +185,6 @@ runStepDownTest({
 runStepsDowntoRemoved({
     testMsg: "reconfig via heartbeat - primary to removed",
     stepDownFn: () => {
-        load("./jstests/replsets/rslib.js");
         var newConfig = rst.getReplSetConfigFromNode();
 
         var oldMasterId = rst.getNodeId(primary);
@@ -213,9 +203,7 @@ runStepsDowntoRemoved({
 runStepDownTest({
     testMsg: "stepdown via heartbeat",
     stepDownFn: () => {
-        load("./jstests/replsets/rslib.js");
         var newConfig = rst.getReplSetConfigFromNode();
-
         var newMasterId = rst.getNodeId(secondary);
 
         newConfig.members[newMasterId].priority = 2;
@@ -230,4 +218,3 @@ runStepDownTest({
 });
 
 rst.stopSet();
-})();

@@ -27,25 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <cstddef>
 #include <string>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
 
-const std::vector<std::string> generateIndexes(size_t numIndexes) {
+std::vector<std::string> generateIndexes(size_t numIndexes) {
     std::vector<std::string> indexes;
     for (size_t i = 0; i < numIndexes; i++) {
         indexes.push_back("index_" + std::to_string(i));
@@ -53,7 +59,7 @@ const std::vector<std::string> generateIndexes(size_t numIndexes) {
     return indexes;
 }
 
-const std::vector<HostAndPort> generateCommitReadyMembers(size_t numMembers) {
+std::vector<HostAndPort> generateCommitReadyMembers(size_t numMembers) {
     std::vector<HostAndPort> members;
     for (size_t i = 0; i < numMembers; i++) {
         members.push_back(HostAndPort("localhost:27017"));
@@ -74,8 +80,8 @@ void checkIfEqual(IndexBuildEntry lhs, IndexBuildEntry rhs) {
     ASSERT_TRUE(std::equal(lhsIndexNames.begin(), lhsIndexNames.end(), rhsIndexNames.begin()));
 
     if (lhs.getCommitReadyMembers() && rhs.getCommitReadyMembers()) {
-        auto lhsMembers = lhs.getCommitReadyMembers().get();
-        auto rhsMembers = rhs.getCommitReadyMembers().get();
+        auto lhsMembers = lhs.getCommitReadyMembers().value();
+        auto rhsMembers = rhs.getCommitReadyMembers().value();
         ASSERT_TRUE(std::equal(lhsMembers.begin(), lhsMembers.end(), rhsMembers.begin()));
     } else {
         ASSERT_FALSE(lhs.getCommitReadyMembers());
@@ -124,9 +130,9 @@ TEST(IndexBuildEntryTest, SerializeAndDeserialize) {
     entry.setCommitReadyMembers(generateCommitReadyMembers(3));
 
     BSONObj obj = entry.toBSON();
-    ASSERT_TRUE(obj.valid());
+    ASSERT_TRUE(validateBSON(obj).isOK());
 
-    IDLParserErrorContext ctx("IndexBuildsEntry Parser");
+    IDLParserContext ctx("IndexBuildsEntry Parser");
     IndexBuildEntry rebuiltEntry = IndexBuildEntry::parse(ctx, obj);
 
     checkIfEqual(entry, rebuiltEntry);

@@ -30,13 +30,19 @@
 #include "mongo/base/dependency_graph.h"
 
 #include <algorithm>
+#include <compare>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
-#include <iostream>
+#include <fmt/ranges.h>  // IWYU pragma: keep
 #include <iterator>
 #include <random>
-#include <sstream>
+#include <utility>
 
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/string_map.h"
 
@@ -87,14 +93,15 @@ void throwGraphContainsCycle(Iter first, Iter last, std::vector<std::string>* cy
 
 }  // namespace
 
-std::vector<std::string> DependencyGraph::topSort(std::vector<std::string>* cycle) const {
+std::vector<std::string> DependencyGraph::topSort(unsigned randomSeed,
+                                                  std::vector<std::string>* cycle) const {
     // Topological sort via repeated depth-first traversal.
     // All nodes must have an initFn before running topSort, or we return BadValue.
     struct Element {
         const std::string& name() const {
             return nodeIter->first;
         }
-        stdx::unordered_map<std::string, Node>::const_iterator nodeIter;
+        std::map<std::string, Node>::const_iterator nodeIter;
         std::vector<Element*> children;
         std::vector<Element*>::iterator membership;  // Position of this in `elements`.
     };
@@ -105,6 +112,9 @@ std::vector<std::string> DependencyGraph::topSort(std::vector<std::string>* cycl
     // Swap the pointers in the `elements` vector that point to `a` and `b`.
     // Update their 'membership' data members to reflect the change.
     auto swapPositions = [](Element& a, Element& b) {
+        if (&a == &b) {
+            return;
+        }
         using std::swap;
         swap(*a.membership, *b.membership);
         swap(a.membership, b.membership);
@@ -147,8 +157,7 @@ std::vector<std::string> DependencyGraph::topSort(std::vector<std::string>* cycl
 
     // Shuffle the inputs to improve test coverage of undeclared dependencies.
     {
-        std::random_device slowSeedGen;
-        std::mt19937 generator(slowSeedGen());
+        std::mt19937 generator(randomSeed);
         std::shuffle(elements.begin(), elements.end(), generator);
         for (Element* e : elements)
             std::shuffle(e->children.begin(), e->children.end(), generator);

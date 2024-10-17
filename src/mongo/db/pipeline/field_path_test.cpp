@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
 using std::string;
-using std::vector;
 
 /** FieldPath constructed from empty string. */
 TEST(FieldPathTest, Empty) {
@@ -225,6 +224,27 @@ TEST(FieldPathTest, Concat) {
     checkConcatWorks("some.long.path.with.many.parts", "another.long.ish.path");
     checkConcatWorks("$db", "$id");
     checkConcatWorks("$db.$id", "$id.$db");
+}
+
+TEST(FieldPathTest, ConcatFailsIfExceedsMaxDepth) {
+    std::string firstHalfStr;
+    std::string secondHalfStr;
+    int pathLength = 201;
+    int firstHalfMax = 99;
+    int secondHalfMax = pathLength - 1;
+    for (int i = 0; i <= firstHalfMax; ++i) {
+        firstHalfStr.append(std::to_string(pathLength - i));
+        firstHalfStr.append(".");
+    }
+    firstHalfStr.append(std::to_string(firstHalfMax + 1));
+    for (int i = 101; i < secondHalfMax; ++i) {
+        secondHalfStr.append(std::to_string(pathLength - i));
+        secondHalfStr.append(".");
+    }
+    secondHalfStr.append(std::to_string(pathLength));
+    FieldPath firstHalf(firstHalfStr);
+    FieldPath secondHalf(secondHalfStr);
+    ASSERT_THROWS_CODE(firstHalf.concat(secondHalf), AssertionException, ErrorCodes::Overflow);
 }
 }  // namespace
 }  // namespace mongo

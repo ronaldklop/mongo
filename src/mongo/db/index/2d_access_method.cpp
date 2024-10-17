@@ -29,34 +29,42 @@
 
 #include "mongo/db/index/2d_access_method.h"
 
-#include <string>
-#include <vector>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/index/2d_common.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
-#include "mongo/db/index_names.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/index/index_descriptor.h"
 
 namespace mongo {
 
 TwoDAccessMethod::TwoDAccessMethod(IndexCatalogEntry* btreeState,
                                    std::unique_ptr<SortedDataInterface> btree)
-    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     ExpressionParams::parseTwoDParams(descriptor->infoObj(), &_params);
 }
 
+void TwoDAccessMethod::validateDocument(const CollectionPtr& collection,
+                                        const BSONObj& obj,
+                                        const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
 /** Finds the key objects to put in an index */
-void TwoDAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+void TwoDAccessMethod::doGetKeys(OperationContext* opCtx,
+                                 const CollectionPtr& collection,
+                                 const IndexCatalogEntry* entry,
+                                 SharedBufferFragmentBuilder& pooledBufferBuilder,
                                  const BSONObj& obj,
                                  GetKeysContext context,
                                  KeyStringSet* keys,
                                  KeyStringSet* multikeyMetadataKeys,
                                  MultikeyPaths* multikeyPaths,
-                                 boost::optional<RecordId> id) const {
+                                 const boost::optional<RecordId>& id) const {
     ExpressionKeysPrivate::get2DKeys(pooledBufferBuilder,
                                      obj,
                                      _params,

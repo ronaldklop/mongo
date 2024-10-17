@@ -27,19 +27,20 @@
  *    it in the license file.
  */
 
+
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <utility>
+
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/background_thread_clock_source.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/time_support.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/background_thread_clock_source.h"
-
-#include <chrono>
-#include <memory>
-#include <thread>
-
-#include "mongo/stdx/thread.h"
-#include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -62,10 +63,6 @@ BackgroundThreadClockSource::~BackgroundThreadClockSource() {
 
 Milliseconds BackgroundThreadClockSource::getPrecision() {
     return _granularity;
-}
-
-Status BackgroundThreadClockSource::setAlarm(Date_t when, unique_function<void()> action) {
-    MONGO_UNREACHABLE;
 }
 
 Date_t BackgroundThreadClockSource::now() {

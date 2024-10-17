@@ -30,7 +30,7 @@ global:
   cpp_namespace: "mongo"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
 
 structs:
 
@@ -49,6 +49,9 @@ structs:
         type: long
         default: 0
       waitingForDecisionAcks:
+        type: long
+        default: 0
+      writingEndOfTransaction:
         type: long
         default: 0
       deletingCoordinatorDoc:

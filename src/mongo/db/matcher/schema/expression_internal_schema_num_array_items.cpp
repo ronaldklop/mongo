@@ -27,15 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_num_array_items.h"
 
 namespace mongo {
 
 InternalSchemaNumArrayItemsMatchExpression::InternalSchemaNumArrayItemsMatchExpression(
     MatchType type,
-    StringData path,
+    boost::optional<StringData> path,
     long long numItems,
     StringData name,
     clonable_ptr<ErrorAnnotation> annotation)
@@ -46,20 +52,13 @@ InternalSchemaNumArrayItemsMatchExpression::InternalSchemaNumArrayItemsMatchExpr
 void InternalSchemaNumArrayItemsMatchExpression::debugString(StringBuilder& debug,
                                                              int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << path() << " " << _name << " " << _numItems << "\n";
-
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+    debug << path() << " " << _name << " " << _numItems;
+    _debugStringAttachTagInfo(&debug);
 }
 
-BSONObj InternalSchemaNumArrayItemsMatchExpression::getSerializedRightHandSide() const {
-    BSONObjBuilder objBuilder;
-    objBuilder.append(_name, _numItems);
-    return objBuilder.obj();
+void InternalSchemaNumArrayItemsMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    opts.appendLiteral(bob, _name, _numItems);
 }
 
 bool InternalSchemaNumArrayItemsMatchExpression::equivalent(const MatchExpression* other) const {

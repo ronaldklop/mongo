@@ -1,11 +1,9 @@
 /**
  * Test that initial sync works without error when the sync source has an oplog hole.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 // Set up replica set. Disallow chaining so nodes always sync from primary.
 const testName = "initial_sync_oplog_hole";
@@ -31,6 +29,10 @@ const secondaryColl = secondaryDB[collName];
 const nss = primaryColl.getFullName();
 TestData.testName = testName;
 TestData.collectionName = collName;
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 jsTestLog("Writing data before oplog hole to collection.");
 assert.commandWorked(primaryColl.insert({_id: "a"}));
@@ -83,11 +85,10 @@ joinHungWrite();
 
 jsTestLog("Checking that primary has all data items.");
 // Make sure the primary collection has all three data items.
-assert.docEq(primaryColl.find().toArray(), [{"_id": "a"}, {"_id": "b"}, {"_id": "c"}]);
+assert.docEq([{"_id": "a"}, {"_id": "b"}, {"_id": "c"}], primaryColl.find().toArray());
 
 jsTestLog("Checking that secondary has all data items.");
 replTest.awaitReplication();
-assert.docEq(secondaryColl.find().toArray(), [{"_id": "a"}, {"_id": "b"}, {"_id": "c"}]);
+assert.docEq([{"_id": "a"}, {"_id": "b"}, {"_id": "c"}], secondaryColl.find().toArray());
 
 replTest.stopSet();
-})();

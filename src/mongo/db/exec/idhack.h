@@ -31,9 +31,18 @@
 
 #include <memory>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
@@ -51,16 +60,16 @@ public:
     IDHackStage(ExpressionContext* expCtx,
                 CanonicalQuery* query,
                 WorkingSet* ws,
-                const CollectionPtr& collection,
+                VariantCollectionPtrOrAcquisition collection,
                 const IndexDescriptor* descriptor);
 
     IDHackStage(ExpressionContext* expCtx,
                 const BSONObj& key,
                 WorkingSet* ws,
-                const CollectionPtr& collection,
+                VariantCollectionPtrOrAcquisition collection,
                 const IndexDescriptor* descriptor);
 
-    ~IDHackStage();
+    ~IDHackStage() override;
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -72,7 +81,7 @@ public:
         return STAGE_IDHACK;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 

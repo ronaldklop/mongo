@@ -35,10 +35,11 @@
  * @tags: [requires_replication]
  */
 
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 var name = 'user_defined_roles_on_secondaries';
-var m0, m1;
+var m0;
 
 function assertListContainsRole(list, role, msg) {
     var i;
@@ -46,7 +47,7 @@ function assertListContainsRole(list, role, msg) {
         if (list[i].role == role.role && list[i].db == role.db)
             return;
     }
-    doassert("Could not find value " + tojson(val) + " in " + tojson(list) +
+    doassert("Could not find value " + tojson(role) + " in " + tojson(list) +
              (msg ? ": " + msg : ""));
 }
 
@@ -121,9 +122,17 @@ rstest.nodes.forEach(function(node) {
     assertListContainsRole(role.roles, {role: "dbAdmin", db: "db1"});
 });
 
+setLogVerbosity(rstest.nodes, {"command": {"verbosity": 2}});
+
 // Verify that dropping roles propagates.
-rstest.getPrimary().getDB("db1").dropRole("r2", {w: 2});
+jsTestLog("Dropping role r2");
+assert.eq(true, rstest.getPrimary().getDB("db1").dropRole("r2", {w: 2}));
+assert.eq(null, rstest.getPrimary().getDB("db1").getRole("r2"));
 rstest.nodes.forEach(function(node) {
+    jsTestLog(`Testing node ${node}`);
+    const roles = assert.commandWorked(node.getDB("db1").runCommand({rolesInfo: 1}));
+    jsTestLog(`Roles: ${tojson(roles)}`);
+
     assert.eq(null, node.getDB("db1").getRole("r2"));
     var role = node.getDB("db1").getRole("r3");
     assert.eq(1, role.roles.length, tojson(node));
@@ -198,19 +207,20 @@ assert.commandWorked(rstest.getPrimary().getDB("admin").runCommand({
         {
             op: "u",
             ns: "admin.system.roles",
-            o: {$set: {roles: [{role: "readWrite", db: "db1"}]}},
+            o: {$v: 2, diff: {u: {roles: [{role: "readWrite", db: "db1"}]}}},
             o2: {_id: "db1.t2"}
         }
     ]
 }));
 
-assert.commandWorked(rstest.getPrimary().getDB("admin").getLastErrorObj(2));
+rstest.awaitReplication();
+
 rstest.nodes.forEach(function(node) {
     var role = node.getDB("db1").getRole("t1");
     assert.eq(1, role.roles.length, tojson(node));
     assertListContainsRole(role.roles, {role: "read", db: "db1"}, node);
 
-    var role = node.getDB("db1").getRole("t2");
+    role = node.getDB("db1").getRole("t2");
     assert.eq(1, role.roles.length, tojson(node));
     assertListContainsRole(role.roles, {role: "readWrite", db: "db1"}, node);
 });
@@ -226,4 +236,3 @@ rstest.nodes.forEach(function(node) {
 });
 
 rstest.stopSet();
-}());

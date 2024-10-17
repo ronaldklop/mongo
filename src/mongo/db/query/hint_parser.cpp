@@ -29,10 +29,18 @@
 
 #include "mongo/db/query/hint_parser.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 BSONObj parseHint(const BSONElement& element) {
     if (element.type() == BSONType::String) {
         return BSON("$hint" << element.valueStringData());
@@ -44,6 +52,10 @@ BSONObj parseHint(const BSONElement& element) {
     MONGO_UNREACHABLE;
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void serializeHintToBSON(const BSONObj& hint, StringData fieldName, BSONObjBuilder* builder) {
     if (hint.isEmpty())
         return;

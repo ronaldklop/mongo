@@ -27,20 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <iterator>
 #include <limits>
 #include <random>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/ftdc/compressor.h"
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/decompressor.h"
 #include "mongo/db/ftdc/ftdc_test.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -133,17 +143,17 @@ public:
     addSample(const BSONObj& sample) {
         auto st = _compressor.addSample(sample, Date_t());
 
-        if (!st.getValue().is_initialized()) {
+        if (!st.getValue().has_value()) {
             _docs.emplace_back(sample);
-        } else if (std::get<1>(st.getValue().get()) ==
+        } else if (std::get<1>(st.getValue().value()) ==
                    FTDCCompressor::CompressorState::kSchemaChanged) {
-            validate(std::get<0>(st.getValue().get()));
+            validate(std::get<0>(st.getValue().value()));
             _docs.clear();
             _docs.emplace_back(sample);
-        } else if (std::get<1>(st.getValue().get()) ==
+        } else if (std::get<1>(st.getValue().value()) ==
                    FTDCCompressor::CompressorState::kCompressorFull) {
             _docs.emplace_back(sample);
-            validate(std::get<0>(st.getValue().get()));
+            validate(std::get<0>(st.getValue().value()));
             _docs.clear();
         } else {
             MONGO_UNREACHABLE;
@@ -154,8 +164,8 @@ public:
 
     void validate(boost::optional<ConstDataRange> cdr) {
         std::vector<BSONObj> list;
-        if (cdr.is_initialized()) {
-            auto sw = _decompressor.uncompress(cdr.get());
+        if (cdr.has_value()) {
+            auto sw = _decompressor.uncompress(cdr.value());
             ASSERT_TRUE(sw.isOK());
             list = sw.getValue();
         } else {

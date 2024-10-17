@@ -14,15 +14,13 @@
 // Test killing a pinned cursor. Since cursors are generally pinned for short periods while result
 // batches are generated, this requires some special machinery to keep a cursor permanently pinned.
 
-(function() {
-"use strict";
-
 // This test runs manual getMores using different connections, which will not inherit the
 // implicit session of the cursor establishing command.
 TestData.disableImplicitSessions = true;
 
-load("jstests/libs/fixture_helpers.js");     // For "isMongos".
-load("jstests/libs/pin_getmore_cursor.js");  // For "withPinnedCursor".
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {withPinnedCursor} from "jstests/libs/pin_getmore_cursor.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 const st = new ShardingTest({shards: 2});
 
 // Enables the specified 'failPointName', executes 'runGetMoreFunc' function in a parallel
@@ -56,7 +54,7 @@ const rs0Conn = st.rs0.getPrimary();
 const testParameters = {
     conn: rs0Conn,
     failPointName: "waitAfterPinningCursorBeforeGetMoreBatch",
-    runGetMoreFunc: function() {
+    runGetMoreFunc: function(collName, cursorId) {
         const response = db.runCommand({getMore: cursorId, collection: collName});
         // We expect that the operation will get interrupted and fail.
         assert.commandFailedWithCode(response, ErrorCodes.CursorKilled);
@@ -103,7 +101,7 @@ for (let conn of connsToRunOn) {
     // batch is returned to the client but a subsequent getMore will fail with a
     // 'CursorNotFound' error.
     testParameters.failPointName = "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch";
-    testParameters.runGetMoreFunc = function() {
+    testParameters.runGetMoreFunc = function(collName, cursorId) {
         const getMoreCmd = {getMore: cursorId, collection: collName, batchSize: 2};
         // We expect that the first getMore will succeed, while the second fails because the
         // cursor has been killed.
@@ -115,4 +113,3 @@ for (let conn of connsToRunOn) {
 }
 
 st.stop();
-})();

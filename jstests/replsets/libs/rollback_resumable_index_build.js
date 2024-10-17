@@ -1,7 +1,8 @@
-load("jstests/noPassthrough/libs/index_build.js");
-load('jstests/replsets/libs/rollback_test.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ResumableIndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
-const RollbackResumableIndexBuildTest = class {
+export class RollbackResumableIndexBuildTest {
     static checkCompletedAndDrop(
         rollbackTest, originalPrimary, dbName, colls, buildUUIDs, indexNames) {
         for (let i = 0; i < colls.length; i++) {
@@ -41,7 +42,7 @@ const RollbackResumableIndexBuildTest = class {
      *   case all index builds will be expected to resume from that phase, or it must be exactly
      *   the length of 'indexSpecs'.
      *
-     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAferResume' and
+     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAfterResume' and
      *   'skippedPhaseLogID'. The former is used to verify that the index build scanned the expected
      *   number of documents in the collection scan after resuming. The latter is used for phases
      *   which do not perform a collection scan after resuming, to verify that the index build did
@@ -59,10 +60,6 @@ const RollbackResumableIndexBuildTest = class {
      *   fixture should be expected to be completed when this function returns. If false, this
      *   function returns the collections, buildUUIDs, and index names of the index builds started
      *   by the test fixture.
-     *
-     * 'skipDataConsistencyChecks' is a boolean which determines whether data consistency checks
-     *   should be skipped by the rollback test fixture when transitioning to steady state
-     *   operations.
      */
     static run(rollbackTest,
                dbName,
@@ -78,24 +75,23 @@ const RollbackResumableIndexBuildTest = class {
                resumeChecks,
                insertsToBeRolledBack,
                sideWrites = [],
-               {shouldComplete = true, skipDataConsistencyChecks = false} = {}) {
+               {shouldComplete = true} = {}) {
         const originalPrimary = rollbackTest.getPrimary();
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(originalPrimary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
 
         rollbackTest.awaitLastOpCommitted();
 
-        assert.commandWorked(
-            originalPrimary.adminCommand({setParameter: 1, logComponentVerbosity: {index: 1}}));
+        assert.commandWorked(originalPrimary.adminCommand({
+            setParameter: 1,
+            logComponentVerbosity: {index: 1, replication: {election: 0, heartbeats: 0}},
+        }));
 
-        // Set internalQueryExecYieldIterations to 0 and maxIndexBuildDrainBatchSize to 1 so that
-        // the index builds are guaranteed to yield their locks between the rollback end and start
-        // failpoints.
+        // Set internalQueryExecYieldIterations to 0, internalIndexBuildBulkLoadYieldIterations to
+        // 1, and maxIndexBuildDrainBatchSize to 1 so that the index builds are guaranteed to yield
+        // their locks between the rollback end and start failpoints.
         assert.commandWorked(
             originalPrimary.adminCommand({setParameter: 1, internalQueryExecYieldIterations: 0}));
+        assert.commandWorked(originalPrimary.adminCommand(
+            {setParameter: 1, internalIndexBuildBulkLoadYieldIterations: 1}));
         assert.commandWorked(
             originalPrimary.adminCommand({setParameter: 1, maxIndexBuildDrainBatchSize: 1}));
 
@@ -111,8 +107,9 @@ const RollbackResumableIndexBuildTest = class {
             assert.commandWorked(colls[i].insert(docs));
 
             awaitCreateIndexes[i] = ResumableIndexBuildTest.createIndexWithSideWrites(
-                rollbackTest, function(collName, indexSpecs, indexNames) {
-                    load("jstests/noPassthrough/libs/index_build.js");
+                rollbackTest, async function(collName, indexSpecs, indexNames) {
+                    const {ResumableIndexBuildTest} =
+                        await import("jstests/noPassthrough/libs/index_build.js");
                     ResumableIndexBuildTest.createIndexesFails(
                         db, collName, indexSpecs, indexNames);
                 }, colls[i], indexSpecs[i], indexNames[i], sideWrites);
@@ -207,7 +204,7 @@ const RollbackResumableIndexBuildTest = class {
                     // Wait for the index build to be aborted for rollback.
                     checkLog.containsJson(db.getMongo(), 465611, {
                         buildUUID: function(uuid) {
-                            return uuid["uuid"]["$uuid"] === buildUUID;
+                            return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                         }
                     });
 
@@ -219,7 +216,8 @@ const RollbackResumableIndexBuildTest = class {
 
         // Wait until the parallel shells have all started.
         assert.soon(() => {
-            return (rawMongoProgramOutput().match(/5113600/g) || []).length === buildUUIDs.length;
+            return (rawMongoProgramOutput().match(/"id":5113600/g) || []).length ===
+                buildUUIDs.length;
         });
         getLogFp.off();
 
@@ -232,13 +230,12 @@ const RollbackResumableIndexBuildTest = class {
         for (const buildUUID of buildUUIDs) {
             checkLog.containsJson(originalPrimary, 20347, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] === buildUUID;
+                    return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                 }
             });
         }
 
-        rollbackTest.transitionToSteadyStateOperations(
-            {skipDataConsistencyChecks: skipDataConsistencyChecks});
+        rollbackTest.transitionToSteadyStateOperations();
 
         if (shouldComplete) {
             // Ensure that the index builds completed after rollback.
@@ -258,11 +255,6 @@ const RollbackResumableIndexBuildTest = class {
         rollbackTest, dbName, docs, indexSpec, insertsToBeRolledBack, sideWrites = []) {
         const originalPrimary = rollbackTest.getPrimary();
 
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(originalPrimary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
         const fp1 = configureFailPoint(originalPrimary, "hangAfterIndexBuildDumpsInsertsFromBulk");
         const fp2 = configureFailPoint(originalPrimary, "hangAfterIndexBuildFirstDrain");
 
@@ -281,7 +273,7 @@ const RollbackResumableIndexBuildTest = class {
             0,  // rollbackEndFailPointsIteration
             ["setYieldAllLocksHang"],
             ["collection scan"],
-            [{numScannedAferResume: docs.length - 1}],
+            [{numScannedAfterResume: docs.length - 1}],
             insertsToBeRolledBack,
             sideWrites,
             {shouldComplete: false});
@@ -311,7 +303,7 @@ const RollbackResumableIndexBuildTest = class {
         // Ensure that the index build restarted, rather than resumed.
         checkLog.containsJson(originalPrimary, 20660, {
             buildUUID: function(uuid) {
-                return uuid["uuid"]["$uuid"] === testInfo.buildUUIDs[0];
+                return uuid && uuid["uuid"]["$uuid"] === testInfo.buildUUIDs[0];
             }
         });
         assert(!checkLog.checkContainsOnceJson(originalPrimary, 4841700));
@@ -323,4 +315,4 @@ const RollbackResumableIndexBuildTest = class {
                                                               testInfo.buildUUIDs,
                                                               testInfo.indexNames);
     }
-};
+}

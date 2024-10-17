@@ -5,11 +5,9 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Start one of the nodes with priority: 0 to avoid elections.
 const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
@@ -84,7 +82,6 @@ rst.waitForState(primary, ReplSetTest.State.SECONDARY);
 // Validate that the read operation got killed during step down.
 let replMetrics = assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
-assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
 
 // Allow the primary to be re-elected, and wait for it.
 assert.commandWorked(primaryAdmin.adminCommand({replSetFreeze: 0}));
@@ -109,4 +106,3 @@ assert.commandWorked(sessionDB.adminCommand({
 }));
 
 rst.stopSet();
-})();

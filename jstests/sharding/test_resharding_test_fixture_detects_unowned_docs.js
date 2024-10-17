@@ -4,15 +4,12 @@
  * Verifies that an exception is thrown if a recipient shard has a document it doesn't actually own.
  *
  * @tags: [
- *   requires_fcv_49,
  *   uses_atclustertime,
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/discover_topology.js');
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
+import {ShardVersioningUtil} from "jstests/sharding/libs/shard_versioning_util.js";
 
 // The test purposely emplaces documents on a shard that doesn't own them.
 TestData.skipCheckOrphans = true;
@@ -60,8 +57,10 @@ const err = assert.throws(() => {
 
             // Insert a document directly into recipient0 that is truly owned by recipient1.
             const tempColl = recipient0.getCollection(tempNs);
-            assert.commandWorked(
-                tempColl.insert({_id: "unowned by recipient0", oldKey: 10, newKey: 10}));
+            assert.commandWorked(tempColl.runCommand("insert", {
+                documents: [{_id: "unowned by recipient0", oldKey: 10, newKey: 10}],
+                shardVersion: ShardVersioningUtil.kIgnoredShardVersion
+            }));
         });
 });
 
@@ -76,4 +75,3 @@ assert.soon(() => {
 });
 
 reshardingTest.teardown();
-})();

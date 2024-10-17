@@ -29,11 +29,36 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
-#include "mongo/db/s/resharding/resharding_critical_section.h"
-#include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo {
 
@@ -42,8 +67,8 @@ public:
     static constexpr StringData kServiceName = "ReshardingDonorService"_sd;
 
     explicit ReshardingDonorService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {}
-    ~ReshardingDonorService() = default;
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
+    ~ReshardingDonorService() override = default;
 
     class DonorStateMachine;
 
@@ -57,13 +82,18 @@ public:
         return NamespaceString::kDonorReshardingOperationsNamespace;
     }
 
-    ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO Limit the size of ReshardingDonorService thread pool.
-        return ThreadPool::Limits();
-    }
+    ThreadPool::Limits getThreadPoolLimits() const override;
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialState) const override;
+    // The service implemented its own conflict check before this method was added.
+    void checkIfConflictsWithOtherInstances(
+        OperationContext* opCtx,
+        BSONObj initialState,
+        const std::vector<const Instance*>& existingInstances) override {}
+
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 /**
@@ -73,13 +103,15 @@ public:
 class ReshardingDonorService::DonorStateMachine final
     : public repl::PrimaryOnlyService::TypedInstance<DonorStateMachine> {
 public:
-    explicit DonorStateMachine(const BSONObj& donorDoc,
-                               std::unique_ptr<DonorStateMachineExternalState> externalState);
+    explicit DonorStateMachine(const ReshardingDonorService* donorService,
+                               const ReshardingDonorDocument& donorDoc,
+                               std::unique_ptr<DonorStateMachineExternalState> externalState,
+                               ServiceContext* serviceContext);
 
-    ~DonorStateMachine();
+    ~DonorStateMachine() override = default;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancellationToken& token) noexcept override;
+                         const CancellationToken& stepdownToken) noexcept override;
 
     void interrupt(Status status) override;
 
@@ -98,14 +130,71 @@ public:
     void onReshardingFieldsChanges(OperationContext* opCtx,
                                    const TypeCollectionReshardingFields& reshardingFields);
 
+    void onReadDuringCriticalSection();
+    void onWriteDuringCriticalSection();
+
+    SharedSemiFuture<void> awaitCriticalSectionAcquired();
+
+    SharedSemiFuture<void> awaitCriticalSectionPromoted();
+
     SharedSemiFuture<void> awaitFinalOplogEntriesWritten();
+
+    /**
+     * Returns a Future fulfilled once the donor locally persists its final state before the
+     * coordinator makes its decision to commit or abort (DonorStateEnum::kError or
+     * DonorStateEnum::kBlockingWrites).
+     */
+    SharedSemiFuture<void> awaitInBlockingWritesOrError() const {
+        return _inBlockingWritesOrError.getFuture();
+    }
 
     static void insertStateDocument(OperationContext* opCtx,
                                     const ReshardingDonorDocument& donorDoc);
 
+    /**
+     * Indicates that the coordinator has persisted a decision. Unblocks the
+     * _coordinatorHasDecisionPersisted promise.
+     */
+    void commit();
+
+    /**
+     * Initiates the cancellation of the resharding operation.
+     */
+    void abort(bool isUserCancelled);
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
+
 private:
-    DonorStateMachine(const ReshardingDonorDocument& donorDoc,
-                      std::unique_ptr<DonorStateMachineExternalState> externalState);
+    /**
+     * Runs up until the donor is either in state kBlockingWrites or encountered an error.
+     */
+    ExecutorFuture<void> _runUntilBlockingWritesOrErrored(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken) noexcept;
+
+    /**
+     * Notifies the coordinator if the donor is in kBlockingWrites or kError and waits for
+     * _coordinatorHasDecisionPersisted to be fulfilled (success) or for the abortToken to be
+     * canceled (failure or stepdown).
+     */
+    ExecutorFuture<void> _notifyCoordinatorAndAwaitDecision(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken) noexcept;
+
+    /**
+     * Finishes the work left remaining on the donor after the coordinator persists its decision to
+     * abort or complete resharding.
+     */
+    ExecutorFuture<void> _finishReshardingOperation(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& stepdownToken,
+        bool aborted) noexcept;
+
+    /**
+     * The work inside this function must be run regardless of any work on _scopedExecutor ever
+     * running.
+     */
+    Status _runMandatoryCleanup(Status status, const CancellationToken& stepdownToken);
 
     // The following functions correspond to the actions to take at a particular donor state.
     void _transitionToPreparingToDonate();
@@ -113,19 +202,18 @@ private:
     void _onPreparingToDonateCalculateTimestampThenTransitionToDonatingInitialData();
 
     ExecutorFuture<void> _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
 
     ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToBlockWrites(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
 
     void _writeTransactionOplogEntryThenTransitionToBlockingWrites();
 
-    ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToDropping(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
-
     // Drops the original collection and throws if the returned status is not either Status::OK()
     // or NamespaceNotFound.
-    void _dropOriginalCollection();
+    void _dropOriginalCollectionThenTransitionToDone();
 
     // Transitions the on-disk and in-memory state to 'newState'.
     void _transitionState(DonorStateEnum newState);
@@ -140,6 +228,9 @@ private:
     // Transitions the on-disk and in-memory state to DonorStateEnum::kError.
     void _transitionToError(Status abortReason);
 
+    // Transitions the on-disk and in-memory state to DonorStateEnum::kDone.
+    void _transitionToDone(bool aborted);
+
     BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, DonorStateEnum newState);
 
     ExecutorFuture<void> _updateCoordinator(
@@ -149,11 +240,21 @@ private:
     void _updateDonorDocument(DonorShardContext&& newDonorCtx);
 
     // Removes the local donor document from disk.
-    void _removeDonorDocument();
+    void _removeDonorDocument(const CancellationToken& stepdownToken, bool aborted);
 
-    // Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
-    // (abort resharding).
-    void _onAbortOrStepdown(WithLock lk, Status status);
+    // Initializes the _abortSource and generates a token from it to return back the caller. If an
+    // abort was reported prior to the initialization, automatically cancels the _abortSource before
+    // returning the token.
+    //
+    // Should only be called once per lifetime.
+    CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
+
+    // The primary-only service instance corresponding to the donor instance. Not owned.
+    const ReshardingDonorService* const _donorService;
+
+    ServiceContext* const _serviceContext;
+
+    std::unique_ptr<ReshardingMetrics> _metrics;
 
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.donor.
@@ -164,27 +265,49 @@ private:
     // config.localReshardingOperations.donor.
     DonorShardContext _donorCtx;
 
+    // This is only used to restore metrics on a stepup.
+    const ReshardingDonorMetrics _donorMetricsToRestore;
+
     const std::unique_ptr<DonorStateMachineExternalState> _externalState;
 
+    // ThreadPool used by CancelableOperationContext.
+    // CancelableOperationContext must have a thread that is always available to it to mark its
+    // opCtx as killed when the cancelToken has been cancelled.
+    const std::shared_ptr<ThreadPool> _markKilledExecutor;
+    boost::optional<CancelableOperationContextFactory> _cancelableOpCtxFactory;
+
     // Protects the state below
-    Mutex _mutex = MONGO_MAKE_LATCH("DonorStateMachine::_mutex");
+    stdx::mutex _mutex;
 
-    // Contains the status with which the operation was aborted.
-    boost::optional<Status> _abortStatus;
+    // Canceled by 2 different sources: (1) This DonorStateMachine when it learns of an
+    // unrecoverable error (2) The primary-only service instance driving this DonorStateMachine that
+    // cancels the parent CancellationSource upon stepdown/failover.
+    boost::optional<CancellationSource> _abortSource;
 
-    boost::optional<ReshardingCriticalSection> _critSec;
+    // The identifier associated to the recoverable critical section.
+    const BSONObj _critSecReason;
+
+    // It states whether the current node has also the recipient role.
+    const bool _isAlsoRecipient;
 
     // Each promise below corresponds to a state on the donor state machine. They are listed in
-    // ascending order, such that the first promise below will be the first promise fulfilled.
+    // ascending order, such that the first promise below will be the first promise fulfilled -
+    // fulfillment order is not necessarily maintained if the operation gets aborted.
     SharedPromise<void> _allRecipientsDoneCloning;
 
     SharedPromise<void> _allRecipientsDoneApplying;
 
     SharedPromise<void> _finalOplogEntriesWritten;
 
+    SharedPromise<void> _inBlockingWritesOrError;
+
     SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
+
+    // Promises used to synchronize the acquisition/promotion of the recoverable critical section.
+    SharedPromise<void> _critSecWasAcquired;
+    SharedPromise<void> _critSecWasPromoted;
 };
 
 /**
@@ -209,6 +332,12 @@ public:
     virtual void updateCoordinatorDocument(OperationContext* opCtx,
                                            const BSONObj& query,
                                            const BSONObj& update) = 0;
+
+    virtual std::unique_ptr<ShardingRecoveryService::BeforeReleasingCustomAction>
+    getOnReleaseCriticalSectionCustomAction() = 0;
+
+    virtual void refreshCollectionPlacementInfo(OperationContext* opCtx,
+                                                const NamespaceString& sourceNss) = 0;
 };
 
 }  // namespace mongo

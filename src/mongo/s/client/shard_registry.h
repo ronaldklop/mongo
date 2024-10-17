@@ -29,23 +29,48 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_factory.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/read_through_cache.h"
 
 namespace mongo {
+
+namespace shard_registry_stats {
+
+extern Counter64& blockedOpsGauge;
+
+}  // namespace shard_registry_stats
 
 class ShardRegistryData {
 public:
@@ -156,10 +181,30 @@ private:
 };
 
 /**
- * Maintains the set of all shards known to the instance and their connections and exposes
- * functionality to run commands against shards. All commands which this registry executes are
- * retried on NotPrimary class of errors and in addition all read commands are retried on network
- * errors automatically as well.
+ * Each node (router, shard server, config server, primaries and secondaries) has one instance of
+ * this object. It is an in-memory cache mirroring the `config.shards` collection on the config
+ * server, whose causal consistency is driven by the `topologyTime` component of the vector clock.
+ * The collection (and thus the cache) contains an entry for each shard in the cluster. Each entry
+ * contains the connection string for that shard.
+ *
+ * Retrieving a shard from the registry returns a `Shard` object. Using that object, one can access
+ * more information about a shard and run commands against that shard. A `Shard` object can be
+ * retrieved from the registry by using any of:
+ * - The shard's name
+ * - The replica set's name
+ * - The HostAndPort object
+ * - The connection string
+ *
+ * REFRESHES: The shard registry refreshes itself in these scenarios:
+ * - Upon the node's start-up
+ * - Upon completion of a background job that runs every thirty seconds
+ * - Upon an attempt to retrieve a shard that doesn’t have a matching entry in the cache
+ * - Upon calling the ShardRegistry’s reload function (ShardRegistry::reload())
+ * - After an operation has gossipped-in a higher `topologyTime`
+ *
+ * The shard registry makes updates to the `config.shards` collection in one case. If the shard
+ * registry discovers an updated connection string for another shard via a replica set topology
+ * change, it will persist that update to `config.shards`.
  */
 class ShardRegistry {
     ShardRegistry(const ShardRegistry&) = delete;
@@ -185,17 +230,28 @@ public:
      *                          hook is expected not to throw. If it does throw, the process will be
      *                          terminated.
      */
-    ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
-                  const ConnectionString& configServerCS,
+    ShardRegistry(ServiceContext* service,
+                  std::unique_ptr<ShardFactory> shardFactory,
+                  const boost::optional<ConnectionString>& configServerCS,
                   std::vector<ShardRemovalHook> shardRemovalHooks = {});
 
     ~ShardRegistry();
 
     /**
-     * Initializes ShardRegistry with config shard. Must be called outside c-tor to avoid calls on
-     * this while its still not fully constructed.
+     * Initializes ShardRegistry with config shard, if a connection string was provided at
+     * construction.
+     *
+     * The creation of the config shard object will intialize the associated RSM monitor that in
+     * turn will call ShardRegistry::updateReplSetHosts(). Hence the config shard object MUST be
+     * created after the ShardRegistry is fully constructed.
      */
-    void init(ServiceContext* service);
+    void init();
+
+    /**
+     * Sets up the registry's config shard from the given connection string. Only takes effect if
+     * the registry has not already done this.
+     */
+    void initConfigShardIfNecessary(const ConnectionString& configCS);
 
     /**
      * Startup the periodic reloader of the ShardRegistry.
@@ -239,6 +295,9 @@ public:
      */
     StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* opCtx, const ShardId& shardId);
 
+    SemiFuture<std::shared_ptr<Shard>> getShard(ExecutorPtr executor,
+                                                const ShardId& shardId) noexcept;
+
     /**
      * Returns a vector containing all known shard IDs.
      * The order of the elements is not guaranteed.
@@ -269,10 +328,10 @@ public:
     std::unique_ptr<Shard> createConnection(const ConnectionString& connStr) const;
 
     /**
-     * The ShardRegistry is "up" once a successful lookup from the config servers has been
-     * completed.
+     * Returns a ShardLocal for the config server that is not tracked by the registry. May only be
+     * called on a config server node.
      */
-    bool isUp() const;
+    std::shared_ptr<Shard> createLocalConfigShard() const;
 
     void toBSON(BSONObjBuilder* result) const;
 
@@ -283,17 +342,31 @@ public:
     void reload(OperationContext* opCtx);
 
     /**
-     * Clears all entries from the shard registry entries, which will force the registry to do a
-     * reload on next access.
+     * To be used on mongod only. If the mongod is a primary, schedules a write to update the
+     * connection string in the config.shards document for the shard it corresponds to. Upon an
+     * error, retries if the mongod is still a primary.
      */
-    void clearEntries();
+    static void scheduleReplicaSetUpdateOnConfigServerIfNeeded(
+        const std::function<bool()>& isPrimaryFn) noexcept;
+
+    /*
+     * Returns true if the given host is part of the config server replica set.
+     *
+     * This method relies on the RSM to have pushed the correct CSRS membership information.
+     */
+    bool isConfigServer(const HostAndPort& host) const;
 
     /**
-     * For use in mongos which needs notifications about changes to shard replset membership to
-     * update the config.shards collection.
+     * Returns an optional boolean indicating whether the config server is in the shard registry as
+     * a shard.
+     * - If there is cached data available, returns true if the config server is in the shard
+     * registry, and false otherwise.
+     * - If there is no cached data, returns boost::none.
+     *
+     * Note: This function does not refresh the shard registry or perform any network traffic. It is
+     * a non-causally consistent call to the cached data from the shard registry.
      */
-    static void updateReplicaSetOnConfigServer(ServiceContext* serviceContex,
-                                               const ConnectionString& connStr) noexcept;
+    boost::optional<bool> cachedClusterHasConfigShard() const;
 
     // TODO SERVER-50206: Remove usage of these non-causally consistent accessors.
     //
@@ -304,24 +377,14 @@ public:
     // refreshed via _lookup()).
 
     /**
-     * Returns a shared pointer to the shard object with the given shard id. The shardId parameter
-     * can actually be the shard name or the HostAndPort for any server in the shard. Will not
-     * refresh the shard registry or otherwise perform any network traffic. This means that if the
-     * shard was recently added it may not be found.  USE WITH CAUTION.
-     */
-    std::shared_ptr<Shard> getShardNoReload(const ShardId& shardId) const;
-
-    /**
      * Finds the Shard that the mongod listening at this HostAndPort is a member of. Will not
      * refresh the shard registry or otherwise perform any network traffic.
      */
     std::shared_ptr<Shard> getShardForHostNoReload(const HostAndPort& shardHost) const;
 
-    std::vector<ShardId> getAllShardIdsNoReload() const;
-
-    int getNumShardsNoReload() const;
-
 private:
+    friend class ShardRegistryTest;
+
     /**
      * The ShardRegistry uses the ReadThroughCache to handle refreshing itself.  The cache stores
      * a single entry, with key of Singleton, value of ShardRegistryData, and causal-consistency
@@ -334,57 +397,71 @@ private:
     struct Time {
         explicit Time() {}
 
-        explicit Time(Timestamp topologyTime,
-                      Increment rsmIncrement,
-                      Increment forceReloadIncrement)
-            : topologyTime(topologyTime),
-              rsmIncrement(rsmIncrement),
-              forceReloadIncrement(forceReloadIncrement) {}
-
         bool operator==(const Time& other) const {
-            return topologyTime == other.topologyTime && rsmIncrement == other.rsmIncrement &&
-                forceReloadIncrement == other.forceReloadIncrement;
+            return tie() == other.tie();
         }
         bool operator!=(const Time& other) const {
-            return !(*this == other);
+            return tie() != other.tie();
         }
         bool operator>(const Time& other) const {
-            return topologyTime > other.topologyTime || rsmIncrement > other.rsmIncrement ||
-                forceReloadIncrement > other.forceReloadIncrement;
+            return tie() > other.tie();
         }
         bool operator>=(const Time& other) const {
-            return (*this > other) || (*this == other);
+            return tie() >= other.tie();
         }
         bool operator<(const Time& other) const {
-            return !(*this >= other);
+            return tie() < other.tie();
         }
         bool operator<=(const Time& other) const {
-            return !(*this > other);
+            return tie() <= other.tie();
         }
 
-        BSONObj toBSON() const {
+        std::string toString() const {
             BSONObjBuilder bob;
-            bob.append("topologyTime", topologyTime);
-            bob.append("rsmIncrement", rsmIncrement);
-            bob.append("forceReloadIncrement", forceReloadIncrement);
-            return bob.obj();
+            bob.append("forceReloadIncrement", _forceReloadIncrement);
+            bob.append("topologyTime", _topologyTime);
+            return bob.obj().toString();
         }
 
-        Timestamp topologyTime;
+        /**
+         * Create a Time to trigger a forced reload.
+         */
+        static Time makeForForcedReload();
 
-        // The increments are used locally to trigger the lookup function.
-        //
-        // The rsmIncrement is used to indicate that that there are stashed RSM updates that need to
-        // be incorporated.
-        //
-        // The forceReloadIncrement is used to indicate that the latest data should be fetched from
-        // the configsvrs (ie. when the topologyTime can't be used for this, eg. in the first
-        // lookup, and in contexts like unittests where topologyTime isn't gossipped but the
-        // ShardRegistry still needs to be reloaded).  This is how reload() is able to force a
-        // refresh from the config servers - incrementing the forceReloadIncrement causes the cache
-        // to call _lookup() (rather than having reload() attempt to do a synchronous refresh).
-        Increment rsmIncrement{0};
-        Increment forceReloadIncrement{0};
+        /**
+         * Create a Time with the latest known topologyTime.
+         */
+        static Time makeLatestKnown(ServiceContext*);
+
+        /**
+         * Create a Time which will cause merging of force reload requests that have been made
+         * before 'lookupFn' is evaluated, and contain the topologyTime returned by 'lookupFn'.
+         */
+        static Time makeWithLookup(std::function<Timestamp(void)>&& lookupFn);
+
+    private:
+        explicit Time(Increment _forceReloadIncrement, Timestamp topologyTime)
+            : _forceReloadIncrement(_forceReloadIncrement), _topologyTime(topologyTime) {}
+
+        // Tie the Time components in a std::tuple, to leverage the total ordering comparators.
+        // We want the _forceReloadIncrement to be the most significative component, so a refresh
+        // is always forced when requested.
+        std::tuple<Increment, Timestamp> tie() const {
+            return std::tie(_forceReloadIncrement, _topologyTime);
+        }
+
+        // Source for the _forceReloadIncrement field.
+        static AtomicWord<Increment> _forceReloadIncrementSource;
+
+        // The _forceReloadIncrement is used to indicate that the latest data should be fetched
+        // from the configsvrs regardless of the topologyTime (ie. when the topologyTime can't be
+        // used for this, eg. in the first lookup, and in contexts like unittests where topologyTime
+        // isn't gossipped but the ShardRegistry still needs to be reloaded).  This is how reload()
+        // is able to force a refresh from the config servers - incrementing the
+        // _forceReloadIncrement causes the cache to call _lookup() (rather than having reload()
+        // attempt to do a synchronous refresh).
+        Increment _forceReloadIncrement{0};
+        Timestamp _topologyTime;
     };
 
     enum class Singleton { Only };
@@ -409,6 +486,24 @@ private:
      */
     SharedSemiFuture<Cache::ValueHandle> _getDataAsync();
 
+    SharedSemiFuture<Cache::ValueHandle> _getDataAsyncCommon();
+
+    /**
+     * Updates the timeInStore with the latest known topologyTime, or a time which would force a
+     * reload if 'forceReload' is true.
+     */
+    void _updateTimeInStore(bool forceReload = false);
+
+    /**
+     * Triggers a reload without waiting for it to complete.
+     */
+    void _scheduleForcedLookup();
+
+    /**
+     * Trigger a lookup only if the cache is out of sync with the latest known topologyTime.
+     */
+    void _scheduleLookupIfRequired();
+
     /**
      * Gets the latest-cached copy of the ShardRegistryData.  Never fetches from the config servers.
      * Only used by the "NoReload" accessors.
@@ -416,23 +511,21 @@ private:
      */
     Cache::ValueHandle _getCachedData() const;
 
-    /**
-     * Lookup shard by replica set name. Returns nullptr if the name can't be found.
-     * Note: this doesn't refresh the table if the name isn't found, so it's possible that a
-     * newly added shard/Replica Set may not be found.
-     * TODO SERVER-50206: Remove usage of this non-causally consistent accessor.
-     */
-    std::shared_ptr<Shard> _getShardForRSNameNoReload(const std::string& name) const;
-
     using LatestConnStrings = stdx::unordered_map<ShardId, ConnectionString, ShardId::Hasher>;
 
-    std::pair<std::vector<LatestConnStrings::value_type>, Increment> _getLatestConnStrings() const;
+    std::vector<LatestConnStrings::value_type> _getLatestConnStrings() const;
 
     void _removeReplicaSet(const std::string& setName);
 
     void _initializeCacheIfNecessary() const;
 
-    void _periodicReload(const executor::TaskExecutor::CallbackArgs& cbArgs);
+    void _initConfigShard(WithLock, const ConnectionString& configCS);
+
+    SharedSemiFuture<Cache::ValueHandle> _reloadAsync();
+
+    Status _pingForNewTopologyTime(OperationContext* opCtx);
+
+    ServiceContext* _service{nullptr};
 
     /**
      * Factory to create shards.  Never changed after startup so safe to access outside of _mutex.
@@ -443,7 +536,7 @@ private:
      * Specified in the ShardRegistry c-tor. It's used only in init() to initialize the config
      * shard.
      */
-    const ConnectionString _initConfigServerCS;
+    const boost::optional<ConnectionString> _initConfigServerCS;
 
     /**
      * A list of callbacks to be called asynchronously when it has been discovered that a shard was
@@ -455,19 +548,13 @@ private:
     ThreadPool _threadPool;
 
     // Executor for periodically reloading the registry (ie. in which _periodicReload() runs).
-    std::unique_ptr<executor::TaskExecutor> _executor{};
+    std::shared_ptr<executor::TaskExecutor> _executor{};
 
-    mutable Mutex _cacheMutex = MONGO_MAKE_LATCH("ShardRegistry::_cacheMutex");
+    mutable stdx::mutex _cacheMutex;
     std::unique_ptr<Cache> _cache;
 
-    // Counters for incrementing the rsmIncrement and forceReloadIncrement fields of the Time used
-    // by the _cache.  See the comments for these fields in the Time class above for an explanation
-    // of their purpose.
-    AtomicWord<Increment> _rsmIncrement{0};
-    AtomicWord<Increment> _forceReloadIncrement{0};
-
     // Protects _configShardData, and _latestNewConnStrings.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ShardRegistry::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Store a reference to the configShard.
     ShardRegistryData _configShardData;
@@ -477,13 +564,8 @@ private:
 
     AtomicWord<bool> _isInitialized{false};
 
-    // The ShardRegistry is "up" once there has been a successful refresh.
-    AtomicWord<bool> _isUp{false};
-
     // Set to true in shutdown call to prevent calling it twice.
     AtomicWord<bool> _isShutdown{false};
-
-    ServiceContext* _service{nullptr};
 };
 
 }  // namespace mongo

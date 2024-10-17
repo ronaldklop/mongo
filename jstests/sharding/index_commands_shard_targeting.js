@@ -3,17 +3,26 @@
  * that have chunks for the collection. Also test that the commands fail if they are run
  * when the critical section is in progress, and block until the critical section is over.
  */
-(function() {
-"use strict";
-
-load('jstests/libs/chunk_manipulation_util.js');
-load("jstests/libs/fail_point_util.js");
-load("jstests/sharding/libs/sharded_index_util.js");
-load("jstests/sharding/libs/shard_versioning_util.js");
-load("jstests/libs/parallelTester.js");  // For Thread.
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {ShardVersioningUtil} from "jstests/sharding/libs/shard_versioning_util.js";
+import {ShardedIndexUtil} from "jstests/sharding/libs/sharded_index_util.js";
 
 // Test deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;
+
+// This test connects directly to shards and creates collections.
+TestData.skipCheckShardFilteringMetadata = true;
+
+// Do not check metadata consistency as collections on non-primary shards are created for testing
+// purposes.
+TestData.skipCheckMetadataConsistency = true;
 
 /*
  * Runs the command after performing chunk operations to make the primary shard (shard0) not own
@@ -55,7 +64,8 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
     // (no chunks).
     ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard0, ns, latestCollectionVersion);
 
-    // Assert that the targeted shards have the latest collection version after the command is run.
+    // Assert that the targeted shards have the latest collection version after the command is
+    // run.
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard1, ns, latestCollectionVersion);
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard2, ns, latestCollectionVersion);
 }
@@ -66,7 +76,7 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
  * the given command function. Asserts that the command is blocked behind the critical section.
  */
 function assertCommandBlocksIfCriticalSectionInProgress(
-    st, staticMongod, dbName, collName, testCase) {
+    st, staticMongod, dbName, collName, allShards, testCase) {
     const ns = dbName + "." + collName;
     const fromShard = st.shard0;
     const toShard = st.shard1;
@@ -93,6 +103,10 @@ function assertCommandBlocksIfCriticalSectionInProgress(
     // It could be possible that the following check fails on slow clusters because the request
     // expired its maxTimeMS on the mongos before to reach the shard.
     checkLog.checkContainsOnceJsonStringMatch(st.shard0, 22062, "error", "MaxTimeMSExpired");
+
+    allShards.forEach(function(shard) {
+        testCase.assertCommandDidNotRunOnShard(shard);
+    });
 
     // Turn off the fail point and wait for moveChunk to complete.
     unpauseMoveChunkAtStep(fromShard, moveChunkStepNames.chunkDataCommitted);
@@ -180,23 +194,10 @@ const testCases = {
             }
         };
     },
-    collMod: collName => {
-        return {
-            command: {collMod: collName, validator: {x: {$type: "string"}}},
-            assertCommandRanOnShard: (shard) => {
-                assert.commandFailedWithCode(
-                    shard.getCollection(dbName + "." + collName).insert({x: 1}),
-                    ErrorCodes.DocumentValidationFailure);
-            },
-            assertCommandDidNotRunOnShard: (shard) => {
-                assert.commandWorked(shard.getCollection(dbName + "." + collName).insert({x: 1}));
-            }
-        };
-    },
 };
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 // Test that the index commands send and check shard vesions, and only target the shards
 // that own chunks for the collection.
@@ -231,13 +232,9 @@ for (const command of Object.keys(testCases)) {
     let testCase = testCases[command](collName);
 
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: shardKey}));
-    assertCommandBlocksIfCriticalSectionInProgress(st, staticMongod, dbName, collName, testCase);
-
-    allShards.forEach(function(shard) {
-        testCase.assertCommandDidNotRunOnShard(shard);
-    });
+    assertCommandBlocksIfCriticalSectionInProgress(
+        st, staticMongod, dbName, collName, allShards, testCase);
 }
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

@@ -27,26 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
 
 #include <algorithm>
-#include <array>
-#include <cmath>
-#include <memory>
+#include <cstddef>
 #include <string>
 #include <utility>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/config.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
-#include "mongo/platform/decimal128.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/hex.h"
+#include "mongo/util/shared_buffer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace {
 std::string initTestData();
@@ -703,7 +706,7 @@ const std::string data2 = R"VOGON(
           "extjson": "{\"d\" : {\"$numberDecimal\" : \"1.0000000000000000000000000E+6136\"}}"
         },
 )VOGON";
-const std::string data3 = R"VOGON(        
+const std::string data3 = R"VOGON(
         {
           "description": "[decq620] fold-down full sequence",
           "bson": "18000000136400000000A1EDCCCE1BC2D300000000FE5F00",
@@ -3460,7 +3463,7 @@ const std::string data12 = R"VOGON(
             "bson": "180000001364000A00000000000000000000000000FE5F00",
             "extjson": "{\"d\" : {\"$numberDecimal\" : \"1E+6112\"}}",
             "canonical_extjson": "{\"d\" : {\"$numberDecimal\" : \"1.0E+6112\"}}"
-        }   
+        }
     ]
 })VOGON";
 

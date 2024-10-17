@@ -28,7 +28,20 @@
  */
 #pragma once
 
+#include <boost/smart_ptr.hpp>
+#include <new>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/static_immortal.h"
 
 namespace mongo {
@@ -61,7 +74,7 @@ class CancellationState : public RefCountable {
 public:
     CancellationState() = default;
 
-    ~CancellationState() {
+    ~CancellationState() override {
         auto state = _state.load();
         invariant(state == State::kCanceled || state == State::kDismissed);
         invariant(_cancellationPromise.getFuture().isReady());
@@ -88,7 +101,7 @@ public:
     }
 
     bool isCanceled() const {
-        return _state.loadRelaxed() == State::kCanceled;
+        return _state.load() == State::kCanceled;
     }
 
     SharedSemiFuture<void> onCancel() const {
@@ -99,7 +112,7 @@ public:
      * Returns true if neither cancel() nor dismiss() has been called.
      */
     bool isCancelable() const {
-        return _state.loadRelaxed() == State::kInit;
+        return _state.load() == State::kInit;
     }
 
 private:
@@ -125,7 +138,7 @@ class CancellationStateHolder : public RefCountable {
 public:
     CancellationStateHolder() = default;
 
-    ~CancellationStateHolder() {
+    ~CancellationStateHolder() override {
         _state->dismiss();
     }
 

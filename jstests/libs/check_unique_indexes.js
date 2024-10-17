@@ -4,7 +4,7 @@
  * Verifies that all unique indexes belonging to all collections on all databases on the server
  * are in correct data format version.
  */
-function checkUniqueIndexFormatVersion(adminDB) {
+export function checkUniqueIndexFormatVersion(adminDB) {
     // Data format version is WiredTiger specific and not required to be tested for other
     // storage engines.
     const isWiredTiger =
@@ -12,7 +12,7 @@ function checkUniqueIndexFormatVersion(adminDB) {
     if (!isWiredTiger)
         return;
 
-    res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
+    let res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
     let databaseList = res.databases;
 
     databaseList.forEach(function(database) {
@@ -29,21 +29,19 @@ function checkUniqueIndexFormatVersion(adminDB) {
 
             let currentCollection = currentDatabase.getCollection(c.name);
             currentCollection.getIndexes().forEach(function(index) {
-                if (index.unique) {
+                if (index.unique && !index.clustered) {
                     let ifv = currentCollection.aggregate({$collStats: {storageStats: {}}})
                                   .next()
                                   .storageStats.indexDetails[index.name]
                                   .metadata.formatVersion;
                     if (index.v === 2) {
-                        assert.eq(
-                            ifv,
-                            12,
-                            "Expected index format version 12 for unique index: " + tojson(index));
+                        assert(ifv == 12 || ifv == 14,
+                               "Expected index format version 12 or 14 for unique index: " +
+                                   tojson(index));
                     } else {
-                        assert.eq(
-                            ifv,
-                            11,
-                            "Expected index format version 11 for unique index: " + tojson(index));
+                        assert(ifv == 11 || ifv == 13,
+                               "Expected index format version 11 or 13 for unique index: " +
+                                   tojson(index));
                     }
                 }
             });

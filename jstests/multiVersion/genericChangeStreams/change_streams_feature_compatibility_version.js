@@ -1,11 +1,6 @@
-// Test that a change stream is able to survive an upgrade. This is the most basic test to
-// demonstrate the survival of a stream, presuming the driver will attempt to retry and resume the
-// stream after network errors.
-// @tags: [uses_change_streams, requires_majority_read_concern]
-(function() {
-"use strict";
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load("jstests/multiVersion/libs/multi_rs.js");  // For upgradeSet.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function runTest(downgradeVersion) {
     jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
@@ -64,7 +59,8 @@ function runTest(downgradeVersion) {
     });
 
     // Explicitly set feature compatibility version to the latest FCV.
-    assert.commandWorked(testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
     const streamStartedOnNewVersion = coll.watch();
 
@@ -103,4 +99,3 @@ function runTest(downgradeVersion) {
 
 runTest("last-continuous");
 runTest("last-lts");
-}());

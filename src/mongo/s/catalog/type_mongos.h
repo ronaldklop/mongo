@@ -29,10 +29,16 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/time_support.h"
@@ -51,12 +57,14 @@ public:
 
     // Field names and types in the mongos collection type.
     static const BSONField<std::string> name;
+    static const BSONField<Date_t> created;
     static const BSONField<Date_t> ping;
     static const BSONField<long long> uptime;
     static const BSONField<bool> waiting;
     static const BSONField<std::string> mongoVersion;
     static const BSONField<long long> configVersion;
     static const BSONField<BSONArray> advisoryHostFQDNs;
+    static const BSONField<bool> embeddedRouter;
 
     /**
      * Returns the BSON representation of the entry.
@@ -85,6 +93,11 @@ public:
     }
     void setName(const std::string& name);
 
+    const Date_t& getCreated() const {
+        return _created.get();
+    }
+    void setCreated(const Date_t& created);
+
     const Date_t& getPing() const {
         return _ping.get();
     }
@@ -93,7 +106,7 @@ public:
     long long getUptime() const {
         return _uptime.get();
     }
-    void setUptime(const long long uptime);
+    void setUptime(long long uptime);
 
     bool getWaiting() const {
         return _waiting.get();
@@ -101,7 +114,7 @@ public:
     bool isWaitingSet() const {
         return _waiting.is_initialized();
     }
-    void setWaiting(const bool waiting);
+    void setWaiting(bool waiting);
 
     const std::string& getMongoVersion() const {
         return _mongoVersion.get();
@@ -114,24 +127,36 @@ public:
     long long getConfigVersion() const {
         return _configVersion.get();
     }
-    void setConfigVersion(const long long configVersion);
+    void setConfigVersion(long long configVersion);
 
     std::vector<std::string> getAdvisoryHostFQDNs() const {
         return _advisoryHostFQDNs.value_or(std::vector<std::string>());
     }
     void setAdvisoryHostFQDNs(const std::vector<std::string>& advisoryHostFQDNs);
 
+    /**
+     * True if this instance is defined by a router port of a mongod. Otherwise, false.
+     */
+    bool isEmbeddedRouter() const {
+        return _embeddedRouter;
+    }
+    void setEmbeddedRouter(bool embeddedRouter);
+
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial rule.
 
     // (M) "host:port" for this mongos
     boost::optional<std::string> _name;
+    // (M) Time of mongos creation
+    boost::optional<Date_t> _created;
     // (M) last time it was seen alive
     boost::optional<Date_t> _ping;
     // (M) uptime at the last ping
     boost::optional<long long> _uptime;
     // (M) used to indicate if we are going to sleep after ping. For testing purposes
     boost::optional<bool> _waiting;
+    // (O) used to indicate if this router is part of a mongod. Default to false.
+    bool _embeddedRouter = false;
     // (O) the mongodb version of the pinging mongos
     boost::optional<std::string> _mongoVersion;
     // (O) the config version of the pinging mongos

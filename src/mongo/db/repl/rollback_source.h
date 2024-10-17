@@ -85,14 +85,14 @@ public:
      * Fetch a single document from the sync source using the UUID. Returns the namespace matching
      * the UUID on the sync source as well.
      */
-    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+    virtual std::pair<BSONObj, NamespaceString> findOneByUUID(const DatabaseName& db,
                                                               UUID uuid,
                                                               const BSONObj& filter) const = 0;
 
     /**
      * Finds and returns collection info using the UUID.
      */
-    virtual StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    virtual StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                         const UUID& uuid) const = 0;
 
     /**

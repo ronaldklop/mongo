@@ -6,10 +6,11 @@
 // @tags: [
 //   do_not_wrap_aggregations_in_facets,
 // ]
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For 'aggPlanHasStage' and other explain helpers.
+import {
+    hasRejectedPlans,
+    isQueryPlan,
+    planHasStage,
+} from "jstests/libs/query/analyze_plan.js";
 
 const coll = db.use_query_sort;
 coll.drop();
@@ -34,15 +35,6 @@ function assertHasBlockingQuerySort(pipeline, expectRejectedPlans) {
     assert(isQueryPlan(explainOutput), explainOutput);
     assert(planHasStage(db, explainOutput, "SORT"), explainOutput);
     assert.eq(expectRejectedPlans, hasRejectedPlans(explainOutput), explainOutput);
-}
-
-function assertDoesNotHaveQuerySort(pipeline, expectRejectedPlans) {
-    const explainOutput = coll.explain().aggregate(pipeline);
-    assert(isAggregationPlan(explainOutput), explainOutput);
-    assert(aggPlanHasStage(explainOutput, "$sort"), explainOutput);
-    assert(!aggPlanHasStage(explainOutput, "SORT"), explainOutput);
-    assert.eq(expectRejectedPlans, hasRejectedPlans(explainOutput), explainOutput);
-    return explainOutput;
 }
 
 // Test that a sort on _id can use the query system to provide the sort. Since the sort and match
@@ -87,4 +79,3 @@ assertHasBlockingQuerySort(
 // sort is currently a supported way to randomize the order of the data, it shouldn't preclude
 // pushdown of the sort into the plan stage layer.
 assertHasBlockingQuerySort([{$sort: {key: {$meta: "randVal"}}}], false);
-}());

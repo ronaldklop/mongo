@@ -27,11 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
 #include "mongo/db/exec/sbe/stages/sorted_merge.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo::sbe {
 /**
@@ -55,7 +73,7 @@ public:
         const int numSlots = checkNumSlots(inputStreams);
         invariant(numKeySlots < numSlots);
 
-        std::vector<std::unique_ptr<PlanStage>> inputScans;
+        PlanStage::Vector inputScans;
         std::vector<value::SlotVector> inputSlots;
         for (auto&& array : inputStreams) {
             auto [tag, val] = stage_builder::makeValue(array);

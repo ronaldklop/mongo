@@ -2,7 +2,7 @@
 
 assert(db.getName() == "test");
 
-t = db.bg1;
+let t = db.bg1;
 t.drop();
 
 var a = new Mongo(db.getMongo().host).getDB(db.getName());
@@ -18,7 +18,7 @@ for (var i = 0; i < 100000; i++) {
 }
 
 // start bg indexing
-a.bg1.createIndex({i: 1}, {name: "i_1", background: true});
+a.bg1.createIndex({i: 1}, {name: "i_1"});
 
 // add more data
 bulk = t.initializeUnorderedBulkOp();

@@ -29,18 +29,36 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/match_details.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -52,6 +70,7 @@ namespace mongo {
 extern FailPoint disableMatchExpressionOptimization;
 
 class CollatorInterface;
+
 class MatchExpression;
 class TreeMatchExpression;
 
@@ -107,6 +126,7 @@ public:
 
         // Expressions that are only created internally
         INTERNAL_2D_POINT_IN_ANNULUS,
+        INTERNAL_BUCKET_GEO_WITHIN,
 
         // Used to represent expression language comparisons in a match expression tree, since $eq,
         // $gt, $gte, $lt and $lte in the expression language has different semantics than their
@@ -117,10 +137,14 @@ public:
         INTERNAL_EXPR_LT,
         INTERNAL_EXPR_LTE,
 
+        // Used to represent the comparison to a hashed index key value.
+        INTERNAL_EQ_HASHED_KEY,
+
         // JSON Schema expressions.
         INTERNAL_SCHEMA_ALLOWED_PROPERTIES,
         INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
         INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
+        INTERNAL_SCHEMA_BIN_DATA_FLE2_ENCRYPTED_TYPE,
         INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
         INTERNAL_SCHEMA_COND,
         INTERNAL_SCHEMA_EQ,
@@ -137,6 +161,7 @@ public:
         INTERNAL_SCHEMA_TYPE,
         INTERNAL_SCHEMA_UNIQUE_ITEMS,
         INTERNAL_SCHEMA_XOR,
+
     };
 
     /**
@@ -207,6 +232,7 @@ public:
 
     using Iterator = MatchExpressionIterator<false>;
     using ConstIterator = MatchExpressionIterator<true>;
+    using InputParamId = int32_t;
 
     /**
      * Tracks the information needed to generate a document validation error for a
@@ -229,17 +255,41 @@ public:
         };
 
         /**
+         * JSON Schema annotations - 'title' and 'description' attributes.
+         */
+        struct SchemaAnnotations {
+            /**
+             * Constructs JSON schema annotations with annotation fields not set.
+             */
+            SchemaAnnotations() {}
+
+            /**
+             * Constructs JSON schema annotations from JSON Schema element 'jsonSchemaElement'.
+             */
+            SchemaAnnotations(const BSONObj& jsonSchemaElement);
+
+            void appendElements(BSONObjBuilder& builder) const;
+
+            boost::optional<std::string> title;
+            boost::optional<std::string> description;
+        };
+
+        /**
          * Constructs an annotation for a MatchExpression which does not contribute to error output.
          */
-        ErrorAnnotation(Mode mode) : tag(""), annotation(BSONObj()), mode(mode) {
+        ErrorAnnotation(Mode mode)
+            : tag(""), annotation(BSONObj()), mode(mode), schemaAnnotations(SchemaAnnotations()) {
             invariant(mode != Mode::kGenerateError);
         }
 
         /**
          * Constructs a complete annotation for a MatchExpression which contributes to error output.
          */
-        ErrorAnnotation(std::string tag, BSONObj annotation)
-            : tag(std::move(tag)), annotation(annotation.getOwned()), mode(Mode::kGenerateError) {}
+        ErrorAnnotation(std::string tag, BSONObj annotation, BSONObj schemaAnnotationsObj)
+            : tag(std::move(tag)),
+              annotation(annotation.getOwned()),
+              mode(Mode::kGenerateError),
+              schemaAnnotations(SchemaAnnotations(schemaAnnotationsObj)) {}
 
         std::unique_ptr<ErrorAnnotation> clone() const {
             return std::make_unique<ErrorAnnotation>(*this);
@@ -252,6 +302,7 @@ public:
         // Tracks the original expression as specified by the user.
         const BSONObj annotation;
         const Mode mode;
+        const SchemaAnnotations schemaAnnotations;
     };
 
     /**
@@ -262,23 +313,10 @@ public:
      *   - a pointer to a new MatchExpression.
      *
      * The value of 'expression' must not be nullptr.
+     * 'enableSimplification' parameter controls Boolean Expression Simplifier.
      */
-    static std::unique_ptr<MatchExpression> optimize(std::unique_ptr<MatchExpression> expression) {
-        // If the disableMatchExpressionOptimization failpoint is enabled, optimizations are skipped
-        // and the expression is left unmodified.
-        if (MONGO_unlikely(disableMatchExpressionOptimization.shouldFail())) {
-            return expression;
-        }
-
-        auto optimizer = expression->getOptimizer();
-
-        try {
-            return optimizer(std::move(expression));
-        } catch (DBException& ex) {
-            ex.addContext("Failed to optimize expression");
-            throw;
-        }
-    }
+    static std::unique_ptr<MatchExpression> optimize(std::unique_ptr<MatchExpression> expression,
+                                                     bool enableSimplification = true);
 
     /**
      * Traverses expression tree post-order. Sorts children at each non-leaf node by (MatchType,
@@ -289,11 +327,34 @@ public:
     /**
      * Convenience method which normalizes a MatchExpression tree by optimizing and then sorting it.
      */
-    static std::unique_ptr<MatchExpression> normalize(std::unique_ptr<MatchExpression> tree) {
-        tree = optimize(std::move(tree));
-        sortTree(tree.get());
-        return tree;
-    }
+    static std::unique_ptr<MatchExpression> normalize(std::unique_ptr<MatchExpression> tree,
+                                                      bool enableSimplification = true);
+
+    /**
+     * Assigns an optional input parameter ID to each node which is eligible for
+     * auto-parameterization.
+     * - tree - The MatchExpression to be parameterized.
+     * - maxParamCount - Optional maximum number of parameters that can be created. If the
+     *   number of parameters would exceed this value, no parameterization will be performed.
+     * - startingParamId - Optional first parameter ID to use. This enables parameterizing a forest
+     *   of match expressions, where each tree continues IDs where the prior one left off.
+     * - parameterized - Optional output argument. If non-null, the method sets this output to
+     *   indicate whether parameterization was actually done.
+     *
+     * Returns a vector-form map to a parameterized MatchExpression from assigned InputParamId. (The
+     * vector index serves as the map key.)
+     */
+    static std::vector<const MatchExpression*> parameterize(
+        MatchExpression* tree,
+        boost::optional<size_t> maxParamCount = boost::none,
+        InputParamId startingParamId = 0,
+        bool* parameterized = nullptr);
+
+    /**
+     * Sets max param count in MatchExpression::parameterize to 0, clearing MatchExpression
+     * auto-parameterization before CanonicalQuery to ABT translation.
+     */
+    static std::vector<const MatchExpression*> unparameterize(MatchExpression* tree);
 
     MatchExpression(MatchType type, clonable_ptr<ErrorAnnotation> annotation = nullptr);
     virtual ~MatchExpression() {}
@@ -321,19 +382,26 @@ public:
      */
     virtual MatchExpression* getChild(size_t index) const = 0;
 
+
     /**
-     * For MatchExpression nodes that can participate in tree restructuring (like AND/OR), returns a
-     * non-const vector of MatchExpression* child nodes. If the MatchExpression does not
-     * participated in tree restructuring, returns boost::none.
-     * Do not use to traverse the MatchExpression tree. Use numChildren() and getChild(), which
-     * provide access to all nodes.
+     * Delegates to the specified child unique_ptr's reset() method in order to replace child
+     * expressions while traversing the tree.
+     */
+    virtual void resetChild(size_t index, MatchExpression* other) = 0;
+
+    /**
+     * For MatchExpression nodes that can participate in tree restructuring (like AND/OR),
+     * returns a non-const vector of MatchExpression* child nodes. If the MatchExpression does
+     * not participated in tree restructuring, returns boost::none. Do not use to traverse the
+     * MatchExpression tree. Use numChildren() and getChild(), which provide access to all
+     * nodes.
      */
     virtual std::vector<std::unique_ptr<MatchExpression>>* getChildVector() = 0;
 
     /**
      * Get the path of the leaf.  Returns StringData() if there is no path (node is logical).
      */
-    virtual const StringData path() const {
+    virtual StringData path() const {
         return StringData();
     }
     /**
@@ -363,7 +431,7 @@ public:
      * also ensure that the buffer held by the underlying BSONObj will not be destroyed during the
      * lifetime of the clone.
      */
-    virtual std::unique_ptr<MatchExpression> shallowClone() const = 0;
+    virtual std::unique_ptr<MatchExpression> clone() const = 0;
 
     // XXX document
     virtual bool equivalent(const MatchExpression* other) const = 0;
@@ -429,24 +497,42 @@ public:
     void setCollator(const CollatorInterface* collator);
 
     /**
-     * Add the fields required for matching to 'deps'.
+     * Serialize the MatchExpression to BSON, appending to 'out'.
+     *
+     * See 'SerializationOptions' for some options.
+     *
+     * Generally, the output of this method is expected to be a valid query object that, when
+     * parsed, produces a logically equivalent MatchExpression. However, if special options are set,
+     * this no longer holds.
+     *
+     * If 'options.literalPolicy' is set to 'kToDebugTypeString', the result is no longer expected
+     * to re-parse, since we will put strings in places where strings may not be accpeted
+     * syntactically (e.g. a number is always expected, as in with the $mod expression).
+     *
+     * includePath:
+     * If set to false, serializes without including the path. For example {a: {$gt: 2}} would
+     * serialize as just {$gt: 2}.
+     *
+     * It is expected that most callers want to set 'includePath' to true to get a correct
+     * serialization. Internally, we may set this to false if we have a situation where an outer
+     * expression serializes a path and we don't want to repeat the path in the inner expression.
+
+     * For example in {a: {$elemMatch: {$eq: 2}}} the "a" is serialized by the $elemMatch, and
+     * should not be serialized by the EQ child.
+     * The $elemMatch will serialize {a: {$elemMatch: <recurse>}} and the EQ will serialize just
+     * {$eq: 2} instead of its usual {a: {$eq: 2}}.
      */
-    void addDependencies(DepsTracker* deps) const;
+    virtual void serialize(BSONObjBuilder* out,
+                           const SerializationOptions& options = {},
+                           bool includePath = true) const = 0;
 
     /**
-     * Serialize the MatchExpression to BSON, appending to 'out'. Output of this method is expected
-     * to be a valid query object, that, when parsed, produces a logically equivalent
-     * MatchExpression. If 'includePath' is false then the serialization should assume it's in a
-     * context where the path has been serialized elsewhere, such as within an $elemMatch value.
+     * Convenience method which serializes this MatchExpression to a BSONObj. See the override with
+     * a BSONObjBuilder* argument for details.
      */
-    virtual void serialize(BSONObjBuilder* out, bool includePath = true) const = 0;
-
-    /**
-     * Convenience method which serializes this MatchExpression to a BSONObj.
-     */
-    BSONObj serialize(bool includePath = true) const {
+    BSONObj serialize(const SerializationOptions& options = {}, bool includePath = true) const {
         BSONObjBuilder bob;
-        serialize(&bob, includePath);
+        serialize(&bob, options, includePath);
         return bob.obj();
     }
 
@@ -504,6 +590,13 @@ public:
      */
     std::string toString() const;
 
+    /**
+     * Returns true of the match type represents a node that
+     * (1) has a path and
+     * (2) has children that can operate on that path.
+     */
+    static bool isInternalNodeWithPath(MatchType m);
+
 protected:
     /**
      * An ExpressionOptimizerFunc implements tree simplifications for a MatchExpression tree with a
@@ -520,9 +613,17 @@ protected:
      */
     virtual void _doSetCollator(const CollatorInterface* collator){};
 
-    virtual void _doAddDependencies(DepsTracker* deps) const {}
-
     void _debugAddSpace(StringBuilder& debug, int indentationLevel) const;
+
+    /** Adds the tag information to the debug string. */
+    void _debugStringAttachTagInfo(StringBuilder* debug) const {
+        MatchExpression::TagData* td = getTag();
+        if (nullptr != td) {
+            td->debugString(debug);
+        } else {
+            *debug << "\n";
+        }
+    }
 
     clonable_ptr<ErrorAnnotation> _errorAnnotation;
 

@@ -7,10 +7,8 @@
 // 5. Kill the stepDown operation.
 // 6. Writes should become allowed again and the primary should stay primary.
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = "interruptStepDown";
 var replSet = new ReplSetTest({name: name, nodes: 3});
@@ -26,6 +24,10 @@ replSet.initiate({
 });
 
 replSet.waitForState(replSet.nodes[0], ReplSetTest.State.PRIMARY);
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(replSet.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replSet.awaitReplication();
 
 var secondary = replSet.getSecondary();
 jsTestLog('Disable replication on the SECONDARY ' + secondary.host);
@@ -81,4 +83,3 @@ assert.eq(0, exitCode);
 assert.commandWorked(primary.getDB(name).foo.remove({}));
 restartServerReplication(secondary);
 replSet.stopSet();
-})();

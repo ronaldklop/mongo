@@ -29,53 +29,70 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/drop_database_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-class DropDatabaseCoordinator final : public ShardingDDLCoordinator {
+class DropDatabaseCoordinator final
+    : public RecoverableShardingDDLCoordinator<DropDatabaseCoordinatorDocument,
+                                               DropDatabaseCoordinatorPhaseEnum> {
+
 public:
     using StateDoc = DropDatabaseCoordinatorDocument;
     using Phase = DropDatabaseCoordinatorPhaseEnum;
 
-    DropDatabaseCoordinator(const BSONObj& initialState);
-    ~DropDatabaseCoordinator() = default;
+    DropDatabaseCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "DropDatabaseCoordinator", initialState),
+          _dbName(nss().dbName()),
+          _critSecReason(BSON("dropDatabase" << DatabaseNameUtil::serialize(
+                                  _dbName, SerializationContext::stateCommandRequest()))) {}
+    ~DropDatabaseCoordinator() override = default;
 
-    void checkIfOptionsConflict(const BSONObj& doc) const override {}
-
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void checkIfOptionsConflict(const BSONObj& doc) const final {}
 
 private:
+    StringData serializePhase(const Phase& phase) const override {
+        return DropDatabaseCoordinatorPhase_serializer(phase);
+    }
+
+    bool _mustAlwaysMakeProgress() override {
+        return _doc.getPhase() > Phase::kUnset;
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
+    void _dropShardedCollection(OperationContext* opCtx,
+                                const CollectionType& coll,
+                                std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                const CancellationToken& token);
 
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
+    void _clearDatabaseInfoOnPrimary(OperationContext* opCtx);
 
-    void _insertStateDocument(OperationContext* opCtx, StateDoc&& doc);
-    void _updateStateDocument(OperationContext* opCtx, StateDoc&& newStateDoc);
-    void _removeStateDocument();
-    void _enterPhase(Phase newPhase);
+    void _clearDatabaseInfoOnSecondaries(OperationContext* opCtx);
 
-    DropDatabaseCoordinatorDocument _doc;
-    StringData _dbName;
+    DatabaseName _dbName;
+
+    const BSONObj _critSecReason;
 };
 
 }  // namespace mongo

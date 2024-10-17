@@ -30,8 +30,14 @@
 #pragma once
 
 
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
@@ -48,7 +54,7 @@ public:
               long long toSkip,
               WorkingSet* ws,
               std::unique_ptr<PlanStage> child);
-    ~SkipStage();
+    ~SkipStage() override;
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -66,8 +72,13 @@ public:
 private:
     WorkingSet* _ws;
 
-    // We drop the first _toSkip results that we would have returned.
-    long long _toSkip;
+    // The number of results left to skip. This number is decremented during query execution as we
+    // successfully skip a document.
+    long long _leftToSkip;
+
+    // Represents the number of results to skip. Unlike '_leftToSkip', this remains constant and
+    // is used when gathering statistics in explain.
+    const long long _skipAmount;
 
     // Stats
     SkipStats _specificStats;

@@ -1,13 +1,6 @@
 // Tests that given a $text stage before a $lookup stage, the $lookup's subpipeline cannot
 // reference the text score metadata from that $text search.
-// TODO SERVER-29159: Enable test on passthroughs with sharded collections.
-// @tags: [
-//   assumes_unsharded_collection,
-// ]
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const outer = db.outer;
 const inner = db.inner;
@@ -108,4 +101,3 @@ pipeline = [
     ];
 
 assertErrorCode(outer, pipeline, kNoTextScoreAvailableErrCode);
-}());

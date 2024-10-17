@@ -1,6 +1,4 @@
-(function() {
-// Test applyOps behavior for collection creation with explicit UUIDs.
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 1});
 replTest.startSet();
@@ -47,4 +45,3 @@ jsTestLog("Check that test.foo no longer exists");
 assert.eq(
     db.getCollectionInfos({name: "foo"}).length, 0, "expected foo collection to no longer exist");
 replTest.stopSet();
-}());

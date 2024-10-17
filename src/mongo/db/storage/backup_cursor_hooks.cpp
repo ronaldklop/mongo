@@ -27,17 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/storage/backup_cursor_hooks.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/backup_cursor_hooks.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
 namespace {
-BackupCursorHooks::InitializerFunction initializer = [](StorageEngine* storageEngine) {
+BackupCursorHooks::InitializerFunction initializer = []() {
     return std::make_unique<BackupCursorHooks>();
 };
 
@@ -52,8 +53,8 @@ void BackupCursorHooks::registerInitializer(InitializerFunction func) {
     initializer = func;
 }
 
-void BackupCursorHooks::initialize(ServiceContext* service, StorageEngine* storageEngine) {
-    getBackupCursorHooks(service).ptr = initializer(storageEngine);
+void BackupCursorHooks::initialize(ServiceContext* service) {
+    getBackupCursorHooks(service).ptr = initializer();
 }
 
 BackupCursorHooks* BackupCursorHooks::get(ServiceContext* service) {
@@ -95,4 +96,14 @@ BackupCursorExtendState BackupCursorHooks::extendBackupCursor(OperationContext* 
 bool BackupCursorHooks::isBackupCursorOpen() const {
     return false;
 }
+
+bool BackupCursorHooks::isFileReturnedByCursor(const UUID& backupId,
+                                               boost::filesystem::path filePath) {
+    MONGO_UNREACHABLE;
+}
+
+void BackupCursorHooks::addFile(const UUID& backupId, boost::filesystem::path filePath) {
+    MONGO_UNREACHABLE;
+}
+
 }  // namespace mongo

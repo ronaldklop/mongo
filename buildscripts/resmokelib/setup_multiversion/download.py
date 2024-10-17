@@ -1,15 +1,17 @@
 """Helper functions to download."""
+
 import contextlib
 import errno
 import glob
 import os
 import shutil
 import tarfile
-import tempfile
 import zipfile
 
 import requests
 import structlog
+
+from buildscripts.resmokelib.utils.filesystem import build_hygienic_bin_path, mkdtemp_in_build_dir
 
 S3_BUCKET = "mciuploads"
 
@@ -26,13 +28,13 @@ def download_from_s3(url):
     """Download file from S3 bucket by a given URL."""
 
     if not url:
-        raise DownloadError("Download URL not found.")
+        raise DownloadError("Download URL not found")
 
     LOGGER.info("Downloading.", url=url)
-    filename = os.path.join(tempfile.gettempdir(), url.split('/')[-1].split('?')[0])
+    filename = os.path.join(mkdtemp_in_build_dir(), url.split("/")[-1].split("?")[0])
 
     with requests.get(url, stream=True) as reader:
-        with open(filename, 'wb') as file_handle:
+        with open(filename, "wb") as file_handle:
             shutil.copyfileobj(reader.raw, file_handle)
 
     return filename
@@ -67,7 +69,7 @@ def extract_archive(archive_file, install_dir):
     """Uncompress file and return root of extracted directory."""
 
     LOGGER.info("Extracting archive data.", archive=archive_file, install_dir=install_dir)
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = mkdtemp_in_build_dir()
     archive_name = os.path.basename(archive_file)
     _, file_suffix = os.path.splitext(archive_name)
 
@@ -91,11 +93,8 @@ def extract_archive(archive_file, install_dir):
 
     try:
         os.makedirs(install_dir)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST and os.path.isdir(install_dir):
-            pass
-        else:
-            raise
+    except FileExistsError:
+        pass
 
     _rsync_move_dir(temp_dir, install_dir)
     shutil.rmtree(temp_dir)
@@ -105,23 +104,38 @@ def extract_archive(archive_file, install_dir):
     return install_dir
 
 
-def symlink_version(suffix, installed_dir, link_dir):
-    """Symlink the binaries in the 'installed_dir' to the 'link_dir'."""
+def mkdir_p(path):
+    """Python equivalent of `mkdir -p`."""
     try:
-        os.makedirs(link_dir)
+        os.makedirs(path)
     except OSError as exc:
-        if exc.errno == errno.EEXIST and os.path.isdir(link_dir):
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
         else:
             raise
 
-    hygienic_bin_dir = os.path.join(installed_dir, "dist-test", "bin")
+
+def symlink_version(suffix, installed_dir, link_dir=None):
+    """
+    Symlink the binaries in the 'installed_dir' to the 'link_dir'.
+
+    If `link_dir` is None, link to the physical executable's directory (`bin_dir`).
+    """
+    hygienic_bin_dir = build_hygienic_bin_path(parent=installed_dir)
     if os.path.isdir(hygienic_bin_dir):
         bin_dir = hygienic_bin_dir
     else:
         bin_dir = installed_dir
 
+    if link_dir is None:
+        link_dir = bin_dir
+    else:
+        mkdir_p(link_dir)
+
     for executable in os.listdir(bin_dir):
+        if executable.endswith(".dll"):
+            LOGGER.debug("Skipping linking DLL", file=executable)
+            continue
 
         executable_name, executable_extension = os.path.splitext(executable)
         if suffix:
@@ -133,11 +147,13 @@ def symlink_version(suffix, installed_dir, link_dir):
             executable = os.path.join(bin_dir, executable)
             executable_link = os.path.join(link_dir, link_name)
 
+            link_method = os.symlink
             if os.name == "nt":
                 # os.symlink is not supported on Windows, use a direct method instead.
                 def symlink_ms(source, symlink_name):
                     """Provide symlink for Windows."""
                     import ctypes
+
                     csl = ctypes.windll.kernel32.CreateSymbolicLinkW
                     csl.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
                     csl.restype = ctypes.c_ubyte
@@ -145,8 +161,8 @@ def symlink_version(suffix, installed_dir, link_dir):
                     if csl(symlink_name, source.replace("/", "\\"), flags) == 0:
                         raise ctypes.WinError()
 
-                os.symlink = symlink_ms
-            os.symlink(executable, executable_link)
+                link_method = symlink_ms
+            link_method(executable, executable_link)
             LOGGER.debug("Symlink created.", executable=executable, executable_link=executable_link)
 
         except OSError as exc:
@@ -156,3 +172,4 @@ def symlink_version(suffix, installed_dir, link_dir):
                 raise
 
     LOGGER.info("Symlinks for all executables are created in the directory.", link_dir=link_dir)
+    return link_dir

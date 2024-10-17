@@ -27,10 +27,34 @@
  *    it in the license file.
  */
 
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string_view>
+
+#include <absl/container/inlined_vector.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/numeric/conversion/converter_policies.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/db/exec/sbe/sbe_unittest.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/exec/sbe/vm/vm_printer.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/golden_test.h"
+#include "mongo/util/represent_as.h"
 
 namespace mongo::sbe {
 
@@ -109,16 +133,33 @@ TEST(SBEValues, Hash) {
 
     value::releaseValue(tagDecimalInf, valDecimalInf);
 
-    auto tagDoubleNan = value::TypeTags::NumberDouble;
-    auto valDoubleNan = value::bitcastFrom<double>(std::numeric_limits<double>::quiet_NaN());
+    auto testDoubleVsDecimal = [](double doubleValue, double decimalValue) {
+        auto tagDouble = value::TypeTags::NumberDouble;
+        auto valDouble = value::bitcastFrom<double>(doubleValue);
 
-    auto [tagDecimalNan, valDecimalNan] =
-        value::makeCopyDecimal(mongo::Decimal128(std::numeric_limits<double>::quiet_NaN()));
+        auto [tagDecimal, valDecimal] = value::makeCopyDecimal(mongo::Decimal128(decimalValue));
+        value::ValueGuard guard{tagDecimal, valDecimal};
 
-    ASSERT_EQUALS(value::hashValue(tagDoubleNan, valDoubleNan),
-                  value::hashValue(tagDecimalNan, valDecimalNan));
+        ASSERT_EQUALS(value::hashValue(tagDouble, valDouble),
+                      value::hashValue(tagDecimal, valDecimal));
+    };
 
-    value::releaseValue(tagDecimalNan, valDecimalNan);
+    // Test bitwise identical NaNs.
+    testDoubleVsDecimal(std::numeric_limits<double>::quiet_NaN(),
+                        std::numeric_limits<double>::quiet_NaN());
+
+    // Test NaNs with different bit representation.
+    if constexpr (std::numeric_limits<double>::has_signaling_NaN) {
+        const auto firstNan = std::numeric_limits<double>::quiet_NaN();
+        const auto secondNan = std::numeric_limits<double>::signaling_NaN();
+        auto getDoubleBits = [](double value) {
+            uint64_t bits = 0;
+            memcpy(&bits, &value, sizeof(value));
+            return bits;
+        };
+        ASSERT_NOT_EQUALS(getDoubleBits(firstNan), getDoubleBits(secondNan));
+        testDoubleVsDecimal(firstNan, secondNan);
+    }
 
     // Start with a relatively large number that still fits in 64 bits.
     int64_t num = 0x7000000000000000;
@@ -212,6 +253,47 @@ TEST(SBEValues, HashCompound) {
         value::releaseValue(tag1, val1);
         value::releaseValue(tag2, val2);
     }
+
+    {
+        auto [tag1, val1] = value::makeNewArraySet();
+        auto set1 = value::getArraySetView(val1);
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-5));
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-6));
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-7));
+
+        auto [tag2, val2] = value::makeNewArraySet();
+        auto set2 = value::getArraySetView(val2);
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-7.0));
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-6.0));
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-5.0));
+
+
+        ASSERT_EQUALS(value::hashValue(tag1, val1), value::hashValue(tag2, val2));
+
+        value::releaseValue(tag1, val1);
+        value::releaseValue(tag2, val2);
+    }
+
+    {
+        auto [tag1, val1] = value::makeNewArrayMultiSet();
+        auto set1 = value::getArrayMultiSetView(val1);
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-5));
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-5));
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-6));
+        set1->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-7));
+
+        auto [tag2, val2] = value::makeNewArrayMultiSet();
+        auto set2 = value::getArrayMultiSetView(val2);
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-7.0));
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-6.0));
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-5.0));
+        set2->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(-5.0));
+
+        ASSERT_EQUALS(value::hashValue(tag1, val1), value::hashValue(tag2, val2));
+
+        value::releaseValue(tag1, val1);
+        value::releaseValue(tag2, val2);
+    }
 }
 
 TEST(SBEVM, Add) {
@@ -225,7 +307,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagInt32, valInt32);
         code.appendConstVal(tagInt64, valInt64);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -243,7 +325,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagInt32, valInt32);
         code.appendConstVal(tagDouble, valDouble);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -260,7 +342,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagDecimal, valDecimal);
         code.appendConstVal(tagDouble, valDouble);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -286,7 +368,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -306,7 +388,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -326,7 +408,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -350,7 +432,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -374,7 +456,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -396,9 +478,96 @@ TEST(SBEVM, ConvertBinDataToBsonObj) {
     array.push_back(binDataTag, binDataVal);
 
     BSONArrayBuilder builder;
-    bson::convertToBsonObj(builder, &array);
+    bson::convertToBsonArr(builder, &array);
     auto convertedBinData = builder.done();
 
     ASSERT_EQ(originalBinData.woCompare(convertedBinData), 0);
+}
+
+TEST(SBEVM, CodeFragmentToStringSanity) {
+    vm::CodeFragment code;
+    auto ptr2str = [](const void* ptr) {
+        std::stringstream ss;
+        ss << ptr;
+        return ss.str();
+    };
+
+    code.appendDiv({}, {});
+    std::string instrs = code.toString();
+
+    ASSERT_TRUE(instrs.find("[" + ptr2str(code.instrs().data()) + "]: div") >= 0);
+}
+
+TEST(SBEVM, CodeFragmentPrintStable) {
+    GoldenTestContext ctx(&goldenTestConfigSbe);
+    ctx.printTestHeader(GoldenTestContext::HeaderFormat::Text);
+
+    auto& os = ctx.outStream();
+
+    vm::CodeFragment code;
+    code.appendFillEmpty(vm::Instruction::Null);
+    code.appendFillEmpty(vm::Instruction::False);
+    code.appendFillEmpty(vm::Instruction::True);
+    code.appendTraverseP(0xAA, vm::Instruction::Nothing);
+    code.appendTraverseP(0xAA, vm::Instruction::Int32One);
+    code.appendTraverseF(0xBB, vm::Instruction::True);
+    code.appendGetField({}, "Hello world!"_sd);
+    code.appendAdd({}, {});
+
+    TimeZoneDatabase timezoneDB;
+    code.appendDateTrunc(
+        TimeUnit::day, 1, timezoneDB.getTimeZone("America/New_York"_sd), DayOfWeek::monday);
+
+    vm::CodeFragmentPrinter printer(vm::CodeFragmentPrinter::PrintFormat::Stable);
+    printer.print(os, code);
+    os << std::endl;
+}
+
+namespace {
+
+/**
+ * Fills bytes after the null terminator in the string with 'pattern'.
+ *
+ * We use this function in the tests to ensure that the implementation of 'getStringLength' for
+ * 'StringSmall' type does not rely on the fact that all bytes after null terminator are zero or any
+ * other special value.
+ */
+void fillSmallStringTail(value::Value val, char pattern) {
+    char* rawView = value::getRawStringView(value::TypeTags::StringSmall, val);
+    for (auto i = std::strlen(rawView) + 1; i <= value::kSmallStringMaxLength; i++) {
+        rawView[i] = pattern;
+    }
+}
+}  // namespace
+
+TEST(SBESmallString, Length) {
+    std::vector<std::pair<std::string, size_t>> testCases{
+        {"", 0},
+        {"a", 1},
+        {"ab", 2},
+        {"abc", 3},
+        {"abcd", 4},
+        {"abcde", 5},
+        {"abcdef", 6},
+        {"abcdefh", 7},
+    };
+
+    for (const auto& [string, length] : testCases) {
+        ASSERT(value::canUseSmallString(string));
+        auto [tag, val] = value::makeSmallString(string);
+        ASSERT_EQ(tag, value::TypeTags::StringSmall);
+
+        fillSmallStringTail(val, char(0));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, char(1));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, char(1 << 7));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, ~char(0));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+    }
 }
 }  // namespace mongo::sbe

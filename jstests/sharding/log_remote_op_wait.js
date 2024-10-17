@@ -1,17 +1,21 @@
-/*
+/**
  * Test that aggregation log lines include remoteOpWaitMillis: the amount of time the merger spent
  * waiting for results from shards.
+ *
+ * @tags: [
+ * # $mergeCursors was added to explain output in 5.3.
+ * requires_fcv_53
+ * ]
+ *
  */
-(function() {
-
-load("jstests/libs/log.js");  // For findMatchingLogLine.
+import {findMatchingLogLine, iterateMatchingLogLines} from "jstests/libs/log.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2, rs: {nodes: 1}});
 st.stopBalancer();
 
 const dbName = st.s.defaultDB;
 const coll = st.s.getDB(dbName).getCollection('profile_remote_op_wait');
-const shardDB = st.shard0.getDB(dbName);
 
 coll.drop();
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
@@ -37,16 +41,16 @@ assert.commandWorked(
 const pipeline = [{$sort: {x: 1}}];
 const pipelineComment = 'example_pipeline_should_have_remote_op_wait';
 
-// Explain plans do not explicitly include the $mergeCursors stage, which does the merge sort. So to
-// verify that the query will do a merge sort as we expect, we can check that:
-// 1. The query targets both shards
-// 2. The sort stage is pushed down
 {
     const explain = coll.explain().aggregate(pipeline);
     assert(explain.shards, explain);
     assert.eq(2, Object.keys(explain.shards).length, explain);
     assert.eq(explain.splitPipeline.shardsPart, [{$sort: {sortKey: {x: 1}}}], explain);
-    assert.eq(explain.splitPipeline.mergerPart, [], explain);
+    // The mergerPart will only have a $mergeCursors stage that merge-sorts the results from each
+    // shard.
+    assert.eq(1, explain.splitPipeline.mergerPart.length, tojson(explain));
+    assert(explain.splitPipeline.mergerPart[0].hasOwnProperty("$mergeCursors"), tojson(explain));
+    assert.eq({x: 1}, explain.splitPipeline.mergerPart[0]["$mergeCursors"]["sort"]);
 }
 
 // Set the slow query logging threshold (slowMS) to -1 to ensure every query gets logged.
@@ -88,7 +92,7 @@ cursor.hasNext();
 {
     const mongosLog = assert.commandWorked(st.s.adminCommand({getLog: "global"}));
     const lines =
-        [...findMatchingLogLines(mongosLog.log, {msg: "Slow query", comment: pipelineComment})];
+        [...iterateMatchingLogLines(mongosLog.log, {msg: "Slow query", comment: pipelineComment})];
     const line = lines.find(line => line.match(/command.{1,4}getMore/));
     assert(line, 'Failed to find a getMore log line matching the comment');
     const remoteOpWait = getRemoteOpWait(line);
@@ -96,9 +100,11 @@ cursor.hasNext();
     assert.lte(remoteOpWait, duration);
 }
 
-// A changestream is a type of aggregation, so it reports remoteOpWait.
+// A changestream is a type of aggregation, so it reports remoteOpWait. The initial $changeStream
+// 'aggregate' command never pauses execution while awaiting data, and so we expect the remoteOpWait
+// time to be less than or equal to the total execution duration.
 const watchComment = 'example_watch_should_have_remote_op_wait';
-coll.watch([], {comment: watchComment}).hasNext();
+const csCursor = coll.watch([], {comment: watchComment});
 {
     const mongosLog = assert.commandWorked(st.s.adminCommand({getLog: "global"}));
     const line = findMatchingLogLine(mongosLog.log, {msg: "Slow query", comment: watchComment});
@@ -108,28 +114,19 @@ coll.watch([], {comment: watchComment}).hasNext();
     assert.lte(remoteOpWait, duration);
 }
 
-// An equivalent .find() does not include remoteOpWaitMillis.
-const findComment = 'example_find_should_not_have_remote_op_wait';
-coll.find().sort({x: 1}).comment(findComment).next();
+// A $changeStream getMore may pause execution while awaiting data if no results are currently
+// available. In this case, it is possible for the total execution time to be less than the
+// remoteOpWait time.
+assert(!csCursor.hasNext());
 {
     const mongosLog = assert.commandWorked(st.s.adminCommand({getLog: "global"}));
-    const lines =
-        [...findMatchingLogLines(mongosLog.log, {msg: "Slow query", comment: findComment})];
-    const line = lines.find(line => line.match(/command.{1,4}find/));
-    assert(line, "Failed to find a 'find' log line matching the comment");
-    assert(!line.match(/remoteOpWait/), `Log line unexpectedly contained remoteOpWait: ${line}`);
-}
-
-// Other cursor-producing commands do not include remoteOpWaitMillis, such as listCollections.
-const listCollectionsComment = 'example_listCollections_should_not_have_remote_op_wait';
-coll.runCommand({listCollections: 1, comment: listCollectionsComment});
-{
-    const mongosLog = assert.commandWorked(st.s.adminCommand({getLog: "global"}));
-    const lines = [...findMatchingLogLines(mongosLog.log,
-                                           {msg: "Slow query", comment: listCollectionsComment})];
-    const line = lines.find(line => line.match(/command.{1,4}listCollections/));
-    assert(line, "Failed to find a 'listCollections' log line matching the comment");
-    assert(!line.match(/remoteOpWait/), `Log line unexpectedly contained remoteOpWait: ${line}`);
+    const line = findMatchingLogLine(
+        mongosLog.log, {msg: "Slow query", comment: watchComment, command: "getMore"});
+    assert(line, "Failed to find a log line matching the comment");
+    const remoteOpWait = getRemoteOpWait(line);
+    const duration = getDuration(line);
+    assert.lte(duration, 100);
+    assert.gte(remoteOpWait, 900);
 }
 
 // A query that merges on a shard logs remoteOpWaitMillis on the shard.
@@ -146,8 +143,8 @@ coll.aggregate(pipeline2, {allowDiskUse: true, comment: pipelineComment2}).next(
     const shard0Log = assert.commandWorked(st.shard0.adminCommand({getLog: "global"}));
     const shard1Log = assert.commandWorked(st.shard1.adminCommand({getLog: "global"}));
     const bothShardsLogLines = shard0Log.log.concat(shard1Log.log);
-    const lines = [...findMatchingLogLines(bothShardsLogLines,
-                                           {msg: "Slow query", comment: pipelineComment2})];
+    const lines = [...iterateMatchingLogLines(bothShardsLogLines,
+                                              {msg: "Slow query", comment: pipelineComment2})];
     // The line we want is whichever had a $mergeCursors stage.
     const line = lines.find(line => line.match(/mergeCursors/));
     assert(line, `Failed to find a log line mentioning 'mergeCursors': ${lines}`);
@@ -157,4 +154,3 @@ coll.aggregate(pipeline2, {allowDiskUse: true, comment: pipelineComment2}).next(
 }
 
 st.stop();
-})();

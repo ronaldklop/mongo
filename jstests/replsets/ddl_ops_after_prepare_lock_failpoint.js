@@ -7,10 +7,9 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/get_index_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -80,12 +79,12 @@ let testDDLOps = () => {
         testDB.runCommand(
             {createIndexes: collName, indexes: [{key: {"b": 1}, name: indexToCreate}]}),
         ErrorCodes.LockTimeout);
-    assert.eq(null, GetIndexHelpers.findByName(testColl.getIndexes(), indexToCreate));
+    assert.eq(null, IndexCatalogHelpers.findByName(testColl.getIndexes(), indexToCreate));
 
     // Try dropping the index we created originally. This should also fail.
     assert.commandFailedWithCode(testDB.runCommand({dropIndexes: collName, index: indexToDrop}),
                                  ErrorCodes.LockTimeout);
-    assert.neq(null, GetIndexHelpers.findByName(testColl.getIndexes(), indexToDrop));
+    assert.neq(null, IndexCatalogHelpers.findByName(testColl.getIndexes(), indexToDrop));
 };
 
 /**
@@ -102,8 +101,8 @@ const docToUpdateTo = {
 const docToRemove = docToUpdateTo;
 
 let testCRUDOps = (collConn) => {
-    // TODO: SERVER-40167 Having an extra document in the collection is necessary to avoid
-    // prepare conflicts when deleting documents.
+    // Having an extra document in the collection is necessary to avoid prepare conflicts when
+    // deleting adjacent documents. See SERVER-40167.
     assert.commandWorked(collConn.insert({num: 1}));
 
     assert.commandWorked(collConn.insert(docToInsert));
@@ -134,4 +133,3 @@ assert.commandWorked(
 
 assert.commandWorked(session.abortTransaction_forTesting());
 rst.stopSet();
-})();

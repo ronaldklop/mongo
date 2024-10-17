@@ -3,13 +3,12 @@
 // not just on the mongos.
 //
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "coll";
 
-const st = new ShardingTest({shards: 1, mongos: 1, config: 1});
+const st = new ShardingTest({shards: 1, mongos: 1});
 const mongosDB = st.s0.getDB(dbName);
 let coll = mongosDB.getCollection(collName);
 
@@ -48,4 +47,3 @@ let docs = coll.find().toArray();
 assert.sameMembers(docs, [{_id: 0}]);
 
 st.stop();
-})();

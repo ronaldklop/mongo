@@ -29,7 +29,20 @@
 
 #pragma once
 
+#include <cmath>
+#include <limits>
+#include <string>
+#include <utility>
+
 #include "expression.h"
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -147,7 +160,7 @@ public:
     /**
      * evaluateNumericArg  evaluates the implented trig function on one numericArg.
      */
-    Value evaluateNumericArg(const Value& numericArg) const {
+    Value evaluateNumericArg(const Value& numericArg) const override {
         switch (numericArg.getType()) {
             case BSONType::NumberDouble: {
                 auto input = numericArg.getDouble();
@@ -192,7 +205,7 @@ public:
     /**
      * getOpName returns the name of the operation, e.g., $sin
      */
-    virtual const char* getOpName() const = 0;
+    const char* getOpName() const override = 0;
 };
 
 /**
@@ -235,7 +248,7 @@ public:
     /**
      * getOpName returns the name of the operation, e.g., $sinh
      */
-    virtual const char* getOpName() const = 0;
+    const char* getOpName() const override = 0;
 };
 
 class ExpressionArcTangent2 final : public ExpressionTwoNumericArgs<ExpressionArcTangent2> {
@@ -271,7 +284,11 @@ public:
         return "$atan2";
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
         return visitor->visit(this);
     }
 };
@@ -308,7 +325,11 @@ public:
             return "$" #funcName;                                                                  \
         }                                                                                          \
                                                                                                    \
-        void acceptVisitor(ExpressionVisitor* visitor) final {                                     \
+        void acceptVisitor(ExpressionMutableVisitor* visitor) final {                              \
+            return visitor->visit(this);                                                           \
+        }                                                                                          \
+                                                                                                   \
+        void acceptVisitor(ExpressionConstVisitor* visitor) const final {                          \
             return visitor->visit(this);                                                           \
         }                                                                                          \
     };
@@ -374,7 +395,11 @@ CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Tangent,
             return "$" #funcName;                                              \
         }                                                                      \
                                                                                \
-        void acceptVisitor(ExpressionVisitor* visitor) final {                 \
+        void acceptVisitor(ExpressionMutableVisitor* visitor) final {          \
+            return visitor->visit(this);                                       \
+        }                                                                      \
+                                                                               \
+        void acceptVisitor(ExpressionConstVisitor* visitor) const final {      \
             return visitor->visit(this);                                       \
         }                                                                      \
     };
@@ -421,7 +446,11 @@ public:
         return "$degreesToRadians";
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
         return visitor->visit(this);
     }
 };
@@ -443,7 +472,11 @@ public:
         return "$radiansToDegrees";
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
         return visitor->visit(this);
     }
 };

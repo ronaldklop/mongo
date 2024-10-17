@@ -27,28 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/keys_collection_client_direct.h"
-
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/keys_collection_client_direct.h"
 #include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace {
@@ -70,15 +78,17 @@ bool isRetriableError(ErrorCodes::Error code, Shard::RetryPolicy options) {
 
 }  // namespace
 
-KeysCollectionClientDirect::KeysCollectionClientDirect() : _rsLocalClient() {}
+KeysCollectionClientDirect::KeysCollectionClientDirect(bool mustUseLocalReads)
+    : _rsLocalClient(), _mustUseLocalReads(mustUseLocalReads) {}
 
 StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewInternalKeys(
     OperationContext* opCtx,
     StringData purpose,
     const LogicalTime& newerThanThis,
-    bool useMajority) {
+    bool tryUseMajority) {
+
     return _getNewKeys<KeysCollectionDocument>(
-        opCtx, NamespaceString::kKeysCollectionNamespace, purpose, newerThanThis, useMajority);
+        opCtx, NamespaceString::kKeysCollectionNamespace, purpose, newerThanThis, tryUseMajority);
 }
 
 StatusWith<std::vector<ExternalKeysCollectionDocument>>
@@ -91,7 +101,7 @@ KeysCollectionClientDirect::getAllExternalKeys(OperationContext* opCtx, StringDa
         // It is safe to read external keys with local read concern because they are only used to
         // validate incoming signatures, not to sign them. If a cached key is rolled back, it will
         // eventually be reaped from the cache.
-        false /* useMajority */);
+        false /* tryUseMajority */);
 }
 
 template <typename KeyDocumentType>
@@ -100,13 +110,14 @@ StatusWith<std::vector<KeyDocumentType>> KeysCollectionClientDirect::_getNewKeys
     const NamespaceString& nss,
     StringData purpose,
     const LogicalTime& newerThanThis,
-    bool useMajority) {
+    bool tryUseMajority) {
     BSONObjBuilder queryBuilder;
     queryBuilder.append("purpose", purpose);
     queryBuilder.append("expiresAt", BSON("$gt" << newerThanThis.asTimestamp()));
 
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    auto readConcern = storageEngine->supportsReadConcernMajority() && useMajority
+    // Use majority read concern if the caller wants that and the client supports it. Otherwise fall
+    // back to local read concern.
+    auto readConcern = (tryUseMajority && !_mustUseLocalReads)
         ? repl::ReadConcernLevel::kMajorityReadConcern
         : repl::ReadConcernLevel::kLocalReadConcern;
 
@@ -127,7 +138,7 @@ StatusWith<std::vector<KeyDocumentType>> KeysCollectionClientDirect::_getNewKeys
     for (auto&& keyDoc : keyDocs) {
         KeyDocumentType key;
         try {
-            key = KeyDocumentType::parse(IDLParserErrorContext("keyDoc"), keyDoc);
+            key = KeyDocumentType::parse(IDLParserContext("keyDoc"), keyDoc);
         } catch (...) {
             return exceptionToStatus();
         }
@@ -161,20 +172,31 @@ StatusWith<Shard::QueryResponse> KeysCollectionClientDirect::_query(
 }
 
 Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
-                                           const NamespaceString& nss,
                                            const BSONObj& doc,
                                            const WriteConcernOptions& writeConcern) {
-    BatchedCommandRequest request([&] {
-        write_ops::InsertCommandRequest insertOp(nss);
+    // TODO SERVER-88742 Just use write_ops::InsertCommandRequest
+    BatchedCommandRequest batchRequest([&] {
+        write_ops::InsertCommandRequest insertOp(NamespaceString::kKeysCollectionNamespace);
         insertOp.setDocuments({doc});
         return insertOp;
     }());
-    request.setWriteConcern(writeConcern.toBSON());
-    const BSONObj cmdObj = request.toBSON();
+
+    // A request dispatched through a local client is served within the same thread that submits it
+    // (so that the opCtx needs to be used as the vehicle to pass the WC to the ServiceEntryPoint).
+    const auto originalWC = opCtx->getWriteConcern();
+    ScopeGuard resetWCGuard([&] { opCtx->setWriteConcern(originalWC); });
+    opCtx->setWriteConcern(writeConcern);
+
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        return cmdObjBuilder.obj();
+    }();
 
     for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
         // Note: write commands can only be issued against a primary.
-        auto swResponse = _rsLocalClient.runCommandOnce(opCtx, nss.db().toString(), cmdObj);
+        auto swResponse = _rsLocalClient.runCommandOnce(
+            opCtx, NamespaceString::kKeysCollectionNamespace.dbName(), cmdObj);
 
         BatchedCommandResponse batchResponse;
         auto writeStatus =
@@ -185,7 +207,7 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
                         2,
                         "Batch write command to {nss_db}failed with retriable error and will be "
                         "retried{causedBy_writeStatus}",
-                        "nss_db"_attr = nss.db(),
+                        "nss_db"_attr = NamespaceString::kKeysCollectionNamespace.db(omitTenant),
                         "causedBy_writeStatus"_attr = causedBy(redact(writeStatus)));
             continue;
         }
@@ -196,10 +218,7 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
 }
 
 Status KeysCollectionClientDirect::insertNewKey(OperationContext* opCtx, const BSONObj& doc) {
-    return _insert(opCtx,
-                   NamespaceString::kKeysCollectionNamespace,
-                   doc,
-                   ShardingCatalogClient::kMajorityWriteConcern);
+    return _insert(opCtx, doc, ShardingCatalogClient::kMajorityWriteConcern);
 }
 
 }  // namespace mongo

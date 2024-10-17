@@ -27,27 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
-#include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/ensure_fcv.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
-using unittest::EnsureFCV;
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_VersionMustBe1) {
     ReplicationCoordinatorExternalStateMock rses;
@@ -155,7 +163,9 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_SelfMustBeElectable) {
                       .getStatus());
 }
 
-TEST_F(ServiceContextTest, ValidateConfigForInitiate_WriteConcernMustBeSatisfiable) {
+DEATH_TEST_REGEX_F(ServiceContextTest,
+                   ValidateConfigForInitiate_NonDefaultGetLastErrorDefaults,
+                   "Fatal assertion.*5624101") {
     ReplSetConfig config;
     OID newReplSetId = OID::gen();
     config =
@@ -170,10 +180,7 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_WriteConcernMustBeSatisfiab
                                         newReplSetId);
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-
-    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
-                  validateConfigForInitiate(&presentOnceExternalState, config, getServiceContext())
-                      .getStatus());
+    validateConfigForInitiate(&presentOnceExternalState, config, getServiceContext()).getStatus();
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_ArbiterPriorityMustBeZeroOrOne) {
@@ -768,7 +775,7 @@ TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigInvalid) {
                   validateConfigForReconfig(oldConfig, newConfig, true, false));
 }
 
-TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigWriteConcernNotSatisifiable) {
+TEST_F(ServiceContextTest, ValidateConfigForReconfig_NonDefaultGetLastErrorDefaults) {
     // The new config is not valid due to an unsatisfiable write concern. This tests that if the
     // new config is invalid, validateConfigForReconfig will return a status indicating what is
     // wrong with the new config.
@@ -790,11 +797,11 @@ TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigWriteConcernNotSat
 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
-                  validateConfigForReconfig(oldConfig, newConfig, false, false));
+    ASSERT_THROWS_CODE(
+        validateConfigForReconfig(oldConfig, newConfig, false, false), AssertionException, 5624102);
     // Forced reconfigs also do not allow this.
-    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
-                  validateConfigForReconfig(oldConfig, newConfig, true, false));
+    ASSERT_THROWS_CODE(
+        validateConfigForReconfig(oldConfig, newConfig, true, false), AssertionException, 5624102);
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigInvalid) {
@@ -837,7 +844,9 @@ TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigValid) {
                   .getStatus());
 }
 
-TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigWriteConcernNotSatisfiable) {
+DEATH_TEST_REGEX_F(ServiceContextTest,
+                   ValidateConfigForStartUp_NewConfigNonDefaultGetLastErrorDefaults,
+                   "Fatal assertion.*5624100") {
     // The new config contains an unsatisfiable write concern.  We don't allow these configs to be
     // created anymore, but we allow any which exist to pass and the database to start up to
     // maintain backwards compatibility.
@@ -852,8 +861,7 @@ TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigWriteConcernNotSati
 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-    ASSERT_OK(validateConfigForStartUp(&presentOnceExternalState, newConfig, getServiceContext())
-                  .getStatus());
+    validateConfigForStartUp(&presentOnceExternalState, newConfig, getServiceContext()).getStatus();
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigInvalid) {
@@ -873,7 +881,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigInvalid) 
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_EQUALS(ErrorCodes::BadValue,
                   validateConfigForHeartbeatReconfig(
-                      &presentOnceExternalState, newConfig, getServiceContext())
+                      &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
                       .getStatus());
 }
 
@@ -892,11 +900,13 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigValid) {
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_OK(validateConfigForHeartbeatReconfig(
-                  &presentOnceExternalState, newConfig, getServiceContext())
+                  &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
                   .getStatus());
 }
 
-TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigWriteConcernNotSatisfiable) {
+DEATH_TEST_REGEX_F(ServiceContextTest,
+                   ValidateConfigForHeartbeatReconfig_NonDefaultGetLastErrorDefaults,
+                   "Tripwire assertion.*5624103") {
     // The new config contains an unsatisfiable write concern.  We don't allow these configs to be
     // created anymore, but we allow any which exist to be received in a heartbeat.
     ReplSetConfig newConfig;
@@ -912,9 +922,11 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigWriteConc
 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-    ASSERT_OK(validateConfigForHeartbeatReconfig(
-                  &presentOnceExternalState, newConfig, getServiceContext())
-                  .getStatus());
+    ASSERT_THROWS_CODE(validateConfigForHeartbeatReconfig(
+                           &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
+                           .getStatus(),
+                       AssertionException,
+                       5624103);
 }
 
 TEST_F(ServiceContextTest, ValidateForReconfig_ForceStillNeedsValidConfig) {
@@ -1070,6 +1082,7 @@ TEST_F(ServiceContextTest, ValidateForReconfig_SimultaneousAddAndRemoveOfArbiter
 }
 
 TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfArbitersDisallowed) {
+    RAIIServerParameterControllerForTest controller{"allowMultipleArbiters", true};
     BSONArray oldMembers = BSON_ARRAY(m1 << m2);
     BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3_Arbiter << m4_Arbiter);  // add two arbiters.
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
@@ -1279,6 +1292,87 @@ TEST_F(ServiceContextTest, FindSelfInConfig) {
         ErrorCodes::NodeNotElectable,
         findSelfInConfigIfElectable(&presentOnceExternalState, newConfig, getServiceContext())
             .getStatus());
+}
+
+TEST_F(ServiceContextTest, FindSelfInConfigFastAndSlow) {
+    ReplSetConfig newConfig;
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")
+                                                        << BSON("_id" << 2 << "host"
+                                                                      << "h2")
+                                                        << BSON("_id" << 3 << "host"
+                                                                      << "h3"))));
+
+    {
+        // Present once only on the slow path, but fast enough to be found
+        ReplicationCoordinatorExternalStateMock presentOnceExternalState;
+        presentOnceExternalState.addSelfSlow(HostAndPort("h2"), Seconds(29));
+        ASSERT_EQUALS(1,
+                      unittest::assertGet(findSelfInConfig(
+                          &presentOnceExternalState, newConfig, getServiceContext())));
+    }
+
+    {
+        // Present twice only on the slow path, but fast enough to be found both times.
+        ReplicationCoordinatorExternalStateMock presentTwiceExternalState;
+        presentTwiceExternalState.addSelfSlow(HostAndPort("h2"), Seconds(29));
+        presentTwiceExternalState.addSelfSlow(HostAndPort("h3"), Seconds(29));
+        ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                      findSelfInConfig(&presentTwiceExternalState, newConfig, getServiceContext())
+                          .getStatus());
+    }
+
+    {
+        // Present once on the fast path, once on the slow path. This is expected to erroneously
+        // succeed, because we should not check the slow path if we got a unique result on the fast
+        // path.
+        ReplicationCoordinatorExternalStateMock presentFastAndSlowExternalState;
+        presentFastAndSlowExternalState.addSelf(HostAndPort("h2"));
+        presentFastAndSlowExternalState.addSelfSlow(HostAndPort("h3"), Seconds(29));
+        ASSERT_EQUALS(1,
+                      unittest::assertGet(findSelfInConfig(
+                          &presentFastAndSlowExternalState, newConfig, getServiceContext())));
+    }
+
+    {
+        // Present only on the slow path, with a long timeout.  This will fail.
+        ReplicationCoordinatorExternalStateMock presentLongTimeoutExternalState;
+        presentLongTimeoutExternalState.addSelfSlow(HostAndPort("h2"), Seconds(31));
+        ASSERT_EQUALS(
+            ErrorCodes::NodeNotFound,
+            findSelfInConfig(&presentLongTimeoutExternalState, newConfig, getServiceContext())
+                .getStatus());
+    }
+}
+
+TEST_F(ServiceContextTest, FindOwnHostInConfigQuick) {
+    ReplSetConfig newConfig;
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1:1234")
+                                                        << BSON("_id" << 2 << "host"
+                                                                      << "h2:1234")
+                                                        << BSON("_id" << 3 << "host"
+                                                                      << "h3:1234")
+                                                        << BSON("_id" << 4 << "host"
+                                                                      << "h2:1234"))));
+
+    // Does not exist.
+    ASSERT_EQUALS(-1, findOwnHostInConfigQuick(newConfig, HostAndPort("non-existent")));
+
+    // First in config, not duplicated.
+    ASSERT_EQUALS(0, findOwnHostInConfigQuick(newConfig, HostAndPort("h1:1234")));
+
+    // Not first in config but also not duplicated.
+    ASSERT_EQUALS(2, findOwnHostInConfigQuick(newConfig, HostAndPort("h3:1234")));
+
+    // First match in a tie.
+    ASSERT_EQUALS(1, findOwnHostInConfigQuick(newConfig, HostAndPort("h2:1234")));
 }
 
 }  // namespace

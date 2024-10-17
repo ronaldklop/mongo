@@ -3,8 +3,7 @@
 // with a compound shard key.
 //
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var getShardVersion = function() {
     var res = st.shard0.adminCommand({getShardVersion: coll + ""});
@@ -39,8 +38,8 @@ var chunks = mongos.getCollection("config.chunks");
 var coll = mongos.getCollection("foo.bar");
 
 jsTest.log("Create a sharded collection with a compound shard key.");
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-printjson(admin.runCommand({movePrimary: coll.getDB() + "", to: st.shard0.shardName}));
+assert.commandWorked(
+    admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard0.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {x: 1, y: 1}}));
 
 // Chunks after splits:
@@ -89,4 +88,3 @@ jsTest.log("Merge chunks whos bounds are MinKey/MaxKey, but which have a compoun
 checkMergeWorked({x: MinKey, y: MinKey}, {x: MaxKey, y: MaxKey});
 
 st.stop();
-})();

@@ -1,12 +1,13 @@
 /**
  * Test to demonstrate usage of $indexStats in an aggregation pipeline to detect inconsistent
  * indexes in a sharded cluster.
+ * @tags: [
+ *   expects_explicit_underscore_id_index,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For documentEq.
+import {documentEq} from "jstests/aggregation/extras/utils.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test deliberately creates indexes in an inconsistent state.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
@@ -70,8 +71,8 @@ const pipeline = [
     {$project: {_id: 0, indexName: "$$ROOT._id", inconsistentProperties: 1, missingFromShards: 1}}
 ];
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 function shardCollectionWithChunkOnEachShard(collName) {
     const ns = dbName + "." + collName;
@@ -339,4 +340,3 @@ function shardCollectionWithChunkOnEachShard(collName) {
 })();
 
 st.stop();
-})();

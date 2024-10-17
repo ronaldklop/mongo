@@ -1,15 +1,9 @@
 /*
  * Run the kill_sessions tests against a sharded cluster.
- *
- * TODO SERVER-45385: These tests can be enabled in multiversion once the logging of session cursor
- * cleanup has been backported and released in last-lts.
- * @tags: [multiversion_incompatible]
  */
 
-load("jstests/libs/kill_sessions.js");
-
-(function() {
-'use strict';
+import {KillSessionsTestHelper} from "jstests/libs/kill_sessions.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test involves killing all sessions, which will not work as expected if the kill command is
 // sent with an implicit session.
@@ -25,7 +19,7 @@ function runTests(needAuth) {
         other.keyFile = 'jstests/libs/key1';
     }
 
-    var st = new ShardingTest({shards: 2, mongos: 1, config: 1, other: other});
+    var st = new ShardingTest({shards: 2, mongos: 1, other: other});
 
     var forExec = st.s0;
 
@@ -48,12 +42,6 @@ function runTests(needAuth) {
             host.getDB("local").auth("__system", "foopdedoop");
         }
         hosts.push(host);
-
-        assert.soon(function() {
-            var fcv =
-                host.getDB("admin").runCommand({getParameter: 1, featureCompatibilityVersion: 1});
-            return fcv["ok"] && fcv["featureCompatibilityVersion"] != "3.4";
-        });
     }
 
     var args = [forExec, forKill, hosts];
@@ -68,4 +56,3 @@ function runTests(needAuth) {
 
 runTests(true);
 runTests(false);
-})();

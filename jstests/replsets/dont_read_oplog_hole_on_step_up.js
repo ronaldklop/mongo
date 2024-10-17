@@ -8,11 +8,8 @@
  *   multiversion_incompatible,
  * ]
  */
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var rst = new ReplSetTest({
     name: TestData.testName,
@@ -28,6 +25,10 @@ const nodes = rst.startSet();
 // its initial sync. This prevents the long getMore timeout from causing the first initial sync to
 // take so much time that the second cannot succeed.
 rst.initiate();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const oldPrimary = nodes[0];
 const newPrimary = nodes[1];
@@ -60,10 +61,7 @@ rst.awaitReplication();
 const planExecFP = configureFailPoint(newPrimary, "planExecutorHangWhileYieldedInWaitForInserts");
 
 jsTestLog("Stepping up new primary");
-assert.commandWorked(newPrimary.adminCommand({replSetStepUp: 1}));
-
-// Wait for the node to transition to primary and accept writes.
-assert.eq(newPrimary, rst.getPrimary());
+rst.stepUp(newPrimary);
 
 const createCollFP = configureFailPoint(newPrimary, "hangBeforeLoggingCreateCollection");
 const createShell = startParallelShell(() => {
@@ -93,4 +91,3 @@ createShell();
 
 rst.awaitReplication();
 rst.stopSet();
-}());

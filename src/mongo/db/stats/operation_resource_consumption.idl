@@ -37,6 +37,7 @@ server_parameters:
     cpp_varname: gAggregateOperationResourceConsumptionMetrics
     cpp_vartype: bool
     default: false
+    redact: false
 
   profileOperationResourceConsumptionMetrics:
     description: "When true, records and profiles per-operation resource consumption metrics"
@@ -45,6 +46,7 @@ server_parameters:
     cpp_varname: gProfileOperationResourceConsumptionMetrics
     cpp_vartype: bool
     default: false
+    redact: false
 
   documentUnitSizeBytes:
     description: "The size of a document unit in bytes for resource consumption metrics collection"
@@ -55,6 +57,7 @@ server_parameters:
     default: 128
     validator:
       gte: 1
+    redact: false
 
   indexEntryUnitSizeBytes:
     description: "The size of an index entry unit for resource consumption metrics collection"
@@ -65,3 +68,15 @@ server_parameters:
     default: 16
     validator:
       gte: 1
+    redact: false
+
+  totalUnitWriteSizeBytes:
+    description: "The size of a (doc + index) unit in written bytes for resource consumption metrics collection"
+    set_at:
+      - startup
+    cpp_varname: gTotalUnitWriteSizeBytes
+    cpp_vartype: int32_t
+    default: 128
+    validator:
+      gte: 1
+    redact: false

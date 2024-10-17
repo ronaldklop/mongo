@@ -29,23 +29,52 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/s/reshard_collection_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
-class ReshardCollectionCoordinator final
-    : public ShardingDDLCoordinator_NORESILIENT,
-      public std::enable_shared_from_this<ReshardCollectionCoordinator> {
+class ReshardCollectionCoordinator
+    : public RecoverableShardingDDLCoordinator<ReshardCollectionCoordinatorDocument,
+                                               ReshardCollectionCoordinatorPhaseEnum> {
 public:
-    ReshardCollectionCoordinator(OperationContext* opCtx,
-                                 const ShardsvrReshardCollection& reshardCollectionParams);
+    using StateDoc = ReshardCollectionCoordinatorDocument;
+    using Phase = ReshardCollectionCoordinatorPhaseEnum;
+
+    ReshardCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                 const BSONObj& initialState);
+
+    void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
+
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
+
+protected:
+    ReshardCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                 const BSONObj& initialState,
+                                 bool persistCoordinatorDocument);
 
 private:
-    SemiFuture<void> runImpl(std::shared_ptr<executor::TaskExecutor> executor) override;
+    StringData serializePhase(const Phase& phase) const override {
+        return ReshardCollectionCoordinatorPhase_serializer(phase);
+    }
 
-    ServiceContext* _serviceContext;
-    const ShardsvrReshardCollection _request;
-    const NamespaceString& _nss;
+    ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                  const CancellationToken& token) noexcept override;
+
+    const mongo::ReshardCollectionRequest _request;
 };
+
 }  // namespace mongo

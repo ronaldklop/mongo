@@ -29,14 +29,22 @@
 
 /** Unit tests for BSONElementHasher. */
 
-#include "mongo/platform/basic.h"
+#include <limits>
+#include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/hasher.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -155,7 +163,7 @@ TEST(BSONElementHasher, MinKeyMaxKeyHashesDiffer) {
 // Test squashing very large doubles and very small doubles
 TEST(BSONElementHasher, VeryLargeAndSmallDoubles) {
     long long maxInt = std::numeric_limits<long long>::max();
-    double smallerDouble = maxInt / 2;
+    double smallerDouble = static_cast<double>(maxInt) / 2;
     double biggerDouble = ((double)maxInt) * ((double)maxInt);
     ASSERT_NOT_EQUALS(hashIt(BSON("a" << maxInt)), hashIt(BSON("a" << smallerDouble)));
     ASSERT_EQUALS(hashIt(BSON("a" << maxInt)), hashIt(BSON("a" << biggerDouble)));
@@ -218,7 +226,8 @@ TEST(BSONElementHasher, HashIntOrLongOrDouble) {
     ASSERT_EQUALS(hashIt(o), 1143184177162245883LL);
 
     // Large/small double values.
-    ASSERT(std::numeric_limits<long long>::max() < std::numeric_limits<double>::max());
+    ASSERT(static_cast<double>(std::numeric_limits<long long>::max()) <
+           std::numeric_limits<double>::max());
     o = BSON("check" << std::numeric_limits<double>::max());
     ASSERT_EQUALS(hashIt(o), 921523596458303250LL);
     o = BSON("check" << std::numeric_limits<long long>::max());  // 9223372036854775807

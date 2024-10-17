@@ -1,4 +1,4 @@
-/* test removing a node from a replica set
+/**test removing a node from a replica set
  *
  * Start set with two nodes
  * Initial sync
@@ -6,18 +6,11 @@
  * Bring secondary back up
  * Add it back as secondary
  * Make sure both nodes are either primary or secondary
- *
- * This test assumes 'newlyAdded' fields are enabled, so blacklist from multiversion tests
- * against 4.4.
- *
- * SERVER-49428: Disable for ephemeralForTest, writeConcernMajorityJournalDefault is not off
- * @tags: [
- *   requires_fcv_47,
- *   incompatible_with_eft,
- * ]
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
+
 var name = "removeNodes";
 var host = getHostName();
 

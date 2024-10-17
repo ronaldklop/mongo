@@ -27,11 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/util/bson_extract.h"
+#include <cmath>
+#include <numeric>
+#include <string>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/mirroring_sampler.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -101,13 +111,13 @@ public:
     }
 
     void resetHitCounts() {
-        for (auto pair : _hitCounts) {
+        for (const auto& pair : _hitCounts) {
             _hitCounts[pair.first] = 0;
         }
     }
 
     void populteHitCounts(std::vector<HostAndPort>& targets) {
-        for (auto host : targets) {
+        for (const auto& host : targets) {
             auto it = _hitCounts.find(host.toString());
             invariant(it != _hitCounts.end());
             it->second++;
@@ -129,7 +139,7 @@ public:
     double getHitCountsSTD() {
         const auto mean = getHitCounsMean();
         double standardDeviation = 0.0;
-        for (auto pair : _hitCounts) {
+        for (const auto& pair : _hitCounts) {
             standardDeviation += std::pow(pair.second - mean, 2);
         }
 
@@ -164,7 +174,9 @@ TEST_F(MirroringSamplerFixture, SamplerFunction) {
             resetPseudoRandomSeed();
             resetHitCounts();
 
-            auto pseudoRandomGen = [&]() -> int { return this->nextPseudoRandom(); };
+            auto pseudoRandomGen = [&]() -> int {
+                return this->nextPseudoRandom();
+            };
 
             for (size_t i = 0; i < repeats; i++) {
                 auto targets = MirroringSampler::getMirroringTargets(hello, ratio, pseudoRandomGen);

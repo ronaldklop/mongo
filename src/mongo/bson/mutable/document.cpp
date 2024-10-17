@@ -27,18 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/bson/mutable/document.h"
-
-#include <cstdlib>
-#include <cstring>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <limits>
+#include <new>
 #include <type_traits>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
-#include "mongo/bson/mutable/damage_vector.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/storage/damage_vector.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/debug_util.h"
 
 namespace mongo {
@@ -473,26 +475,19 @@ struct ElementRep {
     // constructing a BSONElement object. These fields are private (even though the rest of this
     // struct is public) because of the somewhat complex requirements to update and use them
     // correctly.
-    void setFieldNameSizeAndTotalSize(int fieldNameSize, int totalSize) {
-        _fieldNameSize = fieldNameSize <= std::numeric_limits<int16_t>::max() ? fieldNameSize : -1;
-        _totalSize = totalSize <= std::numeric_limits<int16_t>::max() ? totalSize : -1;
+    void setFieldNameSize(int fieldNameSize) {
+        _fieldNameSize = fieldNameSize;
     }
 
     BSONElement toSerializedElement(const BSONObj& holder) const {
-        return BSONElement(holder.objdata() + offset,  //
-                           _fieldNameSize,
-                           _totalSize,
-                           BSONElement::CachedSizeTag());
+        return _fieldNameSize > 0
+            ? BSONElement(holder.objdata() + offset, _fieldNameSize, BSONElement::TrustedInitTag{})
+            : BSONElement(holder.objdata() + offset);
     }
 
 private:
-    // The cached sizes for this element, or -1 if unknown or too big to fit.
-    // TODO consider putting _fieldNameSize in the reserved bit field above to allow larger total
-    // sizes to be cached. Alternatively, could use an 8/24 split uint32_t. Since BSONObj is limited
-    // to just over 16MB, that will cover all practical element sizes. For now, this is fine since
-    // computing the size is a trivial cost when working with elements larger 32KB.
-    int16_t _fieldNameSize;
-    int16_t _totalSize;
+    // The cached sizes for this element, or -1 if unknown.
+    int32_t _fieldNameSize;
 };
 #pragma pack(pop)
 
@@ -526,7 +521,6 @@ ElementRep ElementRep::makeDefaultRep() {
     out.child = {Element::kInvalidRepIdx, Element::kInvalidRepIdx};
     out.parent = Element::kInvalidRepIdx;
     out._fieldNameSize = -1;
-    out._totalSize = -1;
     return out;
 }
 
@@ -683,12 +677,12 @@ public:
     }
 
     // Insert a new ElementRep for a leaf element at the given offset and return its ID.
-    Element::RepIdx insertLeafElement(int offset, int fieldNameSize = -1, int totalSize = -1) {
+    Element::RepIdx insertLeafElement(int offset, int fieldNameSize = -1) {
         // BufBuilder hands back sizes in 'int's.
         Element::RepIdx inserted;
         ElementRep& rep = makeNewRep(&inserted);
 
-        rep.setFieldNameSizeAndTotalSize(fieldNameSize, totalSize);
+        rep.setFieldNameSize(fieldNameSize);
         rep.objIdx = kLeafObjIdx;
         rep.serialized = true;
         dassert(offset >= 0);
@@ -819,7 +813,6 @@ public:
             // Do this now before other writes so compiler can exploit knowing
             // that we are not eoo.
             const int32_t fieldNameSize = childElt.fieldNameSize();
-            const int32_t totalSize = childElt.size();
 
             Element::RepIdx inserted;
             ElementRep& newRep = makeNewRep(&inserted);
@@ -837,7 +830,7 @@ public:
                 newRep.child.left = Element::kOpaqueRepIdx;
                 newRep.child.right = Element::kOpaqueRepIdx;
             }
-            newRep.setFieldNameSizeAndTotalSize(fieldNameSize, totalSize);
+            newRep.setFieldNameSize(fieldNameSize);
             rep->child.left = inserted;
         } else {
             rep->child.left = Element::kInvalidRepIdx;
@@ -891,7 +884,6 @@ public:
             // Do this now before other writes so compiler can exploit knowing
             // that we are not eoo.
             const int32_t fieldNameSize = rightElt.fieldNameSize();
-            const int32_t totalSize = rightElt.size();
 
             Element::RepIdx inserted;
             ElementRep& newRep = makeNewRep(&inserted);
@@ -910,7 +902,7 @@ public:
                 newRep.child.left = Element::kOpaqueRepIdx;
                 newRep.child.right = Element::kOpaqueRepIdx;
             }
-            newRep.setFieldNameSizeAndTotalSize(fieldNameSize, totalSize);
+            newRep.setFieldNameSize(fieldNameSize);
             rep->sibling.right = inserted;
         } else {
             rep->sibling.right = Element::kInvalidRepIdx;
@@ -1027,13 +1019,12 @@ public:
         return getCurrentInPlaceMode() == Document::kInPlaceEnabled;
     }
 
-    void recordDamageEvent(DamageEvent::OffsetSizeType targetOffset,
-                           DamageEvent::OffsetSizeType sourceOffset,
-                           size_t size) {
+    void recordDamageEvent(size_t targetOffset, size_t sourceOffset, size_t size) {
         _damages.push_back(DamageEvent());
         _damages.back().targetOffset = targetOffset;
+        _damages.back().targetSize = size;
         _damages.back().sourceOffset = sourceOffset;
-        _damages.back().size = size;
+        _damages.back().sourceSize = size;
         if (kDebugBuild && paranoid) {
             // Force damage events to new addresses to catch invalidation errors.
             DamageVector new_damages(_damages);
@@ -1122,7 +1113,7 @@ private:
     // creating and destroying a string and its buffer each time.
     std::string _fieldNameScratch;
 
-    // Queue of damage events and status bit for whether  in-place updates are possible.
+    // Queue of damage events and status bit for whether in-place updates are possible.
     DamageVector _damages;
     Document::InPlaceMode _inPlaceMode;
 };
@@ -1503,7 +1494,7 @@ bool Element::isIntegral() const {
     return ((type == mongo::NumberLong) || (type == mongo::NumberInt));
 }
 
-const BSONElement Element::getValue() const {
+BSONElement Element::getValue() const {
     invariant(ok());
     const Document::Impl& impl = getDocument().getImpl();
     const ElementRep& thisRep = impl.getElementRep(_repIdx);
@@ -1528,7 +1519,7 @@ SafeNum Element::getValueSafeNum() const {
 }
 
 int Element::compareWithElement(const ConstElement& other,
-                                const StringData::ComparatorInterface* comparator,
+                                const StringDataComparator* comparator,
                                 bool considerFieldName) const {
     invariant(ok());
     invariant(other.ok());
@@ -1611,7 +1602,7 @@ int Element::compareWithElement(const ConstElement& other,
 }
 
 int Element::compareWithBSONElement(const BSONElement& other,
-                                    const StringData::ComparatorInterface* comparator,
+                                    const StringDataComparator* comparator,
                                     bool considerFieldName) const {
     invariant(ok());
 
@@ -1652,7 +1643,7 @@ int Element::compareWithBSONElement(const BSONElement& other,
 }
 
 int Element::compareWithBSONObj(const BSONObj& other,
-                                const StringData::ComparatorInterface* comparator,
+                                const StringDataComparator* comparator,
                                 bool considerFieldName) const {
     invariant(ok());
 
@@ -2086,10 +2077,10 @@ Status Element::setValue(const Element::RepIdx newValueIdx) {
             // calculate the source and target offsets in the damage entries we are
             // going to write.
 
-            const DamageEvent::OffsetSizeType targetBaseOffset =
+            const size_t targetBaseOffset =
                 getElementOffset(impl.getObject(thisRep.objIdx), thisElt);
 
-            const DamageEvent::OffsetSizeType sourceBaseOffset =
+            const size_t sourceBaseOffset =
                 getElementOffset(impl.getObject(valueRep.objIdx), valueElt);
 
             // If this is a type change, record a damage event for the new type.
@@ -2277,14 +2268,14 @@ Document::Document(const BSONObj& value, InPlaceMode inPlaceMode)
 
 void Document::reset() {
     _impl->reset(Document::kInPlaceDisabled);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement();
+    [[maybe_unused]] const Element newRoot = makeRootElement();
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }
 
 void Document::reset(const BSONObj& value, InPlaceMode inPlaceMode) {
     _impl->reset(inPlaceMode);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement(value);
+    [[maybe_unused]] const Element newRoot = makeRootElement(value);
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }
@@ -2314,8 +2305,7 @@ Element Document::makeElementDouble(StringData fieldName, const double value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementString(StringData fieldName, StringData value) {
@@ -2326,8 +2316,7 @@ Element Document::makeElementString(StringData fieldName, StringData value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementObject(StringData fieldName) {
@@ -2349,8 +2338,7 @@ Element Document::makeElementObject(StringData fieldName, const BSONObj& value) 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    Element::RepIdx newEltIdx =
-        impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef);
+    Element::RepIdx newEltIdx = impl.insertLeafElement(leafRef, fieldName.size() + 1);
     ElementRep& newElt = impl.getElementRep(newEltIdx);
 
     newElt.child.left = Element::kOpaqueRepIdx;
@@ -2379,8 +2367,7 @@ Element Document::makeElementArray(StringData fieldName, const BSONObj& value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendArray(fieldName, value);
-    Element::RepIdx newEltIdx =
-        impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef);
+    Element::RepIdx newEltIdx = impl.insertLeafElement(leafRef, fieldName.size() + 1);
     ElementRep& newElt = impl.getElementRep(newEltIdx);
     newElt.child.left = Element::kOpaqueRepIdx;
     newElt.child.right = Element::kOpaqueRepIdx;
@@ -2398,8 +2385,7 @@ Element Document::makeElementBinary(StringData fieldName,
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendBinData(fieldName, len, binType, data);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementUndefined(StringData fieldName) {
@@ -2409,8 +2395,7 @@ Element Document::makeElementUndefined(StringData fieldName) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendUndefined(fieldName);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementNewOID(StringData fieldName) {
@@ -2426,8 +2411,7 @@ Element Document::makeElementOID(StringData fieldName, const OID value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementBool(StringData fieldName, const bool value) {
@@ -2437,8 +2421,7 @@ Element Document::makeElementBool(StringData fieldName, const bool value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendBool(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementDate(StringData fieldName, const Date_t value) {
@@ -2448,8 +2431,7 @@ Element Document::makeElementDate(StringData fieldName, const Date_t value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendDate(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementNull(StringData fieldName) {
@@ -2459,8 +2441,7 @@ Element Document::makeElementNull(StringData fieldName) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendNull(fieldName);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementRegex(StringData fieldName, StringData re, StringData flags) {
@@ -2472,8 +2453,7 @@ Element Document::makeElementRegex(StringData fieldName, StringData re, StringDa
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendRegex(fieldName, re, flags);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementDBRef(StringData fieldName, StringData ns, const OID value) {
@@ -2483,8 +2463,7 @@ Element Document::makeElementDBRef(StringData fieldName, StringData ns, const OI
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendDBRef(fieldName, ns, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementCode(StringData fieldName, StringData value) {
@@ -2495,8 +2474,7 @@ Element Document::makeElementCode(StringData fieldName, StringData value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendCode(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementSymbol(StringData fieldName, StringData value) {
@@ -2507,8 +2485,7 @@ Element Document::makeElementSymbol(StringData fieldName, StringData value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendSymbol(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementCodeWithScope(StringData fieldName,
@@ -2522,8 +2499,7 @@ Element Document::makeElementCodeWithScope(StringData fieldName,
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendCodeWScope(fieldName, code, scope);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementInt(StringData fieldName, const int32_t value) {
@@ -2533,8 +2509,7 @@ Element Document::makeElementInt(StringData fieldName, const int32_t value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementTimestamp(StringData fieldName, const Timestamp value) {
@@ -2544,8 +2519,7 @@ Element Document::makeElementTimestamp(StringData fieldName, const Timestamp val
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementLong(StringData fieldName, const int64_t value) {
@@ -2555,8 +2529,7 @@ Element Document::makeElementLong(StringData fieldName, const int64_t value) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, static_cast<long long int>(value));
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementDecimal(StringData fieldName, const Decimal128 value) {
@@ -2566,8 +2539,7 @@ Element Document::makeElementDecimal(StringData fieldName, const Decimal128 valu
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.append(fieldName, value);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementMinKey(StringData fieldName) {
@@ -2577,8 +2549,7 @@ Element Document::makeElementMinKey(StringData fieldName) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendMinKey(fieldName);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElementMaxKey(StringData fieldName) {
@@ -2588,8 +2559,7 @@ Element Document::makeElementMaxKey(StringData fieldName) {
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendMaxKey(fieldName);
-    return Element(this,
-                   impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+    return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
 }
 
 Element Document::makeElement(const BSONElement& value) {
@@ -2610,7 +2580,7 @@ Element Document::makeElement(const BSONElement& value) {
         BSONObjBuilder& builder = impl.leafBuilder();
         const int leafRef = builder.len();
         builder.append(value);
-        return Element(this, impl.insertLeafElement(leafRef, value.fieldNameSize(), value.size()));
+        return Element(this, impl.insertLeafElement(leafRef, value.fieldNameSize()));
     }
 }
 
@@ -2630,8 +2600,7 @@ Element Document::makeElementWithNewFieldName(StringData fieldName, const BSONEl
         BSONObjBuilder& builder = impl.leafBuilder();
         const int leafRef = builder.len();
         builder.appendAs(value, fieldName);
-        return Element(
-            this, impl.insertLeafElement(leafRef, fieldName.size() + 1, builder.len() - leafRef));
+        return Element(this, impl.insertLeafElement(leafRef, fieldName.size() + 1));
     }
 }
 
@@ -2719,9 +2688,7 @@ Element Document::makeElement(ConstElement element, const StringData* fieldName)
         const Impl& oImpl = element.getDocument().getImpl();
         oImpl.writeElement(element.getIdx(), &builder, fieldName);
         return Element(this,
-                       impl.insertLeafElement(leafRef,
-                                              fieldName ? fieldName->size() + 1 : -1,
-                                              builder.len() - leafRef));
+                       impl.insertLeafElement(leafRef, fieldName ? fieldName->size() + 1 : -1));
     }
 }
 

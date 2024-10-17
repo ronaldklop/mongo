@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
@@ -41,5 +44,7 @@ BSONObj createObjWithLargePrefix(const std::string& suffix);
 
 BSONObj generateDoc(PseudoRandom* rng, MutableDocument* doc, int depthLevel);
 
-BSONObj applyDiffTestHelper(BSONObj preImage, BSONObj diff);
+BSONObj applyDiffTestHelper(BSONObj preImage,
+                            BSONObj diff,
+                            bool mustCheckExistenceForInsertOperations = true);
 }  // namespace mongo::doc_diff

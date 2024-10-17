@@ -27,25 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/json.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/matcher/match_details.h"
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
+namespace mongo {
 namespace MatcherTests {
-
-using std::cout;
-using std::endl;
-using std::string;
 
 class CollectionBase {
 public:
@@ -54,7 +72,7 @@ public:
     virtual ~CollectionBase() {}
 };
 
-const NamespaceString kTestNss = NamespaceString("db.dummy");
+const NamespaceString kTestNss = NamespaceString::createNamespaceString_forTest("db.dummy");
 
 template <typename M>
 class Basic {
@@ -216,7 +234,7 @@ public:
         ASSERT(matcher.matches(fromjson("{ a:[ { b:1 } ] }"), &details));
         // The '0' entry of the 'a' array is matched.
         ASSERT(details.hasElemMatchKey());
-        ASSERT_EQUALS(string("0"), details.elemMatchKey());
+        ASSERT_EQUALS(std::string("0"), details.elemMatchKey());
     }
 };
 
@@ -226,7 +244,8 @@ public:
     void run() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
-        const NamespaceString nss("unittests.matchertests");
+        const NamespaceString nss =
+            NamespaceString::createNamespaceString_forTest("unittests.matchertests");
         AutoGetCollectionForReadCommand ctx(&opCtx, nss);
 
         const boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(
@@ -266,8 +285,8 @@ public:
         long all =
             TimingBase<M>::dotime(BSON("x" << BSON("$all" << BSON_ARRAY(5))), BSON("x" << 5));
 
-        cout << "AllTiming " << demangleName(typeid(M)) << " normal: " << normal << " all: " << all
-             << endl;
+        std::cout << "AllTiming " << demangleName(typeid(M)) << " normal: " << normal
+                  << " all: " << all << std::endl;
     }
 };
 
@@ -302,13 +321,13 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("matcher") {}
 
 #define ADD_BOTH(TEST) add<TEST<Matcher>>();
 
-    void setupTests() {
+    void setupTests() override {
         ADD_BOTH(Basic);
         ADD_BOTH(DoubleEqual);
         ADD_BOTH(MixedNumericEqual);
@@ -327,6 +346,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> dball;
+unittest::OldStyleSuiteInitializer<All> dball;
 
 }  // namespace MatcherTests
+}  // namespace mongo

@@ -27,34 +27,48 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <limits>
 #include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
 // Insert multiple keys and try to iterate through all of them
-// using a forward cursor while calling savePosition() and
-// restorePosition() in succession.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursor) {
+// using a forward cursor while calling save() and
+// restore() in succession.
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursor) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
@@ -66,16 +80,74 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursor) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         int i = 0;
-        for (auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true));
-             entry;
-             i++, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i++, entry = cursor->next()) {
+            ASSERT_LT(i, nToInsert);
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
+
+            cursor->save();
+            cursor->save();  // It is legal to save twice in a row.
+            cursor->restore();
+        }
+        ASSERT(!cursor->next());
+        ASSERT_EQ(i, nToInsert);
+
+        cursor->save();
+        cursor->save();  // It is legal to save twice in a row.
+        cursor->restore();
+        ASSERT(!cursor->next());
+    }
+}
+
+// Insert multiple keys and try to iterate through all of them
+// using a forward cursor with set end position, while calling save() and
+// restore() in succession.
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorWithEndPosition) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42, i * 2);
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
+        cursor->setEndPosition(BSON("" << std::numeric_limits<double>::infinity()), true);
+
+        int i = 0;
+        for (auto entry = cursor->next(); entry; i++, entry = cursor->next()) {
             ASSERT_LT(i, nToInsert);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
@@ -88,21 +160,23 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursor) {
 }
 
 // Insert multiple keys and try to iterate through all of them
-// using a reverse cursor while calling savePosition() and
-// restorePosition() in succession.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversed) {
+// using a reverse cursor while calling save() and
+// restore() in succession.
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorReversed) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
@@ -114,18 +188,17 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversed) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         int i = nToInsert - 1;
-        for (auto entry =
-                 cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true));
-             entry;
-             i--, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i--, entry = cursor->next()) {
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
@@ -139,19 +212,21 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversed) {
 
 // Insert multiple keys on the _id index and try to iterate through all of them using a forward
 // cursor while calling save() and restore() in succession.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorOnIdIndex) {
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorOnIdIndex) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newIdIndexSortedDataInterface());
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
@@ -163,18 +238,17 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorOnIdIndex) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         int i = nToInsert - 1;
-        for (auto entry =
-                 cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true));
-             entry;
-             i--, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i--, entry = cursor->next()) {
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
@@ -188,19 +262,21 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorOnIdIndex) {
 
 // Insert multiple keys on the _id index and try to iterate through all of them using a reverse
 // cursor while calling save() and restore() in succession.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversedOnIdIndex) {
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorReversedOnIdIndex) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newIdIndexSortedDataInterface());
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
@@ -212,18 +288,17 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversedOnIdIn
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         int i = nToInsert - 1;
-        for (auto entry =
-                 cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true));
-             entry;
-             i--, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i--, entry = cursor->next()) {
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
 
@@ -236,22 +311,24 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorReversedOnIdIn
 }
 
 // Insert the same key multiple times and try to iterate through each
-// occurrence using a forward cursor while calling savePosition() and
-// restorePosition() in succession. Verify that the RecordId is saved
+// occurrence using a forward cursor while calling save() and
+// restore() in succession. Verify that the RecordId is saved
 // as part of the current position of the cursor.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeys) {
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorWithDupKeys) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             RecordId loc(42, i * 2);
@@ -263,16 +340,16 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeys) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         int i = 0;
-        for (auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true));
-             entry;
-             i++, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i++, entry = cursor->next()) {
             ASSERT_LT(i, nToInsert);
             ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(42, i * 2)));
 
@@ -285,22 +362,24 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeys) {
 }
 
 // Insert the same key multiple times and try to iterate through each
-// occurrence using a reverse cursor while calling savePosition() and
-// restorePosition() in succession. Verify that the RecordId is saved
+// occurrence using a reverse cursor while calling save() and
+// restore() in succession. Verify that the RecordId is saved
 // as part of the current position of the cursor.
-TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeysReversed) {
+TEST(SortedDataInterface, SaveAndRestoreWhileIterateCursorWithDupKeysReversed) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     int nToInsert = 10;
     for (int i = 0; i < nToInsert; i++) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             RecordId loc(42, i * 2);
@@ -312,18 +391,17 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeysRev
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         int i = nToInsert - 1;
-        for (auto entry =
-                 cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true));
-             entry;
-             i--, entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; i--, entry = cursor->next()) {
             ASSERT_GTE(i, 0);
             ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(42, i * 2)));
 
@@ -335,20 +413,22 @@ TEST(SortedDataInterface, SaveAndRestorePositionWhileIterateCursorWithDupKeysRev
     }
 }
 
-// Call savePosition() on a forward cursor without ever calling restorePosition().
+// Call save() on a forward cursor without ever calling restore().
 // May be useful to run this test under valgrind to verify there are no leaks.
-TEST(SortedDataInterface, SavePositionWithoutRestore) {
+TEST(SortedDataInterface, saveWithoutRestore) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), false));
@@ -358,30 +438,34 @@ TEST(SortedDataInterface, SavePositionWithoutRestore) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         cursor->save();
     }
 }
 
-// Call savePosition() on a reverse cursor without ever calling restorePosition().
+// Call save() on a reverse cursor without ever calling restore().
 // May be useful to run this test under valgrind to verify there are no leaks.
-TEST(SortedDataInterface, SavePositionWithoutRestoreReversed) {
+TEST(SortedDataInterface, saveWithoutRestoreReversed) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
@@ -391,11 +475,13 @@ TEST(SortedDataInterface, SavePositionWithoutRestoreReversed) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         cursor->save();
@@ -404,131 +490,174 @@ TEST(SortedDataInterface, SavePositionWithoutRestoreReversed) {
 
 // Ensure that restore lands as close as possible to original position, even if data inserted
 // while saved.
-void testSaveAndRestorePositionSeesNewInserts(bool forward, bool unique) {
+enum class IndexType { kId, kUnique, kNonUnique };
+void testSaveAndRestoreSeesNewInserts(bool forward, IndexType type) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface();
+    } else {
+        sorted =
+            harnessHelper->newSortedDataInterface(IndexType::kUnique == type, /*partial=*/false);
+    }
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(unique,
-                                                        /*partial=*/false,
-                                                        {
-                                                            {key1, loc1},
-                                                            {key3, loc1},
-                                                        });
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc1}, {key3, loc3}}, /*dupsAllowed*/ false);
 
     auto cursor = sorted->newCursor(opCtx.get(), forward);
-    const auto seekPoint = forward ? key1 : key3;
-
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), seekPoint, forward, true)),
-              IndexKeyEntry(seekPoint, loc1));
+    if (forward) {
+        const auto seekPoint = key1;
+        ASSERT_EQ(
+            cursor->seek(
+                makeKeyStringForSeek(sorted.get(), seekPoint, forward, true).finishAndGetBuffer()),
+            IndexKeyEntry(seekPoint, loc1));
+    } else {
+        const auto seekPoint = key3;
+        ASSERT_EQ(
+            cursor->seek(
+                makeKeyStringForSeek(sorted.get(), seekPoint, forward, true).finishAndGetBuffer()),
+            IndexKeyEntry(seekPoint, loc3));
+    }
 
     cursor->save();
-    insertToIndex(opCtx, sorted, {{key2, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc2}}, /*dupsAllowed*/ false);
     cursor->restore();
 
-    ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
+    ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInserts_Forward_Unique) {
-    testSaveAndRestorePositionSeesNewInserts(true, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Forward_Unique) {
+    testSaveAndRestoreSeesNewInserts(true, IndexType::kUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInserts_Forward_Standard) {
-    testSaveAndRestorePositionSeesNewInserts(true, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Forward_Standard) {
+    testSaveAndRestoreSeesNewInserts(true, IndexType::kNonUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInserts_Reverse_Unique) {
-    testSaveAndRestorePositionSeesNewInserts(false, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Forward_Id) {
+    testSaveAndRestoreSeesNewInserts(true, IndexType::kId);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInserts_Reverse_Standard) {
-    testSaveAndRestorePositionSeesNewInserts(false, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Reverse_Unique) {
+    testSaveAndRestoreSeesNewInserts(false, IndexType::kUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Reverse_Standard) {
+    testSaveAndRestoreSeesNewInserts(false, IndexType::kNonUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInserts_Reverse_Id) {
+    testSaveAndRestoreSeesNewInserts(false, IndexType::kId);
 }
 
 // Ensure that repeated restores lands as close as possible to original position, even if data
 // inserted while saved and the current position removed.
-void testSaveAndRestorePositionSeesNewInsertsAfterRemove(bool forward, bool unique) {
+void testSaveAndRestoreSeesNewInsertsAfterRemove(bool forward, IndexType type) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface();
+    } else {
+        sorted =
+            harnessHelper->newSortedDataInterface(IndexType::kUnique == type, /*partial=*/false);
+    }
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(unique,
-                                                        /*partial=*/false,
-                                                        {
-                                                            {key1, loc1},
-                                                            {key3, loc1},
-                                                        });
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc1}, {key3, loc1}}, /*dupsAllowed*/ false);
 
     auto cursor = sorted->newCursor(opCtx.get(), forward);
     const auto seekPoint = forward ? key1 : key3;
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), seekPoint, forward, true)),
-              IndexKeyEntry(seekPoint, loc1));
+    ASSERT_EQ(
+        cursor->seek(
+            makeKeyStringForSeek(sorted.get(), seekPoint, forward, true).finishAndGetBuffer()),
+        IndexKeyEntry(seekPoint, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
     cursor->restore();
     // The restore may have seeked since it can't return to the saved position.
 
     cursor->save();  // Should still save originally saved key as "current position".
-    insertToIndex(opCtx, sorted, {{key2, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc1}}, /*dupsAllowed*/ false);
     cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterRemove_Forward_Unique) {
-    testSaveAndRestorePositionSeesNewInsertsAfterRemove(true, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Forward_Unique) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(true, IndexType::kUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterRemove_Forward_Standard) {
-    testSaveAndRestorePositionSeesNewInsertsAfterRemove(true, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Forward_Standard) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(true, IndexType::kNonUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterRemove_Reverse_Unique) {
-    testSaveAndRestorePositionSeesNewInsertsAfterRemove(false, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Forward_Id) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(true, IndexType::kId);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterRemove_Reverse_Standard) {
-    testSaveAndRestorePositionSeesNewInsertsAfterRemove(false, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Reverse_Unique) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(false, IndexType::kUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Reverse_Standard) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(false, IndexType::kNonUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterRemove_Reverse_Id) {
+    testSaveAndRestoreSeesNewInsertsAfterRemove(false, IndexType::kId);
 }
 
 // Ensure that repeated restores lands as close as possible to original position, even if data
 // inserted while saved and the current position removed in a way that temporarily makes the
 // cursor EOF.
-void testSaveAndRestorePositionSeesNewInsertsAfterEOF(bool forward, bool unique) {
+void testSaveAndRestoreSeesNewInsertsAfterEOF(bool forward, IndexType type) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface();
+    } else {
+        sorted =
+            harnessHelper->newSortedDataInterface(IndexType::kUnique == type, /*partial=*/false);
+    }
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(/*unique=*/false,
-                                                        /*partial=*/false,
-                                                        {
-                                                            {key1, loc1},
-                                                        });
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc1}}, /*dupsAllowed*/ false);
 
     auto cursor = sorted->newCursor(opCtx.get(), forward);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, forward, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, forward, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
     // next() would return EOF now.
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
     cursor->restore();
     // The restore may have seeked to EOF.
 
     auto insertPoint = forward ? key2 : key0;
     cursor->save();  // Should still save key1 as "current position".
-    insertToIndex(opCtx, sorted, {{insertPoint, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{insertPoint, loc1}}, /*dupsAllowed*/ false);
     cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(insertPoint, loc1));
 }
 
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterEOF_Forward_Unique) {
-    testSaveAndRestorePositionSeesNewInsertsAfterEOF(true, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Forward_Unique) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(true, IndexType::kUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterEOF_Forward_Standard) {
-    testSaveAndRestorePositionSeesNewInsertsAfterEOF(true, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Forward_Standard) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(true, IndexType::kNonUnique);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterEOF_Reverse_Unique) {
-    testSaveAndRestorePositionSeesNewInsertsAfterEOF(false, true);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Forward_Id) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(true, IndexType::kId);
 }
-TEST(SortedDataInterface, SaveAndRestorePositionSeesNewInsertsAfterEOF_Reverse_Standard) {
-    testSaveAndRestorePositionSeesNewInsertsAfterEOF(false, false);
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Reverse_Unique) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(false, IndexType::kUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Reverse_Standard) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(false, IndexType::kNonUnique);
+}
+TEST(SortedDataInterface, SaveAndRestoreSeesNewInsertsAfterEOF_Reverse_Id) {
+    testSaveAndRestoreSeesNewInsertsAfterEOF(false, IndexType::kId);
 }
 
 // Make sure we restore to a RecordId at or ahead of save point if same key.
-TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_Forward) {
+TEST(SortedDataInterface, SaveAndRestoreStandardIndexConsidersRecordId_Forward) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(/*unique*/ false,
                                                         /*partial=*/false,
                                                         {
@@ -537,31 +666,35 @@ TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_F
                                                             {key3, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc1}});
-    insertToIndex(opCtx, sorted, {{key1, loc2}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc2}});
     cursor->restore();  // Lands on inserted key.
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc2));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc2}});
-    insertToIndex(opCtx, sorted, {{key1, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc2}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
     cursor->restore();  // Lands after inserted.
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
 
     cursor->save();
-    insertToIndex(opCtx, sorted, {{key2, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();  // Lands at same point as initial save.
 
     // Advances from restore point since restore didn't move position.
@@ -569,30 +702,37 @@ TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_F
 }
 
 // Test that cursors over unique indices will never return the same key twice.
-TEST(SortedDataInterface, SaveAndRestorePositionUniqueIndexWontReturnDupKeys_Forward) {
+TEST(SortedDataInterface, SaveAndRestoreUniqueIndexWontReturnDupKeys_Forward) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    auto sorted = harnessHelper->newSortedDataInterface(/*unique*/ true,
+                                                        /*partial=*/false,
+                                                        {
+                                                            {key1, loc1},
+                                                            {key2, loc2},
+                                                            {key3, loc2},
+                                                            {key4, loc2},
+                                                        });
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(
-        /*unique*/ true,
-        /*partial=*/false,
-        {{key1, loc1}, {key2, loc2}, {key3, loc2}, {key4, loc2}});
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
 
     auto cursor = sorted->newCursor(opCtx.get());
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc1}});
-    insertToIndex(opCtx, sorted, {{key1, loc2}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc2}});
     cursor->restore();
 
     // We should skip over (key1, loc2) since we already returned (key1, loc1).
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key2, loc2}});
-    insertToIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc2}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
 
     // We should skip over (key2, loc1) since we already returned (key2, loc2).
@@ -600,21 +740,20 @@ TEST(SortedDataInterface, SaveAndRestorePositionUniqueIndexWontReturnDupKeys_For
 
     // If the key we just returned is removed, we should simply return the next key after restoring.
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key3, loc2}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key3, loc2}});
     cursor->restore();
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key4, loc2));
 
     // If a key is inserted just ahead of our position, we should return it after restoring.
     cursor->save();
-    insertToIndex(opCtx, sorted, {{key5, loc2}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key5, loc2}});
     cursor->restore();
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key5, loc2));
 }
 
 // Make sure we restore to a RecordId at or ahead of save point if same key on reverse cursor.
-TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_Reverse) {
+TEST(SortedDataInterface, SaveAndRestoreStandardIndexConsidersRecordId_Reverse) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(/*unique*/ false,
                                                         /*partial=*/false,
                                                         {
@@ -623,31 +762,35 @@ TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_R
                                                             {key2, loc2},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get(), false);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true)),
-              IndexKeyEntry(key2, loc2));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key2, loc2));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key2, loc2}});
-    insertToIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc2}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key2, loc1}});
-    insertToIndex(opCtx, sorted, {{key2, loc2}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key2, loc2}});
     cursor->restore();
 
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key1, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
     cursor->restore();
 
     cursor->save();
-    insertToIndex(opCtx, sorted, {{key1, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key1, loc1}});
     cursor->restore();  // Lands at same point as initial save.
 
     // Advances from restore point since restore didn't move position.
@@ -655,30 +798,37 @@ TEST(SortedDataInterface, SaveAndRestorePositionStandardIndexConsidersRecordId_R
 }
 
 // Test that reverse cursors over unique indices will never return the same key twice.
-TEST(SortedDataInterface, SaveAndRestorePositionUniqueIndexWontReturnDupKeys_Reverse) {
+TEST(SortedDataInterface, SaveAndRestoreUniqueIndexWontReturnDupKeys_Reverse) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    auto sorted = harnessHelper->newSortedDataInterface(/*unique*/ true,
+                                                        /*partial=*/false,
+                                                        {
+                                                            {key1, loc1},
+                                                            {key2, loc1},
+                                                            {key3, loc1},
+                                                            {key4, loc2},
+                                                        });
+
     auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(
-        /*unique*/ true,
-        /*partial=*/false,
-        {{key1, loc1}, {key2, loc1}, {key3, loc1}, {key4, loc2}});
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
 
     auto cursor = sorted->newCursor(opCtx.get(), false);
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true)),
-              IndexKeyEntry(key4, loc2));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key4, false, true).finishAndGetBuffer()),
+        IndexKeyEntry(key4, loc2));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key4, loc2}});
-    insertToIndex(opCtx, sorted, {{key4, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key4, loc2}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key4, loc1}});
     cursor->restore();
 
     // We should skip over (key4, loc1) since we already returned (key4, loc2).
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc1));
 
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key3, loc1}});
-    insertToIndex(opCtx, sorted, {{key3, loc2}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key3, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key3, loc2}});
     cursor->restore();
 
     // We should skip over (key3, loc2) since we already returned (key3, loc1).
@@ -686,13 +836,13 @@ TEST(SortedDataInterface, SaveAndRestorePositionUniqueIndexWontReturnDupKeys_Rev
 
     // If the key we just returned is removed, we should simply return the next key after restoring.
     cursor->save();
-    removeFromIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
 
     // If a key is inserted just ahead of our position, we should return it after restoring.
     cursor->save();
-    insertToIndex(opCtx, sorted, {{key0, loc1}});
+    insertToIndex(opCtx.get(), sorted.get(), {{key0, loc1}});
     cursor->restore();
     ASSERT_EQ(cursor->next(), IndexKeyEntry(key0, loc1));
 }
@@ -700,7 +850,6 @@ TEST(SortedDataInterface, SaveAndRestorePositionUniqueIndexWontReturnDupKeys_Rev
 // Ensure that SaveUnpositioned allows later use of the cursor.
 TEST(SortedDataInterface, SaveUnpositionedAndRestore) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
     auto sorted = harnessHelper->newSortedDataInterface(/*unique=*/false,
                                                         /*partial=*/false,
                                                         {
@@ -709,23 +858,104 @@ TEST(SortedDataInterface, SaveUnpositionedAndRestore) {
                                                             {key3, loc1},
                                                         });
 
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     auto cursor = sorted->newCursor(opCtx.get());
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
-              IndexKeyEntry(key2, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key2, loc1));
 
     cursor->saveUnpositioned();
-    removeFromIndex(opCtx, sorted, {{key2, loc1}});
+    removeFromIndex(opCtx.get(), sorted.get(), {{key2, loc1}});
     cursor->restore();
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-              IndexKeyEntry(key1, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key1, loc1));
 
     cursor->saveUnpositioned();
     cursor->restore();
 
-    ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true)),
-              IndexKeyEntry(key3, loc1));
+    ASSERT_EQ(
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true).finishAndGetBuffer()),
+        IndexKeyEntry(key3, loc1));
+}
+
+TEST(SortedDataInterface, SaveRestoreLex) {
+    const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    const auto key1 = BSON(""
+                           << "abc");
+    const auto key2 = BSON(""
+                           << "abcd");
+    auto sorted = harnessHelper->newSortedDataInterface(/*unique=*/false,
+                                                        /*partial=*/false,
+                                                        {{key1, RecordId(1)}, {key2, RecordId(2)}});
+
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+    // Check that these keys are lexicographically sorted.
+    auto cursor = sorted->newCursor(opCtx.get());
+    auto entry = cursor->seek(
+        makeKeyStringForSeek(sorted.get(), BSONObj(), true, true).finishAndGetBuffer());
+    ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(1)));
+
+    entry = cursor->next();
+    ASSERT_EQ(entry, IndexKeyEntry(key2, RecordId(2)));
+
+    cursor->save();
+
+    // Delete abcd, restore make sure that we don't get abc.
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        sorted->unindex(opCtx.get(),
+                        makeKeyString(sorted.get(), key2, RecordId(2)),
+                        true /* allow duplicates */);
+        uow.commit();
+    }
+
+    cursor->restore();
+    entry = cursor->next();
+    ASSERT_EQ(boost::none, entry);
+}
+
+TEST(SortedDataInterface, SaveRestoreLexWithEndPosition) {
+    const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
+    const auto key1 = BSON(""
+                           << "abc");
+    const auto key2 = BSON(""
+                           << "abcd");
+    auto sorted = harnessHelper->newSortedDataInterface(/*unique=*/false,
+                                                        /*partial=*/false,
+                                                        {{key1, RecordId(1)}, {key2, RecordId(2)}});
+
+    auto opCtx = harnessHelper->newOperationContext();
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+    // Check that these keys are lexicographically sorted.
+    auto cursor = sorted->newCursor(opCtx.get());
+    cursor->setEndPosition(key1, true);
+
+    auto entry =
+        cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer());
+    ASSERT_EQ(boost::none, entry);
+
+    cursor->setEndPosition(key2, true);
+
+    entry = cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer());
+    ASSERT_EQ(entry, IndexKeyEntry(key1, RecordId(1)));
+
+    entry = cursor->next();
+    ASSERT_EQ(entry, IndexKeyEntry(key2, RecordId(2)));
+
+    cursor->save();
+
+    cursor->setEndPosition(key1, true);
+    cursor->restore();
+    entry = cursor->next();
+    ASSERT_EQ(boost::none, entry);
 }
 
 }  // namespace

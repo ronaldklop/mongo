@@ -30,8 +30,6 @@
 
 #pragma once
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
-
 #include "asio/detail/config.hpp"
 
 #include "asio/detail/push_options.hpp"
@@ -46,6 +44,8 @@
 #include "mongo/util/net/ssl/detail/stream_core.hpp"
 #include "mongo/util/net/ssl/error.hpp"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace asio {
 namespace ssl {
@@ -155,10 +155,6 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
 
     if (_certs && (status == ::errSecSuccess)) {
         status = ::SSLSetCertificate(_ssl.get(), _certs.get());
-    }
-
-    if (status == ::errSecSuccess) {
-        status = ::SSLSetPeerID(_ssl.get(), _ssl.get(), sizeof(native_handle_type));
     }
 
     if (status == ::errSecSuccess) {
@@ -309,7 +305,8 @@ asio::mutable_buffer engine::get_output(const asio::mutable_buffer& data) {
     const auto requested = *data_len;
     *data_len = std::min<size_t>(requested, max_outbuf_size - this_->_outbuf.size());
     this_->_outbuf.insert(this_->_outbuf.end(), p, p + *data_len);
-    return (requested == *data_len) ? ::errSecSuccess : ::errSSLWouldBlock;
+    return (requested == *data_len) ? static_cast<OSStatus>(::errSecSuccess)
+                                    : static_cast<OSStatus>(::errSSLWouldBlock);
 }
 
 boost::optional<std::string> engine::get_sni() {

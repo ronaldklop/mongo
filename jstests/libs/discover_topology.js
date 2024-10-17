@@ -1,16 +1,17 @@
-'use strict';
-
 // The tojson() function that is commonly used to build up assertion messages doesn't support the
 // Symbol type, so we just use unique string values instead.
-var Topology = {
+export var Topology = {
     kStandalone: 'stand-alone',
     kRouter: 'mongos router',
     kReplicaSet: 'replica set',
     kShardedCluster: 'sharded cluster',
 };
 
-var DiscoverTopology = (function() {
-    const kDefaultConnectFn = (host) => new Mongo(host);
+export var DiscoverTopology = (function() {
+    const kDefaultConnectFn = (host) => new Mongo(host, undefined, {gRPC: false});
+    // Nodes discovered via isMaster have a MongoRPC port and must not use gRPC.
+    const kDisableGRPCConnString = (hostConn) =>
+        jsTestOptions().shellGRPC ? `mongodb://${hostConn}/?grpc=false` : hostConn;
 
     function getDataMemberConnectionStrings(conn) {
         const res = assert.commandWorked(conn.adminCommand({isMaster: 1}));
@@ -25,8 +26,9 @@ var DiscoverTopology = (function() {
         res.passives = res.passives || [];
         return {
             type: Topology.kReplicaSet,
-            primary: res.primary,
-            nodes: [...res.hosts, ...res.passives]
+            configsvr: res.configsvr == 2,
+            primary: kDisableGRPCConnString(res.primary),
+            nodes: [...res.hosts, ...res.passives].map(host => kDisableGRPCConnString(host))
         };
     }
 
@@ -54,6 +56,7 @@ var DiscoverTopology = (function() {
 
         const configsvrConn = connectFn(getConfigServerConnectionString());
         const configsvrHosts = getDataMemberConnectionStrings(configsvrConn);
+        configsvrConn.close();
 
         const shards = assert.commandWorked(conn.adminCommand({listShards: 1})).shards;
         const shardHosts = {};
@@ -61,6 +64,7 @@ var DiscoverTopology = (function() {
         for (let shardInfo of shards) {
             const shardConn = connectFn(shardInfo.host);
             shardHosts[shardInfo._id] = getDataMemberConnectionStrings(shardConn);
+            shardConn.close();
         }
 
         // Discover mongos URIs from the connection string. If a mongos is not passed in explicitly,

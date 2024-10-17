@@ -3,19 +3,23 @@
  *
  *
  * @tags: [
- *     assumes_unsharded_collection,
- *     requires_timeseries,
- *     requires_fcv_49,
+ *   # TimeseriesAggTests doesn't handle stepdowns.
+ *   does_not_support_stepdowns,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
+ *   references_foreign_collection,
+ *   requires_getmore,
  * ]
  */
-(function() {
-"use strict";
+import {TimeseriesAggTests} from "jstests/core/timeseries/libs/timeseries_agg_helpers.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
-load("jstests/core/timeseries/libs/timeseries_agg_helpers.js");
-
-if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series collection feature flag is disabled");
-    return;
+// TODO (SERVER-82066): Re-enable after handling direct connections correctly.
+const isMultiversion = Boolean(jsTest.options().useRandomBinVersionsWithinReplicaSet);
+if (isMultiversion ||
+    FeatureFlagUtil.isPresentAndEnabled(db, "TrackUnshardedCollectionsUponCreation")) {
+    jsTest.log("Skipping test since featureFlagTrackUnshardedCollectionsUponCreation is enabled");
+    quit();
 }
 
 const testDB = TimeseriesAggTests.getTestDb();
@@ -30,7 +34,7 @@ function prepareOutputCollectionForMergeOn(outColl) {
     outColl.drop();
     assert.commandWorked(testDB.createCollection(outColl.getName()));
 
-    assert.commandWorked(outColl.createIndex({"hostid": 1}, {unique: true}));
+    assert.commandWorked(outColl.createIndex({"tags.hostid": 1}, {unique: true}));
 }
 
 /**
@@ -64,7 +68,7 @@ let runMergeOnErrorTestCase = () => {
     var err = assert.throws(() => inColl.aggregate([{
         $merge: {
             into: outColl.getName(),
-            on: "hostid",
+            on: "tags.hostid",
             whenMatched: "replace",
         }
     }]));
@@ -76,12 +80,12 @@ let runMergeOnErrorTestCase = () => {
  */
 let runMergeOnTestCase = () => {
     var mergePipeline = [
-        {$project: {_id: 0, cpu: 1, idle: 1, hostid: 1, time: 1}},
+        {$project: {_id: 0, cpu: 1, idle_user: 1, "tags.hostid": 1, time: 1}},
         {$sort: {time: 1}},
         {
             $merge: {
                 into: "observer_out",
-                on: "hostid",
+                on: "tags.hostid",
                 whenMatched: "merge",
             }
         }
@@ -112,4 +116,3 @@ let runMergeOnTestCase = () => {
 runSimpleMergeTestCase();
 runMergeOnErrorTestCase();
 runMergeOnTestCase();
-})();

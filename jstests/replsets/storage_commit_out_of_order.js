@@ -7,10 +7,8 @@
  * few seconds while the other threads get later optimes and commit their inserts.  The hung thread
  * is released after a few seconds and asserts that its write concern can be satisfied.
  */
-(function() {
-'use strict';
-
-load('jstests/libs/parallelTester.js');
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -24,7 +22,8 @@ const coll = primary.getDB(dbName).getCollection(collName);
 /**
  * Waits for the provided latch to reach 0 and then does a single w:majority insert.
  */
-const majorityInsert = function(num, host, dbName, collName, latch) {
+const majorityInsert = async function(num, host, dbName, collName, latch) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
     const m = new Mongo(host);
     latch.countDown();
     while (latch.getCount() > 0) {
@@ -71,4 +70,3 @@ for (let i = 0; i < numThreads; ++i) {
 }
 
 rst.stopSet();
-}());

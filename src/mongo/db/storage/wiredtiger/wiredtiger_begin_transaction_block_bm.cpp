@@ -27,23 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <memory>
+#include <ostream>
+#include <string>
 
-#include "mongo/base/checked_cast.h"
-#include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/recovery_unit_test_harness.h"
+#include <wiredtiger.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
@@ -57,7 +59,7 @@ public:
         ss << extraStrings;
         std::string config = ss.str();
         int ret = wiredtiger_open(dbpath.toString().c_str(), nullptr, config.c_str(), &_conn);
-        invariant(wtRCToStatus(ret).isOK());
+        invariant(wtRCToStatus(ret, nullptr));
     }
     ~WiredTigerConnection() {
         _conn->close(_conn, nullptr);
@@ -70,96 +72,74 @@ private:
     WT_CONNECTION* _conn;
 };
 
-class WiredTigerTestHelper {
+class WiredTigerTestHelper : public ScopedGlobalServiceContextForTest {
 public:
-    WiredTigerTestHelper()
-        : _dbpath("wt_test"),
-          _connection(_dbpath.path(), ""),
-          _sessionCache(_connection.getConnection(), &_clockSource) {
-        _opCtx.reset(newOperationContext());
-        auto ru = WiredTigerRecoveryUnit::get(_opCtx.get());
-        _wtSession = ru->getSession()->getSession();
-        invariant(wtRCToStatus(_wtSession->create(_wtSession, "table:mytable", nullptr)).isOK());
-        ru->abandonSnapshot();
+    WiredTigerTestHelper() {
+        _ru = std::make_unique<WiredTigerRecoveryUnit>(&_sessionCache, &_oplogManager);
+        _session = _ru->getSession();
+        auto wt_session = _session->getSession();
+        invariant(
+            wtRCToStatus(wt_session->create(wt_session, "table:mytable", nullptr), wt_session));
+        _ru->abandonSnapshot();
     }
 
-    WiredTigerSessionCache* getSessionCache() {
-        return &_sessionCache;
-    }
-
-    WiredTigerOplogManager* getOplogManager() {
-        return &_oplogManager;
-    }
-
-    WT_SESSION* wtSession() const {
-        return _wtSession;
-    }
-
-    OperationContext* newOperationContext() {
-        return new OperationContextNoop(
-            new WiredTigerRecoveryUnit(getSessionCache(), &_oplogManager));
-    }
-
-    OperationContext* getOperationContext() const {
-        return _opCtx.get();
+    WiredTigerSession* session() const {
+        return _session;
     }
 
 private:
-    unittest::TempDir _dbpath;
-    WiredTigerConnection _connection;
+    unittest::TempDir _dbpath{"wt_test"};
+    WiredTigerConnection _connection{_dbpath.path(), ""};
     ClockSourceMock _clockSource;
-    WiredTigerSessionCache _sessionCache;
+    WiredTigerSessionCache _sessionCache{_connection.getConnection(), &_clockSource};
     WiredTigerOplogManager _oplogManager;
-    std::unique_ptr<OperationContext> _opCtx;
-    WT_SESSION* _wtSession;
+    std::unique_ptr<WiredTigerRecoveryUnit> _ru;
+
+    WiredTigerSession* _session;
 };
 
 void BM_WiredTigerBeginTxnBlock(benchmark::State& state) {
     WiredTigerTestHelper helper;
     for (auto _ : state) {
-        WiredTigerBeginTxnBlock beginTxn(helper.wtSession(), nullptr);
+        WiredTigerBeginTxnBlock beginTxn(helper.session(), nullptr);
     }
 }
 
-using mongo::WiredTigerBeginTxnBlock;
-
-template <PrepareConflictBehavior behavior, RoundUpPreparedTimestamps round>
+template <PrepareConflictBehavior behavior, bool round>
 void BM_WiredTigerBeginTxnBlockWithArgs(benchmark::State& state) {
     WiredTigerTestHelper helper;
     for (auto _ : state) {
-        WiredTigerBeginTxnBlock beginTxn(helper.wtSession(), behavior, round);
+        WiredTigerBeginTxnBlock beginTxn(helper.session(),
+                                         behavior,
+                                         round,
+                                         RoundUpReadTimestamp::kNoRoundError,
+                                         RecoveryUnit::UntimestampedWriteAssertionLevel::kEnforce);
     }
 }
-
 
 void BM_setTimestamp(benchmark::State& state) {
     WiredTigerTestHelper helper;
     for (auto _ : state) {
-        WiredTigerBeginTxnBlock beginTxn(helper.wtSession(), nullptr);
+        WiredTigerBeginTxnBlock beginTxn(helper.session(), nullptr);
         ASSERT_OK(beginTxn.setReadSnapshot(Timestamp(1)));
     }
 }
 
 BENCHMARK(BM_WiredTigerBeginTxnBlock);
-BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
-                   PrepareConflictBehavior::kEnforce,
-                   RoundUpPreparedTimestamps::kNoRound);
-BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
-                   PrepareConflictBehavior::kEnforce,
-                   RoundUpPreparedTimestamps::kRound);
+BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs, PrepareConflictBehavior::kEnforce, false);
+BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs, PrepareConflictBehavior::kEnforce, true);
 BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
                    PrepareConflictBehavior::kIgnoreConflicts,
-                   RoundUpPreparedTimestamps::kNoRound);
+                   false);
 BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
                    PrepareConflictBehavior::kIgnoreConflicts,
-                   RoundUpPreparedTimestamps::kRound);
+                   true);
 BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
                    PrepareConflictBehavior::kIgnoreConflictsAllowWrites,
-                   RoundUpPreparedTimestamps::kNoRound);
+                   false);
 BENCHMARK_TEMPLATE(BM_WiredTigerBeginTxnBlockWithArgs,
                    PrepareConflictBehavior::kIgnoreConflictsAllowWrites,
-                   RoundUpPreparedTimestamps::kRound);
-
+                   true);
 BENCHMARK(BM_setTimestamp);
 
 }  // namespace

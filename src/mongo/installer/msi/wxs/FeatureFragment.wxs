@@ -50,15 +50,6 @@
                <ComponentGroupRef Id="cg_EnterpriseServer" />
              <?endif ?>
         </Feature>
-        <Feature Id="Client"
-                 Title ="Client"
-                 Description="The MongoDB client/shell (mongo)"
-                 Level ="1">
-          <ComponentRef Id="c_mongo"/>
-          <?if $(var.Edition) = Enterprise ?>
-            <ComponentGroupRef Id="cg_EnterpriseBase" />
-          <?endif ?>
-        </Feature>
         <Feature Id="Router"
                  Title ="Router"
                  Description="The MongoDB Router (mongos)"
@@ -87,6 +78,7 @@
                 Level ="1">
           <ComponentRef Id="c_mongocryptd"/>
           <ComponentRef Id="c_mongocryptdPdb"/>
+          <ComponentGroupRef Id="cg_EnterpriseBase" />
         </Feature>
         <?endif ?>
       </Feature>

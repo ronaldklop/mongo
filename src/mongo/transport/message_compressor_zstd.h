@@ -27,6 +27,10 @@
  *    it in the license file.
  */
 
+#include <cstddef>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/status_with.h"
 #include "mongo/transport/message_compressor_base.h"
 
 namespace mongo {
@@ -39,6 +43,8 @@ public:
     StatusWith<std::size_t> compressData(ConstDataRange input, DataRange output) override;
 
     StatusWith<std::size_t> decompressData(ConstDataRange input, DataRange output) override;
+
+    std::size_t getMaxDecompressedSize(const void* src, size_t srcSize);
 };
 
 

@@ -2,7 +2,6 @@
  * Test that a $project with a combination of expressions and field projections gets evaluted
  * correctly, and overwrites the data present in the input document when necessary.
  */
-(function() {
 const coll = db.project_with_expressions;
 coll.drop();
 
@@ -21,7 +20,7 @@ function assertProjectionResultForFindAndAgg(projection, expectedResults) {
     function assertResultsEqual(results, expected) {
         assert.eq(results.length, expected.length);
         for (let i = 0; i < results.length; ++i) {
-            assert.docEq(results[i], expected[i]);
+            assert.docEq(expected[i], results[i]);
         }
     }
     assertResultsEqual(aggResults, expectedResults);
@@ -46,4 +45,3 @@ assertProjectionResultForFindAndAgg(
 assertProjectionResultForFindAndAgg(
     {_id: 0, a: {subObj2: 1, subObj1: {$literal: 1}, subObj3: {q: 1}}},
     [{a: {subObj2: {p: 1}, subObj3: {}, subObj1: 1}}]);
-})();

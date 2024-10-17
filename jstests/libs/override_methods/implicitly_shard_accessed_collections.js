@@ -5,119 +5,48 @@
  * The DB.prototype.getCollection() function is called whenever an undefined property is accessed
  * on the db object.
  *
- * DBCollection.prototype.drop() function will re-shard any non-blacklisted collection that is
+ * DBCollection.prototype.drop() function will re-shard any non-denylisted collection that is
  * dropped in a sharded cluster.
  */
 
-/**
- * Settings for the converting implictily accessed collections to sharded collections.
- */
-const ImplicitlyShardAccessCollSettings = (function() {
-    let mode = 0;  // Default to hashed shard key.
+import {OverrideHelpers} from "jstests/libs/override_methods/override_helpers.js";
+import {
+    setTestMayRunDropInParallel,
+    ShardingOverrideCommon
+} from "jstests/libs/override_methods/shard_collection_util.js";
+import {
+    ImplicitlyShardAccessCollSettings
+} from "jstests/libs/override_methods/shard_collection_util.js";
 
-    return {
-        Modes: {
-            kUseHashedSharding: 0,
-            kHashedMoveToSingleShard: 1,
-        },
-        setMode: function(newMode) {
-            if (newMode !== 0 && newMode !== 1) {
-                throw new Error("Cannot set mode to unknown mode: " + newMode);
-            }
-
-            mode = newMode;
-        },
-        getMode: function() {
-            return mode;
-        },
-    };
-})();
-
-(function() {
-'use strict';
-
-load("jstests/libs/override_methods/override_helpers.js");  // For 'OverrideHelpers'.
+// Expose settings for this override on `globalThis`
+globalThis.ImplicitlyShardAccessCollSettings = ImplicitlyShardAccessCollSettings;
 
 // Save a reference to the original methods in the IIFE's scope.
 // This scoping allows the original methods to be called by the overrides below.
 var originalGetCollection = DB.prototype.getCollection;
+var originalCreateCollection = DB.prototype.createCollection;
 var originalDBCollectionDrop = DBCollection.prototype.drop;
 var originalStartParallelShell = startParallelShell;
 var originalRunCommand = Mongo.prototype.runCommand;
 
-var testMayRunDropInParallel = false;
+DB.prototype.createCollection = function() {
+    const createCollResult = originalCreateCollection.apply(this, arguments);
 
-// Blacklisted namespaces that should not be sharded.
-var blacklistedNamespaces = [
-    /\$cmd/,
-    /^admin\./,
-    /^config\./,
-    /\.system\./,
-];
-
-const kZoneName = 'moveToHereForMigrationPassthrough';
-
-function shardCollection(collection) {
-    var db = collection.getDB();
-    var dbName = db.getName();
-    var fullName = collection.getFullName();
-
-    for (var ns of blacklistedNamespaces) {
-        if (fullName.match(ns)) {
-            return;
-        }
+    if (!createCollResult.ok || arguments.length < 2 || arguments[1] == null ||
+        !isObject(arguments[1]) || !arguments[1].timeseries || !arguments[1].timeseries.timeField) {
+        return createCollResult;
     }
 
-    var res = db.adminCommand({enableSharding: dbName});
+    const timeField = arguments[1]["timeseries"]["timeField"];
+    ShardingOverrideCommon.shardCollectionWithSpec({
+        db: this,
+        collName: arguments[0],
+        shardKey: {[timeField]: 1},
+        timeseriesSpec: arguments[1]["timeseries"]
+    });
 
-    // enableSharding may only be called once for a database.
-    if (res.code !== ErrorCodes.AlreadyInitialized) {
-        assert.commandWorked(res, "enabling sharding on the '" + dbName + "' db failed");
-    }
-
-    res = db.adminCommand(
-        {shardCollection: fullName, key: {_id: 'hashed'}, collation: {locale: "simple"}});
-
-    let checkResult = function(res, opDescription) {
-        if (res.ok === 0 && testMayRunDropInParallel) {
-            // We ignore ConflictingOperationInProgress error responses from the
-            // "shardCollection" command if it's possible the test was running a "drop" command
-            // concurrently. We could retry running the "shardCollection" command, but tests
-            // that are likely to trigger this case are also likely running the "drop" command
-            // in a loop. We therefore just let the test continue with the collection being
-            // unsharded.
-            assert.commandFailedWithCode(res, ErrorCodes.ConflictingOperationInProgress);
-            jsTest.log("Ignoring failure while " + opDescription +
-                       " due to a concurrent drop operation: " + tojson(res));
-        } else {
-            assert.commandWorked(res, opDescription + " failed");
-        }
-    };
-
-    checkResult(res, 'shard ' + fullName);
-
-    // Set the entire chunk range to a single zone, so balancer will be forced to move the
-    // evenly distributed chunks to a shard (selected at random).
-    if (res.ok === 1 &&
-        ImplicitlyShardAccessCollSettings.getMode() ===
-            ImplicitlyShardAccessCollSettings.Modes.kHashedMoveToSingleShard) {
-        let shardName =
-            db.getSiblingDB('config').shards.aggregate([{$sample: {size: 1}}]).toArray()[0]._id;
-
-        checkResult(db.adminCommand({addShardToZone: shardName, zone: kZoneName}),
-                    'add ' + shardName + ' to zone ' + kZoneName);
-        checkResult(db.adminCommand({
-            updateZoneKeyRange: fullName,
-            min: {_id: MinKey},
-            max: {_id: MaxKey},
-            zone: kZoneName
-        }),
-                    'set zone for ' + fullName);
-
-        // Wake up the balancer.
-        checkResult(db.adminCommand({balancerStart: 1}), 'turn on balancer');
-    }
-}
+    return createCollResult;
+};
 
 DB.prototype.getCollection = function() {
     var collection = originalGetCollection.apply(this, arguments);
@@ -137,6 +66,11 @@ DB.prototype.getCollection = function() {
     try {
         TestData.doNotOverrideReadPreference = true;
         collStats = this.runCommand({collStats: collection.getName()});
+        if (!collStats.ok && collStats.codeName == "CommandNotSupportedOnView") {
+            // In case we catch CommandNotSupportedOnView it means the collection was actually a
+            // view and should be returned without attempting to shard it (which is not allowed)
+            return collection;
+        }
     } finally {
         TestData.doNotOverrideReadPreference = testDataDoNotOverrideReadPreferenceOriginal;
     }
@@ -147,7 +81,9 @@ DB.prototype.getCollection = function() {
     }
 
     // Attempt to enable sharding on database and collection if not already done.
-    shardCollection(collection);
+    if (!TestData.implicitlyShardOnCreateCollectionOnly) {
+        ShardingOverrideCommon.shardCollection(collection);
+    }
 
     return collection;
 };
@@ -156,7 +92,9 @@ DBCollection.prototype.drop = function() {
     var dropResult = originalDBCollectionDrop.apply(this, arguments);
 
     // Attempt to enable sharding on database and collection if not already done.
-    shardCollection(this);
+    if (!TestData.implicitlyShardOnCreateCollectionOnly) {
+        ShardingOverrideCommon.shardCollection(this);
+    }
 
     return dropResult;
 };
@@ -212,11 +150,10 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
 // Tests may use a parallel shell to run the "drop" command concurrently with other
 // operations. This can cause the "shardCollection" command to return a
 // ConflictingOperationInProgress error response.
-startParallelShell = function() {
-    testMayRunDropInParallel = true;
+globalThis.startParallelShell = function() {
+    setTestMayRunDropInParallel(true);
     return originalStartParallelShell.apply(this, arguments);
 };
 
 OverrideHelpers.prependOverrideInParallelShell(
     "jstests/libs/override_methods/implicitly_shard_accessed_collections.js");
-}());

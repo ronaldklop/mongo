@@ -1,15 +1,6 @@
 /**
  * Tests for the $lookup stage with sub-pipeline syntax and localField/foreignField syntax.
- *
- * Accessed collections cannot be implicitly sharded because you cannot $lookup into a sharded
- * collection.
- * @tags: [
- *   assumes_unsharded_collection,
- * ]
  */
-(function() {
-"use strict";
-
 const testDB = db.getSiblingDB(jsTestName());
 assert(testDB.dropDatabase());
 
@@ -327,4 +318,3 @@ expected = [{
     }
 }];
 assert.sameMembers(result, expected);
-}());

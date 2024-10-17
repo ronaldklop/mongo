@@ -27,14 +27,33 @@
  *    it in the license file.
  */
 
+#include <absl/container/node_hash_map.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_backend_local.h"
+#include "mongo/db/auth/authorization_backend_mock.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/auth/authorization_router_impl.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/service_entry_point_shard_role.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -67,6 +86,14 @@ class BaseMockMechanism : public MakeServerMechanism<Policy> {
 public:
     explicit BaseMockMechanism(std::string authenticationDatabase)
         : MakeServerMechanism<Policy>(std::move(authenticationDatabase)) {}
+
+    boost::optional<unsigned int> currentStep() const override {
+        return boost::none;
+    }
+
+    boost::optional<unsigned int> totalSteps() const override {
+        return boost::none;
+    }
 
 protected:
     StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
@@ -179,27 +206,29 @@ class MechanismRegistryTest : public ServiceContextTest {
 public:
     MechanismRegistryTest()
         : opCtx(makeOperationContext()),
-          authManagerExternalState(new AuthzManagerExternalStateMock()),
-          authManager(new AuthorizationManagerImpl(
-              getServiceContext(),
-              std::unique_ptr<AuthzManagerExternalStateMock>(authManagerExternalState))),
           // By default the registry is initialized with all mechanisms enabled.
-          registry(opCtx->getServiceContext(), {"FOO", "BAR", "InternalAuth"}) {
-        AuthorizationManager::set(getServiceContext(),
-                                  std::unique_ptr<AuthorizationManager>(authManager));
+          registry(opCtx->getService(), {"FOO", "BAR", "InternalAuth"}) {
 
-        ASSERT_OK(authManagerExternalState->updateOne(
-            opCtx.get(),
-            AuthorizationManager::versionCollectionNamespace,
-            AuthorizationManager::versionDocumentQuery,
-            BSON("$set" << BSON(AuthorizationManager::schemaVersionFieldName
-                                << AuthorizationManager::schemaVersion26Final)),
-            true,
-            BSONObj()));
+        auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+        AuthorizationManager::set(getService(),
+                                  globalAuthzManagerFactory->createShard(getService()));
 
-        ASSERT_OK(authManagerExternalState->insert(
+        auth::AuthorizationBackendInterface::set(
+            getService(), globalAuthzManagerFactory->createBackendInterface(getService()));
+        authzBackend = reinterpret_cast<auth::AuthorizationBackendMock*>(
+            auth::AuthorizationBackendInterface::get(getService()));
+
+        // Initialize the serviceEntryPoint so that DBDirectClient can function.
+        getService()->setServiceEntryPoint(std::make_unique<ServiceEntryPointShardRole>());
+
+        // Setup the repl coordinator in standalone mode so we don't need an oplog etc.
+        repl::ReplicationCoordinator::set(getServiceContext(),
+                                          std::make_unique<repl::ReplicationCoordinatorMock>(
+                                              getServiceContext(), repl::ReplSettings()));
+
+        ASSERT_OK(authzBackend->insert(
             opCtx.get(),
-            NamespaceString("admin.system.users"),
+            NamespaceString::createNamespaceString_forTest("admin.system.users"),
             BSON("_id"
                  << "test.sajack"
                  << "user"
@@ -213,19 +242,22 @@ public:
             BSONObj()));
 
 
-        ASSERT_OK(authManagerExternalState->insert(opCtx.get(),
-                                                   NamespaceString("admin.system.users"),
-                                                   BSON("_id"
-                                                        << "$external.sajack"
-                                                        << "user"
-                                                        << "sajack"
-                                                        << "db"
-                                                        << "$external"
-                                                        << "credentials" << BSON("external" << true)
-                                                        << "roles" << BSONArray()),
-                                                   BSONObj()));
+        ASSERT_OK(authzBackend->insert(opCtx.get(),
+                                       NamespaceString::createNamespaceString_forTest(
+                                           "admin.system.users"),
+                                       BSON("_id"
+                                            << "$external.sajack"
+                                            << "user"
+                                            << "sajack"
+                                            << "db"
+                                            << "$external"
+                                            << "credentials" << BSON("external" << true) << "roles"
+                                            << BSONArray()),
+                                       BSONObj()));
 
-        internalSecurity.user = UserHandle(User(UserName("__system", "local")));
+        std::unique_ptr<UserRequest> systemLocal =
+            std::make_unique<UserRequestGeneral>(UserName("__system"_sd, "local"_sd), boost::none);
+        internalSecurity.setUser(std::make_shared<UserHandle>(User(std::move(systemLocal))));
     }
 
     BSONObj getMechsFor(const UserName user) {
@@ -235,13 +267,12 @@ public:
     }
 
     ServiceContext::UniqueOperationContext opCtx;
-    AuthzManagerExternalStateMock* authManagerExternalState;
-    AuthorizationManager* authManager;
+    auth::AuthorizationBackendMock* authzBackend;
 
     SASLServerMechanismRegistry registry;
 
     const UserName internalSajack = {"sajack"_sd, "test"_sd};
-    const UserName externalSajack = {"sajack"_sd, "$external"_sd};
+    const UserName externalSajack = {"sajack"_sd, DatabaseName::kExternal.db(omitTenant)};
 };
 
 TEST_F(MechanismRegistryTest, acquireInternalMechanism) {
@@ -319,7 +350,7 @@ TEST_F(MechanismRegistryTest, internalAuth) {
     ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("BAR")), getMechsFor(internalSajack));
     ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth"
                                                               << "BAR")),
-                      getMechsFor(internalSecurity.user->getName()));
+                      getMechsFor((*internalSecurity.getUser())->getName()));
 
     registry.setEnabledMechanisms({"BAR", "InternalAuth"});
     ASSERT_BSONOBJ_EQ(BSON("saslSupportedMechs" << BSON_ARRAY("InternalAuth"

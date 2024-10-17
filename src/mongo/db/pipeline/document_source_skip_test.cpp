@@ -27,14 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <limits>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_skip.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -102,6 +104,13 @@ TEST_F(DocumentSourceSkipTest, SkipsChainedTogetherShouldNotOverFlowWhenOptimizi
     skipFirst->doOptimizeAt(containerOptimized.begin(), &containerOptimized);
     ASSERT_EQUALS(containerOptimized.size(), 1U);
     ASSERT_EQUALS(skipFirst->getSkip(), 2);
+}
+
+TEST_F(DocumentSourceSkipTest, Redaction) {
+    auto stage = DocumentSourceSkip::create(getExpCtx(), 1337);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$skip":"?number"})",
+        redact(*stage));
 }
 }  // namespace
 }  // namespace mongo

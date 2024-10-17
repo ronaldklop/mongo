@@ -29,11 +29,26 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/index_builds_manager.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl_index_build_state.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/uuid.h"
 
 
 namespace mongo {
@@ -52,21 +67,33 @@ public:
     ~ActiveIndexBuilds();
 
     /**
+     * Waits for all index builds to stop after they have been interrupted during shutdown.
+     * Leaves the index builds in a recoverable state.
+     *
+     * This should only be called when certain the server will not start any new index builds --
+     * i.e. when the server is not accepting user requests and no internal operations are
+     * concurrently starting new index builds.
+     */
+    void waitForAllIndexBuildsToStopForShutdown();
+
+    /**
      * The following functions all have equivalent definitions in IndexBuildsCoordinator. The
      * IndexBuildsCoordinator functions forward to these functions. For descriptions of what they
      * do, see IndexBuildsCoordinator.
      */
-    void waitForAllIndexBuildsToStopForShutdown(OperationContext* opCtx);
+    void waitForAllIndexBuildsToStop(Interruptible* opCtx);
 
     void assertNoIndexBuildInProgress() const;
 
-    void waitUntilAnIndexBuildFinishes(OperationContext* opCtx);
+    void waitUntilAnIndexBuildFinishes(OperationContext* opCtx, Date_t deadline);
 
     void sleepIndexBuilds_forTestOnly(bool sleep);
 
     void verifyNoIndexBuilds_forTestOnly() const;
 
     StatusWith<std::shared_ptr<ReplIndexBuildState>> getIndexBuild(const UUID& buildUUID) const;
+
+    std::vector<std::shared_ptr<ReplIndexBuildState>> getAllIndexBuilds() const;
 
     void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                   const UUID& collectionUUID,
@@ -75,7 +102,7 @@ public:
     void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                   const UUID& collectionUUID);
 
-    void awaitNoBgOpInProgForDb(OperationContext* opCtx, StringData db);
+    void awaitNoBgOpInProgForDb(OperationContext* opCtx, const DatabaseName& dbName);
 
     /**
      * Unregisters the index build.
@@ -96,6 +123,17 @@ public:
     Status registerIndexBuild(std::shared_ptr<ReplIndexBuildState> replIndexBuildState);
 
     /**
+     * Get the number of in-progress index builds.
+     */
+    size_t getActiveIndexBuildsCount() const;
+
+    /**
+     * Provides passthrough access to ReplIndexBuildState for index build info.
+     * Does nothing if build UUID does not refer to an active index build.
+     */
+    void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
+
+    /**
      * When _sleepForTest is true, this function will sleep for 100ms and then check the value
      * of _sleepForTest again.
      */
@@ -110,7 +148,7 @@ private:
         WithLock lk, IndexBuildFilterFn indexBuildFilter) const;
 
     // Manages all of the below state
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ActiveIndexBuilds::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Build UUID to index build information
     stdx::unordered_map<UUID, std::shared_ptr<ReplIndexBuildState>, UUID::Hash> _allIndexBuilds;

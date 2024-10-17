@@ -9,13 +9,15 @@
  * operations will fail, but a later operation will need to succeed to pass the test. This will show
  * that operations from a transaction are executed in separate storage transactions.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
 replTest.startSet();
@@ -100,4 +102,3 @@ let res = secondary.getDB(dbName).getCollection(collName).find();
 assert.eq(res.toArray(), [{_id: 1, a: 0}, {_id: 2}, {_id: 3, a: 1}], res);
 
 replTest.stopSet();
-})();

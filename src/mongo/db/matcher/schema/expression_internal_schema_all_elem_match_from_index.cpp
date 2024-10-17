@@ -26,12 +26,16 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
 
 namespace mongo {
 
@@ -39,7 +43,7 @@ constexpr StringData InternalSchemaAllElemMatchFromIndexMatchExpression::kName;
 
 InternalSchemaAllElemMatchFromIndexMatchExpression::
     InternalSchemaAllElemMatchFromIndexMatchExpression(
-        StringData path,
+        boost::optional<StringData> path,
         long long index,
         std::unique_ptr<ExpressionWithPlaceholder> expression,
         clonable_ptr<ErrorAnnotation> annotation)
@@ -48,10 +52,9 @@ InternalSchemaAllElemMatchFromIndexMatchExpression::
       _index(index),
       _expression(std::move(expression)) {}
 
-std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::shallowClone()
-    const {
+std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::clone() const {
     auto clone = std::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
-        path(), _index, _expression->shallowClone(), _errorAnnotation);
+        path(), _index, _expression->clone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
@@ -71,22 +74,17 @@ bool InternalSchemaAllElemMatchFromIndexMatchExpression::equivalent(
 void InternalSchemaAllElemMatchFromIndexMatchExpression::debugString(StringBuilder& debug,
                                                                      int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << kName << "\n";
+    debug << kName;
+    _debugStringAttachTagInfo(&debug);
     debug << " index: " << _index << ", query:\n";
     _expression->getFilter()->debugString(debug, indentationLevel + 1);
 }
 
-BSONObj InternalSchemaAllElemMatchFromIndexMatchExpression::getSerializedRightHandSide() const {
-    BSONObjBuilder allElemMatchBob;
-    BSONArrayBuilder subArray(allElemMatchBob.subarrayStart(kName));
-    subArray.append(_index);
-    {
-        BSONObjBuilder eBuilder(subArray.subobjStart());
-        _expression->getFilter()->serialize(&eBuilder, true);
-        eBuilder.doneFast();
-    }
-    subArray.doneFast();
-    return allElemMatchBob.obj();
+void InternalSchemaAllElemMatchFromIndexMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const SerializationOptions& opts, bool includePath) const {
+    bob->append(kName,
+                BSON_ARRAY(opts.serializeLiteral(_index)
+                           << _expression->getFilter()->serialize(opts, includePath)));
 }
 
 MatchExpression::ExpressionOptimizerFunc

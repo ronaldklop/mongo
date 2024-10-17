@@ -27,26 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#include <string>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
-/* for diagnostic / testing purposes. Enabled via command line. */
+/* For diagnostic / testing purposes. Enabled via command line. See docs/test_commands.md. */
 class CmdSleep : public BasicCommand {
 public:
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
@@ -68,32 +84,48 @@ public:
     }
 
     // No auth needed because it only works when enabled via command line.
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
 
+    /**
+     * An empty 'ns' causes the global lock to be taken.
+     * A 'ns' that contains <db> causes only the rstl/global/database locks to be taken.
+     * A complete 'ns' <coll>.<db> causes the rstl/global/database/collection locks to be taken.
+     *
+     * Any higher level locks are taken in the appropriate MODE_IS or MODE_IX to match 'mode'.
+     */
     void _sleepInLock(mongo::OperationContext* opCtx,
                       long long millis,
                       LockMode mode,
-                      const StringData& ns) {
+                      StringData ns) {
         if (ns.empty()) {
             Lock::GlobalLock lk(opCtx, mode, Date_t::max(), Lock::InterruptBehavior::kThrow);
+            LOGV2(6001601,
+                  "Global lock acquired by sleep command.",
+                  "lockMode"_attr = modeName(mode));
             opCtx->sleepFor(Milliseconds(millis));
             return;
         }
-        auto nss = NamespaceString(ns);
-        uassert(
-            50961, "lockTarget is not a valid namespace", NamespaceString::validDBName(nss.db()));
+        // This is not ran in multitenancy since sleep is an internal testing command.
+        auto nss =
+            NamespaceStringUtil::deserialize(boost::none, ns, SerializationContext::stateDefault());
+        uassert(50961, "lockTarget is not a valid namespace", DatabaseName::isValid(nss.dbName()));
 
         auto dbMode = mode;
-        if (!nsIsDbOnly(ns)) {
+        if (!nss.isDbOnly()) {
             // Only acquire minimum dbLock mode required for collection lock acquisition.
             dbMode = isSharedLockMode(mode) ? MODE_IS : MODE_IX;
         }
 
-        Lock::DBLock dbLock(opCtx, nss.db(), dbMode, Date_t::max());
+        Lock::DBLock dbLock(opCtx, nss.dbName(), dbMode, Date_t::max());
 
-        if (nsIsDbOnly(ns)) {
+        if (nss.isDbOnly()) {
+            LOGV2(6001602,
+                  "Database lock acquired by sleep command.",
+                  "lockMode"_attr = modeName(dbMode));
             opCtx->sleepFor(Milliseconds(millis));
             return;
         }
@@ -101,23 +133,25 @@ public:
         // Need to acquire DBLock before attempting to acquire a collection lock.
         uassert(50962,
                 "lockTarget is not a valid namespace",
-                NamespaceString::validCollectionComponent(ns));
+                NamespaceString::validCollectionComponent(nss));
         Lock::CollectionLock collLock(opCtx, nss, mode, Date_t::max());
+        LOGV2(6001603,
+              "Collection lock acquired by sleep command.",
+              "lockMode"_attr = modeName(mode));
         opCtx->sleepFor(Milliseconds(millis));
     }
 
-    void _sleepInPBWM(mongo::OperationContext* opCtx, long long millis) {
-        Lock::ResourceLock pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode);
-        pbwm.lock(nullptr, MODE_X);
+    void _sleepInRSTL(mongo::OperationContext* opCtx, long long millis) {
+        Lock::ResourceLock rstl(opCtx, resourceIdReplicationStateTransitionLock, MODE_X);
+        LOGV2(6001600, "RSTL MODE_X lock acquired by sleep command.");
         opCtx->sleepFor(Milliseconds(millis));
-        pbwm.unlock();
     }
 
     CmdSleep() : BasicCommand("sleep") {}
     bool run(OperationContext* opCtx,
-             const std::string& ns,
+             const DatabaseName&,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
+             BSONObjBuilder& result) override {
         LOGV2(20504, "Test-only command 'sleep' invoked");
         long long msToSleep = 0;
 
@@ -166,8 +200,8 @@ public:
                 lockTarget = cmdObj["lockTarget"].checkAndGetStringData();
             }
 
-            if (lockTarget == "ParallelBatchWriterMode") {
-                _sleepInPBWM(opCtx, msRemaining.count());
+            if (lockTarget == "RSTL") {
+                _sleepInRSTL(opCtx, msRemaining.count());
                 continue;
             }
 
@@ -204,7 +238,16 @@ public:
 
         return true;
     }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+
+    bool allowedWithSecurityToken() const override {
+        // This is a test only command, we can safely allow it with multi-tenancy.
+        return true;
+    }
 };
 
-MONGO_REGISTER_TEST_COMMAND(CmdSleep);
+MONGO_REGISTER_COMMAND(CmdSleep).testOnly().forShard();
 }  // namespace mongo

@@ -1,9 +1,11 @@
 // SERVER-21118 don't hang at shutdown or apply ops too soon with secondaryDelaySecs.
 //
-// @tags: [requires_persistence, requires_fcv_49]
-load('jstests/replsets/rslib.js');
-(function() {
-"use strict";
+// @tags: [
+//   requires_persistence,
+// ]
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getLatestOp, reconfig} from "jstests/replsets/rslib.js";
 
 // Skip db hash check since secondary has slave delay.
 TestData.skipCheckDBHashes = true;
@@ -18,13 +20,9 @@ var conf = rst.getReplSetConfig();
 conf.members[1].votes = 0;
 conf.members[1].priority = 0;
 conf.members[1].hidden = true;
+conf.members[1].secondaryDelaySecs = 0;  // Set later.
 
 rst.startSet();
-// If featureFlagUseSecondaryDelaySecs is enabled, we must use the 'secondaryDelaySecs' field
-// name in our config. Otherwise, we use 'slaveDelay'.
-const delayFieldName = selectDelayFieldName(rst);
-conf.members[1][delayFieldName] = 0;  // Set later.
-
 rst.initiate(conf);
 
 var primary = rst.getPrimary();  // Waits for PRIMARY state.
@@ -35,9 +33,9 @@ assert.commandWorked(primary.getCollection(ns).insert([{}, {}, {}], {writeConcer
 // Set the delay field and wait for secondary to receive the change.
 conf = rst.getReplSetConfigFromNode();
 conf.version++;
-conf.members[1][delayFieldName] = 24 * 60 * 60;
+conf.members[1].secondaryDelaySecs = 24 * 60 * 60;
 reconfig(rst, conf);
-assert.soon(() => rst.getReplSetConfigFromNode(1).members[1][delayFieldName] > 0,
+assert.soon(() => rst.getReplSetConfigFromNode(1).members[1].secondaryDelaySecs > 0,
             () => rst.getReplSetConfigFromNode(1));
 
 // The secondary apply loop only checks for the delay field changes once per second.
@@ -46,19 +44,22 @@ var secondary = rst.getSecondary();
 const lastOp = getLatestOp(secondary);
 
 assert.commandWorked(primary.getCollection(ns).insert([{}, {}, {}]));
-assert.soon(() => secondary.adminCommand('serverStatus').metrics.repl.buffer.count > 0,
-            () => secondary.adminCommand('serverStatus').metrics.repl);
+if (!FeatureFlagUtil.isPresentAndEnabled(secondary, "ReduceMajorityWriteLatency")) {
+    assert.soon(() => secondary.adminCommand('serverStatus').metrics.repl.buffer.count > 0,
+                () => secondary.adminCommand('serverStatus').metrics.repl);
+}
 assert.neq(getLatestOp(primary), lastOp);
 assert.eq(getLatestOp(secondary), lastOp);
 
-sleep(2000);  // Prevent the test from passing by chance.
+sleep(5000);  // Prevent the test from passing by chance.
 assert.eq(getLatestOp(secondary), lastOp);
 
 // Make sure shutdown won't take a long time due to I/O.
 secondary.adminCommand('fsync');
 
-// Shutting down shouldn't take long.
-assert.lt(Date.timeFunc(() => rst.stop(1)), 60 * 1000);
+// Shutting down shouldn't take long, but in case of a slow machine closing/opening of wiredTiger on
+// shutdown for reconfiguration takes extra time hence the two minutes wait.
+assert.lt(Date.timeFunc(() => rst.stop(1)), 2 * 60 * 1000);
 
 secondary = rst.restart(1);
 rst.awaitSecondaryNodes();
@@ -68,4 +69,3 @@ sleep(2000);  // Prevent the test from passing by chance.
 assert.eq(getLatestOp(secondary), lastOp);
 
 rst.stopSet();
-})();

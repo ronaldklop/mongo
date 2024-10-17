@@ -1,5 +1,5 @@
-(function() {
-'use strict';
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const runTest = function(conn, failPointConn) {
     jsTestLog("Setting up users");
@@ -13,8 +13,7 @@ const runTest = function(conn, failPointConn) {
     assert.commandWorked(db.getSiblingDB("test").test.insert({}));
 
     jsTestLog("blocking finds and starting parallel shell to create op");
-    assert.commandWorked(failPointConn.getDB("admin").runCommand(
-        {configureFailPoint: "waitInFindBeforeMakingBatch", mode: "alwaysOn"}));
+    const fp = configureFailPoint(failPointConn, "waitInFindBeforeMakingBatch");
     let finderWait = startParallelShell(function() {
         assert.eq(db.getSiblingDB("admin").auth("testuser", "pwd"), 1);
         let testDB = db.getSiblingDB("test");
@@ -37,8 +36,7 @@ const runTest = function(conn, failPointConn) {
     });
 
     jsTestLog("found op");
-    assert.commandWorked(failPointConn.getDB("admin").runCommand(
-        {configureFailPoint: "waitInFindBeforeMakingBatch", mode: "off"}));
+    fp.off();
     finderWait();
 
     const authedUsers = myOp["effectiveUsers"];
@@ -46,14 +44,14 @@ const runTest = function(conn, failPointConn) {
     print(tojson(authedUsers), tojson(impersonators));
     if (impersonators) {
         assert.eq(authedUsers.length, 1);
-        assert.docEq(authedUsers[0], {user: "testuser", db: "admin"});
+        assert.docEq({user: "testuser", db: "admin"}, authedUsers[0]);
         assert(impersonators);
         assert.eq(impersonators.length, 1);
-        assert.docEq(impersonators[0], {user: "__system", db: "local"});
+        assert.docEq({user: "__system", db: "local"}, impersonators[0]);
     } else {
         assert(authedUsers);
         assert.eq(authedUsers.length, 1);
-        assert.docEq(authedUsers[0], {user: "testuser", db: "admin"});
+        assert.docEq({user: "testuser", db: "admin"}, authedUsers[0]);
     }
 };
 
@@ -61,9 +59,8 @@ const m = MongoRunner.runMongod();
 runTest(m, m);
 MongoRunner.stopMongod(m);
 
-if (!jsTestOptions().noJournal) {
+if (jsTestOptions().storageEngine != "inMemory") {
     const st = new ShardingTest({shards: 1, mongos: 1, config: 1, keyFile: 'jstests/libs/key1'});
     runTest(st.s0, st.shard0);
     st.stop();
 }
-})();

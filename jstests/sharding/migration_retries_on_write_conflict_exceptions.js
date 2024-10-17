@@ -2,11 +2,9 @@
  * Tests that WriteConflictException is handled when applying transfer mods during migrations.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -15,8 +13,8 @@ const ns = dbName + "." + collName;
 let st = new ShardingTest({shards: 2});
 
 // Create a sharded collection with two chunks: [-inf, 50), [50, inf)
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 50}}));
 
@@ -59,5 +57,9 @@ preTransferModsFailpoint.off();
 
 awaitResult();
 
+// After the migration has finished, check that writes are possible on both shards (meaning the
+// critical sections have been properly released).
+assert.commandWorked(testColl.update({x: 49}, {$set: {c: 1}}));
+assert.commandWorked(testColl.update({x: 50}, {$set: {c: 1}}));
+
 st.stop();
-})();

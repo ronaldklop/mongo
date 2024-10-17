@@ -27,14 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/repl/oplog_interface_local.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
 
@@ -50,26 +61,27 @@ public:
     StatusWith<Value> next() override;
 
 private:
-    AutoGetOplog _oplogRead;
+    AutoGetOplogFastPath _oplogRead;
     OldClientContext _ctx;
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 };
 
 OplogIteratorLocal::OplogIteratorLocal(OperationContext* opCtx)
     : _oplogRead(opCtx, OplogAccessMode::kRead),
-      _ctx(opCtx, NamespaceString::kRsOplogNamespace.ns()),
-      _exec(InternalPlanner::collectionScan(opCtx,
-                                            NamespaceString::kRsOplogNamespace.ns(),
-                                            &_oplogRead.getCollection(),
-                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                                            InternalPlanner::BACKWARD)) {}
+      _ctx(opCtx, NamespaceString::kRsOplogNamespace),
+      _exec(_oplogRead.getCollection()
+                ? InternalPlanner::collectionScan(opCtx,
+                                                  &_oplogRead.getCollection(),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                  InternalPlanner::BACKWARD)
+                : nullptr) {}
 
 StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
     BSONObj obj;
     RecordId recordId;
 
     PlanExecutor::ExecState state;
-    if (PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
+    if (!_exec || PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
         return StatusWith<Value>(ErrorCodes::CollectionIsEmpty,
                                  "no more operations in local oplog");
     }
@@ -89,8 +101,8 @@ OplogInterfaceLocal::OplogInterfaceLocal(OperationContext* opCtx) : _opCtx(opCtx
 std::string OplogInterfaceLocal::toString() const {
     return str::stream() << "LocalOplogInterface: "
                             "operation context: "
-                         << _opCtx->getOpID()
-                         << "; collection: " << NamespaceString::kRsOplogNamespace;
+                         << _opCtx->getOpID() << "; collection: "
+                         << NamespaceString::kRsOplogNamespace.toStringForErrorMsg();
 }
 
 std::unique_ptr<OplogInterface::Iterator> OplogInterfaceLocal::makeIterator() const {

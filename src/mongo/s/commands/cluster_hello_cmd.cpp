@@ -26,37 +26,80 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <functional>
+#include <initializer_list>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/hello_auth.h"
 #include "mongo/db/repl/hello_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/rpc/topology_version_gen.h"
+#include "mongo/s/load_balancer_support.h"
+#include "mongo/s/mongos_hello_response.h"
 #include "mongo/s/mongos_topology_coordinator.h"
+#include "mongo/transport/hello_metrics.h"
 #include "mongo/transport/message_compressor_manager.h"
-#include "mongo/util/net/socket_utils.h"
-#include "mongo/util/version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
 // Hangs in the beginning of each hello command when set.
-MONGO_FAIL_POINT_DEFINE(waitInHello);
+MONGO_FAIL_POINT_DEFINE(routerWaitInHello);
 
-MONGO_FAIL_POINT_DEFINE(appendHelloOkToHelloResponse);
+MONGO_FAIL_POINT_DEFINE(routerAppendHelloOkToHelloResponse);
 
 namespace {
 
@@ -70,12 +113,26 @@ class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
     CmdHello() : CmdHello(kHelloString, {}) {}
 
-    const std::set<std::string>& apiVersions() const final {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const final {
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions, "cluster wide default read concern not permitted"};
+        static const Status kImplicitDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions, "implicit default read concern not permitted"};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
+                {kDefaultReadConcernNotPermitted},
+                {kImplicitDefaultReadConcernNotPermitted}};
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
@@ -86,25 +143,62 @@ public:
         return "Status information for clients negotiating a connection with this server";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        // No auth required
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
     }
 
     bool requiresAuth() const final {
         return false;
     }
 
+    HandshakeRole handshakeRole() const final {
+        return HandshakeRole::kHello;
+    }
+
     bool runWithReplyBuilder(OperationContext* opCtx,
-                             const std::string& dbname,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) final {
-        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
-        const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
-        auto cmd = HelloCommand::parse({"hello", apiStrict}, cmdObj);
+        // Critical to observability and diagnosability, categorize as immediate priority.
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            opCtx, AdmissionContext::Priority::kExempt);
 
-        waitInHello.pauseWhileSet(opCtx);
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        auto cmd = idl::parseCommandDocument<HelloCommand>(IDLParserContext("hello"), cmdObj);
+
+        routerWaitInHello.execute([&](const BSONObj& args) {
+            if (args.hasElement("delayMillis")) {
+                Milliseconds delay{args["delayMillis"].safeNumberLong()};
+                LOGV2(6724103,
+                      "Fail point delays Hello processing",
+                      "cmd"_attr = cmdObj,
+                      "client"_attr = opCtx->getClient()->clientAddress(true),
+                      "desc"_attr = opCtx->getClient()->desc(),
+                      "delay"_attr = delay);
+                opCtx->sleepFor(delay);
+                return;
+            }
+
+            LOGV2(6524600,
+                  "Fail point blocks Hello response until removed",
+                  "cmd"_attr = cmdObj,
+                  "client"_attr = opCtx->getClient()->clientAddress(true),
+                  "desc"_attr = opCtx->getClient()->desc());
+
+            routerWaitInHello.pauseWhileSet(opCtx);
+        });
+
+        // "hello" is exempt from error code rewrites.
+        rpc::RewriteStateChangeErrors::setEnabled(opCtx, false);
+
+        // Negotiate compressors before logging metadata so we can include the result in the log
+        // line.
+        auto result = replyBuilder->getBodyBuilder();
+        MessageCompressorManager::forSession(opCtx->getClient()->session())
+            .serverNegotiate(cmd.getCompression(), &result);
 
         auto client = opCtx->getClient();
         if (ClientMetadata::tryFinalize(client)) {
@@ -139,7 +233,6 @@ public:
                     !clientTopologyVersion && !maxAwaitTimeMS);
         }
 
-        auto result = replyBuilder->getBodyBuilder();
         const auto* mongosTopCoord = MongosTopologyCoordinator::get(opCtx);
 
         auto mongosHelloResponse =
@@ -149,6 +242,8 @@ public:
         mongosHelloResponse->appendToBuilder(&result, useLegacyResponseFields());
         // The hello response always includes a topologyVersion.
         auto currentMongosTopologyVersion = mongosHelloResponse->getTopologyVersion();
+
+        load_balancer_support::handleHello(opCtx, &result, cmd.getLoadBalanced().value_or(false));
 
         // Try to parse the optional 'helloOk' field. On mongos, if we see this field, we will
         // respond with helloOk: true so the client knows that it can continue to send the hello
@@ -162,7 +257,7 @@ public:
             result.append("helloOk", true);
         }
 
-        if (MONGO_unlikely(appendHelloOkToHelloResponse.shouldFail())) {
+        if (MONGO_unlikely(routerAppendHelloOkToHelloResponse.shouldFail())) {
             result.append("clientSupportsHello", client->supportsHello());
         }
 
@@ -179,22 +274,16 @@ public:
 
         // Mongos tries to keep exactly the same version range of the server for which
         // it is compiled.
-        auto wireSpec = WireSpec::instance().get();
+        auto wireSpec = WireSpec::getWireSpec(opCtx->getServiceContext()).get();
         result.append(HelloCommandReply::kMaxWireVersionFieldName,
                       wireSpec->incomingExternalClient.maxWireVersion);
         result.append(HelloCommandReply::kMinWireVersionFieldName,
                       wireSpec->incomingExternalClient.minWireVersion);
 
-        {
-            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
-            auto iter = serverParams.find(kAutomationServiceDescriptorFieldName);
-            if (iter != serverParams.end() && iter->second) {
-                iter->second->append(opCtx, result, kAutomationServiceDescriptorFieldName);
-            }
+        if (auto sp = ServerParameterSet::getNodeParameterSet()->getIfExists(
+                kAutomationServiceDescriptorFieldName)) {
+            sp->append(opCtx, &result, kAutomationServiceDescriptorFieldName, boost::none);
         }
-
-        MessageCompressorManager::forSession(opCtx->getClient()->session())
-            .serverNegotiate(cmd.getCompression(), &result);
 
         if (opCtx->isExhaust()) {
             LOGV2_DEBUG(23872, 3, "Using exhaust for hello protocol");
@@ -228,7 +317,7 @@ public:
             }
         }
 
-        handleHelloAuth(opCtx, cmd, &result);
+        handleHelloAuth(opCtx, dbName, cmd, &result);
 
         if (getTestCommandsEnabled()) {
             validateResult(&result);
@@ -241,11 +330,11 @@ public:
         auto ret = result->asTempObj();
         if (ret[ErrorReply::kErrmsgFieldName].eoo()) {
             // Nominal success case, parse the object as-is.
-            HelloCommandReply::parse({"hello.reply"}, ret);
+            HelloCommandReply::parse(IDLParserContext{"hello.reply"}, ret);
         } else {
             // Something went wrong, still try to parse, but accept a few ignorable fields.
             StringDataSet ignorable({ErrorReply::kCodeFieldName, ErrorReply::kErrmsgFieldName});
-            HelloCommandReply::parse({"hello.reply"}, ret.removeFields(ignorable));
+            HelloCommandReply::parse(IDLParserContext{"hello.reply"}, ret.removeFields(ignorable));
         }
     }
 
@@ -256,18 +345,23 @@ protected:
     virtual bool useLegacyResponseFields() const {
         return false;
     }
-
-} hello;
+};
+MONGO_REGISTER_COMMAND(CmdHello).forRouter();
 
 class CmdIsMaster : public CmdHello {
 public:
     CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
 
+    const std::set<std::string>& apiVersions() const final {
+        return kNoApiVersions;
+    }
+
 protected:
     bool useLegacyResponseFields() const final {
         return true;
     }
-} isMaster;
+};
+MONGO_REGISTER_COMMAND(CmdIsMaster).forRouter();
 
 }  // namespace
 }  // namespace mongo

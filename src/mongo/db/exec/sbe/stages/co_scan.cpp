@@ -27,17 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/sbe/stages/co_scan.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 
 namespace mongo::sbe {
-CoScanStage::CoScanStage(PlanNodeId planNodeId) : PlanStage("coscan"_sd, planNodeId) {}
+CoScanStage::CoScanStage(PlanNodeId planNodeId,
+                         PlanYieldPolicy* yieldPolicy,
+                         bool participateInTrialRunTracking)
+    : PlanStage("coscan"_sd, yieldPolicy, planNodeId, participateInTrialRunTracking) {}
 
 std::unique_ptr<PlanStage> CoScanStage::clone() const {
-    return std::make_unique<CoScanStage>(_commonStats.nodeId);
+    return std::make_unique<CoScanStage>(
+        _commonStats.nodeId, _yieldPolicy, participateInTrialRunTracking());
 }
 void CoScanStage::prepare(CompileCtx& ctx) {}
 value::SlotAccessor* CoScanStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -53,11 +55,10 @@ void CoScanStage::open(bool reOpen) {
 PlanState CoScanStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    checkForInterrupt(_opCtx);
+    checkForInterruptAndYield(_opCtx);
 
     // Run forever.
-    _commonStats.advances++;
-    return PlanState::ADVANCED;
+    return trackPlanState(PlanState::ADVANCED);
 }
 
 std::unique_ptr<PlanStageStats> CoScanStage::getStats(bool includeDebugInfo) const {
@@ -72,7 +73,11 @@ const SpecificStats* CoScanStage::getSpecificStats() const {
 void CoScanStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
+}
+
+size_t CoScanStage::estimateCompileTimeSize() const {
+    return sizeof(*this);
 }
 
 }  // namespace mongo::sbe

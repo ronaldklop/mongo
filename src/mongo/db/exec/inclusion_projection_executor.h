@@ -29,11 +29,44 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/container/small_vector.hpp>
+#include <boost/smart_ptr.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <list>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/fastpath_projection_node.h"
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_node.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/expression_walker.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/projection_ast.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::projection_executor {
 /**
@@ -64,7 +97,7 @@ public:
         }
 
         for (auto&& expressionPair : _expressions) {
-            expressionPair.second->addDependencies(deps);
+            expression::addDependencies(expressionPair.second.get(), deps);
         }
 
         for (auto&& childPair : _children) {
@@ -76,28 +109,34 @@ public:
         return _children.size() + _projectedFields.size();
     }
 
+    // The following two methods extract from the InclusionNode computed projections that depend
+    // only on the 'oldName' field. We need two versions for $project and $addFields, due to
+    // different functionality: we need to replace the fields in $project to not lose them, and we
+    // can just remove them from $addFields.
     /**
-     * All field paths with the first path element in the 'renames' map are substituted for field
-     * paths with respective mapped name as a first element. The change is applied to all
-     * expressions of the InclusionNode, including the expressions in its children.
-     *
+     * Returns a pair of <BSONObj, bool>. The BSONObj contains extracted computed projections that
+     * depend only on the 'oldName' field and is empty if no such projection exists. In the
+     * extracted expressions the 'oldName' is substituted for the 'newName'. If a projection name
+     * is in the 'reservedNames' set, it is ineligible for extraction. Each extracted computed
+     * projection is replaced with a projected field or with an identity projection.
+     * The returned boolean flag is always false meaning that the original projection is not empty
+     * and cannot be deleted.
      */
-    void substituteFieldPathElement(const StringMap<std::string>& renames) {
-        SubstituteFieldPathWalker substituteWalker(renames);
-        for (auto&& expressionPair : _expressions) {
-            auto substExpr =
-                expression_walker::walk(&substituteWalker, expressionPair.second.get());
-            if (substExpr.get() != nullptr) {
-                expressionPair.second = substExpr.release();
-            }
-        }
+    std::pair<BSONObj, bool> extractComputedProjectionsInProject(
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames);
 
-        for (auto&& childPair : _children) {
-            static_cast<InclusionNode*>(childPair.second.get())
-                ->substituteFieldPathElement(renames);
-        }
-    }
-
+    /**
+     * Returns a pair of <BSONObj, bool>. The BSONObj contains extracted computed projections that
+     * depend only on the 'oldName' field and is empty if no such projection exists. In the
+     * extracted expressions the 'oldName' is substituted for the 'newName'. If a projection name
+     * is in the 'reservedNames' set, it is ineligible for extraction. To preserve the original
+     * field order the extraction stops when reaching a field which cannot be extracted. The
+     * extracted projections are removed from the node.
+     * The returned boolean flag is true if the original projection has become empty after the
+     * extraction and can be deleted by the caller.
+     */
+    std::pair<BSONObj, bool> extractComputedProjectionsInAddFields(
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames);
 
 protected:
     // For inclusions, we can apply an optimization here by simply appending to the output document
@@ -123,21 +162,26 @@ protected:
     Value transformSkippedValueForOutput(const Value& value) const final {
         return Value();
     }
+    bool isIncluded() const final {
+        return true;
+    }
 };
 
 /**
  * A fast-path inclusion projection implementation which applies a BSON-to-BSON transformation
  * rather than constructing an output document using the Document/Value API. For inclusion-only
- * projections (which are projections without expressions, metadata, find-only expressions ($slice,
- * $elemMatch, and positional), and not requiring an entire document) it can be much faster than the
- * default InclusionNode implementation. On a document-by-document basis, if the fast-path
+ * projections (as defined by projection_ast::Projection::isInclusionOnly) it can be much faster
+ * than the default InclusionNode implementation. On a document-by-document basis, if the fast-path
  * projection cannot be applied to the input document, it will fall back to the default
  * implementation.
  */
-class FastPathEligibleInclusionNode final : public InclusionNode {
+class FastPathEligibleInclusionNode final
+    : public FastPathProjectionNode<FastPathEligibleInclusionNode, InclusionNode> {
+private:
+    using Base = FastPathProjectionNode<FastPathEligibleInclusionNode, InclusionNode>;
+
 public:
-    FastPathEligibleInclusionNode(ProjectionPolicies policies, std::string pathToNode = "")
-        : InclusionNode(policies, std::move(pathToNode)) {}
+    using Base::Base;
 
     Document applyToDocument(const Document& inputDoc) const final;
 
@@ -148,8 +192,22 @@ protected:
     }
 
 private:
-    void _applyProjections(BSONObj bson, BSONObjBuilder* bob) const;
-    void _applyProjectionsToArray(BSONObj array, BSONArrayBuilder* bab) const;
+    void _applyToProjectedField(const BSONElement& element, BSONObjBuilder* bob) const {
+        // This element is included by the projection, so it is added to the output.
+        bob->append(element);
+    }
+    void _applyToNonProjectedField(const BSONElement& element, BSONObjBuilder* bob) const {
+        // No-op. This element is not included in the projection, so it is not added to the output.
+    }
+    void _applyToNonProjectedField(const BSONElement& element, BSONArrayBuilder* bab) const {
+        // No-op. This array element is not included in the projection, so it is not added to the
+        // output.
+    }
+    void _applyToRemainingFields(BSONObjIterator& it, BSONObjBuilder* bob) const {
+        // No-op. We processed all inclusions, rest of the elements can be discarded.
+    }
+
+    friend class FastPathProjectionNode<FastPathEligibleInclusionNode, InclusionNode>;
 };
 
 /**
@@ -189,16 +247,17 @@ public:
     /**
      * Serialize the projection.
      */
-    Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const final {
+    Document serializeTransformation(boost::optional<ExplainOptions::Verbosity> explain,
+                                     const SerializationOptions& options = {}) const final {
         MutableDocument output;
 
         // The InclusionNode tree in '_root' will always have a top-level _id node if _id is to be
         // included. If the _id node is not present, then explicitly set {_id: false} to avoid
         // ambiguity in the expected behavior of the serialized projection.
-        _root->serialize(explain, &output);
-        if (output.peek()["_id"].missing()) {
-            output.addField("_id", Value{false});
+        _root->serialize(explain, &output, options);
+        auto idFieldName = options.serializeFieldPath("_id");
+        if (output.peek()[idFieldName].missing()) {
+            output.addField(idFieldName, Value{false});
         }
 
         return output.freeze();
@@ -215,9 +274,16 @@ public:
     DepsTracker::State addDependencies(DepsTracker* deps) const final {
         _root->reportDependencies(deps);
         if (_rootReplacementExpression) {
-            _rootReplacementExpression->addDependencies(deps);
+            expression::addDependencies(_rootReplacementExpression.get(), deps);
         }
         return DepsTracker::State::EXHAUSTIVE_FIELDS;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        _root->addVariableRefs(refs);
+        if (_rootReplacementExpression) {
+            expression::addVariableRefs(_rootReplacementExpression.get(), refs);
+        }
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
@@ -227,16 +293,18 @@ public:
             return {DocumentSource::GetModPathsReturn::Type::kAllPaths, {}, {}};
         }
 
-        std::set<std::string> preservedPaths;
+        OrderedPathSet preservedPaths;
         _root->reportProjectedPaths(&preservedPaths);
 
-        std::set<std::string> computedPaths;
+        OrderedPathSet computedPaths;
         StringMap<std::string> renamedPaths;
-        _root->reportComputedPaths(&computedPaths, &renamedPaths);
+        StringMap<std::string> complexRenamedPaths;
+        _root->reportComputedPaths(&computedPaths, &renamedPaths, &complexRenamedPaths);
 
         return {DocumentSource::GetModPathsReturn::Type::kAllExcept,
                 std::move(preservedPaths),
-                std::move(renamedPaths)};
+                std::move(renamedPaths),
+                std::move(complexRenamedPaths)};
     }
 
     /**
@@ -267,14 +335,22 @@ public:
         return exhaustivePaths;
     }
 
-    BSONObj extractComputedProjections(const std::string& oldName,
-                                       const std::string& newName,
-                                       const std::set<StringData>& reservedNames) final {
-        return _root->extractComputedProjections(oldName, newName, reservedNames);
+    std::pair<BSONObj, bool> extractComputedProjections(
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) final {
+        return _root->extractComputedProjectionsInProject(oldName, newName, reservedNames);
+    }
+
+    bool isInclusionOnly() const {
+        return _isInclusionOnly;
+    }
+
+    void setIsInclusionOnly(bool isInclusionOnly) {
+        _isInclusionOnly = isInclusionOnly;
     }
 
 private:
     // The InclusionNode tree does most of the execution work once constructed.
     std::unique_ptr<InclusionNode> _root;
+    bool _isInclusionOnly = false;
 };
 }  // namespace mongo::projection_executor

@@ -1,7 +1,6 @@
 // oplog should contain the field "wt" with wallClock timestamps.
-(function() {
-'use strict';
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getLatestOp} from "jstests/replsets/rslib.js";
 
 var assertLastOplogHasWT = function(primary, msg) {
     const opLogEntry = getLatestOp(primary);
@@ -27,4 +26,3 @@ assert.commandWorked(collection.remove({_id: 1}));
 assertLastOplogHasWT(primary, 'remove');
 
 replSet.stopSet();
-})();

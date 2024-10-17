@@ -1,69 +1,75 @@
-load('jstests/multiVersion/libs/multi_rs.js');
+import "jstests/multiVersion/libs/multi_rs.js";
+
+import {isDebian, isRHEL8, isUbuntu, isUbuntu2004} from "jstests/libs/os_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {basicReplsetTest} from "jstests/replsets/libs/basic_replset_test.js";
 
 // Do not fail if this test leaves unterminated processes because this file expects replset1.js to
 // throw for invalid SSL options.
-TestData.failIfUnterminatedProcesses = false;
+TestData.ignoreUnterminatedProcesses = true;
 
 //=== Shared SSL testing library functions and constants ===
 
-var KEYFILE = "jstests/libs/key1";
-var SERVER_CERT = "jstests/libs/server.pem";
-var CA_CERT = "jstests/libs/ca.pem";
-var CLIENT_CERT = "jstests/libs/client.pem";
-var DH_PARAM = "jstests/libs/8k-prime.dhparam";
+export var KEYFILE = "jstests/libs/key1";
 
-// Note: "sslAllowInvalidCertificates" is enabled to avoid
+export var SERVER_CERT = "jstests/libs/server.pem";
+export var TRUSTED_SERVER_CERT = "jstests/libs/trusted-server.pem";
+export var CA_CERT = "jstests/libs/ca.pem";
+export var TRUSTED_CA_CERT = "jstests/libs/trusted-ca.pem";
+export var CLIENT_CERT = "jstests/libs/client.pem";
+export var TRUSTED_CLIENT_CERT = "jstests/libs/trusted-client.pem";
+export var DH_PARAM = "jstests/libs/8k-prime.dhparam";
+export var CLUSTER_CERT = "jstests/libs/cluster_cert.pem";
+
+// Note: "tlsAllowInvalidCertificates" is enabled to avoid
 // hostname conflicts with our testing certificates
-var disabled = {sslMode: "disabled"};
-var allowSSL = {
-    sslMode: "allowSSL",
-    sslAllowInvalidCertificates: "",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
-};
-var preferSSL = {
-    sslMode: "preferSSL",
-    sslAllowInvalidCertificates: "",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
-};
-var requireSSL = {
-    sslMode: "requireSSL",
-    sslAllowInvalidCertificates: "",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
+export var disabled = {
+    tlsMode: "disabled"
 };
 
-var dhparamSSL = {
-    sslMode: "requireSSL",
-    sslAllowInvalidCertificates: "",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT,
+export var allowTLS = {
+    tlsMode: "allowTLS",
+    tlsAllowInvalidCertificates: "",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
+};
+
+export var preferTLS = {
+    tlsMode: "preferTLS",
+    tlsAllowInvalidCertificates: "",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
+};
+
+export var requireTLS = {
+    tlsMode: "requireTLS",
+    tlsAllowInvalidCertificates: "",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
+};
+
+export var dhparamSSL = {
+    tlsMode: "requireTLS",
+    tlsAllowInvalidCertificates: "",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT,
     setParameter: {"opensslDiffieHellmanParameters": DH_PARAM}
 };
 
 // Test if ssl replset  configs work
 
-var replSetTestFile = "jstests/replsets/replset1.js";
-
-var replShouldSucceed = function(name, opt1, opt2) {
-    ssl_options1 = opt1;
-    ssl_options2 = opt2;
-    ssl_name = name;
+export var replShouldSucceed = function(name, opt1, opt2) {
     // try running this file using the given config
-    load(replSetTestFile);
+    basicReplsetTest(15, opt1, opt2, name);
 };
 
 // Test if ssl replset configs fail
-var replShouldFail = function(name, opt1, opt2) {
-    ssl_options1 = opt1;
-    ssl_options2 = opt2;
-    ssl_name = name;
+export var replShouldFail = function(name, opt1, opt2) {
     // This will cause an assert.soon() in ReplSetTest to fail. This normally triggers the hang
     // analyzer, but since we do not want to run it on expected timeouts, we temporarily disable it.
     MongoRunner.runHangAnalyzer.disable();
     try {
-        assert.throws(load, [replSetTestFile], "This setup should have failed");
+        assert.throws(() => basicReplsetTest(15, opt1, opt2, name));
     } finally {
         MongoRunner.runHangAnalyzer.enable();
     }
@@ -74,7 +80,7 @@ var replShouldFail = function(name, opt1, opt2) {
  * Test that $lookup works with a sharded source collection. This is tested because of
  * the connections opened between mongos/shards and between the shards themselves.
  */
-function testShardedLookup(shardingTest) {
+export function testShardedLookup(shardingTest) {
     var st = shardingTest;
     assert(st.adminCommand({enableSharding: "lookupTest"}),
            "error enabling sharding for this configuration");
@@ -110,18 +116,12 @@ function testShardedLookup(shardingTest) {
  * Takes in two mongod/mongos configuration options and runs a basic
  * sharding test to see if they can work together...
  */
-function mixedShardTest(options1, options2, shouldSucceed) {
+export function mixedShardTest(options1, options2, shouldSucceed) {
     let authSucceeded = false;
     try {
+        // TODO SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
         // off the balancer otherwise, which it will not be authorized to do if auth is enabled.
-        //
-        // Also, the autosplitter will be turned on automatically with 'enableBalancer: true'. We
-        // then want to disable the autosplitter, but cannot do so here with 'enableAutoSplit:
-        // false' because ShardingTest will attempt to call disableAutoSplit(), which it will not be
-        // authorized to do if auth is enabled.
-        //
-        // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
 
         // The mongo shell cannot authenticate as the internal __system user in tests that use x509
         // for cluster authentication. Choosing the default value for wcMajorityJournalDefault in
@@ -129,8 +129,7 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         // authentication, so in this test we must make the choice explicitly, based on the global
         // test options.
         let wcMajorityJournalDefault;
-        if (jsTestOptions().noJournal || jsTestOptions().storageEngine == "ephemeralForTest" ||
-            jsTestOptions().storageEngine == "inMemory") {
+        if (jsTestOptions().storageEngine == "inMemory") {
             wcMajorityJournalDefault = false;
         } else {
             wcMajorityJournalDefault = true;
@@ -154,16 +153,14 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         authSucceeded = true;
 
         st.stopBalancer();
-        st.disableAutoSplit();
 
         // Test that $lookup works because it causes outgoing connections to be opened
         testShardedLookup(st);
 
         // Test mongos talking to config servers
-        var r = st.adminCommand({enableSharding: "test"});
+        var r = st.adminCommand({enableSharding: "test", primaryShard: st.shard0.shardName});
         assert.eq(r, true, "error enabling sharding for this configuration");
 
-        st.ensurePrimaryShard("test", st.shard0.shardName);
         r = st.adminCommand({movePrimary: 'test', to: st.shard1.shardName});
         assert.eq(r, true, "error movePrimary failed for this configuration");
 
@@ -220,8 +217,7 @@ function mixedShardTest(options1, options2, shouldSucceed) {
     }
 }
 
-function determineSSLProvider() {
-    'use strict';
+export function determineSSLProvider() {
     const info = getBuildInfo();
     const ssl = (info.openssl === undefined) ? '' : info.openssl.running;
     if (/OpenSSL/.test(ssl)) {
@@ -235,8 +231,32 @@ function determineSSLProvider() {
     }
 }
 
-function requireSSLProvider(required, fn) {
-    'use strict';
+export function isMacOS(minVersion) {
+    function parseVersion(version) {
+        // Intentionally leave the end of string unanchored.
+        // This allows vesions like: 10.15.7-pl2 or other extra data.
+        const v = version.match(/^(\d+)\.(\d+)\.(\d+)/);
+        assert(v !== null, "Invalid version string '" + version + "'");
+        return (v[1] << 16) | (v[2] << 8) | (v[3]);
+    }
+
+    const macOS = getBuildInfo().macOS;
+    if (macOS === undefined) {
+        // Not macOS at all.
+        return false;
+    }
+
+    if (minVersion === undefined) {
+        // Don't care what version, but it's macOS.
+        return true;
+    }
+
+    assert(macOS.osProductVersion !== undefined,
+           "Expected getBuildInfo() field 'macOS.osProductVersion' not present");
+    return parseVersion(minVersion) <= parseVersion(macOS.osProductVersion);
+}
+
+export function requireSSLProvider(required, fn) {
     if ((typeof required) === 'string') {
         required = [required];
     }
@@ -251,14 +271,15 @@ function requireSSLProvider(required, fn) {
     fn();
 }
 
-function detectDefaultTLSProtocol() {
+export function detectDefaultTLSProtocol() {
     const conn = MongoRunner.runMongod({
-        sslMode: 'allowSSL',
-        sslPEMKeyFile: SERVER_CERT,
-        sslDisabledProtocols: 'none',
+        tlsMode: 'allowTLS',
+        tlsCertificateKeyFile: SERVER_CERT,
+        tlsDisabledProtocols: 'none',
         useLogFiles: true,
         tlsLogVersions: "TLS1_0,TLS1_1,TLS1_2,TLS1_3",
         waitForConnect: true,
+        tlsCAFile: CA_CERT
     });
 
     assert.eq(0,
@@ -266,10 +287,10 @@ function detectDefaultTLSProtocol() {
                               '--ssl',
                               '--port',
                               conn.port,
-                              '--sslPEMKeyFile',
-                              'jstests/libs/client.pem',
-                              '--sslCAFile',
-                              'jstests/libs/ca.pem',
+                              '--tlsCertificateKeyFile',
+                              CLIENT_CERT,
+                              '--tlsCAFile',
+                              CA_CERT,
                               '--eval',
                               ';'));
 
@@ -291,91 +312,43 @@ function detectDefaultTLSProtocol() {
     }
 }
 
-function isRHEL8() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // RHEL 8 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on RHEL 8 that require these versions as a result.
-    const grep_result = runProgram('grep', 'Ootpa', '/etc/redhat-release');
-    if (grep_result == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isUbuntu2004() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Ubuntu 20.04 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on Ubuntu 20.04 that require these versions as a result.
-    const grep_result = runProgram('grep', 'focal', '/etc/os-release');
-    if (grep_result == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isUbuntu1804() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Ubuntu 18.04's TLS 1.3 implementation has an issue with OCSP stapling. We have disabled
-    // stapling on this build variant, so we need to ensure that tests that require stapling
-    // do not run on this machine.
-    const grep_result = runProgram('grep', 'bionic', '/etc/os-release');
-    if (grep_result === 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isDebian10() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Debian 10 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on Debian 10 that require these versions as a result.
-    try {
-        // this file exists on systemd-based systems, necessary to avoid mischaracterizing debian
-        // derivatives as stock debian
-        const releaseFile = cat("/etc/os-release").toLowerCase();
-        const prettyName = releaseFile.split('\n').find(function(line) {
-            return line.startsWith("pretty_name");
-        });
-        return prettyName.includes("debian") &&
-            (prettyName.includes("10") || prettyName.includes("buster") ||
-             prettyName.includes("bullseye"));
-    } catch (e) {
-        return false;
-    }
-}
-
-function sslProviderSupportsTLS1_0() {
+export function sslProviderSupportsTLS1_0() {
     if (isRHEL8()) {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
-    return !isDebian10() && !isUbuntu2004();
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
+    return !isDebian() && !isUbuntu2004();
 }
 
-function sslProviderSupportsTLS1_1() {
+export function sslProviderSupportsTLS1_1() {
     if (isRHEL8()) {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
-    return !isDebian10() && !isUbuntu2004();
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
+    return !isDebian() && !isUbuntu2004();
 }
 
-function opensslVersionAsInt() {
+export function isOpenSSL3orGreater() {
+    // Windows and macOS do not have "openssl.compiled" in buildInfo but they do have "running"
+    const opensslCompiledIn = getBuildInfo().openssl.compiled !== undefined;
+    if (!opensslCompiledIn) {
+        return false;
+    }
+
+    return opensslVersionAsInt() >= 0x3000000;
+}
+
+export function opensslVersionAsInt() {
     const opensslInfo = getBuildInfo().openssl;
     if (!opensslInfo) {
         return null;
@@ -389,7 +362,23 @@ function opensslVersionAsInt() {
     return version;
 }
 
-function copyCertificateFile(a, b) {
+export function supportsFIPS() {
+    // OpenSSL supports FIPS
+    let expectSupportsFIPS = (determineSSLProvider() == "openssl");
+
+    // But OpenSSL supports FIPS only sometimes
+    // - Debian does not support FIPS, Fedora 37 does not, Fedora 38 does
+    // - Ubuntu only supports FIPS with Ubuntu pro
+    if (expectSupportsFIPS) {
+        if (isDebian() || isUbuntu()) {
+            expectSupportsFIPS = false;
+        }
+    }
+
+    return expectSupportsFIPS;
+}
+
+export function copyCertificateFile(a, b) {
     if (_isWindows()) {
         // correctly replace forward slashes for Windows
         a = a.replace(/\//g, "\\");

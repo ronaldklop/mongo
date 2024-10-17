@@ -27,12 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/query/collation/collator_interface_mock.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/query_solution.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -89,6 +117,32 @@ TEST_F(QueryPlannerTest, MaxValid) {
     assertSolutionExists(
         "{fetch: {filter: null, "
         "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxWithoutMinMultipleComponents) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1, b: 1}")), BSONObj(), fromjson("{a: 1, b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1, b: 1},"
+        "bounds: {'$startKey': {'': {$minKey: 1}, '': {$minKey: 1}}, '$endKey': {'': 1, '': 1}}"
+        "}}}}");
+}
+
+TEST_F(QueryPlannerTest, MinWithoutMaxMultipleComponents) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1, b: 1}")), fromjson("{a: 1, b: 1}"), BSONObj());
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1, b: 1},"
+        "bounds: {'$startKey': {'': 1, '': 1}, '$endKey': {'': {$maxKey:1}, '': {$maxKey:1}}}"
+        "}}}}");
 }
 
 TEST_F(QueryPlannerTest, MinMaxSameValue) {
@@ -353,78 +407,11 @@ TEST_F(QueryPlannerTest, HintInvalid) {
 }
 
 //
-// Test the "split limited sort stages" hack.
-//
-
-TEST_F(QueryPlannerTest, SplitLimitedSort) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
-    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-    addIndex(BSON("a" << 1));
-    addIndex(BSON("b" << 1));
-
-    runQuerySortProjSkipNToReturn(fromjson("{a: 1}"), fromjson("{b: 1}"), BSONObj(), 0, 3);
-
-    assertNumSolutions(2U);
-    // First solution has no blocking stage; no need to split.
-    assertSolutionExists(
-        "{fetch: {filter: {a:1}, node: "
-        "{ixscan: {filter: null, pattern: {b: 1}}}}}");
-    // Second solution has a blocking sort with a limit: it gets split and
-    // joined with an OR stage.
-    assertSolutionExists(
-        "{ensureSorted: {pattern: {b: 1}, node: "
-        "{or: {nodes: ["
-        "{sort: {pattern: {b: 1}, limit: 3, type: 'default', node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}, "
-        "{sort: {pattern: {b: 1}, limit: 0, type: 'default', node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}]}}}}");
-}
-
-// The same query run as a find command with a limit should not require the "split limited sort"
-// hack.
-TEST_F(QueryPlannerTest, NoSplitLimitedSortAsCommand) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
-    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-    addIndex(BSON("a" << 1));
-    addIndex(BSON("b" << 1));
-
-    runQueryAsCommand(fromjson("{find: 'testns', filter: {a: 1}, sort: {b: 1}, limit: 3}"));
-
-    assertNumSolutions(2U);
-    assertSolutionExists(
-        "{limit: {n: 3, node: {fetch: {filter: {a:1}, node: "
-        "{ixscan: {filter: null, pattern: {b: 1}}}}}}}");
-    assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 3, type: 'simple', node: {fetch: {filter: null,"
-        "node: {ixscan: {pattern: {a: 1}}}}}}}");
-}
-
-// Same query run as a find command with a batchSize rather than a limit should not require
-// the "split limited sort" hack, and should not have any limit represented inside the plan.
-TEST_F(QueryPlannerTest, NoSplitLimitedSortAsCommandBatchSize) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
-    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-    addIndex(BSON("a" << 1));
-    addIndex(BSON("b" << 1));
-
-    runQueryAsCommand(fromjson("{find: 'testns', filter: {a: 1}, sort: {b: 1}, batchSize: 3}"));
-
-    assertNumSolutions(2U);
-    assertSolutionExists(
-        "{fetch: {filter: {a: 1}, node: {ixscan: "
-        "{filter: null, pattern: {b: 1}}}}}");
-    assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: {fetch: {filter: null,"
-        "node: {ixscan: {pattern: {a: 1}}}}}}}");
-}
-
-
-//
 // Test shard filter query planning
 //
 
 TEST_F(QueryPlannerTest, ShardFilterCollScan) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1);
     addIndex(BSON("a" << 1));
 
@@ -437,7 +424,7 @@ TEST_F(QueryPlannerTest, ShardFilterCollScan) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterBasicIndex) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1);
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -452,7 +439,7 @@ TEST_F(QueryPlannerTest, ShardFilterBasicIndex) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterBasicCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1);
     addIndex(BSON("a" << 1));
 
@@ -466,7 +453,7 @@ TEST_F(QueryPlannerTest, ShardFilterBasicCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterBasicProjCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1);
     addIndex(BSON("a" << 1));
 
@@ -480,7 +467,7 @@ TEST_F(QueryPlannerTest, ShardFilterBasicProjCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterCompoundProjCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1 << "b" << 1);
     addIndex(BSON("a" << 1 << "b" << 1));
 
@@ -494,7 +481,7 @@ TEST_F(QueryPlannerTest, ShardFilterCompoundProjCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterNestedProjCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1 << "b.c" << 1);
     addIndex(BSON("a" << 1 << "b.c" << 1));
 
@@ -508,7 +495,7 @@ TEST_F(QueryPlannerTest, ShardFilterNestedProjCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterHashProjNotCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a"
                            << "hashed");
     addIndex(BSON("a"
@@ -525,7 +512,7 @@ TEST_F(QueryPlannerTest, ShardFilterHashProjNotCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterKeyPrefixIndexCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a" << 1);
     addIndex(BSON("a" << 1 << "b" << 1 << "_id" << 1));
 
@@ -539,7 +526,7 @@ TEST_F(QueryPlannerTest, ShardFilterKeyPrefixIndexCovered) {
 }
 
 TEST_F(QueryPlannerTest, ShardFilterNoIndexNotCovered) {
-    params.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
     params.shardKey = BSON("a"
                            << "hashed");
     addIndex(BSON("b" << 1));
@@ -555,8 +542,8 @@ TEST_F(QueryPlannerTest, ShardFilterNoIndexNotCovered) {
 }
 
 TEST_F(QueryPlannerTest, CannotTrimIxisectParam) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
-    params.options |= QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -577,8 +564,8 @@ TEST_F(QueryPlannerTest, CannotTrimIxisectParam) {
 }
 
 TEST_F(QueryPlannerTest, CannotTrimIxisectParamBeneathOr) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
-    params.options |= QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -611,8 +598,8 @@ TEST_F(QueryPlannerTest, CannotTrimIxisectParamBeneathOr) {
 }
 
 TEST_F(QueryPlannerTest, CannotTrimIxisectAndHashWithOrChild) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
-    params.options |= QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -642,8 +629,8 @@ TEST_F(QueryPlannerTest, CannotTrimIxisectAndHashWithOrChild) {
 }
 
 TEST_F(QueryPlannerTest, CannotTrimIxisectParamSelfIntersection) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
-    params.options |= QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
 
     // true means multikey
     addIndex(BSON("a" << 1), true);
@@ -674,8 +661,8 @@ TEST_F(QueryPlannerTest, CannotTrimIxisectParamSelfIntersection) {
 // If a lookup against a unique index is available as a possible plan, then the planner
 // should not generate other possibilities.
 TEST_F(QueryPlannerTest, UniqueIndexLookup) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
-    params.options |= QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1),
@@ -692,7 +679,7 @@ TEST_F(QueryPlannerTest, UniqueIndexLookup) {
 }
 
 TEST_F(QueryPlannerTest, HintOnNonUniqueIndex) {
-    params.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1),
@@ -709,7 +696,7 @@ TEST_F(QueryPlannerTest, HintOnNonUniqueIndex) {
 }
 
 TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOr) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -735,7 +722,7 @@ TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOr) {
 }
 
 TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOrBelowAnd) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("b" << 1));
@@ -763,7 +750,7 @@ TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOrBelowAnd) {
 }
 
 TEST_F(QueryPlannerTest, CoveredOrUniqueIndexLookup) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1),
@@ -828,25 +815,27 @@ TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
     // No relevant index matching the index tag.
     relevantIndices.push_back(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
 
-    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString("test.collection"));
+    auto findCommand = std::make_unique<FindCommandRequest>(
+        NamespaceString::createNamespaceString_forTest("test.collection"));
     findCommand->setFilter(BSON("a" << 3));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
-    scopedCq->root()->setTag(new IndexTag(1));
+    auto scopedCq = std::make_unique<CanonicalQuery>(
+        CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
+                             .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    scopedCq->getPrimaryMatchExpression()->setTag(new IndexTag(1));
 
-    ASSERT_NOT_OK(
-        QueryPlanner::cacheDataFromTaggedTree(scopedCq->root(), relevantIndices).getStatus());
+    ASSERT_NOT_OK(QueryPlanner::cacheDataFromTaggedTree(scopedCq->getPrimaryMatchExpression(),
+                                                        relevantIndices)
+                      .getStatus());
 }
 
 TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
-    const NamespaceString nss("test.collection");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.collection");
 
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(BSON("a" << 3));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
+    auto scopedCq = std::make_unique<CanonicalQuery>(
+        CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
+                             .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
 
     std::unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
     indexTree->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
@@ -858,62 +847,38 @@ TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
     ASSERT_NOT_OK(s);
 
     // Null indexTree.
-    s = QueryPlanner::tagAccordingToCache(scopedCq->root(), nullptr, indexMap);
+    s = QueryPlanner::tagAccordingToCache(scopedCq->getPrimaryMatchExpression(), nullptr, indexMap);
     ASSERT_NOT_OK(s);
 
     // Index not found.
-    s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
     ASSERT_NOT_OK(s);
 
     // Index found once added to the map.
     indexMap[IndexEntry::Identifier{"a_1"}] = 0;
-    s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
     ASSERT_OK(s);
 
     // Regenerate canonical query in order to clear tags.
     auto newQR = std::make_unique<FindCommandRequest>(nss);
     newQR->setFilter(BSON("a" << 3));
-    statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(newQR));
-    ASSERT_OK(statusWithCQ.getStatus());
-    scopedCq = std::move(statusWithCQ.getValue());
+    scopedCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = makeExpressionContext(opCtx.get(), *newQR),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(newQR)}});
 
     // Mismatched tree topology.
-    PlanCacheIndexTree* child = new PlanCacheIndexTree();
+    auto child = std::make_unique<PlanCacheIndexTree>();
     child->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
-    indexTree->children.push_back(child);
-    s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
+    indexTree->children.push_back(std::move(child));
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
     ASSERT_NOT_OK(s);
 }
 
-// A query run as a find command with a sort and ntoreturn should generate a plan implementing
-// the 'ntoreturn hack'.
-TEST_F(QueryPlannerTest, NToReturnHackWithFindCommand) {
-    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-
-    runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}, ntoreturn:3}"));
-
-    assertNumSolutions(1U);
-    assertSolutionExists(
-        "{ensureSorted: {pattern: {a: 1}, node: "
-        "{or: {nodes: ["
-        "{sort: {limit:3, pattern: {a:1}, type: 'default', node: {cscan: {dir:1}}}}, "
-        "{sort: {limit:0, pattern: {a:1}, type: 'default', node: {cscan: {dir:1}}}}"
-        "]}}}}");
-}
-
-TEST_F(QueryPlannerTest, NToReturnHackWithSingleBatch) {
-    params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-
-    runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}, ntoreturn:3, singleBatch:true}"));
-
-    assertNumSolutions(1U);
-    assertSolutionExists(
-        "{sort: {pattern: {a:1}, limit:3, type: 'simple', node: "
-        "{cscan: {dir:1, filter: {}}}}}");
-}
-
 TEST_F(QueryPlannerTest, DollarResumeAfterFieldPropagatedFromQueryRequestToStageBuilder) {
-    BSONObj cmdObj = BSON("find" << nss.ns() << "hint" << BSON("$natural" << 1) << "sort"
+    BSONObj cmdObj = BSON("find" << nss.ns_forTest() << "hint" << BSON("$natural" << 1) << "sort"
                                  << BSON("$natural" << 1) << "$_requestResumeToken" << true
                                  << "$_resumeAfter" << BSON("$recordId" << 42LL));
 
@@ -922,11 +887,11 @@ TEST_F(QueryPlannerTest, DollarResumeAfterFieldPropagatedFromQueryRequestToStage
 
     const auto* node = solns.front()->root();
     const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(node);
-    ASSERT_EQUALS(RecordId(42LL), csn->resumeAfterRecordId.get());
+    ASSERT_EQUALS(RecordId(42LL), csn->resumeAfterRecordId.value());
 }
 
 TEST_F(QueryPlannerTest, PreserveRecordIdOptionPrecludesSimpleSort) {
-    params.options |= QueryPlannerParams::PRESERVE_RECORD_ID;
+    forceRecordId = true;
 
     runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}}"));
 

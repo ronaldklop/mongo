@@ -1,18 +1,16 @@
 // Test that a certificate with a valid CN, but invalid SAN
 // does not permit connection, but provides a useful error.
 
-(function() {
-'use strict';
-load('jstests/ssl/libs/ssl_helpers.js');
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 // server-intermediate-ca was signed by ca.pem, not trusted-ca.pem
 const CA = 'jstests/libs/ca.pem';
 const SERVER = 'jstests/ssl/libs/localhost-cn-with-san.pem';
 
 const mongod = MongoRunner.runMongod({
-    sslMode: 'requireSSL',
-    sslPEMKeyFile: SERVER,
-    sslCAFile: CA,
+    tlsMode: 'requireTLS',
+    tlsCertificateKeyFile: SERVER,
+    tlsCAFile: CA,
 });
 assert(mongod);
 
@@ -43,4 +41,3 @@ if (determineSSLProvider() === 'openssl') {
 }
 
 MongoRunner.stopMongod(mongod);
-})();

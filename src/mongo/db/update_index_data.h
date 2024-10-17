@@ -29,7 +29,8 @@
 
 #pragma once
 
-#include <set>
+#include <absl/container/btree_set.h>
+#include <string>
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/field_ref.h"
@@ -49,6 +50,12 @@ public:
      * as '$' path components.
      */
     static FieldRef getCanonicalIndexField(const FieldRef& path);
+
+    /**
+     * Returns whether the provided path component can be included in the canonicalized index form
+     * of a path.
+     */
+    static bool isComponentPartOfCanonicalizedIndexPath(StringData pathComponent);
 
     /**
      * Register a path.  Any update targeting this path (or a parent of this path) will
@@ -72,14 +79,19 @@ public:
 
     bool mightBeIndexed(const FieldRef& path) const;
 
+    /**
+     * Return whether this structure has been cleared or has not been initialized yet.
+     */
+    bool isEmpty() const;
+
 private:
     /**
      * Returns true if 'b' is a prefix of 'a', or if the two paths are equal.
      */
     bool _startsWith(const FieldRef& a, const FieldRef& b) const;
 
-    std::set<FieldRef> _canonicalPaths;
-    std::set<std::string> _pathComponents;
+    absl::btree_set<FieldRef> _canonicalPaths;
+    absl::btree_set<std::string> _pathComponents;
 
     bool _allPathsIndexed;
 };

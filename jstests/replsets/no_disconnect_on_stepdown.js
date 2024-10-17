@@ -1,23 +1,11 @@
 /**
  * Tests that stepdown terminates writes, but does not disconnect connections.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/curop_helpers.js");
+import {waitForCurOpByFailPointNoNS} from "jstests/libs/curop_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
-    nodes: [
-        {
-            // Each PrimaryOnlyService rebuilds its instances on stepup, and that may involve doing
-            // read and write operations which are interruptible on stepdown so we need to disable
-            // PrimaryOnlyService rebuild to make the userOperationsKilled check below work
-            // reliably.
-            setParameter:
-                {"failpoint.PrimaryOnlyServiceSkipRebuildingInstances": tojson({mode: "alwaysOn"})}
-        },
-        {rsConfig: {priority: 0}}
-    ],
+    nodes: [{}, {rsConfig: {priority: 0}}],
 });
 rst.startSet();
 rst.initiate();
@@ -32,9 +20,6 @@ const coll = primaryDb[collname];
 
 // Never retry on network error, because this test needs to detect the network error.
 TestData.skipRetryOnNetworkError = true;
-
-// Legacy writes will still disconnect, so don't use them.
-primaryDataConn.forceWriteMode('commands');
 
 assert.commandWorked(coll.insert([
     {_id: 'update0', updateme: true},
@@ -55,6 +40,12 @@ assert.commandWorked(primaryAdmin.adminCommand({replSetFreeze: 0}));
 rst.getPrimary();
 
 function runStepDownTest({description, failpoint, operation, errorCode}) {
+    const primary = rst.getPrimary();
+    // Each PrimaryOnlyService rebuilds its instances on stepup, and that may involve doing read and
+    // write operations which are interruptible on stepdown so we wait for PrimaryOnlyService to
+    // finish rebuilding.
+    rst.waitForPrimaryOnlyServices(primary);
+
     jsTestLog(`Trying ${description} on a stepping-down primary`);
     assert.commandWorked(primaryAdmin.adminCommand({
         configureFailPoint: failpoint,
@@ -63,8 +54,7 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
     }));
 
     errorCode = errorCode || ErrorCodes.InterruptedDueToReplStateChange;
-    const writeCommand = `db.getMongo().forceWriteMode("commands");
-                              assert.commandFailedWithCode(${operation}, ${errorCode});
+    const writeCommand = `assert.commandFailedWithCode(${operation}, ${errorCode});
                               assert.commandWorked(db.adminCommand({ping:1}));`;
 
     const waitForShell = startParallelShell(writeCommand, primary.port);
@@ -84,7 +74,6 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
     const replMetrics =
         assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
     assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
-    assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
     assert.eq(replMetrics.network.notPrimaryUnacknowledgedWrites, 0);
 
     // Allow the primary to be re-elected, and wait for it.
@@ -115,4 +104,3 @@ runStepDownTest({
     operation: "db['" + collname + "'].remove({removeme: true})"
 });
 rst.stopSet();
-})();

@@ -31,10 +31,12 @@
 
 #include <functional>
 #include <list>
+#include <string>
 
+#include "mongo/base/status.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 
@@ -56,7 +58,6 @@ public:
     enum class NextAction {
         kInvalid = 0,
         kDisposeOperationContext = 1,
-        kKeepOperationContext = 2,
         kCancel = 3,
     };
 
@@ -101,9 +102,6 @@ public:
      *     If the task returns kDisposeOperationContext, the task runner destroys the operation
      *     context. The next task to be invoked will receive a new operation context.
      *
-     *     If the task returns kKeepOperationContext, the task runner will retain the operation
-     *     context to pass to the next task in the queue.
-     *
      *     If the task returns kCancel, the task runner will destroy the operation context and
      *     cancel the remaining tasks (each task will be invoked with a status containing the
      *     code ErrorCodes::CallbackCanceled). After all the tasks have been canceled, the task
@@ -140,7 +138,7 @@ private:
      * Loop exits when any of the tasks returns a non-kContinue next action.
      */
     void _runTasks();
-    void _finishRunTasks_inlock();
+    void _finishRunTasks(WithLock lk);
 
     /**
      * Waits for next scheduled task to be added to queue.
@@ -151,7 +149,7 @@ private:
     ThreadPool* _threadPool;
 
     // Protects member data of this TaskRunner.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TaskRunner::_mutex");
+    mutable stdx::mutex _mutex;
 
     stdx::condition_variable _condition;
 

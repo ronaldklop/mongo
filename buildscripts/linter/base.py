@@ -1,7 +1,6 @@
 """Base class and support functions for linters."""
 
 from abc import ABCMeta, abstractmethod
-from typing import Dict, List, Optional
 
 
 class LinterBase(object, metaclass=ABCMeta):
@@ -26,9 +25,8 @@ class LinterBase(object, metaclass=ABCMeta):
         """Get the command to run a linter."""
         pass
 
-    def get_fix_cmd_args(self, file_name):
+    def get_fix_cmd_args(self, _file_name):
         # type: (str) -> Optional[List[str]]
-        # pylint: disable=no-self-use,unused-argument
         """Get the command to run a linter fix."""
         return None
 
@@ -40,7 +38,6 @@ class LinterBase(object, metaclass=ABCMeta):
 
     def needs_file_diff(self):
         # type: () -> bool
-        # pylint: disable=no-self-use
         """
         Check if we need to diff the output of this linter with the original file.
 

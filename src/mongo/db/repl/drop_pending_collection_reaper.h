@@ -31,12 +31,15 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <map>
 #include <memory>
+#include <mutex>
 
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -101,7 +104,7 @@ public:
     void dropCollectionsOlderThan(OperationContext* opCtx, const OpTime& opTime);
 
     void clearDropPendingState() {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _dropPendingNamespaces.clear();
     }
 
@@ -127,7 +130,7 @@ private:
     // (M)  Reads and writes guarded by _mutex.
 
     // Guards access to member variables.
-    Mutex _mutex = MONGO_MAKE_LATCH("DropPendingCollectionReaper::_mutex");
+    stdx::mutex _mutex;
 
     // Used to access the storage layer.
     StorageInterface* const _storageInterface;  // (R)

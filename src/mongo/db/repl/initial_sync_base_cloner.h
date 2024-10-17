@@ -29,9 +29,18 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/initial_sync_shared_data.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace repl {
@@ -44,12 +53,19 @@ public:
                           DBClientConnection* client,
                           StorageInterface* storageInterface,
                           ThreadPool* dbPool);
-    virtual ~InitialSyncBaseCloner() = default;
+    ~InitialSyncBaseCloner() override = default;
+
+    int getRetryableOperationCount_forTest();
 
 protected:
     InitialSyncSharedData* getSharedData() const final {
         return checked_cast<InitialSyncSharedData*>(BaseCloner::getSharedData());
     }
+
+    /**
+     * Clears _retryableOp.
+     */
+    void clearRetryingState() final;
 
 private:
     /**
@@ -72,15 +88,10 @@ private:
     Status checkSyncSourceIsStillValid();
 
     /**
-     * Clears _retryableOp.
-     */
-    void clearRetryingState() final;
-
-    /**
      * Checks to see if we are still within our allowed outage duration.
      * Also probes the sync source for clone-fatal conditions, such as rollback.
      */
-    void handleStageAttemptFailed(BaseClonerStage* stage, Status lastError);
+    void handleStageAttemptFailed(BaseClonerStage* stage, Status lastError) override;
 
     /**
      * Allows the initial sync fuzzer to pause cloner execution at specific points.
@@ -93,12 +104,12 @@ private:
      * string ' db: { ', followed by the stage name, followed by ': ' and the collection UUID
      * if known.
      */
-    virtual std::string describeForFuzzer(BaseClonerStage*) const = 0;
+    std::string describeForFuzzer(BaseClonerStage*) const override = 0;
 
     /**
      * Overriden to allow the BaseCloner to use the initial sync log component.
      */
-    virtual logv2::LogComponent getLogComponent() final;
+    logv2::LogComponent getLogComponent() final;
 
     // Operation that may currently be retrying.
     InitialSyncSharedData::RetryableOperation _retryableOp;

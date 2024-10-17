@@ -27,22 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
 #include "mongo/db/query/plan_yield_policy_impl.h"
-
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/restore_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
-PlanYieldPolicyImpl::PlanYieldPolicyImpl(PlanExecutorImpl* exec,
-                                         PlanYieldPolicy::YieldPolicy policy,
-                                         const Yieldable* yieldable,
-                                         std::unique_ptr<YieldPolicyCallbacks> callbacks)
-    : PlanYieldPolicy(exec->getOpCtx()->lockState()->isGlobalLockedRecursively()
-                          ? PlanYieldPolicy::YieldPolicy::NO_YIELD
-                          : policy,
-                      exec->getOpCtx()->getServiceContext()->getFastClockSource(),
+PlanYieldPolicyImpl::PlanYieldPolicyImpl(
+    OperationContext* opCtx,
+    PlanExecutorImpl* exec,
+    PlanYieldPolicy::YieldPolicy policy,
+    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<YieldPolicyCallbacks> callbacks)
+    : PlanYieldPolicy(opCtx,
+                      policy,
+                      opCtx->getServiceContext()->getFastClockSource(),
                       internalQueryExecYieldIterations.load(),
                       Milliseconds{internalQueryExecYieldPeriodMS.load()},
                       yieldable,
@@ -56,6 +60,39 @@ void PlanYieldPolicyImpl::saveState(OperationContext* opCtx) {
 void PlanYieldPolicyImpl::restoreState(OperationContext* opCtx, const Yieldable* yieldable) {
     _planYielding->restoreStateWithoutRetrying({RestoreContext::RestoreType::kYield, nullptr},
                                                yieldable);
+}
+
+
+PlanYieldPolicyClassicTrialPeriod::PlanYieldPolicyClassicTrialPeriod(
+    OperationContext* opCtx,
+    PlanStage* root,
+    PlanYieldPolicy::YieldPolicy policy,
+    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<YieldPolicyCallbacks> callbacks)
+    : PlanYieldPolicy(opCtx,
+                      policy,
+                      opCtx->getServiceContext()->getFastClockSource(),
+                      internalQueryExecYieldIterations.load(),
+                      Milliseconds{internalQueryExecYieldPeriodMS.load()},
+                      yieldable,
+                      std::move(callbacks)),
+      _root(root) {}
+
+void PlanYieldPolicyClassicTrialPeriod::saveState(OperationContext* opCtx) {
+    _root->saveState();
+
+    if (!usesCollectionAcquisitions()) {
+        setYieldable(nullptr);
+    }
+}
+
+void PlanYieldPolicyClassicTrialPeriod::restoreState(OperationContext* opCtx,
+                                                     const Yieldable* yieldable) {
+    if (!usesCollectionAcquisitions()) {
+        setYieldable(yieldable);
+    }
+
+    _root->restoreState({RestoreContext::RestoreType::kYield, nullptr});
 }
 
 }  // namespace mongo

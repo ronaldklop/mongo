@@ -27,19 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <vector>
 
-#include <boost/intrusive_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_replace_root.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -296,6 +306,33 @@ TEST_F(ReplaceRootBasics, ReplaceRootWithRemoveSystemVariableThrows) {
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
 }
 
+TEST_F(ReplaceRootBasics, ReplaceRootSwapsWithMatchStage) {
+    Pipeline::SourceContainer container;
+
+    auto replaceRoot = createReplaceRoot(BSON("newRoot"
+                                              << "$subDocument"));
+    auto match = DocumentSourceMatch::create(BSON("x" << 2), getExpCtx());
+
+    container.push_back(replaceRoot);
+    container.push_back(match);
+
+    auto singleDocTransform =
+        dynamic_cast<DocumentSourceSingleDocumentTransformation*>(replaceRoot.get());
+    dynamic_cast<ReplaceRootTransformation*>(&singleDocTransform->getTransformer())
+        ->pushDotRenamedMatchBefore(container.begin(), &container);
+
+    ASSERT_EQUALS(2U, container.size());
+
+    auto firstMatch = dynamic_cast<DocumentSourceMatch*>(container.begin()->get());
+    ASSERT(firstMatch);
+    ASSERT_BSONOBJ_EQ(firstMatch->getQuery(),
+                      fromjson("{$or: [{'subDocument.x': {$eq: 2}}, {'subDocument': {$type: [4]}}, "
+                               "{'subDocument': {$not: {$type: [3]}}}]}"));
+
+    ASSERT(dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+        std::next(container.begin())->get()));
+}
+
 /**
  * Fixture to test error cases of initializing the $replaceRoot stage.
  */
@@ -355,7 +392,8 @@ TEST_F(ReplaceRootSpec, OnlyValidOptionInObjectSpecIsNewRoot) {
 
 // Verify that $replaceRoot requires a valid expression as input to the newRoot option.
 TEST_F(ReplaceRootSpec, RequiresExpressionForNewRootOption) {
-    ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSONObj())), AssertionException, 40414);
+    ASSERT_THROWS_CODE(
+        createReplaceRoot(createSpec(BSONObj())), AssertionException, ErrorCodes::IDLFailedToParse);
     ASSERT_THROWS(createReplaceRoot(createSpec(BSON("newRoot"
                                                     << "$$$a"))),
                   AssertionException);

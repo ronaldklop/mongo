@@ -29,8 +29,24 @@
 
 #pragma once
 
-#include "mongo/db/cursor_id.h"
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/oplog_fetcher.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo {
 namespace repl {
@@ -44,7 +60,7 @@ public:
         OnShutdownCallbackFn onShutdownCallbackFn,
         Config config);
 
-    virtual ~OplogFetcherMock();
+    ~OplogFetcherMock() override;
 
     /**
      * Simulate a batch received by the OplogFetcher. This is a batch that will be enqueued using
@@ -76,13 +92,13 @@ public:
 private:
     // =============== AbstractAsyncComponent overrides ================
 
-    Status _doStartup_inlock() noexcept override;
+    void _doStartup(WithLock) override;
 
-    void _doShutdown_inlock() noexcept override;
+    void _doShutdown(WithLock) noexcept override;
 
     void _preJoin() noexcept override {}
 
-    Mutex* _getMutex() noexcept override;
+    stdx::mutex* _getMutex() noexcept override;
 
     // ============= End AbstractAsyncComponent overrides ==============
     class TestCodeBlock {
@@ -106,7 +122,7 @@ private:
 
     void _finishCallback(Status status);
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogFetcherMock::_mutex");
+    mutable stdx::mutex _mutex;
 
     std::unique_ptr<OplogFetcherRestartDecision> _oplogFetcherRestartDecision;
 
@@ -122,8 +138,7 @@ private:
 
     // Mutex to ensure we call join() on the _waitForFinishThread only once.  This mutex should
     // never be held when _mutex is held.
-    mutable Mutex _joinFinishThreadMutex =
-        MONGO_MAKE_LATCH("OplogFetcherMock::_joinFinishThreadMutex");
+    mutable stdx::mutex _joinFinishThreadMutex;
 
     // Thread to wait for _finishPromise and call _onShutdownCallbackFn with the given status only
     // once before the OplogFetcher finishes.

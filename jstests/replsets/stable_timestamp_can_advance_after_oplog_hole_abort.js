@@ -6,10 +6,10 @@
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");  // For Thread.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 1});
 replTest.startSet();
@@ -190,8 +190,12 @@ function testUnpreparedTransactionCommit() {
 
 // Execute all the tests.
 testCreateCollection();
-testInsert();
+// TODO(SERVER-84271):
+// Remove this call and testInsert() and associated code.  With this feature flag enabled,
+// insert does not create a long-lived oplog hole and so we do not need to test this case.
+if (!FeatureFlagUtil.isPresentAndEnabled(testDB, "ReplicateVectoredInsertsTransactionally")) {
+    testInsert();
+}
 testUnpreparedTransactionCommit();
 
 replTest.stopSet();
-}());

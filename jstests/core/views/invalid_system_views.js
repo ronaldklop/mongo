@@ -3,6 +3,9 @@
  * collections.
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: applyOps, compact, reIndex.
+ *   not_allowed_with_signed_security_token,
+ *   assumes_unsharded_collection,
  *   # applyOps is not available on mongos.
  *   assumes_against_mongod_not_mongos,
  *   assumes_superuser_permissions,
@@ -12,13 +15,17 @@
  *   requires_replication,
  *   # The drop of offending views may not happen on the donor after a committed migration.
  *   tenant_migration_incompatible,
+ *   uses_compact,
+ *   references_foreign_collection,
+ *   # The test leaves the database in a broken state such that listCollections will fail and
+ *   # trigger a validation failure.
+ *   antithesis_incompatible,
  * ]
  */
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
-(function() {
-"use strict";
-const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
-const isStandalone = !isMongos && !db.runCommand({hello: 1}).hasOwnProperty("setName");
+const runningOnMongos = FixtureHelpers.isMongos(db);
+const isStandalone = FixtureHelpers.isStandalone(db);
 
 function runTest(badViewDefinition) {
     let viewsDB = db.getSiblingDB("invalid_system_views");
@@ -48,7 +55,7 @@ function runTest(badViewDefinition) {
             " in system.views";
     }
 
-    if (!isMongos) {
+    if (!runningOnMongos) {
         // Commands that run on existing regular collections should not be impacted by the
         // presence of invalid views. However, applyOps doesn't work on mongos.
         assert.commandWorked(
@@ -103,12 +110,15 @@ function runTest(badViewDefinition) {
     }
 
     const storageEngine = jsTest.options().storageEngine;
-    if (isMongos || storageEngine === "ephemeralForTest" || storageEngine === "inMemory" ||
-        storageEngine === "biggie") {
+    if (runningOnMongos || storageEngine === "inMemory") {
         print("Not testing compact command on mongos or ephemeral storage engine");
     } else {
-        assert.commandWorked(viewsDB.runCommand({compact: "collection", force: true}),
-                             makeErrorMessage("compact"));
+        // The compact command can be successful or interrupted because of cache pressure or
+        // concurrent calls to compact.
+        assert.commandWorkedOrFailedWithCode(
+            viewsDB.runCommand({compact: "collection", force: true}),
+            ErrorCodes.Interrupted,
+            makeErrorMessage("compact"));
     }
 
     assert.commandWorked(
@@ -147,4 +157,3 @@ runTest({_id: 7, viewOn: "collection", pipeline: []});
 runTest({_id: "invalid_system_views.embedded\0null", viewOn: "collection", pipeline: []});
 runTest({_id: "invalidNotFullyQualifiedNs", viewOn: "collection", pipeline: []});
 runTest({_id: "invalid_system_views.missingViewOnField", pipeline: []});
-}());

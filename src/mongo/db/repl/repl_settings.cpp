@@ -27,28 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <utility>
 
-#include "mongo/db/repl/repl_settings.h"
 
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/repl/repl_settings_gen.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
 
 
 std::string ReplSettings::ourSetName() const {
+    invariant(!_isServerless);
     size_t sl = _replSetString.find('/');
     if (sl == std::string::npos)
         return _replSetString;
     return _replSetString.substr(0, sl);
 }
 
-bool ReplSettings::usingReplSets() const {
-    return !_replSetString.empty();
+bool ReplSettings::isReplSet() const {
+    return _isServerless || !_replSetString.empty() || _shouldAutoInitiate;
 }
 
 /**
@@ -60,11 +64,20 @@ long long ReplSettings::getOplogSizeBytes() const {
 }
 
 std::string ReplSettings::getReplSetString() const {
+    invariant(!_isServerless);
     return _replSetString;
+}
+
+bool ReplSettings::isServerless() const {
+    return _isServerless;
 }
 
 bool ReplSettings::shouldRecoverFromOplogAsStandalone() {
     return recoverFromOplogAsStandalone;
+}
+
+bool ReplSettings::shouldAutoInitiate() const {
+    return _shouldAutoInitiate;
 }
 
 /**
@@ -76,7 +89,18 @@ void ReplSettings::setOplogSizeBytes(long long oplogSizeBytes) {
 }
 
 void ReplSettings::setReplSetString(std::string replSetString) {
-    _replSetString = replSetString;
+    invariant(!_isServerless);
+    _replSetString = std::move(replSetString);
+}
+
+void ReplSettings::setServerlessMode() {
+    invariant(_replSetString.empty());
+    _isServerless = true;
+}
+
+void ReplSettings::setShouldAutoInitiate() {
+    invariant(!_isServerless);
+    _shouldAutoInitiate = true;
 }
 
 }  // namespace repl

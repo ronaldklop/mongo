@@ -29,18 +29,35 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/config.h"
-#include "mongo/executor/egress_tag_closer.h"
-#include "mongo/executor/egress_tag_closer_manager.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/executor/egress_connection_closer.h"
+#include "mongo/executor/egress_connection_closer_manager.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
@@ -65,7 +82,8 @@ struct ConnectionPoolStats;
  * The overall workflow here is to manage separate pools for each unique
  * HostAndPort. See comments on the various Options for how the pool operates.
  */
-class ConnectionPool : public EgressTagCloser, public std::enable_shared_from_this<ConnectionPool> {
+class ConnectionPool : public EgressConnectionCloser,
+                       public std::enable_shared_from_this<ConnectionPool> {
     class LimitController;
 
 public:
@@ -79,6 +97,7 @@ public:
     using ConnectionHandleDeleter = std::function<void(ConnectionInterface* connection)>;
     using ConnectionHandle = std::unique_ptr<ConnectionInterface, ConnectionHandleDeleter>;
 
+    using RetrieveConnection = unique_function<SemiFuture<ConnectionHandle>()>;
     using GetConnectionCallback = unique_function<void(StatusWith<ConnectionHandle>)>;
 
     using PoolId = uint64_t;
@@ -145,7 +164,7 @@ public:
          *
          * The manager will hold this pool for the lifetime of the pool.
          */
-        EgressTagCloserManager* egressTagCloserManager = nullptr;
+        EgressConnectionCloserManager* egressConnectionCloserManager = nullptr;
 
         /**
          * Connections created through this connection pool will not attempt to authenticate.
@@ -210,6 +229,7 @@ public:
         size_t pending = 0;
         size_t ready = 0;
         size_t active = 0;
+        size_t leased = 0;
 
         std::string toString() const;
     };
@@ -240,30 +260,74 @@ public:
                             std::string name,
                             Options options = Options{});
 
-    ~ConnectionPool();
+    ~ConnectionPool() override;
 
     void shutdown();
 
     void dropConnections(const HostAndPort& hostAndPort) override;
 
-    void dropConnections(transport::Session::TagMask tags) override;
+    /**
+     * Drops all connections, but if a certain SpecificPool (and therefore HostAndPort) is
+     * marked as keep open, that connection will not be dropped.
+     */
+    void dropConnections() override;
 
-    void mutateTags(const HostAndPort& hostAndPort,
-                    const std::function<transport::Session::TagMask(transport::Session::TagMask)>&
-                        mutateFunc) override;
+    /**
+     * Marks SpecificPool to be kept open for dropConnections(), must acquire connection pool
+     * mutex.
+     */
+    void setKeepOpen(const HostAndPort& hostAndPort, bool keepOpen) override;
 
-    SemiFuture<ConnectionHandle> get(const HostAndPort& hostAndPort,
-                                     transport::ConnectSSLMode sslMode,
-                                     Milliseconds timeout);
+    inline SemiFuture<ConnectionHandle> get(
+        const HostAndPort& hostAndPort,
+        transport::ConnectSSLMode sslMode,
+        Milliseconds timeout,
+        CancellationToken token = CancellationToken::uncancelable()) {
+        return _get(hostAndPort, sslMode, timeout, false /*lease*/, std::move(token));
+    }
+
     void get_forTest(const HostAndPort& hostAndPort,
                      Milliseconds timeout,
                      GetConnectionCallback cb);
+
+    /**
+     * "Lease" a connection from the pool.
+     *
+     * Connections retrieved via this method are not assumed to be in active use for the duration of
+     * their lease and are reported separately in metrics. Otherwise, this method behaves similarly
+     * to `ConnectionPool::get`.
+     */
+    inline SemiFuture<ConnectionHandle> lease(
+        const HostAndPort& hostAndPort,
+        transport::ConnectSSLMode sslMode,
+        Milliseconds timeout,
+        CancellationToken token = CancellationToken::uncancelable()) {
+        return _get(hostAndPort, sslMode, timeout, true /*lease*/, std::move(token));
+    }
+
+    void lease_forTest(const HostAndPort& hostAndPort,
+                       Milliseconds timeout,
+                       GetConnectionCallback cb);
 
     void appendConnectionStats(ConnectionPoolStats* stats) const;
 
     size_t getNumConnectionsPerHost(const HostAndPort& hostAndPort) const;
 
+    std::string getName() const {
+        return _name;
+    }
+
 private:
+    ClockSource* _getFastClockSource() const;
+
+    SemiFuture<ConnectionHandle> _get(const HostAndPort& hostAndPort,
+                                      transport::ConnectSSLMode sslMode,
+                                      Milliseconds timeout,
+                                      bool leased,
+                                      const CancellationToken& token);
+
+    void retrieve_forTest(RetrieveConnection retrieve, GetConnectionCallback cb);
+
     std::string _name;
 
     const std::shared_ptr<DependentTypeFactoryInterface> _factory;
@@ -272,12 +336,15 @@ private:
     std::shared_ptr<ControllerInterface> _controller;
 
     // The global mutex for specific pool access and the generation counter
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(1), "ExecutorConnectionPool::_mutex");
+    mutable stdx::mutex _mutex;
     PoolId _nextPoolId = 0;
     stdx::unordered_map<HostAndPort, std::shared_ptr<SpecificPool>> _pools;
+    bool _isShutDown = false;
 
-    EgressTagCloserManager* _manager;
+    EgressConnectionCloserManager* _manager;
+
+    mutable ClockSource* _fastClockSource{nullptr};
+    mutable std::once_flag _fastClkSrcInitFlag;
 };
 
 /**
@@ -329,7 +396,7 @@ class ConnectionPool::ConnectionInterface : public TimerInterface {
 public:
     explicit ConnectionInterface(size_t generation) : _generation(generation) {}
 
-    virtual ~ConnectionInterface() = default;
+    ~ConnectionInterface() override = default;
 
     /**
      * Indicates that the user is now done with this connection. Users MUST call either
@@ -383,6 +450,11 @@ public:
     Date_t getLastUsed() const;
 
     /**
+     * Returns the number of times the connection was used by operations.
+     */
+    size_t getTimesUsed() const;
+
+    /**
      * Returns the status associated with the connection. If the status is not
      * OK, the connection will not be returned to the pool.
      */
@@ -409,7 +481,7 @@ protected:
      * Sets up the connection. This should include connection + auth + any
      * other associated hooks.
      */
-    virtual void setup(Milliseconds timeout, SetupCallback cb) = 0;
+    virtual void setup(Milliseconds timeout, SetupCallback cb, std::string instanceName) = 0;
 
     /**
      * Resets the connection's state to kConnectionStateUnknown for the next user.
@@ -425,6 +497,7 @@ protected:
 private:
     size_t _generation;
     Date_t _lastUsed;
+    size_t _timesUsed = 0;
     Status _status = ConnectionPool::kConnectionStateUnknown;
 };
 
@@ -492,6 +565,10 @@ public:
         return _pool;
     }
 
+    Options getPoolOptions() const {
+        return _pool->_options;
+    }
+
     virtual void updateConnectionPoolStats([[maybe_unused]] ConnectionPoolStats* cps) const = 0;
 
 protected:
@@ -536,10 +613,24 @@ public:
     virtual Date_t now() = 0;
 
     /**
+     * Returns the fast clock source.
+     * The default implementation gets it from the global service context.
+     */
+    virtual ClockSource* getFastClockSource();
+
+    /**
      * shutdown
      */
     virtual void shutdown() = 0;
 };
+
+inline ClockSource* ConnectionPool::_getFastClockSource() const {
+    if (MONGO_unlikely(!_fastClockSource)) {
+        std::call_once(_fastClkSrcInitFlag,
+                       [&]() { _fastClockSource = _factory->getFastClockSource(); });
+    }
+    return _fastClockSource;
+}
 
 }  // namespace executor
 }  // namespace mongo

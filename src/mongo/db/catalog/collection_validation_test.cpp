@@ -27,155 +27,207 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "mongo/db/catalog/collection_validation.h"
-
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_validation.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/shared_buffer.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
-
 namespace {
 
-const NamespaceString kNss = NamespaceString("test.t");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.t");
 
-/**
- * Test fixture for collection validation with the ephemeralForTest storage engine.
- * Validation with {background:true} is not supported by the ephemeralForTest storage engine.
- */
 class CollectionValidationTest : public CatalogTestFixture {
-public:
-    CollectionValidationTest() : CollectionValidationTest("ephemeralForTest") {}
-
 protected:
-    /**
-     * Allow inheriting classes to select a storage engine with which to run unit tests.
-     */
-    explicit CollectionValidationTest(std::string engine) : CatalogTestFixture(std::move(engine)) {}
+    CollectionValidationTest(Options options = {}) : CatalogTestFixture(std::move(options)) {}
 
 private:
     void setUp() override {
         CatalogTestFixture::setUp();
 
         // Create collection kNss for unit tests to use. It will possess a default _id index.
-        CollectionOptions defaultCollectionOptions;
+        const CollectionOptions defaultCollectionOptions;
         ASSERT_OK(storageInterface()->createCollection(
             operationContext(), kNss, defaultCollectionOptions));
     };
 };
 
-/**
- * Test fixture for testing background collection validation on the wiredTiger engine, which is
- * currently the only storage engine that supports background collection validation.
- *
- * Collection kNss will be created for each unit test, curtesy of inheritance from
- * CollectionValidationTest.
- */
-class BackgroundCollectionValidationTest : public CollectionValidationTest {
-public:
-    /**
-     * Sets up the wiredTiger storage engine that supports data checkpointing.
-     *
-     * Background validation runs on a checkpoint, and therefore only on storage engines that
-     * support checkpoints.
-     */
-    BackgroundCollectionValidationTest() : CollectionValidationTest("wiredTiger") {}
+// Calling verify() is not possible on an ephemeral instance.
+class CollectionValidationDiskTest : public CollectionValidationTest {
+protected:
+    CollectionValidationDiskTest() : CollectionValidationTest(Options{}.ephemeral(false)) {}
 };
 
 /**
- * Calls validate on collection kNss with both kValidateFull and kValidateNormal validation levels
+ * Calls validate on collection nss with both kValidateFull and kValidateNormal validation levels
  * and verifies the results.
+ *
+ * Returns the list of validation results.
  */
-void foregroundValidate(
+std::vector<ValidateResults> foregroundValidate(
+    const NamespaceString& nss,
     OperationContext* opCtx,
     bool valid,
     int numRecords,
     int numInvalidDocuments,
-    int numErrors,
+    int expectedNumErrors,
     std::initializer_list<CollectionValidation::ValidateMode> modes =
         {CollectionValidation::ValidateMode::kForeground,
          CollectionValidation::ValidateMode::kForegroundFull},
     CollectionValidation::RepairMode repairMode = CollectionValidation::RepairMode::kNone) {
+    std::vector<ValidateResults> results;
     for (auto mode : modes) {
         ValidateResults validateResults;
-        BSONObjBuilder output;
         ASSERT_OK(CollectionValidation::validate(
-            opCtx, kNss, mode, repairMode, &validateResults, &output));
-        ASSERT_EQ(validateResults.valid, valid);
-        ASSERT_EQ(validateResults.errors.size(), static_cast<long unsigned int>(numErrors));
+            opCtx,
+            nss,
+            CollectionValidation::ValidationOptions{mode,
+                                                    repairMode,
+                                                    /*logDiagnostics=*/false},
+            &validateResults));
+        BSONObjBuilder validateResultsBuilder;
+        validateResults.appendToResultObj(&validateResultsBuilder, true /* debugging */);
+        auto validateResultsObj = validateResultsBuilder.obj();
 
-        BSONObj obj = output.obj();
-        ASSERT_EQ(obj.getIntField("nrecords"), numRecords);
-        ASSERT_EQ(obj.getIntField("nInvalidDocuments"), numInvalidDocuments);
+        // The total number of errors is: those in the top-level results plus the sum of
+        // all index-specific errors.
+        std::size_t observedNumErrors = validateResults.getErrors().size() +
+            std::accumulate(validateResults.getIndexResultsMap().begin(),
+                            validateResults.getIndexResultsMap().end(),
+                            0,
+                            [](size_t current, const auto& ivr) {
+                                return current + ivr.second.getErrors().size();
+                            });
+
+        ASSERT_EQ(validateResults.isValid(), valid) << validateResultsObj;
+        ASSERT_EQ(observedNumErrors, static_cast<long unsigned int>(expectedNumErrors))
+            << validateResultsObj;
+
+        ASSERT_EQ(validateResultsObj.getIntField("nrecords"), numRecords) << validateResultsObj;
+        ASSERT_EQ(validateResultsObj.getIntField("nInvalidDocuments"), numInvalidDocuments)
+            << validateResultsObj;
+
+        results.push_back(std::move(validateResults));
     }
+    return results;
+}
+
+ValidateResults omitTransientWarnings(const ValidateResults& results) {
+    ValidateResults copy = results;
+    copy.getWarningsUnsafe()->clear();
+    for (const auto& warning : results.getWarnings()) {
+        std::string endMsg =
+            "This is a transient issue as the collection was actively in use by other "
+            "operations.";
+        std::string beginMsg = "Could not complete validation of ";
+        if (warning.size() >= std::max(endMsg.size(), beginMsg.size())) {
+            bool startsWith = std::equal(beginMsg.begin(), beginMsg.end(), warning.begin());
+            bool endsWith = std::equal(endMsg.rbegin(), endMsg.rend(), warning.rbegin());
+            if (!(startsWith && endsWith)) {
+                copy.addWarning(warning);
+            }
+        } else {
+            copy.addWarning(warning);
+        }
+    }
+    return copy;
 }
 
 /**
- * Calls validate on collection kNss with {background:true} and verifies the results.
- * If 'runForegroundAsWell' is set, then foregroundValidate() above will be run in addition.
+ * Inserts a range of documents into the nss collection and then returns that count. The range is
+ * defined by [startIDNum, startIDNum+numDocs), not inclusive of (startIDNum+numDocs), using the
+ * numbers as values for '_id' of the document being inserted followed by numFields fields.
  */
-void backgroundValidate(OperationContext* opCtx,
-                        bool valid,
-                        int numRecords,
-                        int numInvalidDocuments,
-                        int numErrors,
-                        bool runForegroundAsWell) {
-    if (runForegroundAsWell) {
-        foregroundValidate(opCtx, valid, numRecords, numInvalidDocuments, numErrors);
-    }
-
-    // This function will force a checkpoint, so background validation can then read from that
-    // checkpoint.
-    // Set 'stableCheckpoint' to false, so we checkpoint ALL data, not just up to WT's
-    // stable_timestamp.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableTimestamp*/ false);
-
-    ValidateResults validateResults;
-    BSONObjBuilder output;
-    ASSERT_OK(CollectionValidation::validate(opCtx,
-                                             kNss,
-                                             CollectionValidation::ValidateMode::kBackground,
-                                             CollectionValidation::RepairMode::kNone,
-                                             &validateResults,
-                                             &output));
-    BSONObj obj = output.obj();
-
-    ASSERT_EQ(validateResults.valid, valid);
-    ASSERT_EQ(validateResults.errors.size(), static_cast<long unsigned int>(numErrors));
-
-    ASSERT_EQ(obj.getIntField("nrecords"), numRecords);
-    ASSERT_EQ(obj.getIntField("nInvalidDocuments"), numInvalidDocuments);
-}
-
-/**
- * Inserts a range of documents into the kNss collection and then returns that count.
- * The range is defined by [startIDNum, endIDNum), not inclusive of endIDNum, using the numbers as
- * values for '_id' of the document being inserted.
- */
-int insertDataRange(OperationContext* opCtx, int startIDNum, int endIDNum) {
-    invariant(startIDNum < endIDNum,
-              str::stream() << "attempted to insert invalid data range from " << startIDNum
-                            << " to " << endIDNum);
-
-
-    AutoGetCollection coll(opCtx, kNss, MODE_IX);
+int insertDataRangeForNumFields(const NamespaceString& nss,
+                                OperationContext* opCtx,
+                                const int startIDNum,
+                                const int numDocs,
+                                const int numFields) {
+    const AutoGetCollection coll(opCtx, nss, MODE_IX);
     std::vector<InsertStatement> inserts;
-    for (int i = startIDNum; i < endIDNum; ++i) {
-        auto doc = BSON("_id" << i);
-        inserts.push_back(InsertStatement(doc));
+    for (int i = 0; i < numDocs; ++i) {
+        BSONObjBuilder bsonBuilder;
+        bsonBuilder << "_id" << i + startIDNum;
+        for (int c = 1; c <= numFields; ++c) {
+            bsonBuilder << "a" + std::to_string(c) << i + (i * numFields + startIDNum) + c;
+        }
+        const auto obj = bsonBuilder.obj();
+        inserts.push_back(InsertStatement(obj));
     }
 
     {
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_OK(coll->insertDocuments(opCtx, inserts.begin(), inserts.end(), nullptr, false));
+        ASSERT_OK(collection_internal::insertDocuments(
+            opCtx, *coll, inserts.begin(), inserts.end(), nullptr, false));
         wuow.commit();
     }
-    return endIDNum - startIDNum;
+    return numDocs;
+}
+
+/**
+ * Inserts a range of documents into the kNss collection and then returns that count. The range is
+ * defined by [startIDNum, endIDNum), not inclusive of endIDNum, using the numbers as values for
+ * '_id' of the document being inserted.
+ */
+int insertDataRange(OperationContext* opCtx, const int startIDNum, const int endIDNum) {
+    invariant(startIDNum < endIDNum,
+              str::stream() << "attempted to insert invalid data range from " << startIDNum
+                            << " to " << endIDNum);
+
+    return insertDataRangeForNumFields(kNss, opCtx, startIDNum, endIDNum - startIDNum, 0);
 }
 
 /**
@@ -197,73 +249,73 @@ int setUpInvalidData(OperationContext* opCtx) {
     return 1;
 }
 
+/**
+ * Convenience function to convert ValidateResults to a BSON object.
+ */
+BSONObj resultToBSON(const ValidateResults& vr) {
+    BSONObjBuilder builder;
+    vr.appendToResultObj(&builder, true /* debugging */);
+    return builder.obj();
+}
+
+
 // Verify that calling validate() on an empty collection with different validation levels returns an
 // OK status.
 TEST_F(CollectionValidationTest, ValidateEmpty) {
-    // Running on the ephemeralForTest storage engine.
-    foregroundValidate(operationContext(),
+    foregroundValidate(kNss,
+                       operationContext(),
                        /*valid*/ true,
                        /*numRecords*/ 0,
                        /*numInvalidDocuments*/ 0,
                        /*numErrors*/ 0);
-}
-TEST_F(BackgroundCollectionValidationTest, BackgroundValidateEmpty) {
-    // Running on the WT storage engine.
-    backgroundValidate(operationContext(),
-                       /*valid*/ true,
-                       /*numRecords*/ 0,
-                       /*numInvalidDocuments*/ 0,
-                       /*numErrors*/ 0,
-                       /*runForegroundAsWell*/ true);
 }
 
 // Verify calling validate() on a nonempty collection with different validation levels.
 TEST_F(CollectionValidationTest, Validate) {
     auto opCtx = operationContext();
-    foregroundValidate(opCtx,
+    foregroundValidate(kNss,
+                       opCtx,
                        /*valid*/ true,
                        /*numRecords*/ insertDataRange(opCtx, 0, 5),
                        /*numInvalidDocuments*/ 0,
                        /*numErrors*/ 0);
 }
-TEST_F(BackgroundCollectionValidationTest, BackgroundValidate) {
-    auto opCtx = operationContext();
-    backgroundValidate(opCtx,
-                       /*valid*/ true,
-                       /*numRecords*/ insertDataRange(opCtx, 0, 5),
-                       /*numInvalidDocuments*/ 0,
-                       /*numErrors*/ 0,
-                       /*runForegroundAsWell*/ true);
-}
 
 // Verify calling validate() on a collection with an invalid document.
 TEST_F(CollectionValidationTest, ValidateError) {
     auto opCtx = operationContext();
-    foregroundValidate(opCtx,
+    foregroundValidate(kNss,
+                       opCtx,
                        /*valid*/ false,
                        /*numRecords*/ setUpInvalidData(opCtx),
                        /*numInvalidDocuments*/ 1,
                        /*numErrors*/ 1);
 }
-TEST_F(BackgroundCollectionValidationTest, BackgroundValidateError) {
-    auto opCtx = operationContext();
-    backgroundValidate(opCtx,
-                       /*valid*/ false,
-                       /*numRecords*/ setUpInvalidData(opCtx),
-                       /*numInvalidDocuments*/ 1,
-                       /*numErrors*/ 1,
-                       /*runForegroundAsWell*/ true);
-}
 
 // Verify calling validate() with enforceFastCount=true.
 TEST_F(CollectionValidationTest, ValidateEnforceFastCount) {
     auto opCtx = operationContext();
-    foregroundValidate(opCtx,
+    foregroundValidate(kNss,
+                       opCtx,
                        /*valid*/ true,
                        /*numRecords*/ insertDataRange(opCtx, 0, 5),
                        /*numInvalidDocuments*/ 0,
                        /*numErrors*/ 0,
                        {CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount});
+}
+
+TEST_F(CollectionValidationDiskTest, ValidateIndexDetailResultsSurfaceVerifyErrors) {
+    FailPointEnableBlock fp{"WTValidateIndexStructuralDamage"};
+    auto opCtx = operationContext();
+    insertDataRange(opCtx, 0, 5);  // initialize collection
+    foregroundValidate(
+        kNss,
+        opCtx,
+        /*valid*/ false,
+        /*numRecords*/ std::numeric_limits<int32_t>::min(),           // uninitialized
+        /*numInvalidDocuments*/ std::numeric_limits<int32_t>::min(),  // uninitialized
+        /*numErrors*/ 1,
+        {CollectionValidation::ValidateMode::kForegroundFull});
 }
 
 /**
@@ -279,41 +331,124 @@ void waitUntilValidateFailpointHasBeenReached() {
     ASSERT(CollectionValidation::getIsValidationPausedForTest());
 }
 
-TEST_F(BackgroundCollectionValidationTest, BackgroundValidateRunsConcurrentlyWithWrites) {
+/**
+ * Generates a KeyString suitable for positioning a cursor at the beginning of an index.
+ */
+key_string::Value makeFirstKeyString(const SortedDataInterface& sortedDataInterface) {
+    key_string::Builder firstKeyStringBuilder(sortedDataInterface.getKeyStringVersion(),
+                                              BSONObj(),
+                                              sortedDataInterface.getOrdering(),
+                                              key_string::Discriminator::kExclusiveBefore);
+    return firstKeyStringBuilder.getValueCopy();
+}
+
+/**
+ * Extracts KeyString without RecordId.
+ */
+key_string::Value makeKeyStringWithoutRecordId(const key_string::Value& keyStringWithRecordId,
+                                               key_string::Version version) {
+    BufBuilder bufBuilder;
+    keyStringWithRecordId.serializeWithoutRecordIdLong(bufBuilder);
+    auto builderSize = bufBuilder.len();
+
+    auto buffer = bufBuilder.release();
+
+    BufReader bufReader(buffer.get(), builderSize);
+    return key_string::Value::deserialize(bufReader, version, boost::none /* ridFormat */);
+}
+
+// Verify calling validate() on a collection with old (pre-4.2) keys in a WT unique index.
+TEST_F(CollectionValidationTest, ValidateOldUniqueIndexKeyWarning) {
     auto opCtx = operationContext();
-    auto serviceContext = opCtx->getServiceContext();
 
-    // Set up some data in the collection so that we can validate it.
-    int numRecords = insertDataRange(opCtx, 0, 5);
-
-    stdx::thread runBackgroundValidate;
-    int numRecords2;
     {
-        // Set a failpoint in the collection validation code and then start a parallel operation to
-        // run background validation in parallel.
-        FailPointEnableBlock failPoint("pauseCollectionValidationWithLock");
-        runBackgroundValidate = stdx::thread([&serviceContext, &numRecords] {
-            ThreadClient tc("BackgroundValidateConcurrentWithCRUD-thread", serviceContext);
-            auto threadOpCtx = tc->makeOperationContext();
-            backgroundValidate(
-                threadOpCtx.get(), true, numRecords, 0, 0, /*runForegroundAsWell*/ false);
-        });
+        FailPointEnableBlock createOldFormatIndex("WTIndexCreateUniqueIndexesInOldFormat");
 
-        // Wait until validate starts and hangs mid-way on a failpoint, then do concurrent writes,
-        // which should succeed and not affect the background validation.
-        waitUntilValidateFailpointHasBeenReached();
-        numRecords2 = insertDataRange(opCtx, 5, 15);
+        // Durable catalog expects metadata updates to be timestamped but this is
+        // not necessary in our case - we just want to check the contents of the index table.
+        // The alternative here would be to provide a commit timestamp with a TimestamptBlock.
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        auto uniqueIndexSpec = BSON("v" << 2 << "name"
+                                        << "a_1"
+                                        << "key" << BSON("a" << 1) << "unique" << true);
+        ASSERT_OK(
+            storageInterface()->createIndexesOnEmptyCollection(opCtx, kNss, {uniqueIndexSpec}));
     }
 
-    // Make sure the background validation finishes successfully.
-    runBackgroundValidate.join();
+    // Insert single document with the default (new) index key that includes a record id.
+    ASSERT_OK(storageInterface()->insertDocument(opCtx,
+                                                 kNss,
+                                                 {BSON("_id" << 1 << "a" << 1), Timestamp()},
+                                                 repl::OpTime::kUninitializedTerm));
 
-    // Run regular foreground collection validation to make sure everything is OK.
-    foregroundValidate(opCtx,
-                       /*valid*/ true,
-                       /*numRecords*/ numRecords + numRecords2,
-                       0,
-                       0);
+    // Validate the collection here as a sanity check before we modify the index contents in-place.
+    foregroundValidate(
+        kNss, opCtx, /*valid*/ true, /*numRecords*/ 1, /*numInvalidDocuments*/ 0, /*numErrors*/ 0);
+
+    // Update existing entry in index to pre-4.2 format without record id in key string.
+    {
+        AutoGetCollection autoColl(opCtx, kNss, MODE_IX);
+
+        auto indexCatalog = autoColl->getIndexCatalog();
+        auto descriptor = indexCatalog->findIndexByName(opCtx, "a_1");
+        ASSERT(descriptor) << "Cannot find a_1 in index catalog";
+        auto entry = indexCatalog->getEntry(descriptor);
+        ASSERT(entry) << "Cannot look up index catalog entry for index a_1";
+
+        auto sortedDataInterface = entry->accessMethod()->asSortedData()->getSortedDataInterface();
+        ASSERT_FALSE(sortedDataInterface->isEmpty(opCtx)) << "index a_1 should not be empty";
+
+        // Check key in index for only document.
+        auto first = makeFirstKeyString(*sortedDataInterface);
+        auto firstKeyString = StringData(first.getBuffer(), first.getSize());
+        key_string::Value keyStringWithRecordId;
+        {
+            auto cursor = sortedDataInterface->newCursor(opCtx);
+            auto indexEntry = cursor->seekForKeyString(firstKeyString);
+            ASSERT(indexEntry);
+            ASSERT(cursor->isRecordIdAtEndOfKeyString());
+            keyStringWithRecordId = indexEntry->keyString;
+            ASSERT_FALSE(cursor->nextKeyString());
+        }
+
+        // Replace key with old format (without record id).
+        {
+            WriteUnitOfWork wuow(opCtx);
+            bool dupsAllowed = false;
+            sortedDataInterface->unindex(opCtx, keyStringWithRecordId, dupsAllowed);
+            FailPointEnableBlock insertOldFormatKeys("WTIndexInsertUniqueKeysInOldFormat");
+            ASSERT_OK(sortedDataInterface->insert(opCtx, keyStringWithRecordId, dupsAllowed));
+            wuow.commit();
+        }
+
+        // Confirm that key in index is in old format.
+        {
+            auto cursor = sortedDataInterface->newCursor(opCtx);
+            auto indexEntry = cursor->seekForKeyString(firstKeyString);
+            ASSERT(indexEntry);
+            ASSERT_FALSE(cursor->isRecordIdAtEndOfKeyString());
+            ASSERT_EQ(indexEntry->keyString.compareWithoutRecordIdLong(keyStringWithRecordId), 0);
+            ASSERT_FALSE(cursor->nextKeyString());
+        }
+    }
+
+    const auto results = foregroundValidate(kNss,
+                                            opCtx,
+                                            /*valid*/ true,
+                                            /*numRecords*/ 1,
+                                            /*numInvalidDocuments*/ 0,
+                                            /*numErrors*/ 0);
+    ASSERT_EQ(results.size(), 2);
+
+    for (const auto& validateResults : results) {
+        const auto obj = resultToBSON(validateResults);
+        ASSERT(validateResults.isValid()) << obj;
+        const auto warningsWithoutTransientErrors = omitTransientWarnings(validateResults);
+        ASSERT_EQ(warningsWithoutTransientErrors.getWarnings().size(), 1U) << obj;
+        ASSERT_STRING_CONTAINS(warningsWithoutTransientErrors.getWarnings()[0],
+                               "Unique index a_1 has one or more keys in the old format")
+            << obj;
+    }
 }
 
 }  // namespace

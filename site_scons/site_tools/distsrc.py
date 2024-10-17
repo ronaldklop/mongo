@@ -20,17 +20,15 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 
-import SCons
+import io
 import os
-import os.path as ospath
-import subprocess
-import shutil
 import tarfile
 import time
 import zipfile
-import io
-
 from distutils.spawn import find_executable
+
+import git
+import SCons
 
 __distsrc_callbacks = []
 
@@ -61,7 +59,10 @@ class DistSrcArchive:
             )
         elif filename.endswith("zip"):
             return DistSrcZipArchive(
-                "zip", zipfile.ZipFile(filename, "a"), filename, "a",
+                "zip",
+                zipfile.ZipFile(filename, "a"),
+                filename,
+                "a",
             )
 
     def close(self):
@@ -92,11 +93,13 @@ class DistSrcTarArchive(DistSrcArchive):
         self,
         filename,
         file_contents,
-        mtime=time.time(),
+        mtime=None,
         mode=0o644,
         uname="root",
         gname="root",
     ):
+        if mtime is None:
+            mtime = time.time()
         file_metadata = tarfile.TarInfo(name=filename)
         file_metadata.mtime = mtime
         file_metadata.mode = mode
@@ -107,7 +110,9 @@ class DistSrcTarArchive(DistSrcArchive):
         if self.archive_mode == "r":
             self.archive_file.close()
             self.archive_file = tarfile.open(
-                self.archive_name, "a", format=tarfile.PAX_FORMAT,
+                self.archive_name,
+                "a",
+                format=tarfile.PAX_FORMAT,
             )
             self.archive_mode = "a"
         self.archive_file.addfile(file_metadata, fileobj=file_buf)
@@ -142,11 +147,13 @@ class DistSrcZipArchive(DistSrcArchive):
         self,
         filename,
         file_contents,
-        mtime=time.time(),
+        mtime=None,
         mode=0o644,
         uname="root",
         gname="root",
     ):
+        if mtime is None:
+            mtime = time.time()
         self.archive_file.writestr(filename, file_contents)
 
     def append_file(self, filename, localfile):
@@ -179,19 +186,41 @@ def distsrc_action_generator(source, target, env, for_signature):
         archive_wrapper.close()
 
     target_ext = str(target[0])[-3:]
-    if not target_ext in ["zip", "tar"]:
+    if target_ext not in ["zip", "tar"]:
         print("Invalid file format for distsrc. Must be tar or zip file")
         env.Exit(1)
 
-    git_cmd = (
-        '"%s" archive --format %s --output %s --prefix ${MONGO_DIST_SRC_PREFIX} HEAD'
-        % (git_path, target_ext, target[0])
-    )
+    def create_archive(target=None, source=None, env=None):
+        try:
+            git_repo = git.Repo(os.getcwd())
+            # get the original HEAD position of repo
+            head_commit_sha = git_repo.head.object.hexsha
+
+            # add and commit the uncommited changes
+            git_repo.git.add(all=True)
+            # only commit changes if there are any
+            if len(git_repo.index.diff("HEAD")) != 0:
+                with git_repo.git.custom_environment(
+                    GIT_COMMITTER_NAME="Evergreen", GIT_COMMITTER_EMAIL="evergreen@mongodb.com"
+                ):
+                    git_repo.git.commit("--author='Evergreen <>'", "-m", "temp commit")
+
+            # archive repo
+            dist_src_prefix = env.get("MONGO_DIST_SRC_PREFIX")
+            git_repo.git.archive(
+                "--format", target_ext, "--output", target[0], "--prefix", dist_src_prefix, "HEAD"
+            )
+
+            # reset branch to original state
+            git_repo.git.reset("--mixed", head_commit_sha)
+        except Exception as e:
+            env.FatalError(f"Error archiving: {e}")
 
     return [
-        SCons.Action.Action(git_cmd, "Running git archive for $TARGET"),
+        SCons.Action.Action(create_archive, "Creating archive for $TARGET"),
         SCons.Action.Action(
-            run_distsrc_callbacks, "Running distsrc callbacks for $TARGET"
+            run_distsrc_callbacks,
+            "Running distsrc callbacks for $TARGET",
         ),
     ]
 

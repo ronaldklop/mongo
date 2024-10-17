@@ -4,7 +4,7 @@
  * @tags: [requires_replication]
  */
 
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rsTest = new ReplSetTest({nodes: 3});
 rsTest.startSet({
@@ -69,4 +69,3 @@ const uriShellMech =
 assert.eq(uriShellMech, 0, 'Failed to connect using URI');
 
 rsTest.stopSet();
-})();

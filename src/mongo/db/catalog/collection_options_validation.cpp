@@ -29,6 +29,11 @@
 
 #include "mongo/db/catalog/collection_options_validation.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/util/str.h"
+
 namespace mongo::collection_options_validation {
 Status validateStorageEngineOptions(const BSONObj& storageEngine) {
     // Every field inside 'storageEngine' must be a document.
@@ -54,4 +59,5 @@ Status validateStorageEngineOptions(const BSONObj& storageEngine) {
     }
     return Status::OK();
 }
+
 }  // namespace mongo::collection_options_validation

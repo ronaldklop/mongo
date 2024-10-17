@@ -27,9 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstdio>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/parse_number.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
@@ -119,9 +126,9 @@ int LexNumCmp::cmp(StringData sd1, StringData sd2, bool lexOnly) {
                 } else if (len2 > len1) {
                     return -1;
                 }
-                // if the lengths are equal, just strcmp
+                // if the lengths of digits are equal, just memcmp
                 else {
-                    result = strncmp(sd1.rawData() + s1, sd2.rawData() + s2, len1);
+                    result = memcmp(sd1.rawData() + s1, sd2.rawData() + s2, len1);
                     if (result)
                         return (result > 0) ? 1 : -1;
                 }
@@ -163,22 +170,6 @@ int LexNumCmp::cmp(StringData s1, StringData s2) const {
 }
 bool LexNumCmp::operator()(StringData s1, StringData s2) const {
     return cmp(s1, s2) < 0;
-}
-
-int versionCmp(const StringData rhs, const StringData lhs) {
-    if (rhs == lhs)
-        return 0;
-
-    // handle "1.2.3-" and "1.2.3-pre"
-    if (rhs.size() < lhs.size()) {
-        if (strncmp(rhs.rawData(), lhs.rawData(), rhs.size()) == 0 && lhs[rhs.size()] == '-')
-            return +1;
-    } else if (rhs.size() > lhs.size()) {
-        if (strncmp(rhs.rawData(), lhs.rawData(), lhs.size()) == 0 && rhs[lhs.size()] == '-')
-            return -1;
-    }
-
-    return LexNumCmp::cmp(rhs, lhs, false);
 }
 
 std::string escape(StringData sd, bool escape_slash) {

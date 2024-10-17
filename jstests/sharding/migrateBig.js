@@ -1,12 +1,10 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({name: "migrateBig", shards: 2, other: {chunkSize: 1}});
 
 assert.commandWorked(
     s.config.settings.update({_id: "balancer"}, {$set: {_waitForDelete: true}}, true));
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {x: 1}}));
 
 var db = s.getDB("test");
@@ -58,11 +56,6 @@ s.printShardingStatus();
 
 s.startBalancer();
 
-assert.soon(function() {
-    var x = s.chunkDiff("foo", "test");
-    print("chunk diff: " + x);
-    return x < 2;
-}, "no balance happened", 8 * 60 * 1000, 2000);
+s.awaitBalance('foo', 'test', 60 * 1000);
 
 s.stop();
-})();

@@ -29,16 +29,37 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <deque>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/counter.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_change_notifier.h"
-#include "mongo/executor/egress_tag_closer.h"
+#include "mongo/client/replica_set_monitor_stats.h"
+#include "mongo/executor/egress_connection_closer.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -51,11 +72,11 @@ class MongoURI;
 class ReplicaSetMonitorManagerNetworkConnectionHook final : public executor::NetworkConnectionHook {
 public:
     ReplicaSetMonitorManagerNetworkConnectionHook() = default;
-    virtual ~ReplicaSetMonitorManagerNetworkConnectionHook() = default;
+    ~ReplicaSetMonitorManagerNetworkConnectionHook() override = default;
 
     Status validateHost(const HostAndPort& remoteHost,
-                        const BSONObj& isMasterRequest,
-                        const executor::RemoteCommandResponse& isMasterReply) override;
+                        const BSONObj& helloRequest,
+                        const executor::RemoteCommandResponse& helloReply) override;
 
     StatusWith<boost::optional<executor::RemoteCommandRequest>> makeRequest(
         const HostAndPort& remoteHost) override;
@@ -64,7 +85,7 @@ public:
                        executor::RemoteCommandResponse&& response) override;
 };
 
-class ReplicaSetMonitorConnectionManager : public executor::EgressTagCloser {
+class ReplicaSetMonitorConnectionManager : public executor::EgressConnectionCloser {
     ReplicaSetMonitorConnectionManager() = delete;
 
 public:
@@ -74,15 +95,13 @@ public:
     void dropConnections(const HostAndPort& hostAndPort) override;
 
     // Not supported.
-    void dropConnections(transport::Session::TagMask tags) override {
+    void dropConnections() override {
         MONGO_UNREACHABLE;
     };
     // Not supported.
-    void mutateTags(const HostAndPort& hostAndPort,
-                    const std::function<transport::Session::TagMask(transport::Session::TagMask)>&
-                        mutateFunc) override {
+    void setKeepOpen(const HostAndPort& hostAndPort, bool keepOpen) override {
         MONGO_UNREACHABLE;
-    };
+    }
 
 private:
     std::shared_ptr<executor::NetworkInterface> _network;
@@ -115,7 +134,13 @@ public:
     /**
      * Retrieves the names of all sets tracked by this manager.
      */
-    std::vector<std::string> getAllSetNames();
+    std::vector<std::string> getAllSetNames() const;
+
+    /**
+     * Returns current cache size including empty items, that will be garbage
+     * collected later. This is intended for tests.
+     */
+    size_t getNumMonitors() const;
 
     /**
      * Removes the specified replica set monitor from being tracked, if it exists. Otherwise
@@ -125,9 +150,10 @@ public:
     void removeMonitor(StringData setName);
 
     /**
-     * Removes the already deleted monitor for 'setName' from the internal map.
+     * Adds the 'setName' to the garbage collect queue for later cleanup.
+     * The 2-step GC is implemented to avoid deadlocks.
      */
-    void garbageCollect(StringData setName);
+    void registerForGarbageCollection(StringData setName);
 
     std::shared_ptr<ReplicaSetMonitor> getMonitorForHost(const HostAndPort& host);
 
@@ -156,18 +182,27 @@ public:
 
     bool isShutdown() const;
 
+    void installMonitor_forTests(std::shared_ptr<ReplicaSetMonitor> monitor);
+
+    /**
+     *  Returns garbage collected monitors count for tests.
+     */
+    size_t getGarbageCollectedMonitorsCount() const {
+        return _monitorsGarbageCollected.get();
+    }
 
 private:
     /**
-     * Returns an EgressTagCloser controlling the executor's network interface.
+     * Returns an EgressConnectionCloser controlling the executor's network interface.
      */
-    std::shared_ptr<executor::EgressTagCloser> _getConnectionManager();
+    std::shared_ptr<executor::EgressConnectionCloser> _getConnectionManager();
 
     using ReplicaSetMonitorsMap = StringMap<std::weak_ptr<ReplicaSetMonitor>>;
 
-    // Protects access to the replica set monitors
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(6), "ReplicaSetMonitorManager::_mutex");
+    // Protects access to the replica set monitors and several fields.
+    mutable stdx::mutex _mutex;
+
+    // Fields guarded by _mutex:
 
     // Executor for monitoring replica sets.
     std::shared_ptr<executor::TaskExecutor> _taskExecutor;
@@ -176,7 +211,7 @@ private:
     // _taskExecutor instance
     std::shared_ptr<ReplicaSetMonitorConnectionManager> _connectionManager;
 
-    // Widget to notify listeners when a RSM notices a change
+    // Widget to notify listeners when a RSM notices a change.
     ReplicaSetChangeNotifier _notifier;
 
     // Needs to be after `_taskExecutor`, so that it will be destroyed before the `_taskExecutor`.
@@ -184,10 +219,32 @@ private:
 
     int _numMonitorsCreated;
 
-    void _setupTaskExecutorInLock();
+    void _setupTaskExecutorAndStatsInLock();
 
-    // set to true when shutdown has been called.
+    // Set to true when shutdown has been called.
     bool _isShutdown{false};
+
+    // Leaf lvl 1 mutex guarding the pending garbage collection.
+    // It is necessary to avoid deadlock while invoking the 'registerForGarbageCollection()' while
+    // already holding any lvl 2-6 mutex up the stack. The 'registerForGarbageCollection()' method
+    // is not locking the lvl 6 _mutex above.
+    mutable stdx::mutex _gcMutex;
+
+    // Fields guarded by _gcMutex.
+
+    std::deque<std::string> _gcQueue;
+
+    // Removes the already deleted monitors pending in '_gcQueue' from the internal map.
+    // Do nothing if the queue is empty.
+    // This requires the parent lvl 6 _mutex to be already locked.
+    void _doGarbageCollectionLocked(WithLock);
+
+    // Used for tests.
+    Counter64 _monitorsGarbageCollected;
+
+    // Pointee is internally synchronized.
+    const std::shared_ptr<ReplicaSetMonitorManagerStats> _stats =
+        std::make_shared<ReplicaSetMonitorManagerStats>();
 };
 
 }  // namespace mongo

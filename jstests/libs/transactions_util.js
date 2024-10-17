@@ -1,9 +1,9 @@
 /**
  * Utilities for testing transactions.
  */
-var TransactionsUtil = (function() {
-    load("jstests/libs/override_methods/override_helpers.js");
+import {OverrideHelpers} from "jstests/libs/override_methods/override_helpers.js";
 
+export var TransactionsUtil = (function() {
     // Although createCollection and createIndexes are supported inside multi-document
     // transactions, we intentionally exclude them from this list since they are non-
     // idempotent and, for createIndexes, are not supported inside multi-document
@@ -17,6 +17,7 @@ var TransactionsUtil = (function() {
         'getMore',
         'insert',
         'update',
+        'bulkWrite',
     ]);
 
     const kCmdsThatWrite = new Set([
@@ -25,13 +26,15 @@ var TransactionsUtil = (function() {
         'findAndModify',
         'findandmodify',
         'delete',
+        'bulkWrite',
     ]);
 
     // Indicates an aggregation command with a pipeline that cannot run in a transaction but can
     // still execute concurrently with other transactions. Pipelines with $changeStream or $out
     // cannot run within a transaction.
     function commandIsNonTxnAggregation(cmdName, cmdObj) {
-        return OverrideHelpers.isAggregationWithOutOrMergeStage(cmdName, cmdObj) ||
+        return !("explain" in cmdObj) &&
+            OverrideHelpers.isAggregationWithOutOrMergeStage(cmdName, cmdObj) ||
             OverrideHelpers.isAggregationWithChangeStreamStage(cmdName, cmdObj);
     }
 
@@ -45,13 +48,38 @@ var TransactionsUtil = (function() {
             return false;
         }
 
-        if (dbName === 'local' || dbName === 'config' || dbName === 'admin') {
-            return false;
-        }
-
-        if (kCmdsThatWrite.has(cmdName)) {
-            if (cmdObj[cmdName].startsWith('system.')) {
+        // bulkWrite always operates on the admin DB so cannot check the dbName directly.
+        // Operating namespaces are also contained within a 'nsInfo' array in the command.
+        if (cmdName === 'bulkWrite') {
+            // 'nsInfo' does not exist in command.
+            if (!cmdObj['nsInfo']) {
                 return false;
+            }
+
+            // Loop through 'nsInfo'.
+            for (const ns of cmdObj['nsInfo']) {
+                if (!ns['ns']) {
+                    return false;
+                }
+                var db = ns['ns'].split('.', 1)[0];
+                if (db === 'local' || db === 'config' || db === 'system') {
+                    return false;
+                }
+                // Make sure no namespaces are system. collections
+                var coll = ns['ns'].substring(ns['ns'].indexOf('.') + 1);
+                if (coll.startsWith('system.')) {
+                    return false;
+                }
+            }
+        } else {
+            if (dbName === 'local' || dbName === 'config' || dbName === 'admin') {
+                return false;
+            }
+
+            if (kCmdsThatWrite.has(cmdName)) {
+                if (cmdObj[cmdName].startsWith('system.')) {
+                    return false;
+                }
             }
         }
 
@@ -93,6 +121,10 @@ var TransactionsUtil = (function() {
                     v = deepCopyObject({}, v);
                 } else if (Array.isArray(v)) {
                     v = deepCopyObject([], v);
+                } else if (v instanceof Set) {
+                    v = new Set(v);
+                } else if (v instanceof Map) {
+                    v = new Map(v);
                 }
             }
             var desc = Object.getOwnPropertyDescriptor(src, k);
@@ -107,11 +139,46 @@ var TransactionsUtil = (function() {
             res.errorLabels.includes('TransientTransactionError');
     }
 
+    function isConflictingOperationInProgress(res) {
+        return res != null && res.hasOwnProperty('codeName') &&
+            res.codeName === "ConflictingOperationInProgress";
+    }
+
+    // Runs a function 'func()' in a transaction on database 'db'. Invokes function
+    // 'beforeTransactionFunc()' before the transaction (can be used to get references to
+    // collections etc.). Ensures that the transaction is successfully committed, by retrying the
+    // function 'func' in case of the transaction being aborted until the timeout is hit.
+    //
+    // Function 'beforeTransactionFunc(db, session)' accepts database in session 'db' and the
+    // session 'session'.
+    // Function 'func(db, state)' accepts database in session 'db' and an object returned by
+    // 'beforeTransactionFunc()' - 'state'.
+    // 'transactionOptions' - parameters for the transaction.
+    function runInTransaction(db, beforeTransactionFunc, func, transactionOptions = {}) {
+        const session = db.getMongo().startSession();
+        const sessionDb = session.getDatabase(db.getName());
+        const state = beforeTransactionFunc(sessionDb, session);
+        let commandResponse;
+        assert.soon(() => {
+            session.startTransaction(transactionOptions);
+            func(sessionDb, state);
+            try {
+                commandResponse = assert.commandWorked(session.commitTransaction_forTesting());
+                return true;
+            } catch {
+                return false;
+            }
+        });
+        return commandResponse;
+    }
+
     return {
         commandIsNonTxnAggregation,
         commandSupportsTxn,
         commandTypeCanSupportTxn,
         deepCopyObject,
         isTransientTransactionError,
+        isConflictingOperationInProgress,
+        runInTransaction,
     };
 })();

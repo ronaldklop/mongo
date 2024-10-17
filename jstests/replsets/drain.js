@@ -9,8 +9,9 @@
 // 7. Enable applying ops.
 // 8. Ensure the ops in queue are applied and that the PRIMARY begins to accept writes as usual.
 
-(function() {
-"use strict";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replSet = new ReplSetTest({name: 'testSet', nodes: 3});
 var nodes = replSet.nodeList();
 replSet.startSet();
@@ -28,6 +29,11 @@ replSet.initiate({
 var primary = replSet.getPrimary();
 var secondary = replSet.getSecondary();
 
+// The default WC is majority and rsSyncApplyStop failpoint will prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Do an initial insert to prevent the secondary from going into recovery
 var numDocuments = 20;
 var bulk = primary.getDB("foo").foo.initializeUnorderedBulkOp();
@@ -37,8 +43,15 @@ replSet.awaitReplication();
 assert.commandWorked(
     secondary.getDB("admin").runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'}),
     'failed to enable fail point on secondary');
+// Wait for Oplog Applier to hang on the failpoint.
+checkLog.contains(secondary,
+                  "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
-var bufferCountBefore = secondary.getDB('foo').serverStatus().metrics.repl.buffer.count;
+const reduceMajorityWriteLatency =
+    FeatureFlagUtil.isPresentAndEnabled(secondary, "ReduceMajorityWriteLatency");
+var bufferCountBefore = (reduceMajorityWriteLatency)
+    ? secondary.getDB('foo').serverStatus().metrics.repl.buffer.write.count
+    : secondary.getDB('foo').serverStatus().metrics.repl.buffer.count;
 for (var i = 1; i < numDocuments; ++i) {
     bulk.insert({big: bigString});
 }
@@ -48,7 +61,8 @@ assert.eq(numDocuments, primary.getDB("foo").foo.find().itcount());
 
 assert.soon(function() {
     var serverStatus = secondary.getDB('foo').serverStatus();
-    var bufferCount = serverStatus.metrics.repl.buffer.count;
+    var bufferCount = (reduceMajorityWriteLatency) ? serverStatus.metrics.repl.buffer.write.count
+                                                   : serverStatus.metrics.repl.buffer.count;
     var bufferCountChange = bufferCount - bufferCountBefore;
     jsTestLog('Number of operations buffered on secondary since stopping applier: ' +
               bufferCountChange);
@@ -94,4 +108,3 @@ assert.commandWorked(primary.getDB("foo").flag.insert({sentinel: 1}));
 // shutting down the original primary.
 assert.gte(primary.getDB("foo").foo.find().itcount(), 2);
 replSet.stopSet();
-})();

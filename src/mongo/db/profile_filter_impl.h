@@ -29,10 +29,18 @@
 
 #pragma once
 
-#include "mongo/db/profile_filter.h"
+#include <functional>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_filter.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -44,7 +52,16 @@ public:
         return _matcher.getMatchExpression()->serialize();
     }
 
+    bool dependsOn(StringData topLevelField) const override {
+        return _needWholeDocument || _dependencies.count(topLevelField) > 0;
+    }
+
+    static void initializeDefaults(ServiceContext* svcCtx);
+
 private:
+    StringSet _dependencies;
+    bool _needWholeDocument = false;
+
     Matcher _matcher;
     std::function<BSONObj(ProfileFilter::Args)> _makeBSON;
 };

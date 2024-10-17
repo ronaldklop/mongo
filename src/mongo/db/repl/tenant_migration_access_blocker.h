@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/executor/task_executor.h"
@@ -39,34 +40,47 @@
 namespace mongo {
 
 /**
- * Tenant access blocking interface used by TenantMigrationDonorAccessBlocker.
+ * Tenant access blocking interface used by TenantMigrationDonorAccessBlocker and
+ * TenantMigrationRecipientAccessBlocker.
  */
 class TenantMigrationAccessBlocker {
 public:
-    TenantMigrationAccessBlocker() = default;
-    virtual ~TenantMigrationAccessBlocker() = default;
-
     /**
-     * The operation type determines the states during which we need to block.
+     * The blocker type determines the context in which the access blocker is used.
      */
-    enum OperationType { kWrite, kIndexBuild };
+    enum class BlockerType { kDonor, kRecipient };
+
+    TenantMigrationAccessBlocker(BlockerType type, const UUID& migrationId)
+        : _type(type), _migrationId(migrationId) {}
+    virtual ~TenantMigrationAccessBlocker() = default;
 
     //
     // Called by all writes and reads against the database.
     //
 
-    virtual Status checkIfCanWrite() = 0;
-    virtual Status waitUntilCommittedOrAborted(OperationContext* opCtx,
-                                               OperationType operationType) = 0;
+    virtual Status checkIfCanWrite(Timestamp writeTs) = 0;
+    virtual Status waitUntilCommittedOrAborted(OperationContext* opCtx) = 0;
+
 
     virtual Status checkIfLinearizableReadWasAllowed(OperationContext* opCtx) = 0;
-    virtual SharedSemiFuture<void> getCanReadFuture(OperationContext* opCtx) = 0;
+    virtual SharedSemiFuture<void> getCanRunCommandFuture(OperationContext* opCtx,
+                                                          StringData command) = 0;
 
     //
     // Called by index build user threads before acquiring an index build slot, and again right
     // after registering the build.
     //
     virtual Status checkIfCanBuildIndex() = 0;
+
+    /**
+     * Checks if opening a new change stream should block.
+     */
+    virtual Status checkIfCanOpenChangeStream() = 0;
+
+    /**
+     * Checks if getMores for change streams should fail.
+     */
+    virtual Status checkIfCanGetMoreChangeStream() = 0;
 
     // We suspend TTL deletions at the recipient side to avoid the race when a document is updated
     // at the donor side, which may prevent it from being garbage collected by TTL, while the
@@ -83,20 +97,38 @@ public:
      */
     virtual void onMajorityCommitPointUpdate(repl::OpTime opTime) = 0;
 
-    virtual std::shared_ptr<executor::TaskExecutor> getAsyncBlockingOperationsExecutor() = 0;
-
     virtual void appendInfoForServerStatus(BSONObjBuilder* builder) const = 0;
 
     /**
-     * Returns structured info with tenant id and connection string.
+     * Returns structured info.
      */
-    virtual BSONObj getDebugInfo() const = 0;
+    BSONObj getDebugInfo() const {
+        return BSON("migrationId" << _migrationId.toString());
+    }
 
     /**
      * Updates the runtime statistics for the number of tenant migration errors that have been
      * thrown based on the given status.
      */
     virtual void recordTenantMigrationError(Status status) = 0;
+
+    /**
+     * Returns the type of access blocker.
+     */
+    BlockerType getType() {
+        return _type;
+    }
+
+    /**
+     * Returns the migration id of access blocker.
+     */
+    const UUID& getMigrationId() const {
+        return _migrationId;
+    }
+
+private:
+    const BlockerType _type;
+    const UUID _migrationId;
 };
 
 }  // namespace mongo

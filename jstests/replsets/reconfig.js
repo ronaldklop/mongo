@@ -2,8 +2,8 @@
  * Simple test to ensure that an invalid reconfig fails, a valid one succeeds, and a reconfig won't
  * succeed without force if force is needed.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
@@ -33,6 +33,10 @@ const lastOp = primaryOplog.find(expectedNoOp).sort({'$natural': -1}).limit(1).t
 assert(lastOp.length > 0);
 replTest.awaitReplication();
 
+// Make sure that all nodes have installed the config before moving on.
+replTest.waitForConfigReplication(primary, nodes);
+assert.soonNoExcept(() => isConfigCommitted(primary));
+
 jsTestLog("Invalid reconfig");
 config.version++;
 var badMember = {_id: numNodes, host: "localhost:12345", priority: "High"};
@@ -61,4 +65,3 @@ assert.soonNoExcept(() => {
 jsTestLog("Finished waiting for the last node to be REMOVED.");
 
 replTest.stopSet();
-}());

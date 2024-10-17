@@ -29,9 +29,31 @@
 
 #pragma once
 
-#include "mongo/db/exec/projection_executor.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/projection_policies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::projection_executor {
 /**
@@ -102,7 +124,7 @@ public:
     /**
      * Recursively report all paths that are referenced by this projection.
      */
-    void reportProjectedPaths(std::set<std::string>* preservedPaths) const;
+    void reportProjectedPaths(OrderedPathSet* preservedPaths) const;
 
     /**
      * Return an optional number, x, which indicates that it is safe to stop reading the document
@@ -117,10 +139,14 @@ public:
      *
      * Computed paths that are identified as the result of a simple rename are instead filled out in
      * 'renamedPaths'. Each entry in 'renamedPaths' maps from the path's new name to its old name
-     * prior to application of this projection.
+     * prior to application of this projection. 'complexRenamedPaths' is an optional parameter that
+     * acts exactly as the 'renamedPaths' map and includes renames whose old name includes dotted
+     * paths (Note: the dotted path renames are constrained to length 3). The paths that are
+     * included in 'complexRenamedPaths' are also included in 'computedPaths'.
      */
-    void reportComputedPaths(std::set<std::string>* computedPaths,
-                             StringMap<std::string>* renamedPaths) const;
+    void reportComputedPaths(OrderedPathSet* computedPaths,
+                             StringMap<std::string>* renamedPaths,
+                             StringMap<std::string>* complexRenamedPaths = nullptr) const;
 
     const std::string& getPath() const {
         return _pathToNode;
@@ -128,21 +154,26 @@ public:
 
     void optimize();
 
-    Document serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    Document serialize(boost::optional<ExplainOptions::Verbosity> explain,
+                       const SerializationOptions& options) const;
 
     void serialize(boost::optional<ExplainOptions::Verbosity> explain,
-                   MutableDocument* output) const;
+                   MutableDocument* output,
+                   const SerializationOptions& options) const;
 
     /**
-     * Extract computed projections that depend only on the 'oldName' field. Extraction is not
-     * allowed if the name of the projection is in the 'reservedNames' set.
-     * The function returns a BSONObj with computed projections, if such exist, or an empty BSONObj.
-     * Each extracted computed projection is replaced with a projected field or with an identity
-     * projection.
+     * Append the variables referred to by this projection to the set 'refs', without clearing any
+     * pre-existing references. Should not include $$ROOT or field path expressions.
      */
-    BSONObj extractComputedProjections(const StringData& oldName,
-                                       const StringData& newName,
-                                       const std::set<StringData>& reservedNames);
+    void addVariableRefs(std::set<Variables::Id>* refs) const {
+        for (auto&& expressionPair : _expressions) {
+            expression::addVariableRefs(expressionPair.second.get(), refs);
+        }
+
+        for (auto&& childPair : _children) {
+            childPair.second->addVariableRefs(refs);
+        }
+    }
 
 protected:
     /**
@@ -171,14 +202,34 @@ protected:
     // Writes the given value to the output doc, replacing the existing value of 'field' if present.
     virtual void outputProjectedField(StringData field, Value val, MutableDocument* outDoc) const;
 
-    stdx::unordered_map<std::string, std::unique_ptr<ProjectionNode>> _children;
-    stdx::unordered_map<std::string, boost::intrusive_ptr<Expression>> _expressions;
-    stdx::unordered_set<std::string> _projectedFields;
+    // Used to determine if the node is an inclusion or exclusion node.
+    virtual bool isIncluded() const = 0;
+
+    StringMap<std::unique_ptr<ProjectionNode>> _children;
+    StringMap<boost::intrusive_ptr<Expression>> _expressions;
+
+    // List of the projected fields in the order in which they were specified.
+    std::list<std::string> _projectedFields;
+
+    // Set of projected fields. Note that the _projectedFields list actually owns the strings, and
+    // this StringDataSet simply holds views of those strings.
+    StringDataSet _projectedFieldsSet;
+
     ProjectionPolicies _policies;
     std::string _pathToNode;
 
     // Whether this node or any child of this node contains a computed field.
     bool _subtreeContainsComputedFields{false};
+
+    // Our projection semantics are such that all field additions need to be processed in the order
+    // specified. '_orderToProcessAdditionsAndChildren' tracks that order.
+    //
+    // For example, for the specification {a: <expression>, "b.c": <expression>, d: <expression>},
+    // we need to add the top level fields in the order "a", then "b", then "d". This ordering
+    // information needs to be tracked separately, since "a" and "d" will be tracked via
+    // '_expressions', and "b.c" will be tracked as a child ProjectionNode in '_children'. For the
+    // example above, '_orderToProcessAdditionsAndChildren' would be ["a", "b", "d"].
+    std::vector<std::string> _orderToProcessAdditionsAndChildren;
 
 private:
     // Iterates 'inputDoc' for each projected field, adding to or removing from 'outputDoc'. Also
@@ -222,16 +273,6 @@ private:
      * Internal helper function for addProjectionForPath().
      */
     void _addProjectionForPath(const FieldPath& path);
-
-    // Our projection semantics are such that all field additions need to be processed in the order
-    // specified. '_orderToProcessAdditionsAndChildren' tracks that order.
-    //
-    // For example, for the specification {a: <expression>, "b.c": <expression>, d: <expression>},
-    // we need to add the top level fields in the order "a", then "b", then "d". This ordering
-    // information needs to be tracked separately, since "a" and "d" will be tracked via
-    // '_expressions', and "b.c" will be tracked as a child ProjectionNode in '_children'. For the
-    // example above, '_orderToProcessAdditionsAndChildren' would be ["a", "b", "d"].
-    std::vector<std::string> _orderToProcessAdditionsAndChildren;
 
     // Maximum number of fields that need to be projected. This allows for an "early" return
     // optimization which means we don't have to iterate over an entire document. The value is

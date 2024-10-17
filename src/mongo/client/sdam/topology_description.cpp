@@ -26,11 +26,37 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
 #include "mongo/client/sdam/topology_description.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <climits>
+#include <iterator>
+#include <memory>
+#include <ostream>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+// Checkpoint to track when election Id and Set version is changed.
+MONGO_FAIL_POINT_DEFINE(maxElectionIdSetVersionPairUpdated);
 
 namespace mongo::sdam {
 MONGO_FAIL_POINT_DEFINE(topologyDescriptionInstallServerDescription);
@@ -42,7 +68,7 @@ TopologyDescription::TopologyDescription(SdamConfiguration config)
     : _type(config.getInitialType()), _setName(config.getSetName()) {
     if (auto seeds = config.getSeedList()) {
         _servers.clear();
-        for (auto address : *seeds) {
+        for (const auto& address : *seeds) {
             _servers.push_back(std::make_shared<ServerDescription>(address));
         }
     }
@@ -50,14 +76,21 @@ TopologyDescription::TopologyDescription(SdamConfiguration config)
 
 TopologyDescriptionPtr TopologyDescription::create(SdamConfiguration config) {
     auto result = std::make_shared<TopologyDescription>(config);
-    TopologyDescription::associateServerDescriptions(result);
+    for (auto& server : result->_servers) {
+        server->_topologyDescription = result;
+    }
     return result;
 }
 
-TopologyDescriptionPtr TopologyDescription::clone(TopologyDescriptionPtr source) {
-    invariant(source);
-    auto result = std::make_shared<TopologyDescription>(*source);
-    TopologyDescription::associateServerDescriptions(result);
+TopologyDescriptionPtr TopologyDescription::clone(const TopologyDescription& source) {
+    auto result = std::make_shared<TopologyDescription>(source);
+    result->_id = UUID::gen();
+
+    for (auto& server : result->_servers) {
+        server = std::make_shared<ServerDescription>(*server);
+        server->_topologyDescription = result;
+    }
+
     return result;
 }
 
@@ -73,12 +106,22 @@ const boost::optional<std::string>& TopologyDescription::getSetName() const {
     return _setName;
 }
 
-const boost::optional<int>& TopologyDescription::getMaxSetVersion() const {
-    return _maxSetVersion;
+ElectionIdSetVersionPair TopologyDescription::getMaxElectionIdSetVersionPair() const {
+    return _maxElectionIdSetVersionPair;
 }
 
-const boost::optional<OID>& TopologyDescription::getMaxElectionId() const {
-    return _maxElectionId;
+void TopologyDescription::updateMaxElectionIdSetVersionPair(const ElectionIdSetVersionPair& pair) {
+    if (MONGO_unlikely(maxElectionIdSetVersionPairUpdated.shouldFail())) {
+        LOGV2(5940906,
+              "Fail point maxElectionIdSetVersionPairUpdated",
+              "topologyId"_attr = _id,
+              "primaryForSet"_attr = _setName ? *_setName : std::string("Unknown"),
+              "incomingElectionId"_attr = pair.electionId,
+              "currentMaxElectionId"_attr = _maxElectionIdSetVersionPair.electionId,
+              "incomingSetVersion"_attr = pair.setVersion,
+              "currentMaxSetVersion"_attr = _maxElectionIdSetVersionPair.setVersion);
+    }
+    _maxElectionIdSetVersionPair = pair;
 }
 
 const std::vector<ServerDescriptionPtr>& TopologyDescription::getServers() const {
@@ -112,7 +155,7 @@ std::vector<ServerDescriptionPtr> TopologyDescription::findServers(
     return result;
 }
 
-const boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAddress(
+boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAddress(
     HostAndPort address) const {
     auto results = findServers([address](const ServerDescriptionPtr& serverDescription) {
         return serverDescription->getAddress() == address;
@@ -164,7 +207,7 @@ void TopologyDescription::removeServerDescription(const HostAndPort& HostAndPort
 }
 
 void TopologyDescription::checkWireCompatibilityVersions() {
-    const WireVersionInfo supportedWireVersion = {BATCH_COMMANDS, LATEST_WIRE_VERSION};
+    const WireVersionInfo supportedWireVersion = {SUPPORTS_OP_MSG, LATEST_WIRE_VERSION};
     std::ostringstream errorOss;
 
     _compatible = true;
@@ -194,7 +237,7 @@ void TopologyDescription::checkWireCompatibilityVersions() {
     _compatibleError = (_compatible) ? boost::none : boost::make_optional(errorOss.str());
 }
 
-const std::string TopologyDescription::minimumRequiredMongoVersionString(int version) {
+std::string TopologyDescription::minimumRequiredMongoVersionString(int version) {
     switch (version) {
         case RESUMABLE_INITIAL_SYNC:
             return "4.4";
@@ -227,7 +270,7 @@ void TopologyDescription::calculateLogicalSessionTimeout() {
     bool hasDataBearingServer = false;
 
     invariant(_servers.size() > 0);
-    for (auto description : _servers) {
+    for (const auto& description : _servers) {
         if (!description->isDataBearingServer()) {
             continue;
         }
@@ -251,7 +294,7 @@ BSONObj TopologyDescription::toBSON() {
     bson << "topologyType" << mongo::sdam::toString(_type);
 
     BSONObjBuilder bsonServers;
-    for (auto server : this->getServers()) {
+    for (const auto& server : this->getServers()) {
         bsonServers << server->getAddress().toString() << server->toBson();
     }
     bson.append("servers", bsonServers.obj());
@@ -271,12 +314,8 @@ BSONObj TopologyDescription::toBSON() {
         bson << "compatibleError" << *_compatibleError;
     }
 
-    if (_maxSetVersion) {
-        bson << "maxSetVersion" << *_maxSetVersion;
-    }
-
-    if (_maxElectionId) {
-        bson << "maxElectionId" << *_maxElectionId;
+    if (_maxElectionIdSetVersionPair.anyDefined()) {
+        bson << "maxElectionIdSetVersion" << _maxElectionIdSetVersionPair.toBSON();
     }
 
     return bson.obj();
@@ -284,14 +323,6 @@ BSONObj TopologyDescription::toBSON() {
 
 std::string TopologyDescription::toString() {
     return toBSON().toString();
-}
-
-void TopologyDescription::associateServerDescriptions(
-    const TopologyDescriptionPtr& topologyDescription) {
-    auto& servers = topologyDescription->_servers;
-    for (auto& server : servers) {
-        server->_topologyDescription = topologyDescription;
-    }
 }
 
 boost::optional<ServerDescriptionPtr> TopologyDescription::getPrimary() {

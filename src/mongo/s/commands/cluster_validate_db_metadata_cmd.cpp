@@ -27,17 +27,39 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/validate_db_metadata_common.h"
 #include "mongo/db/commands/validate_db_metadata_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -54,7 +76,7 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
-    bool maintenanceOk() const {
+    bool maintenanceOk() const override {
         // The db metadata maybe stale or incorrect while the node is in recovery mode, so we
         // disallow the command.
         return false;
@@ -75,13 +97,12 @@ public:
         }
 
         Reply typedRun(OperationContext* opCtx) {
+            auto& cmd = request();
+            setReadWriteConcern(opCtx, cmd, this);
             auto shardResponses = scatterGatherUnversionedTargetAllShards(
                 opCtx,
                 request().getDbName(),
-                applyReadWriteConcern(
-                    opCtx,
-                    this,
-                    CommandHelpers::filterCommandRequestForPassthrough(unparsedRequest().body)),
+                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON()),
                 ReadPreferenceSetting::get(opCtx),
                 Shard::RetryPolicy::kIdempotent);
 
@@ -103,7 +124,7 @@ public:
                             "The array element in 'apiVersionErrors' should be object",
                             error.type() == Object);
                     ErrorReplyElement apiVersionError = ErrorReplyElement::parse(
-                        IDLParserErrorContext("ErrorReplyElement"), error.Obj());
+                        IDLParserContext("ErrorReplyElement"), error.Obj());
 
                     // Ensure that the final output doesn't exceed max BSON size.
                     apiVersionError.setShard(StringData(shardRes.shardId.toString()));
@@ -131,6 +152,7 @@ public:
             return reply;
         }
     };
-} validateDBMetadataCmd;
+};
+MONGO_REGISTER_COMMAND(ValidateDBMetadataCmd).forRouter();
 }  // namespace
 }  // namespace mongo

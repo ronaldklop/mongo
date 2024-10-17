@@ -29,12 +29,23 @@
 
 #pragma once
 
+#include <cstddef>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -548,7 +559,7 @@ FieldParser::FieldState FieldParser::extract(BSONObj doc,
     }
 
     auto tempVector = std::make_unique<std::vector<T*>>();
-    auto guard = makeGuard([&tempVector] {
+    ScopeGuard guard([&tempVector] {
         if (tempVector) {
             for (T*& raw : *tempVector) {
                 delete raw;

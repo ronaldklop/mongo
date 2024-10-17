@@ -1,9 +1,5 @@
 // Tests that the default read preference is 'unset', and that the slaveOk bit is not set
 // on read commands run with an 'unset' read preference.
-(function() {
-
-"use strict";
-
 var mongo = db.getMongo();
 try {
     var commandsRan = [];
@@ -44,7 +40,7 @@ try {
 
     db.runReadCommand({ping: 1});
     assert.eq(commandsRan.length, 1);
-    assert.docEq(commandsRan[0].cmd, {ping: 1}, "The command should not have been wrapped.");
+    assert.docEq({ping: 1}, commandsRan[0].cmd, "The command should not have been wrapped.");
     assert.eq(
         commandsRan[0].opts & DBQuery.Option.slaveOk, 0, "The slaveOk bit should not be set.");
 
@@ -52,4 +48,3 @@ try {
     db._mongo = mongo;
     db._session = new _DummyDriverSession(mongo);
 }
-})();

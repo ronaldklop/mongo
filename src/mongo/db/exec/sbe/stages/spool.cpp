@@ -27,22 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <absl/meta/type_traits.h>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/stages/spool.h"
+#include "mongo/db/exec/sbe/values/row.h"
 
 namespace mongo::sbe {
 SpoolEagerProducerStage::SpoolEagerProducerStage(std::unique_ptr<PlanStage> input,
                                                  SpoolId spoolId,
                                                  value::SlotVector vals,
-                                                 PlanNodeId planNodeId)
-    : PlanStage{"espool"_sd, planNodeId}, _spoolId{spoolId}, _vals{std::move(vals)} {
+                                                 PlanYieldPolicy* yieldPolicy,
+                                                 PlanNodeId planNodeId,
+                                                 bool participateInTrialRunTracking)
+    : PlanStage{"espool"_sd, yieldPolicy, planNodeId, participateInTrialRunTracking},
+      _spoolId{spoolId},
+      _vals{std::move(vals)} {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> SpoolEagerProducerStage::clone() const {
-    return std::make_unique<SpoolEagerProducerStage>(
-        _children[0]->clone(), _spoolId, _vals, _commonStats.nodeId);
+    return std::make_unique<SpoolEagerProducerStage>(_children[0]->clone(),
+                                                     _spoolId,
+                                                     _vals,
+                                                     _yieldPolicy,
+                                                     _commonStats.nodeId,
+                                                     participateInTrialRunTracking());
 }
 
 void SpoolEagerProducerStage::prepare(CompileCtx& ctx) {
@@ -88,7 +101,7 @@ void SpoolEagerProducerStage::open(bool reOpen) {
 
         size_t idx = 0;
         for (auto accessor : _inAccessors) {
-            auto [tag, val] = accessor->copyOrMoveValue();
+            auto [tag, val] = accessor->getCopyOfValue();
             vals.reset(idx++, true, tag, val);
         }
 
@@ -101,6 +114,7 @@ void SpoolEagerProducerStage::open(bool reOpen) {
 
 PlanState SpoolEagerProducerStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
+    checkForInterruptAndYield(_opCtx);
 
     if (_bufferIt == _buffer->size()) {
         _bufferIt = 0;
@@ -117,8 +131,9 @@ PlanState SpoolEagerProducerStage::getNext() {
 
 void SpoolEagerProducerStage::close() {
     auto optTimer(getOptTimer(_opCtx));
+    trackClose();
 
-    _commonStats.closes++;
+    _buffer->clear();
 }
 
 std::unique_ptr<PlanStageStats> SpoolEagerProducerStage::getStats(bool includeDebugInfo) const {
@@ -127,7 +142,7 @@ std::unique_ptr<PlanStageStats> SpoolEagerProducerStage::getStats(bool includeDe
     if (includeDebugInfo) {
         BSONObjBuilder bob;
         bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
-        bob.append("outputSlots", _vals);
+        bob.append("outputSlots", _vals.begin(), _vals.end());
         ret->debugInfo = bob.obj();
     }
 
@@ -159,12 +174,20 @@ std::vector<DebugPrinter::Block> SpoolEagerProducerStage::debugPrint() const {
     return ret;
 }
 
+size_t SpoolEagerProducerStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_vals);
+    return size;
+}
+
 SpoolLazyProducerStage::SpoolLazyProducerStage(std::unique_ptr<PlanStage> input,
                                                SpoolId spoolId,
                                                value::SlotVector vals,
                                                std::unique_ptr<EExpression> predicate,
-                                               PlanNodeId planNodeId)
-    : PlanStage{"lspool"_sd, planNodeId},
+                                               PlanNodeId planNodeId,
+                                               bool participateInTrialRunTracking)
+    : PlanStage{"lspool"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking},
       _spoolId{spoolId},
       _vals{std::move(vals)},
       _predicate{std::move(predicate)} {
@@ -172,8 +195,12 @@ SpoolLazyProducerStage::SpoolLazyProducerStage(std::unique_ptr<PlanStage> input,
 }
 
 std::unique_ptr<PlanStage> SpoolLazyProducerStage::clone() const {
-    return std::make_unique<SpoolLazyProducerStage>(
-        _children[0]->clone(), _spoolId, _vals, _predicate->clone(), _commonStats.nodeId);
+    return std::make_unique<SpoolLazyProducerStage>(_children[0]->clone(),
+                                                    _spoolId,
+                                                    _vals,
+                                                    _predicate->clone(),
+                                                    _commonStats.nodeId,
+                                                    participateInTrialRunTracking());
 }
 
 void SpoolLazyProducerStage::prepare(CompileCtx& ctx) {
@@ -195,7 +222,7 @@ void SpoolLazyProducerStage::prepare(CompileCtx& ctx) {
         uassert(4822811, str::stream() << "duplicate field: " << slot, inserted);
 
         _inAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
-        _outAccessors.emplace(slot, value::ViewOfValueAccessor{});
+        _outAccessors.emplace(slot, value::OwnedValueAccessor{});
     }
 
     _compiled = true;
@@ -227,6 +254,9 @@ void SpoolLazyProducerStage::open(bool reOpen) {
 PlanState SpoolLazyProducerStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
+    // We are about to call getNext() on our child so do not bother saving our internal state in
+    // case it yields as the state will be completely overwritten after the getNext() call.
+    disableSlotAccess();
     auto state = _children[0]->getNext();
 
     if (state == PlanState::ADVANCED) {
@@ -243,7 +273,7 @@ PlanState SpoolLazyProducerStage::getNext() {
 
             for (size_t idx = 0; idx < _inAccessors.size(); ++idx) {
                 auto [tag, val] = _inAccessors[idx]->getViewOfValue();
-                _outAccessors[_vals[idx]].reset(tag, val);
+                _outAccessors[_vals[idx]].reset(false, tag, val);
 
                 auto [copyTag, copyVal] = value::copyValue(tag, val);
                 vals.reset(idx, true, copyTag, copyVal);
@@ -254,7 +284,7 @@ PlanState SpoolLazyProducerStage::getNext() {
             // Otherwise, just pass through the input values.
             for (size_t idx = 0; idx < _inAccessors.size(); ++idx) {
                 auto [tag, val] = _inAccessors[idx]->getViewOfValue();
-                _outAccessors[_vals[idx]].reset(tag, val);
+                _outAccessors[_vals[idx]].reset(false, tag, val);
             }
         }
     }
@@ -262,10 +292,23 @@ PlanState SpoolLazyProducerStage::getNext() {
     return trackPlanState(state);
 }
 
+void SpoolLazyProducerStage::doSaveState(bool relinquishCursor) {
+    if (!relinquishCursor) {
+        return;
+    }
+
+    for (auto& [slot, accessor] : _outAccessors) {
+        prepareForYielding(accessor, slotsAccessible());
+    }
+}
+
 void SpoolLazyProducerStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
+
+    _buffer->clear();
+    _children[0]->close();
 }
 
 std::unique_ptr<PlanStageStats> SpoolLazyProducerStage::getStats(bool includeDebugInfo) const {
@@ -274,7 +317,7 @@ std::unique_ptr<PlanStageStats> SpoolLazyProducerStage::getStats(bool includeDeb
     if (includeDebugInfo) {
         BSONObjBuilder bob;
         bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
-        bob.append("outputSlots", _vals);
+        bob.append("outputSlots", _vals.begin(), _vals.end());
         if (_predicate) {
             bob.append("filter", DebugPrinter{}.print(_predicate->debugPrint()));
         }
@@ -313,5 +356,13 @@ std::vector<DebugPrinter::Block> SpoolLazyProducerStage::debugPrint() const {
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
     return ret;
+}
+
+size_t SpoolLazyProducerStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_vals);
+    size += _predicate ? _predicate->estimateSize() : 0;
+    return size;
 }
 }  // namespace mongo::sbe

@@ -33,13 +33,17 @@
 
 #include "mongo/db/hasher.h"
 
+#include <cstddef>
+#include <memory>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/util/md5.hpp"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/platform/endian.h"
+#include "mongo/util/md5.h"
 
 namespace mongo {
-
-using std::unique_ptr;
 
 namespace {
 
@@ -81,7 +85,7 @@ private:
 };
 
 Hasher::Hasher(HashSeed seed) : _seed(seed) {
-    md5_init(&_md5State);
+    md5_init_state(&_md5State);
     addSeed(seed);
 }
 

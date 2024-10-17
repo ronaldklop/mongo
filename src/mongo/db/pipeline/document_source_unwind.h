@@ -29,8 +29,33 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/unwind_processor.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
@@ -41,7 +66,11 @@ public:
     // virtuals from DocumentSource
     const char* getSourceName() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kUnwind;
+    }
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Returns the unwound path, and the 'includeArrayIndex' path, if specified.
@@ -68,6 +97,8 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     /**
      * Creates a new $unwind DocumentSource from a BSON specification.
      */
@@ -78,40 +109,61 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const std::string& path,
         bool includeNullIfEmptyOrMissing,
-        const boost::optional<std::string>& includeArrayIndex);
+        const boost::optional<std::string>& includeArrayIndex,
+        bool strict = false);
 
-    std::string getUnwindPath() const {
-        return _unwindPath.fullPath();
+    UnwindProcessor* getUnwindProcessor() {
+        return _unwindProcessor.get_ptr();
+    }
+
+    const std::string& getUnwindPath() const {
+        return _unwindProcessor->getUnwindFullPath();
     }
 
     bool preserveNullAndEmptyArrays() const {
-        return _preserveNullAndEmptyArrays;
+        return _unwindProcessor->getPreserveNullAndEmptyArrays();
     }
 
     const boost::optional<FieldPath>& indexPath() const {
-        return _indexPath;
+        return _unwindProcessor->getIndexPath();
     }
+
+    SbeCompatibility sbeCompatibility() const {
+        return _sbeCompatibility;
+    }
+
+protected:
+    /**
+     * Attempts to swap with a subsequent $sort stage if the $sort is on a different field.
+     */
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
 
 private:
     DocumentSourceUnwind(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                          const FieldPath& fieldPath,
                          bool includeNullIfEmptyOrMissing,
-                         const boost::optional<FieldPath>& includeArrayIndex);
+                         const boost::optional<FieldPath>& includeArrayIndex,
+                         bool strict);
 
     GetNextResult doGetNext() final;
 
-    // Configuration state.
-    const FieldPath _unwindPath;
-    // Documents that have a nullish value, or an empty array for the field '_unwindPath', will pass
-    // through the $unwind stage unmodified if '_preserveNullAndEmptyArrays' is true.
-    const bool _preserveNullAndEmptyArrays;
-    // If set, the $unwind stage will include the array index in the specified path, overwriting any
-    // existing value, setting to null when the value was a non-array or empty array.
-    const boost::optional<FieldPath> _indexPath;
+    // Checks if a sort is eligible to be moved before the unwind.
+    bool canPushSortBack(const DocumentSourceSort* sort) const;
 
-    // Iteration state.
-    class Unwinder;
-    std::unique_ptr<Unwinder> _unwinder;
-};
+    // Checks if a limit is eligible to be moved before the unwind.
+    bool canPushLimitBack(const DocumentSourceLimit* limit) const;
+
+    // Helper class instance to execute unwind logic.
+    boost::optional<UnwindProcessor> _unwindProcessor;
+
+    // If preserveNullAndEmptyArrays is true and unwind is followed by a limit, we can duplicate
+    // the limit before the unwind. We only want to do this if we've found a limit smaller than the
+    // one we already pushed down. boost::none means no push down has occurred yet.
+    boost::optional<long long> _smallestLimitPushedDown;
+
+    // Standalone $unwind pushdown to SBE requires featureFlagSbeFull.
+    SbeCompatibility _sbeCompatibility{SbeCompatibility::requiresSbeFull};
+};  // class DocumentSourceUnwind
 
 }  // namespace mongo

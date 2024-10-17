@@ -1,6 +1,5 @@
 // Test write re-routing on version mismatch.
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2, mongos: 2});
 
@@ -9,8 +8,8 @@ var admin = mongos.getDB("admin");
 var config = mongos.getDB("config");
 var coll = st.s.getCollection('TestDB.coll');
 
-assert.commandWorked(mongos.adminCommand({enableSharding: 'TestDB'}));
-st.ensurePrimaryShard('TestDB', st.shard0.shardName);
+assert.commandWorked(
+    mongos.adminCommand({enableSharding: 'TestDB', primaryShard: st.shard0.shardName}));
 assert.commandWorked(mongos.adminCommand({shardCollection: 'TestDB.coll', key: {_id: 1}}));
 
 jsTest.log("Refreshing second mongos...");
@@ -68,4 +67,3 @@ jsTest.log("All docs written this time!");
 assert.eq(coll.find().itcount(), 6);
 
 st.stop();
-})();

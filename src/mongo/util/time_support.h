@@ -30,21 +30,22 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <iosfwd>
 #include <limits>
 #include <string>
 
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
 
 class BackgroundThreadClockSource;
-
 template <typename Allocator>
 class StringBuilderImpl;
 

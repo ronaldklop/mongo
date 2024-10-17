@@ -29,7 +29,16 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -42,7 +51,9 @@ namespace mozjs {
  * from C++. Current callers are all via the Mongo object.
  */
 struct CursorInfo : public BaseInfo {
-    static void finalize(js::FreeOp* fop, JSObject* obj);
+    enum Slots { CursorHolderSlot, CursorInfoSlotCount };
+
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(close);
@@ -52,12 +63,14 @@ struct CursorInfo : public BaseInfo {
         MONGO_DECLARE_JS_FUNCTION(objsLeftInBatch);
         MONGO_DECLARE_JS_FUNCTION(readOnly);
         MONGO_DECLARE_JS_FUNCTION(getId);
+        MONGO_DECLARE_JS_FUNCTION(hasMoreToCome);
     };
 
-    static const JSFunctionSpec methods[8];
+    static const JSFunctionSpec methods[9];
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(CursorInfoSlotCount) | BaseInfo::finalizeFlag;
     static const InstallType installType = InstallType::Private;
 
     /**

@@ -75,6 +75,7 @@ configs:
             is_constexpr: false
         short_name: port
         arg_vartype: Int
+        validator: { gte: 0, lte: 65535 }
     'net.ipv6':
         description: 'Enable IPv6 support (disabled by default)'
         short_name: ipv6
@@ -98,12 +99,6 @@ configs:
         description: 'Number of worker threads to reserve for admin and internal connections'
         arg_vartype: Int
         source: yaml
-        hidden: true
-    'net.transportLayer':
-        description: 'Sets the ingress transport layer implementation'
-        short_name: transportLayer
-        arg_vartype: String
-        default: asio
         hidden: true
     'processManagement.pidFilePath':
         description: 'Full path to pidfile (if not set, no pidfile is created)'
@@ -164,8 +159,13 @@ configs:
         arg_vartype: Bool
         source: yaml
         hidden: true
-    enableExperimentalStorageDetailsCmd:
-        description: 'EXPERIMENTAL (UNSUPPORTED). Enable command computing aggregate statistics on storage.'
+    crashOnInvalidBSONError:
+        description: "Crashes the shell if invalid BSON is returned from a call to the server. Must be paired with objcheck to provoke a BSON validation check."
         arg_vartype: Switch
         source: [ cli, ini ]
+        hidden: true
+    initializerShuffleSeed:
+        description: "Sets random seed used to shuffle initializers (for testing)"
+        arg_vartype: Unsigned
+        source: [ cli ]
         hidden: true

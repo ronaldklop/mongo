@@ -29,7 +29,46 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_data.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/split_horizon.h"
+#include "mongo/db/repl/split_prepare_session_manager.h"
+#include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -42,13 +81,12 @@ class ReplicationCoordinatorNoOp final : public ReplicationCoordinator {
 
 public:
     ReplicationCoordinatorNoOp(ServiceContext* serviceContext);
-    ~ReplicationCoordinatorNoOp() = default;
+    ~ReplicationCoordinatorNoOp() override = default;
 
     ReplicationCoordinatorNoOp(ReplicationCoordinatorNoOp&) = delete;
     ReplicationCoordinatorNoOp& operator=(ReplicationCoordinatorNoOp&) = delete;
 
-    void startup(OperationContext* opCtx,
-                 LastStorageEngineShutdownState lastStorageEngineShutdownState) final;
+    void startup(OperationContext* opCtx, StorageEngine::LastShutdownState lastShutdownState) final;
 
     void enterTerminalShutdown() final;
 
@@ -56,9 +94,7 @@ public:
 
     bool inQuiesceMode() const final;
 
-    void shutdown(OperationContext* opCtx) final;
-
-    void markAsCleanShutdownIfPossible(OperationContext* opCtx) final;
+    void shutdown(OperationContext* opCtx, BSONObjBuilder* shutdownTimeElapsedBuilder) final;
 
     ServiceContext* getServiceContext() final {
         return _service;
@@ -66,16 +102,15 @@ public:
 
     const ReplSettings& getSettings() const final;
 
-    Mode getReplicationMode() const final;
     bool getMaintenanceMode() final;
 
-    bool isReplEnabled() const final;
     bool isWritablePrimaryForReportingPurposes() final;
     bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const final;
     bool isInPrimaryOrSecondaryState_UNSAFE() const final;
 
-    bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) final;
-    bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) final;
+    bool canAcceptWritesForDatabase(OperationContext* opCtx, const DatabaseName& dbName) final;
+    bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
+                                           const DatabaseName& dbName) final;
 
     bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) final;
     bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
@@ -102,11 +137,11 @@ public:
 
     std::vector<MemberData> getMemberData() const final;
 
-    Status waitForMemberState(MemberState, Milliseconds) final;
+    Status waitForMemberState(Interruptible*, MemberState, Milliseconds) final;
 
     Seconds getSecondaryDelaySecs() const final;
 
-    void clearSyncSourceBlacklist() final;
+    void clearSyncSourceDenylist() final;
 
     ReplicationCoordinator::StatusAndDuration awaitReplication(OperationContext*,
                                                                const OpTime&,
@@ -124,17 +159,23 @@ public:
     bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
                                  const std::vector<mongo::HostAndPort>& members) const final;
 
-    void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
-    void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
+    void setMyLastWrittenOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
+    void setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) final;
+    void setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) final;
 
     void resetMyLastOpTimes() final;
 
     void setMyHeartbeatMessage(const std::string&) final;
 
+    OpTime getMyLastWrittenOpTime() const final;
+    OpTimeAndWallTime getMyLastWrittenOpTimeAndWallTime(bool rollbackSafe = false) const final;
+
     OpTime getMyLastAppliedOpTime() const final;
-    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(bool rollbackSafe = false) const final;
+    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const final;
 
     OpTime getMyLastDurableOpTime() const final;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const final;
@@ -145,6 +186,9 @@ public:
 
     Status waitUntilOpTimeForReadUntil(OperationContext*,
                                        const ReadConcernArgs&,
+                                       boost::optional<Date_t>) final;
+    Status waitUntilOpTimeWrittenUntil(OperationContext*,
+                                       LogicalTime,
                                        boost::optional<Date_t>) final;
 
     Status waitUntilOpTimeForRead(OperationContext*, const ReadConcernArgs&) final;
@@ -160,19 +204,52 @@ public:
 
     Status setFollowerModeRollback(OperationContext* opCtx) final;
 
-    ApplierState getApplierState() final;
+    OplogSyncState getOplogSyncState() final;
 
-    void signalDrainComplete(OperationContext*, long long) final;
+    void signalWriterDrainComplete(OperationContext*, long long) noexcept final;
+
+    void signalApplierDrainComplete(OperationContext*, long long) noexcept final;
 
     void signalUpstreamUpdater() final;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const final;
 
-    Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) final;
+    Status processReplSetGetStatus(OperationContext* opCtx,
+                                   BSONObjBuilder*,
+                                   ReplSetGetStatusResponseStyle) final;
 
     void appendSecondaryInfoData(BSONObjBuilder*) final;
 
     ReplSetConfig getConfig() const final;
+
+    ConnectionString getConfigConnectionString() const final;
+
+    Milliseconds getConfigElectionTimeoutPeriod() const final;
+
+    std::vector<MemberConfig> getConfigVotingMembers() const final;
+
+    size_t getNumConfigVotingMembers() const final;
+
+    std::int64_t getConfigTerm() const final;
+
+    std::int64_t getConfigVersion() const final;
+
+    ConfigVersionAndTerm getConfigVersionAndTerm() const final;
+
+    int getConfigNumMembers() const final;
+
+    Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const final;
+
+    BSONObj getConfigBSON() const final;
+
+    boost::optional<MemberConfig> findConfigMemberByHostAndPort_deprecated(
+        const HostAndPort& hap) const final;
+
+    bool isConfigLocalHostAllowed() const final;
+
+    Milliseconds getConfigHeartbeatInterval() const final;
+
+    Status validateWriteConcern(const WriteConcernOptions& writeConcern) const final;
 
     void processReplSetGetConfig(BSONObjBuilder*,
                                  bool commitmentStatus = false,
@@ -185,7 +262,7 @@ public:
 
     void cancelAndRescheduleElectionTimeout() final;
 
-    Status setMaintenanceMode(bool) final;
+    Status setMaintenanceMode(OperationContext*, bool) final;
 
     Status processReplSetSyncFrom(OperationContext*, const HostAndPort&, BSONObjBuilder*) final;
 
@@ -201,7 +278,9 @@ public:
 
     Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) final;
 
-    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
+    Status awaitConfigCommitment(OperationContext* opCtx,
+                                 bool waitForOplogCommitment,
+                                 long long term) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
@@ -213,7 +292,7 @@ public:
 
     HostAndPort chooseNewSyncSource(const OpTime&) final;
 
-    void blacklistSyncSource(const HostAndPort&, Date_t) final;
+    void denylistSyncSource(const HostAndPort&, Date_t) final;
 
     void resetLastOpTimesFromOplog(OperationContext*) final;
 
@@ -221,7 +300,10 @@ public:
                                                   const rpc::ReplSetMetadata&,
                                                   const rpc::OplogQueryMetadata&,
                                                   const OpTime&,
-                                                  const OpTime&) final;
+                                                  const OpTime&) const final;
+
+    ChangeSyncSourceAction shouldChangeSyncSourceOnError(const HostAndPort&,
+                                                         const OpTime&) const final;
 
     OpTime getLastCommittedOpTime() const final;
 
@@ -231,7 +313,7 @@ public:
                                       const ReplSetRequestVotesArgs&,
                                       ReplSetRequestVotesResponse*) final;
 
-    void prepareReplMetadata(const BSONObj&, const OpTime&, BSONObjBuilder*) const final;
+    void prepareReplMetadata(const GenericArguments&, const OpTime&, BSONObjBuilder*) const final;
 
     Status processHeartbeatV1(const ReplSetHeartbeatArgsV1&, ReplSetHeartbeatResponse*) final;
 
@@ -247,11 +329,13 @@ public:
 
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) final;
 
-    void appendDiagnosticBSON(BSONObjBuilder*) final;
+    void appendDiagnosticBSON(BSONObjBuilder*, StringData) final;
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const final;
 
-    virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) final;
+    void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) final;
+
+    Status waitForPrimaryMajorityReadsAvailable(OperationContext* opCtx) const final;
 
     Status stepUpIfEligible(bool skipDryRun) final;
 
@@ -259,13 +343,9 @@ public:
 
     void incrementNumCatchUpOpsIfCatchingUp(long numOps) final;
 
-    void signalDropPendingCollectionsRemovedFromStorage() final;
-
     boost::optional<Timestamp> getRecoveryTimestamp() final;
 
     bool setContainsArbiter() const final;
-
-    bool replSetContainsNewlyAddedMembers() const final;
 
     void attemptToAdvanceStableTimestamp() final;
 
@@ -274,9 +354,9 @@ public:
     void incrementTopologyVersion() final;
 
     void updateAndLogStateTransitionMetrics(
-        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
-        const size_t numOpsKilled,
-        const size_t numOpsRunning) const final;
+        ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        size_t numOpsKilled,
+        size_t numOpsRunning) const final;
 
     TopologyVersion getTopologyVersion() const final;
 
@@ -297,15 +377,44 @@ public:
     void cancelCbkHandle(executor::TaskExecutor::CallbackHandle activeHandle) override;
 
     BSONObj runCmdOnPrimaryAndAwaitResponse(OperationContext* opCtx,
-                                            const std::string& dbName,
+                                            const DatabaseName& dbName,
                                             const BSONObj& cmdObj,
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
 
-    virtual void restartScheduledHeartbeats_forTest() final;
+    void restartScheduledHeartbeats_forTest() final;
+
+    void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
+
+    class WriteConcernTagChangesNoOp : public WriteConcernTagChanges {
+        ~WriteConcernTagChangesNoOp() override = default;
+        bool reserveDefaultWriteConcernChange() override {
+            return false;
+        };
+        void releaseDefaultWriteConcernChange() override {}
+
+        bool reserveConfigWriteConcernTagChange() override {
+            return false;
+        };
+        void releaseConfigWriteConcernTagChange() override {}
+    };
+
+    WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
+
+    bool isRetryableWrite(OperationContext* opCtx) const override;
+
+    boost::optional<UUID> getInitialSyncId(OperationContext* opCtx) override;
+
+    void setConsistentDataAvailable(OperationContext* opCtx,
+                                    bool isDataMajorityCommitted) override {}
+    bool isDataConsistent() const override;
+    void clearSyncSource() override;
 
 private:
     ServiceContext* const _service;
+    ReplSettings const _settings;
 };
 
 }  // namespace repl

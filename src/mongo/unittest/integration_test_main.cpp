@@ -27,16 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
 
 #include <iostream>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/initializer.h"
+#include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/server_options_base.h"
@@ -44,26 +44,29 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
-#include "mongo/transport/transport_layer_asio.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
-#include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/options_parser/value.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 using namespace mongo;
 
 namespace {
 
 ConnectionString fixtureConnectionString{};
-
-MONGO_INITIALIZER(WireSpec)(InitializerContext*) {
-    WireSpec::instance().initialize(WireSpec::Specification{});
-}
 
 }  // namespace
 
@@ -77,12 +80,20 @@ ConnectionString getFixtureConnectionString() {
 }  // namespace unittest
 }  // namespace mongo
 
+namespace {
+ServiceContext::ConstructorActionRegisterer registerWireSpec{
+    "RegisterWireSpec", [](ServiceContext* service) {
+        WireSpec::getWireSpec(service).initialize(WireSpec::Specification{});
+    }};
+}  // namespace
+
 int main(int argc, char** argv) {
     setupSynchronousSignalHandlers();
     TestingProctor::instance().setEnabled(true);
     runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
     setTestCommandsEnabled(true);
-    setGlobalServiceContext(ServiceContext::make());
+    auto serviceContextHolder = ServiceContext::make();
+    setGlobalServiceContext(std::move(serviceContextHolder));
     quickExit(unittest::Suite::run(std::vector<std::string>(), "", "", 1));
 }
 
@@ -109,7 +120,7 @@ MONGO_STARTUP_OPTIONS_VALIDATE(IntegrationTestOptions)(InitializerContext*) {
 
     if (env.count("help")) {
         std::cout << opts.helpString() << std::endl;
-        quickExit(EXIT_SUCCESS);
+        quickExit(ExitCode::clean);
     }
 }
 

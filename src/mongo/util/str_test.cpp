@@ -29,9 +29,13 @@
 
 #include <bitset>
 #include <fmt/format.h>
+#include <limits>
+#include <memory>
 
-#include "mongo/unittest/unittest.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
@@ -40,28 +44,6 @@ namespace mongo::str {
 
 using namespace fmt::literals;
 using std::string;
-
-TEST(StringUtilsTest, Basic) {
-    //
-    // Basic version comparison tests with different version string types
-    //
-
-    // Equal
-    ASSERT(versionCmp("1.2.3", "1.2.3") == 0);
-
-    // Basic
-    ASSERT(versionCmp("1.2.3", "1.2.4") < 0);
-    ASSERT(versionCmp("1.2.3", "1.2.20") < 0);
-    ASSERT(versionCmp("1.2.3", "1.20.3") < 0);
-    ASSERT(versionCmp("2.2.3", "10.2.3") < 0);
-
-    // Post-fixed
-    ASSERT(versionCmp("1.2.3", "1.2.3-") > 0);
-    ASSERT(versionCmp("1.2.3", "1.2.3-pre") > 0);
-    ASSERT(versionCmp("1.2.3", "1.2.4-") < 0);
-    ASSERT(versionCmp("1.2.3-", "1.2.3") < 0);
-    ASSERT(versionCmp("1.2.3-pre", "1.2.3") < 0);
-}
 
 TEST(StringUtilsTest, Simple1) {
     ASSERT_EQUALS(0, LexNumCmp::cmp("a.b.c", "a.b.c", false));
@@ -323,6 +305,50 @@ TEST(StringUtilsTest, GetCodePointLength) {
             n = 1;  // 7-bit single byte code point.
         ASSERT_EQUALS(getCodePointLength(static_cast<char>(i)), n) << " i:0x{:02x}"_format(i);
     }
+}
+
+TEST(StringUtilsTest, UassertNoEmbeddedNulBytes) {
+    // These shouldn't throw.
+    uassertNoEmbeddedNulBytes({nullptr, 0});
+    uassertNoEmbeddedNulBytes(""_sd);
+    uassertNoEmbeddedNulBytes("hello"_sd);
+    uassertNoEmbeddedNulBytes("hello\0"_sd.substr(0, 5));
+
+    // These should throw.
+    ASSERT_THROWS_CODE(uassertNoEmbeddedNulBytes("\0"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(uassertNoEmbeddedNulBytes("\0hello"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(uassertNoEmbeddedNulBytes("hello\0"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(uassertNoEmbeddedNulBytes("hello\0world"_sd), DBException, 9527900);
+}
+
+TEST(StringUtilsTest, CopyAsCString) {
+    char dest[100];  // big enough for anything we would reasonably add here.
+
+    // Print address not contents on failures.
+    auto ptr = [](const char* p) {
+        return static_cast<const void*>(p);
+    };
+    auto testValid = [&](StringData noNul, int line) {
+        // Make sure we write a nul byte. Without this, the test could pass if dest happened to have
+        // uninitialized zero bytes.
+        std::fill_n(dest, sizeof(dest), 0xff);
+
+        ASSERT_EQ(ptr(copyAsCString(dest, noNul)), ptr(dest + noNul.size() + 1)) << "line:" << line;
+        ASSERT_EQ(dest[noNul.size()], '\0') << "line:" << line;
+        ASSERT_EQ(StringData(dest, noNul.size()), noNul) << "line:" << line;
+    };
+
+    // These shouldn't throw.
+    testValid({nullptr, 0}, __LINE__);
+    testValid(""_sd, __LINE__);
+    testValid("hello"_sd, __LINE__);
+    testValid("hello world"_sd.substr(0, 5), __LINE__);
+
+    // These should throw.
+    ASSERT_THROWS_CODE(copyAsCString(dest, "\0"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(copyAsCString(dest, "\0hello"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(copyAsCString(dest, "hello\0"_sd), DBException, 9527900);
+    ASSERT_THROWS_CODE(copyAsCString(dest, "hello\0world"_sd), DBException, 9527900);
 }
 
 }  // namespace mongo::str

@@ -1,8 +1,7 @@
 /**
  * Test that protocolVersion defaults to 1 even during a replSetReconfig.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var rst = new ReplSetTest({nodes: 2});
 rst.startSet();
@@ -20,4 +19,3 @@ config = primary.getDB("local").system.replset.findOne();
 assert.eq(config.protocolVersion, 1);
 
 rst.stopSet();
-})();

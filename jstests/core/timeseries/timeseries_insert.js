@@ -1,13 +1,17 @@
 /**
  * Inserts time-series data based on the TSBS document-per-event format.
+ * @tags: [
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/timeseries/libs/timeseries.js");
+import {TimeseriesTest} from "jstests/core/timeseries/libs/timeseries.js";
 
 const coll = db.timeseries_insert;
 coll.drop();
+
+assert.commandWorked(db.createCollection(
+    coll.getName(), {timeseries: {timeField: "time", metaField: "measurement"}}));
 
 Random.setRandomSeed();
 
@@ -25,4 +29,3 @@ for (let i = 0; i < 100; i++) {
         tags: host.tags,
     }));
 }
-})();

@@ -1,15 +1,13 @@
 /**
  * Tests for $jsonSchema queries in a sharded cluster.
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "json_schema_sharding";
 
-var st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+var st = new ShardingTest({shards: 2, mongos: 1});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.name);
+assert.commandWorked(st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.name}));
 
 const testDB = st.s.getDB(dbName);
 const coll = testDB.json_schema_sharding;
@@ -62,4 +60,3 @@ res = coll.findAndModify({query: {_id: 150, $jsonSchema: schema}, update: {$set:
 assert.eq(1, res.b);
 
 st.stop();
-})();

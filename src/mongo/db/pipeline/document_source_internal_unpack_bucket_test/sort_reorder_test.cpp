@@ -27,10 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -38,11 +48,12 @@ namespace {
 using InternalUnpackBucketSortReorderTest = AggregationContextFixture;
 
 TEST_F(InternalUnpackBucketSortReorderTest, OptimizeForMetaSort) {
-    auto unpackSpecObj =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'meta1'}}");
-    auto countSpecObj = fromjson("{$sort: {'meta1.a': 1, 'meta1.b': -1}}");
+    auto unpackSpecObj = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'meta1', "
+        "bucketMaxSpanSeconds: 3600}}");
+    auto sortSpecObj = fromjson("{$sort: {'meta1.a': 1, 'meta1.b': -1}}");
 
-    auto pipeline = Pipeline::parse(makeVector(unpackSpecObj, countSpecObj), getExpCtx());
+    auto pipeline = Pipeline::parse(makeVector(unpackSpecObj, sortSpecObj), getExpCtx());
     pipeline->optimizePipeline();
 
     auto serialized = pipeline->serializeToBson();
@@ -54,11 +65,12 @@ TEST_F(InternalUnpackBucketSortReorderTest, OptimizeForMetaSort) {
 }
 
 TEST_F(InternalUnpackBucketSortReorderTest, OptimizeForMetaSortNegative) {
-    auto unpackSpecObj =
-        fromjson("{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'meta1'}}");
-    auto countSpecObj = fromjson("{$sort: {'meta1.a': 1, 'unrelated': -1}}");
+    auto unpackSpecObj = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'meta1', "
+        "bucketMaxSpanSeconds: 3600}}");
+    auto sortSpecObj = fromjson("{$sort: {'meta1.a': 1, 'unrelated': -1}}");
 
-    auto pipeline = Pipeline::parse(makeVector(unpackSpecObj, countSpecObj), getExpCtx());
+    auto pipeline = Pipeline::parse(makeVector(unpackSpecObj, sortSpecObj), getExpCtx());
     pipeline->optimizePipeline();
 
     auto serialized = pipeline->serializeToBson();
@@ -67,6 +79,38 @@ TEST_F(InternalUnpackBucketSortReorderTest, OptimizeForMetaSortNegative) {
     ASSERT_EQ(2, serialized.size());
     ASSERT_BSONOBJ_EQ(unpackSpecObj, serialized[0]);
     ASSERT_BSONOBJ_EQ(fromjson("{$sort: {'meta1.a': 1, 'unrelated': -1}}"), serialized[1]);
+}
+
+TEST_F(InternalUnpackBucketSortReorderTest, OptimizeForMetaSortLimit) {
+    auto unpackSpecObj = fromjson(
+        "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'meta1', "
+        "bucketMaxSpanSeconds: 3600}}");
+    // The $match is necessary here to allow the sort-limit to coalesce.
+    auto matchSpecObj = fromjson("{$match: {meta1: {$gt: 2}}}");
+    auto sortSpecObj = fromjson("{$sort: {'meta1.a': 1, 'meta1.b': -1}}");
+    auto limitSpecObj = fromjson("{$limit: 2}");
+
+    auto pipeline = Pipeline::parse(
+        makeVector(unpackSpecObj, matchSpecObj, sortSpecObj, limitSpecObj), getExpCtx());
+    pipeline->optimizePipeline();
+
+    auto serialized = pipeline->serializeToBson();
+    auto container = pipeline->getSources();
+
+    // $match and $sort are now before $_internalUnpackBucket, with a new $limit added before and
+    // after the stage.
+    ASSERT_EQ(5, serialized.size());
+    ASSERT_BSONOBJ_EQ(fromjson("{$match: {meta: {$gt: 2}}}"), serialized[0]);
+    ASSERT_BSONOBJ_EQ(fromjson("{$sort: {'meta.a': 1, 'meta.b': -1}}"), serialized[1]);
+    ASSERT_BSONOBJ_EQ(fromjson("{$limit: 2}"), serialized[2]);
+    ASSERT_BSONOBJ_EQ(unpackSpecObj, serialized[3]);
+    ASSERT_BSONOBJ_EQ(fromjson("{$limit: 2}"), serialized[4]);
+
+    // The following assertions ensure that the first limit is absorbed by the sort. When we call
+    // serializeToArray on DocumentSourceSort, it tries to pull the limit out of sort as its own
+    // additional stage. The container from pipeline->getSources(), on the other hand, preserves the
+    // original pipeline with limit absorbed into sort. Therefore, there should only be 4 stages
+    ASSERT_EQ(4, container.size());
 }
 
 }  // namespace

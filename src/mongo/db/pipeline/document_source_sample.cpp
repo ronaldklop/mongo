@@ -27,16 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <list>
 
-#include "mongo/db/pipeline/document_source_sample.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
@@ -49,11 +62,13 @@ DocumentSourceSample::DocumentSourceSample(const intrusive_ptr<ExpressionContext
 REGISTER_DOCUMENT_SOURCE(sample,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceSample::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
-    if (_size == 0)
+    if (_size == 0) {
+        pSource->dispose();
         return GetNextResult::makeEOF();
+    }
 
     if (!_sortStage->isPopulated()) {
         // Exhaust source stage, add random metadata, and push all into sorter.
@@ -81,8 +96,8 @@ DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
     return _sortStage->getNext();
 }
 
-Value DocumentSourceSample::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(kStageName << DOC("size" << _size)));
+Value DocumentSourceSample::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(kStageName << DOC("size" << opts.serializeLiteral(_size))));
 }
 
 namespace {
@@ -114,7 +129,7 @@ intrusive_ptr<DocumentSource> DocumentSourceSample::createFromBson(
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceSample::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, long long size) {
-    uassert(28747, "size argument to $sample must not be negative", size >= 0);
+    uassert(28747, "size argument to $sample must be a positive integer", size > 0);
 
     intrusive_ptr<DocumentSourceSample> sample(new DocumentSourceSample(expCtx));
     sample->_size = size;
@@ -128,7 +143,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSample::dist
     DistributedPlanLogic logic;
     logic.shardsStage = this;
     if (_size > 0) {
-        logic.mergingStage = DocumentSourceLimit::create(pExpCtx, _size);
+        logic.mergingStages = {DocumentSourceLimit::create(pExpCtx, _size)};
     }
 
     // Here we don't use 'randSortSpec' because it uses a metadata sort which the merging logic does
@@ -136,7 +151,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSample::dist
     // just used to communicate ascending/descending information. A pattern like {$meta: "randVal"}
     // is neither ascending nor descending, and so will not be useful when constructing the merging
     // logic.
-    logic.inputSortPattern = BSON("$rand" << -1);
+    logic.mergeSortPattern = BSON("$rand" << -1);
     return logic;
 }
 }  // namespace mongo

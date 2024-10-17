@@ -27,73 +27,83 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/stats/counters.h"
 
 #include <fmt/format.h>
+#include <tuple>
 
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/client/authenticate.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 
-namespace {
 using namespace fmt::literals;
+
+void OpCounters::_reset() {
+    _insert->store(0);
+    _query->store(0);
+    _update->store(0);
+    _delete->store(0);
+    _getmore->store(0);
+    _command->store(0);
+    _nestedAggregate->store(0);
+
+    _queryDeprecated->store(0);
+
+    _insertOnExistingDoc->store(0);
+    _updateOnMissingDoc->store(0);
+    _deleteWasEmpty->store(0);
+    _deleteFromMissingNamespace->store(0);
+    _acceptableErrorInCommand->store(0);
 }
 
-void OpCounters::gotOp(int op, bool isCommand) {
-    switch (op) {
-        case dbInsert: /*gotInsert();*/
-            break;     // need to handle multi-insert
-        case dbQuery:
-            if (isCommand)
-                gotCommand();
-            else
-                gotQuery();
-            break;
-
-        case dbUpdate:
-            gotUpdate();
-            break;
-        case dbDelete:
-            gotDelete();
-            break;
-        case dbGetMore:
-            gotGetMore();
-            break;
-        case dbKillCursors:
-        case opReply:
-            break;
-        default:
-            LOGV2(22205, "OpCounters::gotOp unknown op: {op}", "op"_attr = op);
-    }
-}
-
-void OpCounters::_checkWrap(CacheAligned<AtomicWord<long long>> OpCounters::*counter, int n) {
+void OpCounters::_checkWrap(CacheExclusive<AtomicWord<long long>> OpCounters::*counter, int n) {
     static constexpr auto maxCount = 1LL << 60;
-    auto oldValue = (this->*counter).fetchAndAddRelaxed(n);
+    auto oldValue = (this->*counter)->fetchAndAddRelaxed(n);
     if (oldValue > maxCount) {
-        _insert.store(0);
-        _query.store(0);
-        _update.store(0);
-        _delete.store(0);
-        _getmore.store(0);
-        _command.store(0);
+        _reset();
     }
 }
 
 BSONObj OpCounters::getObj() const {
     BSONObjBuilder b;
-    b.append("insert", _insert.loadRelaxed());
-    b.append("query", _query.loadRelaxed());
-    b.append("update", _update.loadRelaxed());
-    b.append("delete", _delete.loadRelaxed());
-    b.append("getmore", _getmore.loadRelaxed());
-    b.append("command", _command.loadRelaxed());
+    b.append("insert", _insert->loadRelaxed());
+    b.append("query", _query->loadRelaxed());
+    b.append("update", _update->loadRelaxed());
+    b.append("delete", _delete->loadRelaxed());
+    b.append("getmore", _getmore->loadRelaxed());
+    b.append("command", _command->loadRelaxed());
+
+    auto queryDep = _queryDeprecated->loadRelaxed();
+    if (queryDep > 0) {
+        BSONObjBuilder d(b.subobjStart("deprecated"));
+        d.append("query", queryDep);
+    }
+
+    // Append counters for constraint relaxations, only if they exist.
+    auto insertOnExistingDoc = _insertOnExistingDoc->loadRelaxed();
+    auto updateOnMissingDoc = _updateOnMissingDoc->loadRelaxed();
+    auto deleteWasEmpty = _deleteWasEmpty->loadRelaxed();
+    auto deleteFromMissingNamespace = _deleteFromMissingNamespace->loadRelaxed();
+    auto acceptableErrorInCommand = _acceptableErrorInCommand->loadRelaxed();
+    auto totalRelaxed = insertOnExistingDoc + updateOnMissingDoc + deleteWasEmpty +
+        deleteFromMissingNamespace + acceptableErrorInCommand;
+
+    if (totalRelaxed > 0) {
+        BSONObjBuilder d(b.subobjStart("constraintsRelaxed"));
+        d.append("insertOnExistingDoc", insertOnExistingDoc);
+        d.append("updateOnMissingDoc", updateOnMissingDoc);
+        d.append("deleteWasEmpty", deleteWasEmpty);
+        d.append("deleteFromMissingNamespace", deleteFromMissingNamespace);
+        d.append("acceptableErrorInCommand", acceptableErrorInCommand);
+    }
+
     return b.obj();
 }
 
@@ -101,12 +111,12 @@ void NetworkCounter::hitPhysicalIn(long long bytes) {
     static const int64_t MAX = 1ULL << 60;
 
     // don't care about the race as its just a counter
-    const bool overflow = _physicalBytesIn.loadRelaxed() > MAX;
+    const bool overflow = _physicalBytesIn->loadRelaxed() > MAX;
 
     if (overflow) {
-        _physicalBytesIn.store(bytes);
+        _physicalBytesIn->store(bytes);
     } else {
-        _physicalBytesIn.fetchAndAdd(bytes);
+        _physicalBytesIn->fetchAndAdd(bytes);
     }
 }
 
@@ -114,12 +124,12 @@ void NetworkCounter::hitPhysicalOut(long long bytes) {
     static const int64_t MAX = 1ULL << 60;
 
     // don't care about the race as its just a counter
-    const bool overflow = _physicalBytesOut.loadRelaxed() > MAX;
+    const bool overflow = _physicalBytesOut->loadRelaxed() > MAX;
 
     if (overflow) {
-        _physicalBytesOut.store(bytes);
+        _physicalBytesOut->store(bytes);
     } else {
-        _physicalBytesOut.fetchAndAdd(bytes);
+        _physicalBytesOut->fetchAndAdd(bytes);
     }
 }
 
@@ -127,17 +137,17 @@ void NetworkCounter::hitLogicalIn(long long bytes) {
     static const int64_t MAX = 1ULL << 60;
 
     // don't care about the race as its just a counter
-    const bool overflow = _together.logicalBytesIn.loadRelaxed() > MAX;
+    const bool overflow = _together->logicalBytesIn.loadRelaxed() > MAX;
 
     if (overflow) {
-        _together.logicalBytesIn.store(bytes);
+        _together->logicalBytesIn.store(bytes);
         // The requests field only gets incremented here (and not in hitPhysical) because the
         // hitLogical and hitPhysical are each called for each operation. Incrementing it in both
         // functions would double-count the number of operations.
-        _together.requests.store(1);
+        _together->requests.store(1);
     } else {
-        _together.logicalBytesIn.fetchAndAdd(bytes);
-        _together.requests.fetchAndAdd(1);
+        _together->logicalBytesIn.fetchAndAdd(bytes);
+        _together->requests.fetchAndAdd(1);
     }
 }
 
@@ -145,43 +155,43 @@ void NetworkCounter::hitLogicalOut(long long bytes) {
     static const int64_t MAX = 1ULL << 60;
 
     // don't care about the race as its just a counter
-    const bool overflow = _logicalBytesOut.loadRelaxed() > MAX;
+    const bool overflow = _logicalBytesOut->loadRelaxed() > MAX;
 
     if (overflow) {
-        _logicalBytesOut.store(bytes);
+        _logicalBytesOut->store(bytes);
     } else {
-        _logicalBytesOut.fetchAndAdd(bytes);
+        _logicalBytesOut->fetchAndAdd(bytes);
     }
 }
 
 void NetworkCounter::incrementNumSlowDNSOperations() {
-    _numSlowDNSOperations.fetchAndAdd(1);
+    _numSlowDNSOperations->fetchAndAdd(1);
 }
 
 void NetworkCounter::incrementNumSlowSSLOperations() {
-    _numSlowSSLOperations.fetchAndAdd(1);
+    _numSlowSSLOperations->fetchAndAdd(1);
 }
 
 void NetworkCounter::acceptedTFOIngress() {
-    _tfo.accepted.fetchAndAddRelaxed(1);
+    _tfoAccepted->fetchAndAddRelaxed(1);
 }
 
 void NetworkCounter::append(BSONObjBuilder& b) {
-    b.append("bytesIn", static_cast<long long>(_together.logicalBytesIn.loadRelaxed()));
-    b.append("bytesOut", static_cast<long long>(_logicalBytesOut.loadRelaxed()));
-    b.append("physicalBytesIn", static_cast<long long>(_physicalBytesIn.loadRelaxed()));
-    b.append("physicalBytesOut", static_cast<long long>(_physicalBytesOut.loadRelaxed()));
-    b.append("numSlowDNSOperations", static_cast<long long>(_numSlowDNSOperations.loadRelaxed()));
-    b.append("numSlowSSLOperations", static_cast<long long>(_numSlowSSLOperations.loadRelaxed()));
-    b.append("numRequests", static_cast<long long>(_together.requests.loadRelaxed()));
+    b.append("bytesIn", static_cast<long long>(_together->logicalBytesIn.loadRelaxed()));
+    b.append("bytesOut", static_cast<long long>(_logicalBytesOut->loadRelaxed()));
+    b.append("physicalBytesIn", static_cast<long long>(_physicalBytesIn->loadRelaxed()));
+    b.append("physicalBytesOut", static_cast<long long>(_physicalBytesOut->loadRelaxed()));
+    b.append("numSlowDNSOperations", static_cast<long long>(_numSlowDNSOperations->loadRelaxed()));
+    b.append("numSlowSSLOperations", static_cast<long long>(_numSlowSSLOperations->loadRelaxed()));
+    b.append("numRequests", static_cast<long long>(_together->requests.loadRelaxed()));
 
     BSONObjBuilder tfo;
 #ifdef __linux__
-    tfo.append("kernelSetting", _tfo.kernelSetting);
+    tfo.append("kernelSetting", _tfoKernelSetting);
 #endif
-    tfo.append("serverSupported", _tfo.kernelSupportServer);
-    tfo.append("clientSupported", _tfo.kernelSupportClient);
-    tfo.append("accepted", _tfo.accepted.loadRelaxed());
+    tfo.append("serverSupported", _tfoKernelSupportServer);
+    tfo.append("clientSupported", _tfoKernelSupportClient);
+    tfo.append("accepted", _tfoAccepted->loadRelaxed());
     b.append("tcpFastOpen", tfo.obj());
 }
 
@@ -202,16 +212,18 @@ void AuthCounter::initializeMechanismMap(const std::vector<std::string>& mechani
     // Ensure it's always included in counts.
     addMechanism(auth::kMechanismMongoX509.toString());
 
-    // SERVER-46399 Use only configured SASL mechanisms for intra-cluster auth.
-    // It's possible for intracluster auth to use a default fallback mechanism of SCRAM-SHA-1/256
+    // It's possible for intracluster auth to use a default fallback mechanism of SCRAM-SHA-256
     // even if it's not configured to do so.
-    // Explicitly add these to the map for now so that they can be incremented if this happens.
-    addMechanism(auth::kMechanismScramSha1.toString());
+    // Explicitly add this to the map for now so that they can be incremented if this happens.
     addMechanism(auth::kMechanismScramSha256.toString());
 }
 
 void AuthCounter::incSaslSupportedMechanismsReceived() {
     _saslSupportedMechanismsReceived.fetchAndAddRelaxed(1);
+}
+
+void AuthCounter::incAuthenticationCumulativeTime(long long micros) {
+    _authenticationCumulativeMicros.fetchAndAddRelaxed(micros);
 }
 
 void AuthCounter::MechanismCounterHandle::incSpeculativeAuthenticateReceived() {
@@ -305,11 +317,65 @@ void AuthCounter::append(BSONObjBuilder* b) {
     }
 
     mechsBuilder.done();
+
+    const auto totalAuthenticationTimeMicros = _authenticationCumulativeMicros.load();
+    b->append("totalAuthenticationTimeMicros", totalAuthenticationTimeMicros);
+}
+
+OpCounterServerStatusSection::OpCounterServerStatusSection(const std::string& sectionName,
+                                                           ClusterRole role,
+                                                           OpCounters* counters)
+    : ServerStatusSection(sectionName, role), _counters(counters) {}
+
+BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
+                                                      const BSONElement& configElement) const {
+    return _counters->getObj();
 }
 
 OpCounters globalOpCounters;
 OpCounters replOpCounters;
 NetworkCounter networkCounter;
 AuthCounter authCounter;
-AggStageCounters aggStageCounters;
+AggStageCounters aggStageCounters{"aggStageCounters."};
+DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
+QueryFrameworkCounters queryFrameworkCounters;
+LookupPushdownCounters lookupPushdownCounters;
+SortCounters sortCounters;
+ValidatorCounters validatorCounters;
+GroupCounters groupCounters;
+SetWindowFieldsCounters setWindowFieldsCounters;
+PlanCacheCounters planCacheCounters;
+FastPathQueryCounters fastPathQueryCounters;
+
+OperatorCounters operatorCountersAggExpressions{"operatorCounters.expressions."};
+OperatorCounters operatorCountersMatchExpressions{"operatorCounters.match."};
+OperatorCounters operatorCountersGroupAccumulatorExpressions{"operatorCounters.groupAccumulators."};
+OperatorCounters operatorCountersWindowAccumulatorExpressions{
+    "operatorCounters.windowAccumulators."};
+
+#define DEFN_QUERY_COUNTER(var)                  \
+    Counter64& var = *MetricBuilder<Counter64> { \
+        std::string{"query."} + #var             \
+    }
+DEFN_QUERY_COUNTER(updateManyCount);
+DEFN_QUERY_COUNTER(deleteManyCount);
+DEFN_QUERY_COUNTER(updateOneTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneTargetedShardedCount);
+DEFN_QUERY_COUNTER(findAndModifyTargetedShardedCount);
+DEFN_QUERY_COUNTER(updateOneUnshardedCount);
+DEFN_QUERY_COUNTER(deleteOneUnshardedCount);
+DEFN_QUERY_COUNTER(findAndModifyUnshardedCount);
+DEFN_QUERY_COUNTER(updateOneNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(findAndModifyNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(nonRetryableDeleteOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(updateOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(nonRetryableUpdateOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(updateOneWithoutShardKeyWithIdRetryCount);
+DEFN_QUERY_COUNTER(deleteOneWithoutShardKeyWithIdRetryCount);
+DEFN_QUERY_COUNTER(internalRetryableWriteCount);
+DEFN_QUERY_COUNTER(externalRetryableWriteCount);
+DEFN_QUERY_COUNTER(retryableInternalTransactionCount);
+#undef DEFN_QUERY_COUNTER
 }  // namespace mongo

@@ -27,15 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <set>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/matcher/matcher_type_set.h"
 #include "mongo/db/matcher/schema/encrypt_schema_gen.h"
 #include "mongo/db/matcher/schema/encrypt_schema_types.h"
-#include "mongo/unittest/bson_test_util.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -97,20 +108,20 @@ TEST(EncryptSchemaTest, ParseFullEncryptObjectFromBSON) {
                                    << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
                                    << "keyId"
                                    << "/pointer");
-    IDLParserErrorContext ctxt("encrypt");
+    IDLParserContext ctxt("encrypt");
     auto encryptInfo = EncryptionInfo::parse(ctxt, encryptInfoBSON);
     MatcherTypeSet resultMatcherSet;
     resultMatcherSet.bsonTypes.insert(BSONType::NumberInt);
     ASSERT_TRUE(encryptInfo.getBsonType() == BSONTypeSet(resultMatcherSet));
-    ASSERT_TRUE(encryptInfo.getAlgorithm().get() == FleAlgorithmEnum::kDeterministic);
-    EncryptSchemaKeyId keyid = encryptInfo.getKeyId().get();
+    ASSERT_TRUE(encryptInfo.getAlgorithm().value() == FleAlgorithmEnum::kDeterministic);
+    EncryptSchemaKeyId keyid = encryptInfo.getKeyId().value();
     ASSERT_TRUE(keyid.type() == EncryptSchemaKeyId::Type::kJSONPointer);
     ASSERT_EQ(keyid.jsonPointer().toString(), "/pointer");
 }
 
 TEST(EncryptSchemaTest, WrongTypeFailsParse) {
     BSONObj encryptInfoBSON = BSON("keyId" << 2);
-    IDLParserErrorContext ctxt("encrypt");
+    IDLParserContext ctxt("encrypt");
     ASSERT_THROWS_CODE(EncryptionInfo::parse(ctxt, encryptInfoBSON), DBException, 51085);
     encryptInfoBSON = BSON("algorithm"
                            << "garbage");

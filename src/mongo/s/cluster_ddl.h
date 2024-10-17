@@ -29,6 +29,13 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
@@ -37,16 +44,30 @@ namespace cluster {
 
 /**
  * Creates (or ensures that it is created) a database `dbName`, with `suggestedPrimaryId` as the
- * primary node and the `shardingEnabled` field set to true.
+ * primary node.
  */
 CachedDatabaseInfo createDatabase(OperationContext* opCtx,
-                                  StringData dbName,
-                                  boost::optional<ShardId> suggestedPrimaryId = boost::none);
+                                  const DatabaseName& dbName,
+                                  const boost::optional<ShardId>& suggestedPrimaryId = boost::none);
 
 /**
- * Creates the specified sharded collection.
+ * Creates the specified collection.
  */
-void createCollection(OperationContext* opCtx, const ShardsvrCreateCollection& request);
+void createCollection(OperationContext* opCtx, ShardsvrCreateCollection request);
+
+/**
+ * Creates a collection with the options specified in `request`. Calls the above createCollection
+ * function within a router loop.
+ */
+void createCollectionWithRouterLoop(OperationContext* opCtx,
+                                    const ShardsvrCreateCollection& request);
+
+
+/**
+ * Creates the specified nss as an unsharded collection. Calls the above
+ * createCollectionWithRouterLoop function.
+ */
+void createCollectionWithRouterLoop(OperationContext* opCtx, const NamespaceString& nss);
 
 }  // namespace cluster
 }  // namespace mongo

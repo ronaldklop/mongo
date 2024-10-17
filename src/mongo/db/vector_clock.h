@@ -30,12 +30,25 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
 
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/vector_clock_document_gen.h"
+#include "mongo/db/vector_clock_gen.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -75,19 +88,88 @@ protected:
 
     using LogicalTimeArray = ComponentArray<LogicalTime>;
 
-    struct component_comparator {
-        bool operator()(const Component& c0, const Component& c1) const {
-            return static_cast<uint8_t>(c0) < static_cast<uint8_t>(c1);
+    /**
+     * Bare-bones std::set like class to hold a set of Components without memory allocation.
+     */
+    class ComponentSet {
+    public:
+        ComponentSet() = default;
+        ComponentSet(Component c) {
+            insert(c);
         }
-    };
 
-    using ComponentSet = std::set<Component, component_comparator>;
+        void insert(Component c) {
+            _components.set(static_cast<std::size_t>(c));
+        }
+
+        /**
+         * Iterator that implements LegacyForwardIterator.
+         */
+        class iterator {
+            friend class ComponentSet;
+
+        public:
+            Component operator*() const {
+                return static_cast<Component>(_pos);
+            }
+
+            iterator operator++() {
+                // Advance one if not at the end and then find a true bit if the current bit is not
+                // true.
+                if (_pos < _set->_components.size()) {
+                    _pos++;
+                    advanceIfNeeded();
+                }
+                return *this;
+            }
+
+            bool operator==(const iterator& right) const {
+                return this->_pos == right._pos;
+            }
+
+            bool operator!=(const iterator& right) const {
+                return this->_pos != right._pos;
+            }
+
+        private:
+            iterator(const ComponentSet* set) : _set(set), _pos(0) {
+                advanceIfNeeded();
+            }
+
+            iterator(const ComponentSet* set, std::size_t pos) : _set(set), _pos(pos) {}
+
+            // advance if the current bit is not true until the next valid bit or reach the end of
+            // the bit set
+            void advanceIfNeeded() {
+                for (; _pos < _set->_components.size(); ++_pos) {
+                    if (_set->_components.test(_pos)) {
+                        break;
+                    }
+                }
+            }
+
+        private:
+            const ComponentSet* _set;
+            std::size_t _pos;
+        };
+
+        iterator begin() const {
+            return iterator(this);
+        }
+
+        iterator end() const {
+            return iterator(this, _components.size());
+        }
+
+    private:
+        std::bitset<static_cast<std::size_t>(Component::_kNumComponents)> _components;
+    };
 
 public:
     class VectorTime {
     public:
         explicit VectorTime(LogicalTimeArray time) : _time(std::move(time)) {}
-        VectorTime() = default;
+        VectorTime() = delete;
 
         LogicalTime clusterTime() const& {
             return _time[Component::ClusterTime];
@@ -114,6 +196,23 @@ public:
 
         LogicalTimeArray _time;
     };
+
+    VectorClock() = default;
+    virtual ~VectorClock() = default;
+
+    // There is a special logic in the storage engine which fixes up Timestamp(0, 0) to the latest
+    // available time on the node. Because of this, we should never gossip or have a VectorClock
+    // initialised with a value of Timestamp(0, 0), because that would cause the checkpointed value
+    // to move forward in time.
+    static const LogicalTime kInitialComponentTime;
+
+    /**
+     * Returns true if the passed LogicalTime is set to a value higher than kInitialComponentTime,
+     * false otherwise.
+     */
+    static bool isValidComponentTime(const LogicalTime& time) {
+        return time > kInitialComponentTime;
+    }
 
     static constexpr char kClusterTimeFieldName[] = "$clusterTime";
     static constexpr char kConfigTimeFieldName[] = "$configTime";
@@ -142,30 +241,22 @@ public:
      */
     bool gossipOut(OperationContext* opCtx,
                    BSONObjBuilder* outMessage,
-                   const transport::Session::TagMask defaultClientSessionTags = 0) const;
+                   bool forceInternal = false) const;
 
     /**
      * Read the necessary fields from inMessage in order to update the current time, based on this
      * message received from another node, taking into account if the gossiping is from an internal
-     * or external client (based on the session tags).
+     * or external client.
      */
     void gossipIn(OperationContext* opCtx,
-                  const BSONObj& inMessage,
+                  const GossipedVectorClockComponents& timepoints,
                   bool couldBeUnauthenticated,
-                  const transport::Session::TagMask defaultClientSessionTags = 0);
+                  bool defaultIsInternalClient = false);
 
     /**
      * Returns true if the clock is enabled and can be used. Defaults to true.
      */
     bool isEnabled() const;
-
-    /**
-     * Advances, if necessary, the clusterTime and configTime components of the vector clock up to
-     * the configOpTime received from another node. Necessary to ensure that the Grid's configOpTime
-     * won't be greater than the VectorClock's clusterTime.
-     * TODO SERVER-54252: Remove this after 5.0 has branched out.
-     */
-    void gossipInConfigOpTime(const repl::OpTime& configOpTime);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     // The group of methods below is only used for unit-testing
@@ -194,21 +285,18 @@ protected:
         // Returns true if the time was output, false otherwise.
         virtual bool out(ServiceContext* service,
                          OperationContext* opCtx,
-                         bool permitRefresh,
                          BSONObjBuilder* out,
                          LogicalTime time,
-                         Component component) const = 0;
+                         Component component,
+                         bool isInternal) const = 0;
         virtual LogicalTime in(ServiceContext* service,
                                OperationContext* opCtx,
-                               const BSONObj& in,
+                               const GossipedVectorClockComponents& timepoints,
                                bool couldBeUnauthenticated,
                                Component component) const = 0;
 
         const std::string _fieldName;
     };
-
-    VectorClock();
-    virtual ~VectorClock();
 
     /**
      * The maximum permissible value for each part of a LogicalTime's Timestamp (ie. "secs" and
@@ -242,35 +330,25 @@ protected:
     /**
      * Returns the set of components that need to be gossiped to a node internal to the cluster.
      */
-    virtual ComponentSet _gossipOutInternal() const = 0;
-
-    /**
-     * As for _gossipOutInternal, except for the components to be sent to a client external to the
-     * cluster, eg. a driver or user client. By default, just the ClusterTime is gossiped.
-     */
-    virtual ComponentSet _gossipOutExternal() const {
-        return ComponentSet{Component::ClusterTime};
+    virtual ComponentSet _getGossipInternalComponents() const {
+        VectorClock::ComponentSet toGossip{Component::ClusterTime};
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+            serverGlobalParams.clusterRole.has(ClusterRole::RouterServer)) {
+            toGossip.insert(Component::ConfigTime);
+            toGossip.insert(Component::TopologyTime);
+        }
+        return toGossip;
     }
 
     /**
-     * Returns the set of components that should be processed during gossiping in of messages from
-     * internal clients.
+     * Returns the set of components that need to be gossiped to the external clients, eg. a driver
+     * or user client. By default, just the ClusterTime is gossiped, although it is disabled in some
+     * cases, e.g. when a node is in an unreadable state.
      */
-    virtual ComponentSet _gossipInInternal() const = 0;
-
-    /**
-     * As for _gossipInInternal, except from a client external to the cluster, eg. a driver or user
-     * client. By default, just the ClusterTime is gossiped.
-     */
-    virtual ComponentSet _gossipInExternal() const {
-        return ComponentSet{Component::ClusterTime};
+    virtual ComponentSet _getGossipExternalComponents() const {
+        return _permitGossipClusterTimeWithExternalClients() ? ComponentSet{Component::ClusterTime}
+                                                             : ComponentSet{};
     }
-
-    /**
-     * Whether or not it's permissable to refresh external state (eg. updating gossip signing keys)
-     * during gossip out.
-     */
-    virtual bool _permitRefreshDuringGossipOut() const = 0;
 
     /**
      * For each component in the LogicalTimeArray, sets the current time to newTime if the newTime >
@@ -294,17 +372,26 @@ protected:
     // Note that ConfigTime is advanced under the ReplicationCoordinator mutex, so to avoid
     // potential deadlocks the ReplicationCoordator mutex should never be acquired whilst the
     // VectorClock mutex is held.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("VectorClock::_mutex");
+    mutable stdx::mutex _mutex;
 
-    bool _isEnabled{true};
+    AtomicWord<bool> _isEnabled{true};
 
-    LogicalTimeArray _vectorTime;
+    LogicalTimeArray _vectorTime = {
+        kInitialComponentTime, kInitialComponentTime, kInitialComponentTime};
 
 private:
     class PlainComponentFormat;
     class SignedComponentFormat;
-    template <class ActualFormat>
-    class OnlyOutOnNewFCVComponentFormat;
+    class ConfigTimeComponent;
+    class TopologyTimeComponent;
+    class ClusterTimeComponent;
+
+    /**
+     * Called to determine if the cluster time component should be gossiped in and out to external
+     * clients. In some circumstances such gossiping is disabled, e.g. for replica set nodes in
+     * unreadable states.
+     */
+    bool _permitGossipClusterTimeWithExternalClients() const;
 
     /**
      * Called in order to output a Component time to the passed BSONObjBuilder, using the
@@ -315,14 +402,15 @@ private:
     bool _gossipOutComponent(OperationContext* opCtx,
                              BSONObjBuilder* out,
                              const LogicalTimeArray& time,
-                             Component component) const;
+                             Component component,
+                             bool isInternal) const;
 
     /**
      * Called in order to input a Component time into the given LogicalTimeArray from the given
      * BSONObj, using the appropriate field name and representation for that Component.
      */
     void _gossipInComponent(OperationContext* opCtx,
-                            const BSONObj& in,
+                            const GossipedVectorClockComponents& timepoints,
                             bool couldBeUnauthenticated,
                             LogicalTimeArray* newTime,
                             Component component);

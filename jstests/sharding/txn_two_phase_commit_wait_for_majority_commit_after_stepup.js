@@ -9,11 +9,10 @@
 // test causes failovers on a shard, so the cached connection is not usable.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/write_concern_util.js');  // for stopping/restarting replication
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {stopServerReplication, restartReplSetReplication} from "jstests/libs/write_concern_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -53,8 +52,13 @@ const setUp = function() {
     // shard0: [-inf, 0)
     // shard1: [0, 10)
     // shard2: [10, +inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: participant0.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: participant0.shardName}));
+    // The default WC is majority and stopServerReplication will prevent satisfying any majority
+    // writes.
+    assert.commandWorked(st.s.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -96,11 +100,10 @@ failPoint.wait();
 // cannot become majority committed, regardless of which node steps up.
 stopServerReplication([coordPrimary, coordSecondary]);
 
-// Induce the coordinator primary to step down.
-
-// The amount of time the node has to wait before becoming primary again.
-const stepDownSecs = 1;
-assert.commandWorked(coordPrimary.adminCommand({replSetStepDown: stepDownSecs, force: true}));
+// Induce the coordinator primary to step down, but allow it to immediately step back up.
+assert.commandWorked(
+    coordPrimary.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
+assert.commandWorked(coordPrimary.adminCommand({replSetFreeze: 0}));
 
 failPoint.off();
 
@@ -124,4 +127,3 @@ jsTest.log("Verify that the transaction was committed on all shards.");
 assert.eq(3, st.s.getDB(dbName).getCollection(collName).find().itcount());
 
 st.stop();
-})();

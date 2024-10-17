@@ -1,8 +1,8 @@
 // Tests 'replSetTest' command:
 //    waitForMemberState - waits for node's state to become 'expectedState'.
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var name = 'test_command';
 var replSet = new ReplSetTest({name: name, nodes: 3});
 var nodes = replSet.nodeList();
@@ -111,4 +111,3 @@ assert.commandWorked(
     'replSetTest waitForMemberState(SECONDARY) failed on node 1 ' + secondary.host);
 
 replSet.stopSet();
-})();

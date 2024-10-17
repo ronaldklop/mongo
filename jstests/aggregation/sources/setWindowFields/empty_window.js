@@ -1,18 +1,6 @@
 /**
  * Test the default behavior of window functions when no documents fall in the window.
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // documentEq
-const featureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1}))
-        .featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
-
 const coll = db[jsTestName()];
 coll.drop();
 
@@ -62,4 +50,3 @@ assert.eq(null, results[0].defaultMin);
 assert.eq(null, results[0].defaultMax);
 // $sum is unique as its default value is 0.
 assert.eq(0, results[0].defaultSum);
-})();

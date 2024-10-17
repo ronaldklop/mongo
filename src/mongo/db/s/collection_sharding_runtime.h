@@ -29,16 +29,45 @@
 
 #pragma once
 
-#include "mongo/db/concurrency/d_concurrency.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/metadata_manager.h"
+#include "mongo/db/s/scoped_collection_metadata.h"
 #include "mongo/db/s/sharding_migration_critical_section.h"
-#include "mongo/db/s/sharding_state_lock.h"
-#include "mongo/platform/atomic_word.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+
+typedef std::pair<CollectionMetadata, boost::optional<ShardingIndexesCatalogCache>>
+    CollectionPlacementAndIndexInfo;
 
 /**
  * See the comments for CollectionShardingState for more information on how this class fits in the
@@ -50,44 +79,94 @@ class CollectionShardingRuntime final : public CollectionShardingState,
     CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
 
 public:
-    CollectionShardingRuntime(ServiceContext* service,
-                              NamespaceString nss,
-                              std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor);
-
-    using CSRLock = ShardingStateLock<CollectionShardingRuntime>;
+    CollectionShardingRuntime(ServiceContext* service, NamespaceString nss);
+    ~CollectionShardingRuntime() override;
 
     /**
-     * Obtains the sharding runtime state for the specified collection. If it does not exist, it
-     * will be created and will remain active until the collection is dropped or unsharded.
-     *
-     * Must be called with some lock held on the specific collection being looked up and the
-     * returned pointer should never be stored.
+     * Obtains the sharding runtime for the specified collection, along with a resource lock in
+     * shared mode protecting it from concurrent modifications, which will be held until the object
+     * goes out of scope.
      */
-    static CollectionShardingRuntime* get(OperationContext* opCtx, const NamespaceString& nss);
+    class ScopedSharedCollectionShardingRuntime {
+    public:
+        ScopedSharedCollectionShardingRuntime(ScopedSharedCollectionShardingRuntime&&) = default;
+
+        const CollectionShardingRuntime* operator->() const {
+            return checked_cast<CollectionShardingRuntime*>(&*_scopedCss);
+        }
+        const CollectionShardingRuntime& operator*() const {
+            return checked_cast<CollectionShardingRuntime&>(*_scopedCss);
+        }
+
+    private:
+        friend class CollectionShardingRuntime;
+
+        ScopedSharedCollectionShardingRuntime(ScopedCollectionShardingState&& scopedCss);
+
+        ScopedCollectionShardingState _scopedCss;
+    };
 
     /**
-     * Obtains the sharding runtime state from the the specified sharding collection state. The
-     * returned pointer should never be stored.
+     * Obtains the sharding runtime for the specified collection, along with a resource lock in
+     * exclusive mode protecting it from concurrent modifications, which will be held until the
+     * object goes out of scope.
      */
-    static CollectionShardingRuntime* get(CollectionShardingState* css);
+    class ScopedExclusiveCollectionShardingRuntime {
+    public:
+        ScopedExclusiveCollectionShardingRuntime(ScopedExclusiveCollectionShardingRuntime&&) =
+            default;
 
-    /**
-     * It is the caller's responsibility to ensure that the collection locks for this namespace are
-     * held when this is called. The returned pointer should never be stored.
-     */
-    static CollectionShardingRuntime* get_UNSAFE(ServiceContext* svcCtx,
-                                                 const NamespaceString& nss);
+        CollectionShardingRuntime* operator->() const {
+            return checked_cast<CollectionShardingRuntime*>(&*_scopedCss);
+        }
+        CollectionShardingRuntime& operator*() const {
+            return checked_cast<CollectionShardingRuntime&>(*_scopedCss);
+        }
+
+    private:
+        friend class CollectionShardingRuntime;
+
+        ScopedExclusiveCollectionShardingRuntime(ScopedCollectionShardingState&& scopedCss);
+
+        ScopedCollectionShardingState _scopedCss;
+    };
+
+    static ScopedSharedCollectionShardingRuntime assertCollectionLockedAndAcquireShared(
+        OperationContext* opCtx, const NamespaceString& nss);
+    static ScopedExclusiveCollectionShardingRuntime assertCollectionLockedAndAcquireExclusive(
+        OperationContext* opCtx, const NamespaceString& nss);
+    static ScopedExclusiveCollectionShardingRuntime acquireExclusive(OperationContext* opCtx,
+                                                                     const NamespaceString& nss);
+
+    static ScopedCollectionShardingState assertCollectionLockedAndAcquire(
+        OperationContext* opCtx, const NamespaceString& nss) = delete;
+    static ScopedCollectionShardingState acquire(OperationContext* opCtx,
+                                                 const NamespaceString& nss) = delete;
+
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) const override;
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx,
+                                                         bool operationIsVersioned) const override;
 
     ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
-                                              OrphanCleanupPolicy orphanCleanupPolicy) override;
+                                              OrphanCleanupPolicy orphanCleanupPolicy,
+                                              bool supportNonVersionedOperations) const override;
+    ScopedCollectionFilter getOwnershipFilter(
+        OperationContext* opCtx,
+        OrphanCleanupPolicy orphanCleanupPolicy,
+        const ShardVersion& receivedShardVersion) const override;
 
-    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override;
+    boost::optional<CollectionIndexes> getCollectionIndexes(OperationContext* opCtx) const override;
 
-    void checkShardVersionOrThrow(OperationContext* opCtx) override;
+    boost::optional<ShardingIndexesCatalogCache> getIndexes(OperationContext* opCtx) const override;
 
-    void appendShardVersion(BSONObjBuilder* builder) override;
+    void checkShardVersionOrThrow(OperationContext* opCtx) const override;
 
-    size_t numberOfRangesScheduledForDeletion() const override;
+    void checkShardVersionOrThrow(OperationContext* opCtx,
+                                  const ShardVersion& receivedShardVersion) const override;
+
+    void appendShardVersion(BSONObjBuilder* builder) const override;
+
+    boost::optional<ShardingIndexesCatalogCache> getIndexesInCritSec(OperationContext* opCtx) const;
 
     /**
      * Returns boost::none if the description for the collection is not known yet. Otherwise
@@ -97,7 +176,7 @@ public:
      * be used for cases such as checking whether a particular config server update has taken
      * effect.
      */
-    boost::optional<CollectionMetadata> getCurrentMetadataIfKnown();
+    boost::optional<CollectionMetadata> getCurrentMetadataIfKnown() const;
 
     /**
      * Updates the collection's filtering metadata based on changes received from the config server
@@ -113,101 +192,142 @@ public:
      * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
      * shard version match will fail with StaleConfig errors in order to trigger an update.
      *
+     * Interrupts any ongoing shard metadata refresh.
+     *
      * It is safe to call this method with only an intent lock on the collection (as opposed to
-     * setFilteringMetadata which requires exclusive), however note that clearing a collection's
-     * filtering metadata will interrupt all in-progress orphan cleanups in which case orphaned data
-     * will remain behind on disk.
+     * setFilteringMetadata which requires exclusive).
      */
     void clearFilteringMetadata(OperationContext* opCtx);
+
+    /**
+     * Calls to clearFilteringMetadata + clears the _metadataManager object.
+     */
+    void clearFilteringMetadataForDroppedCollection(OperationContext* opCtx);
 
     /**
      * Methods to control the collection's critical section. Methods listed below must be called
      * with both the collection lock and CSRLock held in exclusive mode.
      *
      * In these methods, the CSRLock ensures concurrent access to the critical section.
+     *
+     * Entering into the Critical Section interrupts any ongoing filtering metadata refresh.
      */
-    void enterCriticalSectionCatchUpPhase(const CSRLock&);
-    void enterCriticalSectionCommitPhase(const CSRLock&);
+    void enterCriticalSectionCatchUpPhase(const BSONObj& reason);
+    void enterCriticalSectionCommitPhase(const BSONObj& reason);
 
     /**
-     * Method to control the collection's critical secion. Method listed below must be called with
-     * the collection lock in IX mode and the CSRLock in exclusive mode.
-     *
-     * In this method, the CSRLock ensures concurrent access to the critical section.
+     * It transitions the critical section back to the catch up phase.
      */
-    void exitCriticalSection(OperationContext* opCtx);
+    void rollbackCriticalSectionCommitPhaseToCatchUpPhase(const BSONObj& reason);
+
+    /**
+     * Method to control the collection's critical section. Methods listed below must be called with
+     * both the collection lock and CSR acquired in exclusive mode.
+     */
+    void exitCriticalSection(const BSONObj& reason);
+
+    /**
+     * Same semantics than 'exitCriticalSection' but without doing error-checking. Only meant to be
+     * used when recovering the critical sections in the RecoverableCriticalSectionService.
+     */
+    void exitCriticalSectionNoChecks();
 
     /**
      * If the collection is currently in a critical section, returns the critical section signal to
      * be waited on. Otherwise, returns nullptr.
-     *
-     * This method internally acquires the CSRLock in IS to wait for eventual ongoing operations.
      */
     boost::optional<SharedSemiFuture<void>> getCriticalSectionSignal(
-        OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op);
-
-    /**
-     * Schedules documents in `range` for cleanup after any running queries that may depend on them
-     * have terminated. Does not block. Fails if range overlaps any current local shard chunk.
-     * Passed kDelayed, an additional delay (configured via server parameter orphanCleanupDelaySecs)
-     * is added to permit (most) dependent queries on secondaries to complete, too.
-     *
-     * Returns a future that will be resolved when the deletion completes or fails. If that
-     * succeeds, waitForClean can be called to ensure no other deletions are pending for the range.
-     */
-    enum CleanWhen { kNow, kDelayed };
-    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range,
-                                        boost::optional<UUID> migrationId,
-                                        CleanWhen when);
+        OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op) const;
 
     /**
      * Waits for all ranges deletion tasks with UUID 'collectionUuid' overlapping range
      * 'orphanRange' to be processed, even if the collection does not exist in the storage catalog.
+     * It will block until the minimum of the operation context's timeout deadline or 'deadline' is
+     * reached.
      */
     static Status waitForClean(OperationContext* opCtx,
                                const NamespaceString& nss,
                                const UUID& collectionUuid,
-                               ChunkRange orphanRange);
+                               ChunkRange orphanRange,
+                               Date_t deadline);
+
+    /**
+     * Returns a future marked as ready when all the ongoing queries retaining the range complete
+     */
+    SharedSemiFuture<void> getOngoingQueriesCompletionFuture(const UUID& collectionUuid,
+                                                             ChunkRange const& range) const;
 
     std::uint64_t getNumMetadataManagerChanges_forTest() {
         return _numMetadataManagerChanges;
     }
 
     /**
-     * Initializes the shard version recover/refresh shared semifuture for other threads to wait on
-     * it.
-     *
-     * In this method, the CSRLock ensures concurrent access to the shared semifuture.
+     * Initializes the placement version recover/refresh shared semifuture for other threads to wait
+     * on it.
      *
      * To invoke this method, the criticalSectionSignal must not be hold by a different thread.
      */
-    void setShardVersionRecoverRefreshFuture(SharedSemiFuture<void> future, const CSRLock&);
+    void setPlacementVersionRecoverRefreshFuture(SharedSemiFuture<void> future,
+                                                 CancellationSource cancellationSource);
 
     /**
-     * If there an ongoing shard version recover/refresh, it returns the shared semifuture to be
+     * If there an ongoing placement version recover/refresh, it returns the shared semifuture to be
      * waited on. Otherwise, returns boost::none.
-     *
-     * This method internally acquires the CSRLock in IS to wait for eventual ongoing operations.
      */
-    boost::optional<SharedSemiFuture<void>> getShardVersionRecoverRefreshFuture(
-        OperationContext* opCtx);
+    boost::optional<SharedSemiFuture<void>> getPlacementVersionRecoverRefreshFuture(
+        OperationContext* opCtx) const;
 
     /**
-     * Resets the shard version recover/refresh shared semifuture to boost::none.
-     *
-     * In this method, the CSRLock ensures concurrent access to the shared semifuture.
+     * Resets the placement version recover/refresh shared semifuture to boost::none.
      */
-    void resetShardVersionRecoverRefreshFuture(const CSRLock&);
+    void resetPlacementVersionRecoverRefreshFuture();
+
+    /**
+     * Add a new index to the shard-role index info under a lock.
+     */
+    void addIndex(OperationContext* opCtx,
+                  const IndexCatalogType& index,
+                  const CollectionIndexes& collectionIndexes);
+
+    /**
+     * Removes an index from the shard-role index info under a lock.
+     */
+    void removeIndex(OperationContext* opCtx,
+                     const std::string& name,
+                     const CollectionIndexes& collectionIndexes);
+
+    /**
+     * Clears the shard-role index info and set the collectionIndexes to boost::none.
+     */
+    void clearIndexes(OperationContext* opCtx);
+
+    /**
+     * Clears all the indexes and set the new indexes and index version.
+     */
+    void replaceIndexes(OperationContext* opCtx,
+                        const std::vector<IndexCatalogType>& indexes,
+                        const CollectionIndexes& collectionIndexes);
 
 private:
-    friend CSRLock;
+    struct PlacementVersionRecoverOrRefresh {
+    public:
+        PlacementVersionRecoverOrRefresh(SharedSemiFuture<void> future,
+                                         CancellationSource cancellationSource)
+            : future(std::move(future)), cancellationSource(std::move(cancellationSource)){};
+
+        // Tracks ongoing placement version recover/refresh.
+        SharedSemiFuture<void> future;
+
+        // Cancellation source to cancel the ongoing recover/refresh placement version.
+        CancellationSource cancellationSource;
+    };
 
     /**
      * Returns the latest version of collection metadata with filtering configured for
      * atClusterTime if specified.
      */
     std::shared_ptr<ScopedCollectionDescription::Impl> _getCurrentMetadataIfKnown(
-        const boost::optional<LogicalTime>& atClusterTime);
+        const boost::optional<LogicalTime>& atClusterTime, bool preserveRange) const;
 
     /**
      * Returns the latest version of collection metadata with filtering configured for
@@ -215,7 +335,27 @@ private:
      * operation context does not match the shard version on the active metadata object.
      */
     std::shared_ptr<ScopedCollectionDescription::Impl> _getMetadataWithVersionCheckAt(
-        OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
+        OperationContext* opCtx,
+        const boost::optional<mongo::LogicalTime>& atClusterTime,
+        const boost::optional<ShardVersion>& optReceivedShardVersion,
+        bool preserveRange,
+        bool supportNonVersionedOperations = false) const;
+
+    /**
+     * Auxiliary function used to implement the different flavours of clearFilteringMetadata.
+     */
+    void _clearFilteringMetadata(OperationContext* opCtx, bool collIsDropped);
+
+    /**
+     * This function cleans up some state associated with the current sharded metadata before it's
+     * replaced by the new metadata.
+     */
+    void _cleanupBeforeInstallingNewCollectionMetadata(WithLock, OperationContext* opCtx);
+
+    /**
+     * This function throws an StaleConfigInfo exception if the critical section is held.
+     */
+    void _checkCritSecForIndexMetadata(OperationContext* opCtx) const;
 
     // The service context under which this instance runs
     ServiceContext* const _serviceContext;
@@ -223,44 +363,59 @@ private:
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
-    // The executor used for deleting ranges of orphan chunks.
-    std::shared_ptr<executor::TaskExecutor> _rangeDeleterExecutor;
-
-    // Object-wide ResourceMutex to protect changes to the CollectionShardingRuntime or objects held
-    // within (including the MigrationSourceManager, which is a decoration on the CSR). Use only the
-    // CSRLock to lock this mutex.
-    Lock::ResourceMutex _stateChangeMutex;
-
     // Tracks the migration critical section state for this collection.
-    // Must hold CSRLock while accessing.
     ShardingMigrationCriticalSection _critSec;
 
     // Protects state around the metadata manager below
-    mutable Mutex _metadataManagerLock =
-        MONGO_MAKE_LATCH("CollectionShardingRuntime::_metadataManagerLock");
+    mutable stdx::mutex _metadataManagerLock;
 
-    // Tracks whether the filtering metadata is unknown, unsharded, or sharded
-    enum class MetadataType { kUnknown, kUnsharded, kSharded } _metadataType;
+    // Track status of filtering metadata for a specific collection
+    enum class MetadataType {
+        kUnknown,    // metadata is not known to this node
+        kUntracked,  // no metadata found in the sharding catalog
+        kTracked     // metadata for this collection is registered in the sharding catalog
+    } _metadataType;
 
-    // If the collection is sharded, contains all the metadata associated with this collection.
+    // If the collection state is known and is untracked, this will be nullptr.
     //
-    // If the collection is unsharded, the metadata has not been set yet, or the metadata has been
-    // specifically reset by calling clearFilteringMetadata(), this will be nullptr;
+    // If the collection state is known and is tracked, this will point to the metadata
+    // associated with this collection.
+    //
+    // If the collection state is unknown:
+    // - If the metadata had never been set yet, this will be nullptr.
+    // - If the collection state was known and was sharded, this contains the metadata that
+    // were known for the collection before the last invocation of clearFilteringMetadata().
+    //
+    // The following matrix enumerates the valid (Y) and invalid (X) scenarios.
+    //                          __________________________________
+    //                         | _metadataType (collection state) |
+    //                         |__________________________________|
+    //                         | UNKNOWN | UNTRACKED |  TRACKED   |
+    //  _______________________|_________|___________|____________|
+    // |_metadataManager unset |    Y    |     Y     |     X      |
+    // |_______________________|_________|___________|____________|
+    // |_metadataManager set   |    Y    |     X     |     Y      |
+    // |_______________________|_________|___________|____________|
     std::shared_ptr<MetadataManager> _metadataManager;
 
     // Used for testing to check the number of times a new MetadataManager has been installed.
     std::uint64_t _numMetadataManagerChanges{0};
 
-    // Tracks ongoing shard version recover/refresh. Eventually set to the semifuture to wait on.
-    boost::optional<SharedSemiFuture<void>> _shardVersionInRecoverOrRefresh;
+    // Tracks ongoing placement version recover/refresh. Eventually set to the semifuture to wait on
+    // and a CancellationSource to cancel it
+    boost::optional<PlacementVersionRecoverOrRefresh> _placementVersionInRecoverOrRefresh;
+
+    // Contains the global indexes for the collection. This will be boost::none if no global indexes
+    // have ever been created for the collection.
+    boost::optional<ShardingIndexesCatalogCache> _shardingIndexesCatalogInfo;
 };
 
 /**
  * RAII-style class, which obtains a reference to the critical section for the specified collection.
  *
  *
- * Shard version recovery/refresh procedures always wait for the critical section to be released in
- * order to serialise with concurrent moveChunk/shardCollection commit operations.
+ * Placement version recovery/refresh procedures always wait for the critical section to be released
+ * in order to serialise with concurrent moveChunk/shardCollection commit operations.
  *
  * Entering the critical section doesn't serialise with concurrent recovery/refresh, because
  * causally such refreshes would have happened *before* the critical section was entered.
@@ -270,7 +425,7 @@ class CollectionCriticalSection {
     CollectionCriticalSection& operator=(const CollectionCriticalSection&) = delete;
 
 public:
-    CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss);
+    CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss, BSONObj reason);
     ~CollectionCriticalSection();
 
     /**
@@ -282,6 +437,7 @@ private:
     OperationContext* const _opCtx;
 
     NamespaceString _nss;
+    const BSONObj _reason;
 };
 
 }  // namespace mongo

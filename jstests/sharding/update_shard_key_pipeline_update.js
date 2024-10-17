@@ -1,24 +1,39 @@
-/*
+/**
  * Tests that changing the shard key value of a document using pipeline updates.
- * @tags: [requires_find_command, uses_transactions, uses_multi_shard_transaction]
+ * @tags: [
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {
+    assertCannotUpdate_id,
+    assertCannotUpdate_idDottedPath,
+    assertCannotUpdateWithMultiTrue,
+    assertCanUnsetSKFieldUsingPipeline,
+    assertCanUpdateDottedPath,
+    assertCanUpdatePartialShardKey,
+    assertCanUpdatePrimitiveShardKey,
+} from "jstests/sharding/libs/update_shard_key_helpers.js";
 
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/update_shard_key_helpers.js");
-
-const st = new ShardingTest({mongos: 1, shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
+const st = new ShardingTest({
+    mongos: 1,
+    shards: {rs0: {nodes: 3}, rs1: {nodes: 3}},
+    rsOptions:
+        {setParameter: {maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS}}
+});
 const kDbName = 'db';
 const mongos = st.s0;
 const shard0 = st.shard0.shardName;
-const shard1 = st.shard1.shardName;
 const ns = kDbName + '.foo';
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, shard0);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: shard0}));
 
 // Tuples represent [shouldRunCommandInTxn, runUpdateAsFindAndModifyCmd, isUpsert].
 const changeShardKeyOptions = [
@@ -240,4 +255,3 @@ changeShardKeyOptions.forEach(function(updateConfig) {
 });
 
 st.stop();
-})();

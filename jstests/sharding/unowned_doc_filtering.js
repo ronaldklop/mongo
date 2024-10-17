@@ -13,11 +13,9 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 // Test deliberately inserts orphans.
 TestData.skipCheckOrphans = true;
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/chunk_bounds_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {chunkBoundsUtil} from "jstests/sharding/libs/chunk_bounds_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 /*
  * Asserts that find and count command filter out unowned documents.
@@ -73,8 +71,8 @@ let hashedShardedColl = testDB.hashed;
 let rangeShardedNs = rangeShardedColl.getFullName();
 let hashedShardedNs = hashedShardedColl.getFullName();
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 jsTest.log("Test range sharding...");
 assert.commandWorked(testDB.adminCommand({shardCollection: rangeShardedNs, key: {x: 1}}));
@@ -97,4 +95,3 @@ unownedDocs = [{x: -5}, {x: 10}];
 runTest(st, hashedShardedColl, ownedDocs, unownedDocs, true);
 
 st.stop();
-}());

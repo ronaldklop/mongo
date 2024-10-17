@@ -27,14 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <mutex>
+#include <string>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/throttle_cursor.h"
-
 #include "mongo/db/catalog/validate_gen.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -54,7 +66,7 @@ boost::optional<Record> SeekableRecordThrottleCursor::seekExact(OperationContext
                                                                 const RecordId& id) {
     boost::optional<Record> record = _cursor->seekExact(id);
     if (record) {
-        const int64_t dataSize = record->data.size() + sizeof(record->id);
+        const int64_t dataSize = record->data.size() + record->id.memUsage();
         _dataThrottle->awaitIfNeeded(opCtx, dataSize);
     }
 
@@ -64,22 +76,21 @@ boost::optional<Record> SeekableRecordThrottleCursor::seekExact(OperationContext
 boost::optional<Record> SeekableRecordThrottleCursor::next(OperationContext* opCtx) {
     boost::optional<Record> record = _cursor->next();
     if (record) {
-        const int64_t dataSize = record->data.size() + sizeof(record->id);
+        const int64_t dataSize = record->data.size() + record->id.memUsage();
         _dataThrottle->awaitIfNeeded(opCtx, dataSize);
     }
 
     return record;
 }
 
-SortedDataInterfaceThrottleCursor::SortedDataInterfaceThrottleCursor(OperationContext* opCtx,
-                                                                     const IndexAccessMethod* iam,
-                                                                     DataThrottle* dataThrottle) {
+SortedDataInterfaceThrottleCursor::SortedDataInterfaceThrottleCursor(
+    OperationContext* opCtx, const SortedDataIndexAccessMethod* iam, DataThrottle* dataThrottle) {
     _cursor = iam->newCursor(opCtx, /*forward=*/true);
     _dataThrottle = dataThrottle;
 }
 
-boost::optional<IndexKeyEntry> SortedDataInterfaceThrottleCursor::seek(
-    OperationContext* opCtx, const KeyString::Value& key) {
+boost::optional<IndexKeyEntry> SortedDataInterfaceThrottleCursor::seek(OperationContext* opCtx,
+                                                                       StringData key) {
     boost::optional<IndexKeyEntry> entry = _cursor->seek(key);
     if (entry) {
         const int64_t dataSize = entry->key.objsize() + sizeof(entry->loc);
@@ -90,7 +101,7 @@ boost::optional<IndexKeyEntry> SortedDataInterfaceThrottleCursor::seek(
 }
 
 boost::optional<KeyStringEntry> SortedDataInterfaceThrottleCursor::seekForKeyString(
-    OperationContext* opCtx, const KeyString::Value& key) {
+    OperationContext* opCtx, StringData key) {
     boost::optional<KeyStringEntry> entry = _cursor->seekForKeyString(key);
     if (entry) {
         const int64_t dataSize = entry->keyString.getSize() + sizeof(entry->loc);
@@ -130,6 +141,10 @@ void DataThrottle::awaitIfNeeded(OperationContext* opCtx, const int64_t dataSize
         float elapsedTimeSec = static_cast<float>(currentMillis - _startMillis) / 1000;
         float mbProcessed = static_cast<float>(_bytesProcessed + dataSize) / 1024 / 1024;
 
+        // Serialize concurrent access to CurOp dataThroughputLastSecond and dataThroughputAverage
+        // metrics.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+
         // Update how much data we've seen in the last second for CurOp.
         CurOp::get(opCtx)->debug().dataThroughputLastSecond = mbProcessed / elapsedTimeSec;
 
@@ -155,20 +170,20 @@ void DataThrottle::awaitIfNeeded(OperationContext* opCtx, const int64_t dataSize
         return;
     }
 
-    // No throttling should take place if 'gMaxValidateMBperSec' is zero.
-    uint64_t maxValidateBytesPerSec = gMaxValidateMBperSec.load() * 1024 * 1024;
-    if (maxValidateBytesPerSec == 0) {
+    // No throttling should take place if '_maxMBperSec()' is zero.
+    uint64_t maxBytesPerSec = _maxMBperSec() * 1024 * 1024;
+    if (maxBytesPerSec == 0) {
         return;
     }
 
-    if (_bytesProcessed < maxValidateBytesPerSec) {
+    if (_bytesProcessed < maxBytesPerSec) {
         return;
     }
 
     // Wait a period of time proportional to how much extra data we have read. For example, if we
-    // read one 5 MB document and maxValidateBytesPerSec is 1, we should not be waiting until the
+    // read one 5 MB document and maxBytesPerSec is 1, we should not be waiting until the
     // next 1 second period. We should wait 5 seconds to maintain proper throughput.
-    int64_t maxWaitMs = 1000 * std::max(1.0, double(_bytesProcessed) / maxValidateBytesPerSec);
+    int64_t maxWaitMs = 1000 * std::max(1.0, double(_bytesProcessed) / maxBytesPerSec);
 
     do {
         int64_t millisToSleep = maxWaitMs - (currentMillis - _startMillis);

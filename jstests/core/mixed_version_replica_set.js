@@ -1,14 +1,14 @@
 /**
  * Tests initializing a mixed version replica set through resmoke.
  *
- * @tags: [multiversion_sanity_check]
+ * @tags: [
+ *   # The test runs commands that are not allowed with security token: replSetGetStatus.
+ *   not_allowed_with_signed_security_token,
+ *   multiversion_sanity_check
+ * ]
  */
 
-(function() {
-"use strict";
-
 const latestBinVersion = MongoRunner.getBinVersionFor("latest");
-const lastLTSBinVersion = MongoRunner.getBinVersionFor("last-lts");
 
 if (testingReplication && TestData && TestData.mixedBinVersions) {
     const replSetStatus = db.adminCommand({"replSetGetStatus": 1});
@@ -19,8 +19,13 @@ if (testingReplication && TestData && TestData.mixedBinVersions) {
         const admin = conn.getDB("admin");
         const serverStatus = admin.serverStatus();
         const actualVersion = serverStatus["version"];
-        const expectedVersion =
-            TestData.mixedBinVersions[i] === "new" ? latestBinVersion : lastLTSBinVersion;
+        const expectedVersion = TestData.mixedBinVersions[i] === "new"
+            ? latestBinVersion
+            : MongoRunner.getBinVersionFor(TestData.multiversionBinVersion);
+        print(actualVersion,
+              expectedVersion,
+              MongoRunner.getBinVersionFor(TestData.multiversionBinVersion));
+        print(TestData.multiversionBinVersion);
         assert(MongoRunner.areBinVersionsTheSame(actualVersion, expectedVersion));
     }
 } else {
@@ -28,4 +33,3 @@ if (testingReplication && TestData && TestData.mixedBinVersions) {
         "This tests initializing a mixed version replica set through resmoke. Skipping test run" +
         " because testingReplication and TestData.mixedBinVersion are not set.");
 }
-})();

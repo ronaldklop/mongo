@@ -29,9 +29,15 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/inline_auto_update.h"
 
 /**
  * BSON comparison utility macro. Do not use directly.
@@ -48,6 +54,18 @@
 #define ASSERT_BSONOBJ_GT(a, b) ASSERT_BSON_COMPARISON(BSONObjGT, a, b, #a, #b)
 #define ASSERT_BSONOBJ_GTE(a, b) ASSERT_BSON_COMPARISON(BSONObjGTE, a, b, #a, #b)
 #define ASSERT_BSONOBJ_NE(a, b) ASSERT_BSON_COMPARISON(BSONObjNE, a, b, #a, #b)
+
+/**
+ * Use to compare two instances of type BSONObj with unordered fields in unit tests.
+ */
+#define ASSERT_BSONOBJ_EQ_UNORDERED(a, b) ASSERT_BSON_COMPARISON(BSONObjEQ_UNORDERED, a, b, #a, #b)
+#define ASSERT_BSONOBJ_LT_UNORDERED(a, b) ASSERT_BSON_COMPARISON(BSONObjLT_UNORDERED, a, b, #a, #b)
+#define ASSERT_BSONOBJ_LTE_UNORDERED(a, b) \
+    ASSERT_BSON_COMPARISON(BSONObjLTE_UNORDERED, a, b, #a, #b)
+#define ASSERT_BSONOBJ_GT_UNORDERED(a, b) ASSERT_BSON_COMPARISON(BSONObjGT_UNORDERED, a, b, #a, #b)
+#define ASSERT_BSONOBJ_GTE_UNORDERED(a, b) \
+    ASSERT_BSON_COMPARISON(BSONObjGTE_UNORDERED, a, b, #a, #b)
+#define ASSERT_BSONOBJ_NE_UNORDERED(a, b) ASSERT_BSON_COMPARISON(BSONObjNE_UNORDERED, a, b, #a, #b)
 
 /**
  * Use to compare two instances of type BSONElement under the default comparator in unit tests.
@@ -80,6 +98,13 @@ DECLARE_BSON_CMP_FUNC(BSONObj, GT);
 DECLARE_BSON_CMP_FUNC(BSONObj, GTE);
 DECLARE_BSON_CMP_FUNC(BSONObj, NE);
 
+DECLARE_BSON_CMP_FUNC(BSONObj, EQ_UNORDERED);
+DECLARE_BSON_CMP_FUNC(BSONObj, LT_UNORDERED);
+DECLARE_BSON_CMP_FUNC(BSONObj, LTE_UNORDERED);
+DECLARE_BSON_CMP_FUNC(BSONObj, GT_UNORDERED);
+DECLARE_BSON_CMP_FUNC(BSONObj, GTE_UNORDERED);
+DECLARE_BSON_CMP_FUNC(BSONObj, NE_UNORDERED);
+
 DECLARE_BSON_CMP_FUNC(BSONObj, BINARY_EQ);
 
 DECLARE_BSON_CMP_FUNC(BSONElement, EQ);
@@ -90,5 +115,15 @@ DECLARE_BSON_CMP_FUNC(BSONElement, GTE);
 DECLARE_BSON_CMP_FUNC(BSONElement, NE);
 #undef DECLARE_BSON_CMP_FUNC
 
+/**
+ * Given a BSONObj, return a string that wraps the json form of the BSONObj with
+ * `fromjson(R"(<>)")`.
+ */
+std::string formatJsonStr(const std::string& obj);
+
+#define ASSERT_BSONOBJ_EQ_AUTO(expected, actual)                                     \
+    ASSERT(AUTO_UPDATE_HELPER(::mongo::unittest::formatJsonStr(expected),            \
+                              ::mongo::unittest::formatJsonStr(actual.jsonString()), \
+                              false))
 }  // namespace unittest
 }  // namespace mongo

@@ -5,11 +5,9 @@
  * entries for the migration.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function getNewNs(dbName) {
     if (typeof getNewNs.counter == 'undefined') {
@@ -24,8 +22,8 @@ const dbName = "test";
 
 var st = new ShardingTest({shards: 2});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 function getCollectionUuidAndEpoch(ns) {
     const collectionDoc = st.s.getDB("config").getCollection("collections").findOne({_id: ns});
@@ -43,8 +41,12 @@ function assertHasMigrationCoordinatorDoc({conn, ns, uuid, epoch}) {
         recipientShardId: st.shard1.shardName,
         "range.min._id": MinKey,
         "range.max._id": MaxKey,
-        "preMigrationChunkVersion.0": Timestamp(1, 0),
-        "preMigrationChunkVersion.1": epoch
+        $or: [
+            {"preMigrationChunkVersion.0": Timestamp(1, 0)},
+            {"preMigrationChunkVersion.1": epoch},
+            {"preMigrationChunkVersion.v": Timestamp(1, 0)},
+            {"preMigrationChunkVersion.e": epoch}
+        ]
     };
     assert.neq(
         null,
@@ -209,4 +211,3 @@ function assertEventuallyDoesNotHaveRangeDeletionDoc(conn) {
 })();
 
 st.stop();
-})();

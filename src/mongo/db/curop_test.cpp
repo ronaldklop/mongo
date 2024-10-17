@@ -27,14 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <initializer_list>
+#include <mutex>
 
-#include <boost/optional/optional_io.hpp>
-
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -67,6 +76,10 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
     additiveMetricsToAdd.docsExamined = 2;
     currentAdditiveMetrics.nMatched = 5;
     additiveMetricsToAdd.nMatched = 5;
+    currentAdditiveMetrics.nreturned = 10;
+    additiveMetricsToAdd.nreturned = 5;
+    currentAdditiveMetrics.nBatches = 2;
+    additiveMetricsToAdd.nBatches = 1;
     currentAdditiveMetrics.nModified = 3;
     additiveMetricsToAdd.nModified = 1;
     currentAdditiveMetrics.ninserted = 4;
@@ -79,6 +92,8 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
     additiveMetricsToAdd.keysInserted = 5;
     currentAdditiveMetrics.keysDeleted = 4;
     additiveMetricsToAdd.keysDeleted = 2;
+    currentAdditiveMetrics.executionTime = Microseconds{200};
+    additiveMetricsToAdd.executionTime = Microseconds{80};
     currentAdditiveMetrics.prepareReadConflicts.store(1);
     additiveMetricsToAdd.prepareReadConflicts.store(5);
     currentAdditiveMetrics.writeConflicts.store(7);
@@ -96,6 +111,10 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
               *additiveMetricsBeforeAdd.docsExamined + *additiveMetricsToAdd.docsExamined);
     ASSERT_EQ(*currentAdditiveMetrics.nMatched,
               *additiveMetricsBeforeAdd.nMatched + *additiveMetricsToAdd.nMatched);
+    ASSERT_EQ(*currentAdditiveMetrics.nreturned,
+              *additiveMetricsBeforeAdd.nreturned + *additiveMetricsToAdd.nreturned);
+    ASSERT_EQ(*currentAdditiveMetrics.nBatches,
+              *additiveMetricsBeforeAdd.nBatches + *additiveMetricsToAdd.nBatches);
     ASSERT_EQ(*currentAdditiveMetrics.nModified,
               *additiveMetricsBeforeAdd.nModified + *additiveMetricsToAdd.nModified);
     ASSERT_EQ(*currentAdditiveMetrics.ninserted,
@@ -108,6 +127,8 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
               *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
     ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
               *additiveMetricsBeforeAdd.keysDeleted + *additiveMetricsToAdd.keysDeleted);
+    ASSERT_EQ(*currentAdditiveMetrics.executionTime,
+              *additiveMetricsBeforeAdd.executionTime + *additiveMetricsToAdd.executionTime);
     ASSERT_EQ(currentAdditiveMetrics.prepareReadConflicts.load(),
               additiveMetricsBeforeAdd.prepareReadConflicts.load() +
                   additiveMetricsToAdd.prepareReadConflicts.load());
@@ -123,6 +144,8 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     // Initialize field values for both AdditiveMetrics objects.
     additiveMetricsToAdd.keysExamined = 5;
     currentAdditiveMetrics.docsExamined = 4;
+    currentAdditiveMetrics.nreturned = 2;
+    additiveMetricsToAdd.nBatches = 1;
     currentAdditiveMetrics.nModified = 3;
     additiveMetricsToAdd.ninserted = 0;
     currentAdditiveMetrics.keysInserted = 6;
@@ -147,6 +170,14 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     // should be treated as zero.
     ASSERT_EQ(*currentAdditiveMetrics.docsExamined, *additiveMetricsBeforeAdd.docsExamined);
 
+    // The 'nreturned' field for the AdditiveMetrics object to add was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.nreturned, *additiveMetricsBeforeAdd.nreturned);
+
+    // The 'nBatches' field for the current AdditiveMetrics object was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.nBatches, *additiveMetricsToAdd.nBatches);
+
     // The 'nMatched' field for both the current AdditiveMetrics object and the AdditiveMetrics
     // object to add were not initialized, so nMatched should still be uninitialized after the add.
     ASSERT_EQ(currentAdditiveMetrics.nMatched, boost::none);
@@ -154,6 +185,11 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     // The 'nUpserted' field for both the current AdditiveMetrics object and the AdditiveMetrics
     // object to add were not initialized, so nUpserted should still be uninitialized after the add.
     ASSERT_EQ(currentAdditiveMetrics.nUpserted, boost::none);
+
+    // The 'executionTime' field for both the current AdditiveMetrics object and the AdditiveMetrics
+    // object to add were not initialized, so executionTime should still be uninitialized after the
+    // add.
+    ASSERT_EQ(currentAdditiveMetrics.executionTime, boost::none);
 
     // The following field values should have changed after adding.
     ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
@@ -175,6 +211,8 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     additiveMetrics.writeConflicts.store(1);
     additiveMetrics.keysInserted = 2;
     additiveMetrics.prepareReadConflicts.store(6);
+    additiveMetrics.nreturned = 3;
+    additiveMetrics.executionTime = Microseconds{160};
 
     // Increment the fields.
     additiveMetrics.incrementWriteConflicts(1);
@@ -183,6 +221,9 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     additiveMetrics.incrementNinserted(3);
     additiveMetrics.incrementNUpserted(6);
     additiveMetrics.incrementPrepareReadConflicts(2);
+    additiveMetrics.incrementNreturned(2);
+    additiveMetrics.incrementNBatches();
+    additiveMetrics.incrementExecutionTime(Microseconds{120});
 
     ASSERT_EQ(additiveMetrics.writeConflicts.load(), 2);
     ASSERT_EQ(*additiveMetrics.keysInserted, 7);
@@ -190,6 +231,147 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     ASSERT_EQ(*additiveMetrics.ninserted, 3);
     ASSERT_EQ(*additiveMetrics.nUpserted, 6);
     ASSERT_EQ(additiveMetrics.prepareReadConflicts.load(), 8);
+    ASSERT_EQ(*additiveMetrics.nreturned, 5);
+    ASSERT_EQ(*additiveMetrics.nBatches, 1);
+    ASSERT_EQ(*additiveMetrics.executionTime, Microseconds{280});
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateCursorMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.clusterWorkingTime = Milliseconds(3);
+    additiveMetrics.readingTime = Microseconds(4);
+    additiveMetrics.bytesRead = 5;
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+
+    CursorMetrics cursorMetrics(3 /* keysExamined */,
+                                4 /* docsExamined */,
+                                10 /* bytesRead */,
+                                11 /* readingTimeMicros */,
+                                5 /* workingTimeMillis */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.clusterWorkingTime, Milliseconds(8));
+    ASSERT_EQ(additiveMetrics.readingTime, Microseconds(15));
+    ASSERT_EQ(*additiveMetrics.bytesRead, 15);
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateCursorMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+    additiveMetrics.bytesRead = boost::none;
+
+    CursorMetrics cursorMetrics(1 /* keysExamined */,
+                                2 /* docsExamined */,
+                                3 /* bytesRead */,
+                                10 /* workingTimeMillis */,
+                                11 /* readingTimeMicros */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+    ASSERT_EQ(*additiveMetrics.bytesRead, 3);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateDataBearingNodeMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.clusterWorkingTime = Milliseconds(3);
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 3;
+    remoteMetrics.docsExamined = 4;
+    remoteMetrics.clusterWorkingTime = Milliseconds(5);
+    remoteMetrics.hasSortStage = true;
+    remoteMetrics.usedDisk = false;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.clusterWorkingTime, Milliseconds(8));
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateDataBearingNodeMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 1;
+    remoteMetrics.docsExamined = 2;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateStorageStats) {
+    class StorageStatsForTest final : public StorageStats {
+        uint64_t _bytesRead;
+        Microseconds _readingTime;
+
+    public:
+        StorageStatsForTest(uint64_t bytesRead, Microseconds readingTime)
+            : _bytesRead(bytesRead), _readingTime(readingTime) {}
+        BSONObj toBSON() const final {
+            return {};
+        }
+        uint64_t bytesRead() const final {
+            return _bytesRead;
+        }
+        Microseconds readingTime() const final {
+            return _readingTime;
+        }
+        std::unique_ptr<StorageStats> clone() const final {
+            return nullptr;
+        }
+        StorageStats& operator+=(const StorageStats&) final {
+            return *this;
+        }
+        StorageStats& operator-=(const StorageStats&) final {
+            return *this;
+        }
+    };
+
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.bytesRead = 2;
+    additiveMetrics.readingTime = Microseconds(3);
+
+    StorageStatsForTest storageStats{5 /* bytesRead */, Microseconds(7) /* readingTime */};
+
+    additiveMetrics.aggregateStorageStats(storageStats);
+
+    ASSERT_EQ(*additiveMetrics.bytesRead, 7);
+    ASSERT_EQ(*additiveMetrics.readingTime, Microseconds(10));
 }
 
 TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
@@ -208,11 +390,18 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
     BSONObj command = BSON("a" << 3);
 
     // Set dummy 'ns' and 'command'.
-    curop->setGenericOpRequestDetails(
-        opCtx.get(), NamespaceString("myDb.coll"), nullptr, command, NetworkOp::dbQuery);
+    {
+        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
 
     BSONObjBuilder builder;
-    od.append(opCtx.get(), ls, {}, builder);
+    od.append(opCtx.get(), ls, {}, false /*omitCommand*/, builder);
     auto bs = builder.done();
 
     // Append should always include these basic fields.
@@ -222,12 +411,6 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
 
     // Append should include only the basic fields when just initialized.
     ASSERT_EQ(static_cast<size_t>(bs.nFields()), basicFields.size());
-
-    // 'reportString' should only contain basic fields.
-    std::string reportString = od.report(opCtx.get(), nullptr);
-    std::string expectedReportString = "query myDb.coll command: { a: 3 } numYields:0 0ms";
-
-    ASSERT_EQ(reportString, expectedReportString);
 }
 
 TEST(CurOpTest, ShouldNotReportFailpointMsgIfNotSet) {
@@ -238,11 +421,51 @@ TEST(CurOpTest, ShouldNotReportFailpointMsgIfNotSet) {
 
     // Test the reported state should _not_ contain 'failpointMsg'.
     BSONObjBuilder reportedStateWithoutFailpointMsg;
-    curop->reportState(opCtx.get(), &reportedStateWithoutFailpointMsg);
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportState(&reportedStateWithoutFailpointMsg, SerializationContext());
+    }
     auto bsonObj = reportedStateWithoutFailpointMsg.done();
 
     // bsonObj should _not_ contain 'failpointMsg' if a fail point is not set.
     ASSERT_FALSE(bsonObj.hasField("failpointMsg"));
+}
+
+TEST(CurOpTest, ShouldReportIsFromUserConnection) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto client = serviceContext.getClient();
+
+    // Mock a client with a user connection.
+    transport::TransportLayerMock transportLayer;
+    auto clientUserConn = serviceContext.getServiceContext()->getService()->makeClient(
+        "userconn", transportLayer.createSession());
+
+    auto curop = CurOp::get(*opCtx);
+
+    BSONObjBuilder curOpObj;
+    BSONObjBuilder curOpObjUserConn;
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        auto nss = NamespaceString::createNamespaceString_forTest("db", "coll");
+
+        // Serialization Context on expression context should be non-empty in
+        // reportCurrentOpForClient.
+        auto sc = SerializationContext(SerializationContext::Source::Command,
+                                       SerializationContext::CallerType::Reply,
+                                       SerializationContext::Prefix::ExcludePrefix);
+        auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss, sc);
+
+        curop->reportCurrentOpForClient(expCtx, client, false, &curOpObj);
+        curop->reportCurrentOpForClient(expCtx, clientUserConn.get(), false, &curOpObjUserConn);
+    }
+    auto bsonObj = curOpObj.done();
+    auto bsonObjUserConn = curOpObjUserConn.done();
+
+    ASSERT_TRUE(bsonObj.hasField("isFromUserConnection"));
+    ASSERT_TRUE(bsonObjUserConn.hasField("isFromUserConnection"));
+    ASSERT_FALSE(bsonObj.getField("isFromUserConnection").Bool());
+    ASSERT_TRUE(bsonObjUserConn.getField("isFromUserConnection").Bool());
 }
 
 TEST(CurOpTest, ElapsedTimeReflectsTickSource) {
@@ -270,6 +493,56 @@ TEST(CurOpTest, ElapsedTimeReflectsTickSource) {
     ASSERT_TRUE(curop->isDone());
 
     ASSERT_EQ(Milliseconds{20}, duration_cast<Milliseconds>(curop->elapsedTimeTotal()));
+}
+
+TEST(CurOpTest, CheckNSAgainstSerializationContext) {
+    RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
+    TenantId tid = TenantId(OID::gen());
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+
+    // Create dummy command.
+    BSONObj command = BSON("a" << 3);
+
+    // Set dummy 'ns' and 'command'.
+    {
+        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest(tid, "testDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    // Test expectPrefix field.
+    for (bool expectPrefix : {false, true}) {
+        SerializationContext sc = SerializationContext::stateCommandReply();
+        sc.setPrefixState(expectPrefix);
+
+        BSONObjBuilder builder;
+        {
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            curop->reportState(&builder, sc);
+        }
+        auto bsonObj = builder.done();
+
+        std::string serializedNs = expectPrefix ? tid.toString() + "_testDb.coll" : "testDb.coll";
+        ASSERT_EQ(serializedNs, bsonObj.getField("ns").String());
+    }
+}
+
+TEST(CurOpTest, GetCursorMetricsProducesValidObject) {
+    // This test just checks that the cursor metrics object produced by getCursorMetrics
+    // is a valid, serializable object. In particular, it must have all required fields.
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    auto metrics = curop->debug().getCursorMetrics();
+    ASSERT_DOES_NOT_THROW(metrics.toBSON());
 }
 
 }  // namespace

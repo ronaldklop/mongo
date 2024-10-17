@@ -30,6 +30,10 @@ global:
   cpp_namespace: "mongo::test"
   cpp_includes:
   - "mongo/idl/server_parameter_with_storage_test.h"
+  
+imports:
+  - "mongo/db/basic_types.idl"
+  - "mongo/idl/server_parameter_with_storage_test_structs.idl"
 
 server_parameters:
   stdIntPreallocated:
@@ -38,9 +42,10 @@ server_parameters:
     cpp_varname: gStdIntPreallocated
     default: 11
     validator:
-      callback: "validateOdd"
+      callback: "validateOddSP"
       gt: 0
     on_update: "onUpdateStdIntPreallocated"
+    redact: false
 
   stdIntDeclared:
     set_at: [ startup, runtime ]
@@ -51,18 +56,21 @@ server_parameters:
     validator:
       gte: 0
       lt: 1000
+    redact: false
 
   startupString:
     set_at: startup
     description: "Create a startup-only string, and declare storage"
     cpp_vartype: "std::string"
     cpp_varname: gStartupString
+    redact: false
 
   runtimeBoostDouble:
     set_at: runtime
     description: "Create a runtime-only string, using boost::synchronized_value"
     cpp_vartype: "synchronized_value<double>"
     cpp_varname: gRuntimeBoostDouble
+    redact: false
 
   startupStringRedacted:
     set_at: startup
@@ -80,6 +88,7 @@ server_parameters:
     validator:
         gte: { expr: kStartupIntWithExpressionsMinimum, is_constexpr: false }
         lte: { expr: kStartupIntWithExpressionsMaximum, is_constexpr: true }
+    redact: false
 
   'ugly complicated-name.sp':
     set_at: startup
@@ -87,4 +96,15 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: gUglyComplicatedNameSp
     default: true
+    redact: false
 
+  changeStreamOptions:
+    set_at: cluster
+    description: "IDL-generated cluster server parameter"
+    cpp_vartype: ChangeStreamOptionsClusterParam
+    cpp_varname: clusterParamStorage
+    validator:
+      callback: "validateNonNegativeExpireAfterSeconds"
+    on_update: "onUpdateChangeStreamOptions"
+    redact: false
+    omit_in_ftdc: false

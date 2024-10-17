@@ -27,28 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <mutex>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/internal_auth.h"
-
-#include "mongo/bson/json.h"
-#include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_command_constants.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/password_digest.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace auth {
 
-static auto internalAuthKeysMutex = MONGO_MAKE_LATCH();
+static stdx::mutex internalAuthKeysMutex;
 static bool internalAuthSet = false;
 static std::vector<std::string> internalAuthKeys;
 static BSONObj internalAuthParams;
 
 void setInternalAuthKeys(const std::vector<std::string>& keys) {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
 
     internalAuthKeys = keys;
     fassert(50996, internalAuthKeys.size() > 0);
@@ -56,19 +68,19 @@ void setInternalAuthKeys(const std::vector<std::string>& keys) {
 }
 
 void setInternalUserAuthParams(BSONObj obj) {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
     internalAuthParams = obj.getOwned();
     internalAuthKeys.clear();
     internalAuthSet = true;
 }
 
 bool hasMultipleInternalAuthKeys() {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
     return internalAuthSet && internalAuthKeys.size() > 1;
 }
 
 bool isInternalAuthSet() {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
     return internalAuthSet;
 }
 
@@ -78,14 +90,14 @@ BSONObj createInternalX509AuthDocument(boost::optional<StringData> userName) {
     builder.append(saslCommandUserDBFieldName, "$external");
 
     if (userName) {
-        builder.append(saslCommandUserFieldName, userName.get());
+        builder.append(saslCommandUserFieldName, userName.value());
     }
 
     return builder.obj();
 }
 
 BSONObj getInternalAuthParams(size_t idx, StringData mechanism) {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
     if (!internalAuthSet) {
         return BSONObj();
     }
@@ -103,19 +115,19 @@ BSONObj getInternalAuthParams(size_t idx, StringData mechanism) {
     }
 
     auto password = internalAuthKeys.at(idx);
+    auto systemUser = internalSecurity.getUser();
     if (mechanism == kMechanismScramSha1) {
-        password = mongo::createPasswordDigest(
-            internalSecurity.user->getName().getUser().toString(), password);
+        password = mongo::createPasswordDigest((*systemUser)->getName().getUser(), password);
     }
 
     return BSON(saslCommandMechanismFieldName
-                << mechanism << saslCommandUserDBFieldName
-                << internalSecurity.user->getName().getDB() << saslCommandUserFieldName
-                << internalSecurity.user->getName().getUser() << saslCommandPasswordFieldName
-                << password << saslCommandDigestPasswordFieldName << false);
+                << mechanism << saslCommandUserDBFieldName << (*systemUser)->getName().getDB()
+                << saslCommandUserFieldName << (*systemUser)->getName().getUser()
+                << saslCommandPasswordFieldName << password << saslCommandDigestPasswordFieldName
+                << false);
 }
 
-std::string getBSONString(BSONObj container, StringData field) {
+std::string getBSONString(const BSONObj& container, StringData field) {
     auto elem = container[field];
     uassert(ErrorCodes::BadValue,
             str::stream() << "Field '" << field << "' must be of type string",
@@ -125,14 +137,18 @@ std::string getBSONString(BSONObj container, StringData field) {
 
 
 std::string getInternalAuthDB() {
-    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
+    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
 
     if (!internalAuthParams.isEmpty()) {
         return getBSONString(internalAuthParams, saslCommandUserDBFieldName);
     }
 
-    auto isu = internalSecurity.user;
-    return isu ? isu->getName().getDB().toString() : "admin";
+    auto systemUser = internalSecurity.getUser();
+    if (systemUser && *systemUser) {
+        return (*systemUser)->getName().getDB().toString();
+    }
+
+    return "admin";
 }
 
 }  // namespace auth

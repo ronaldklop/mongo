@@ -1,11 +1,14 @@
 /**
  * Test error cases when calling prepare on a non-existent transaction.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   # The test runs commands that are not allowed with security token: endSession,
+ *   # prepareTransaction.
+ *   not_allowed_with_signed_security_token,
+ *   uses_transactions,
+ *   uses_prepare_transaction
+ * ]
  */
-(function() {
-"use strict";
-
 const dbName = "test";
 const collName = "prepare_nonexistent_transaction";
 const testDB = db.getSiblingDB(dbName);
@@ -97,4 +100,3 @@ assert.commandFailedWithCode(sessionDB.adminCommand({
                              ErrorCodes.OperationNotSupportedInTransaction);
 
 session.endSession();
-}());

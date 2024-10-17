@@ -29,39 +29,54 @@
 
 #pragma once
 
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/tailable_mode.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/serialization_context.h"
 
 namespace mongo {
 
-class QueryMessage;
 class Status;
 template <typename T>
 class StatusWith;
 
 /**
- * Parses the QueryMessage or find command received from the user and makes the various fields
- * more easily accessible.
+ * Parses the find command received from the user and makes the various fields more easily
+ * accessible.
  */
 namespace query_request_helper {
 
-static constexpr auto kMaxTimeMSOpOnlyField = "maxTimeMSOpOnly";
-
 // Field names for sorting options.
 static constexpr auto kNaturalSortField = "$natural";
-
-static constexpr auto kShardVersionField = "shardVersion";
 
 /**
  * Assert that collectionName is valid.
  */
 Status validateGetMoreCollectionName(StringData collectionName);
+
+/**
+ * Returns a non-OK status if '$_resumeAfter' is set to an unexpected value, or the wrong type
+ * determined by the collection type.
+ */
+Status validateResumeAfter(OperationContext* opCtx,
+                           const mongo::BSONObj& resumeAfter,
+                           bool isClusteredCollection);
 
 /**
  * Returns a non-OK status if any property of the QR has a bad value (e.g. a negative skip
@@ -78,26 +93,14 @@ Status validateFindCommandRequest(const FindCommandRequest& findCommand);
  * Returns a heap allocated FindCommandRequest on success or an error if 'cmdObj' is not well
  * formed.
  */
-std::unique_ptr<FindCommandRequest> makeFromFindCommand(const BSONObj& cmdObj,
-                                                        boost::optional<NamespaceString> nss,
-                                                        bool apiStrict);
+std::unique_ptr<FindCommandRequest> makeFromFindCommand(
+    const BSONObj& cmdObj,
+    const boost::optional<auth::ValidatedTenancyScope>& vts,
+    const boost::optional<TenantId>& tenantId,
+    const SerializationContext& sc);
 
 std::unique_ptr<FindCommandRequest> makeFromFindCommandForTests(
-    const BSONObj& cmdObj,
-    boost::optional<NamespaceString> nss = boost::none,
-    bool apiStrict = false);
-
-/**
- * If _uuid exists for this FindCommandRequest, update the value of _nss.
- */
-void refreshNSS(const NamespaceString& nss, FindCommandRequest* findCommand);
-
-/**
- * Converts this FindCommandRequest into an aggregation using $match. If this FindCommandRequest has
- * options that cannot be satisfied by aggregation, a non-OK status is returned and 'cmdBuilder' is
- * not modified.
- */
-StatusWith<BSONObj> asAggregationCommand(const FindCommandRequest& findCommand);
+    const BSONObj& cmdObj, boost::optional<NamespaceString> nss = boost::none);
 
 /**
  * Helper function to identify text search sort key
@@ -105,18 +108,19 @@ StatusWith<BSONObj> asAggregationCommand(const FindCommandRequest& findCommand);
  */
 bool isTextScoreMeta(BSONElement elt);
 
-// Read preference is attached to commands in "wrapped" form, e.g.
-//   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
+// Historically for the OP_QUERY wire protocol message, read preference was sent to the server in a
+// "wrapped" form: {$query: <cmd payload>, $readPreference: ...}. Internally, this was converted to
+// the so-called "unwrapped" format for convenience:
 //
-// However, mongos internally "unwraps" the read preference and adds it as a parameter to the
-// command, e.g.
-//  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
-static constexpr auto kWrappedReadPrefField = "$readPreference";
+//   {<cmd payload>, $queryOptions: {$readPreference: ...}}
+//
+// TODO SERVER-29091: This is a holdover from when OP_QUERY was supported by the server and should
+// be deleted.
 static constexpr auto kUnwrappedReadPrefField = "$queryOptions";
 
 // Names of the maxTimeMS command and query option.
 // Char arrays because they are used in static initialization.
-static constexpr auto cmdOptionMaxTimeMS = "maxTimeMS";
+static constexpr auto cmdOptionMaxTimeMS = GenericArguments::kMaxTimeMSFieldName;
 static constexpr auto queryOptionMaxTimeMS = "$maxTimeMS";
 
 // Names of the $meta projection values.
@@ -126,13 +130,8 @@ static constexpr auto metaRecordId = "recordId";
 static constexpr auto metaSortKey = "sortKey";
 static constexpr auto metaTextScore = "textScore";
 
-// A constant by which 'maxTimeMSOpOnly' values are allowed to exceed the max allowed value for
-// 'maxTimeMS'.  This is because mongod and mongos server processes add a small amount to the
-// 'maxTimeMS' value they are given before passing it on as 'maxTimeMSOpOnly', to allow for
-// clock precision.
-static constexpr auto kMaxTimeMSOpOnlyMaxPadding = 100LL;
 
-static constexpr auto kDefaultBatchSize = 101ll;
+static constexpr auto kMaxTimeMSOpOnlyField = "maxTimeMSOpOnly";
 
 void setTailableMode(TailableModeEnum tailableMode, FindCommandRequest* findCommand);
 
@@ -141,29 +140,23 @@ TailableModeEnum getTailableMode(const FindCommandRequest& findCommand);
 /**
  * Asserts whether the cursor response adhere to the format defined in IDL.
  */
-void validateCursorResponse(const BSONObj& outputAsBson);
-
-//
-// Old parsing code: SOON TO BE DEPRECATED.
-//
-
-/**
- * Parse the provided QueryMessage and return a heap constructed FindCommandRequest, which
- * represents it or an error.
- */
-StatusWith<std::unique_ptr<FindCommandRequest>> fromLegacyQueryMessage(const QueryMessage& qm,
-                                                                       bool* explain);
+void validateCursorResponse(const BSONObj& outputAsBson,
+                            const boost::optional<auth::ValidatedTenancyScope>& vts,
+                            boost::optional<TenantId> tenantId,
+                            const SerializationContext& serializationContext);
 
 /**
- * Parse the provided legacy query object and parameters to construct a FindCommandRequest.
+ * Updates the projection object with a $meta projection for the showRecordId option.
  */
-StatusWith<std::unique_ptr<FindCommandRequest>> fromLegacyQuery(NamespaceStringOrUUID nsOrUuid,
-                                                                const BSONObj& queryObj,
-                                                                const BSONObj& proj,
-                                                                int ntoskip,
-                                                                int ntoreturn,
-                                                                int queryOptions,
-                                                                bool* explain);
+void addShowRecordIdMetaProj(FindCommandRequest* findCommand);
+
+/**
+ * Helper that returns true if $natural exists as a key in the passed-in BSONObj, and the value does
+ * not equal -1 or 1.
+ */
+bool hasInvalidNaturalParam(const BSONObj& obj);
+
+long long getDefaultBatchSize();
 
 }  // namespace query_request_helper
 }  // namespace mongo

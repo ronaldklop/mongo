@@ -30,7 +30,7 @@ global:
   cpp_namespace: "mongo"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
   - "mongo/s/sharding_types.idl"
 
 commands:
@@ -57,3 +57,14 @@ commands:
       uuid:
         description: "The source collection's UUID."
         type: uuid
+      reshardingUUID:
+        description: "The unique identifier for the resharding run."
+        optional: true
+        type: uuid
+      relaxed:
+        description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    uuid to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
+        type: bool
+        default: false

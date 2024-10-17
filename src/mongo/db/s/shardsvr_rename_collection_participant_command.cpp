@@ -27,67 +27,44 @@
  *    it in the license file.
  */
 
+
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/rename_collection_participant_service.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/rename_collection.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/range_deletion_util.h"
-#include "mongo/db/s/shard_metadata_util.h"
-#include "mongo/db/s/sharding_ddl_util.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/write_concern.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 namespace mongo {
 namespace {
-
-void dropCollectionLocally(OperationContext* opCtx, const NamespaceString& nss) {
-    bool knownNss = [&]() {
-        try {
-            sharding_ddl_util::dropCollectionLocally(opCtx, nss);
-            return true;
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-            return false;
-        }
-    }();
-
-    if (knownNss) {
-        uassertStatusOK(shardmetadatautil::dropChunksAndDeleteCollectionsEntry(opCtx, nss));
-    }
-
-    LOGV2_DEBUG(5448800,
-                1,
-                "Dropped target collection locally on renameCollection participant",
-                "namespace"_attr = nss,
-                "collectionExisted"_attr = knownNss);
-}
-
-/*
- * Rename the collection if exists locally, otherwise simply drop the source collection.
- * Returns true if the source collection is known, false otherwise.
- */
-void renameOrDropTarget(OperationContext* opCtx,
-                        const NamespaceString& fromNss,
-                        const NamespaceString& toNss,
-                        const RenameCollectionOptions& options) {
-    try {
-        validateAndRunRenameCollection(opCtx, fromNss, toNss, options);
-    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-        // It's ok for a participant shard to have no knowledge about a collection
-        LOGV2_DEBUG(5448801,
-                    1,
-                    "Source namespace not found while trying to rename collection on participant",
-                    "namespace"_attr = fromNss);
-        dropCollectionLocally(opCtx, toNss);
-        deleteRangeDeletionTasksForRename(opCtx, fromNss, toNss);
-    }
-}
 
 class ShardsvrRenameCollectionParticipantCommand final
     : public TypedCommand<ShardsvrRenameCollectionParticipantCommand> {
@@ -98,6 +75,11 @@ public:
         return false;
     }
 
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
     std::string help() const override {
         return "Internal command. Do not call directly. Locally renames a collection.";
     }
@@ -106,47 +88,58 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << Request::kCommandName
-                                  << " must be called with majority writeConcern, got "
-                                  << opCtx->getWriteConcern().wMode,
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+
+            const auto txnParticipant = TransactionParticipant::get(opCtx);
+            uassert(6077302,
+                    str::stream() << Request::kCommandName << " must be run as a retryable write",
+                    txnParticipant);
 
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
+            auto const& req = request();
 
-            const auto& req = request();
-            const auto& fromNss = ns();
-            const auto& toNss = req.getTo();
-            const RenameCollectionOptions options{req.getDropTarget(), req.getStayTemp()};
+            const NamespaceString& fromNss = ns();
+            RenameCollectionParticipantDocument participantDoc(
+                fromNss, ForwardableOperationMetadata(opCtx), req.getSourceUUID());
+            participantDoc.setTargetUUID(req.getTargetUUID());
+            participantDoc.setNewTargetCollectionUuid(req.getNewTargetCollectionUuid());
+            participantDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
 
-            // Acquire source/target critical sections
-            const auto reason = BSON("command"
-                                     << "rename"
-                                     << "from" << fromNss.toString() << "to" << toNss.toString());
-            sharding_ddl_util::acquireRecoverableCriticalSectionBlockWrites(opCtx, fromNss, reason);
-            sharding_ddl_util::acquireRecoverableCriticalSectionBlockReads(opCtx, fromNss, reason);
-            sharding_ddl_util::acquireRecoverableCriticalSectionBlockWrites(opCtx, toNss, reason);
-            sharding_ddl_util::acquireRecoverableCriticalSectionBlockReads(opCtx, toNss, reason);
+            const auto service = RenameCollectionParticipantService::getService(opCtx);
+            const auto participantDocBSON = participantDoc.toBSON();
+            const auto renameCollectionParticipant =
+                RenameParticipantInstance::getOrCreate(opCtx, service, participantDocBSON);
+            bool hasSameOptions = renameCollectionParticipant->hasSameOptions(participantDocBSON);
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Another rename participant for namespace "
+                                  << fromNss.toStringForErrorMsg()
+                                  << "is instantiated with different parameters: `"
+                                  << renameCollectionParticipant->doc() << "` vs `"
+                                  << participantDocBSON << "`",
+                    hasSameOptions);
 
-            // Wait until both persisted critical sections are majority committed
-            WriteConcernResult ignoreResult;
-            const auto latestOpTime =
-                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-            uassertStatusOK(waitForWriteConcern(
-                opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+            renameCollectionParticipant->getBlockCRUDAndRenameCompletionFuture().get(opCtx);
 
-            snapshotRangeDeletionsForRename(opCtx, fromNss, toNss);
-
-            renameOrDropTarget(opCtx, fromNss, toNss, options);
-
-            restoreRangeDeletionTasksForRename(opCtx, toNss);
-            deleteRangeDeletionTasksForRename(opCtx, fromNss, toNss);
+            // Since no write that generated a retryable write oplog entry with this sessionId and
+            // txnNumber happened, we need to make a dummy write so that the session gets durably
+            // persisted on the oplog. This must be the last operation done on this command.
+            DBDirectClient client(opCtx);
+            client.update(NamespaceString::kServerConfigurationNamespace,
+                          BSON("_id" << Request::kCommandName),
+                          BSON("$inc" << BSON("count" << 1)),
+                          true /* upsert */,
+                          false /* multi */);
         }
 
     private:
@@ -162,12 +155,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrRenameCollectionParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrRenameCollectionParticipantCommand).forShard();
 
 class ShardsvrRenameCollectionUnblockParticipantCommand final
     : public TypedCommand<ShardsvrRenameCollectionUnblockParticipantCommand> {
@@ -176,6 +170,11 @@ public:
 
     bool adminOnly() const override {
         return false;
+    }
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
     }
 
     std::string help() const override {
@@ -187,39 +186,55 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << Request::kCommandName
-                                  << " must be called with majority writeConcern, got "
-                                  << opCtx->getWriteConcern().wMode,
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+
+            const auto txnParticipant = TransactionParticipant::get(opCtx);
+            uassert(6077303,
+                    str::stream() << Request::kCommandName << " must be run as a retryable write",
+                    txnParticipant);
 
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
-            const auto& fromNss = ns();
-            const auto& toNss = request().getTo();
+            const NamespaceString& fromNss = ns();
+            const auto& req = request();
 
-            // Release source/target critical sections
-            const auto reason = BSON("command"
-                                     << "rename"
-                                     << "from" << fromNss.toString() << "to" << toNss.toString());
-            sharding_ddl_util::releaseRecoverableCriticalSection(opCtx, fromNss, reason);
-            sharding_ddl_util::releaseRecoverableCriticalSection(opCtx, toNss, reason);
+            const auto service = RenameCollectionParticipantService::getService(opCtx);
+            const auto id = BSON("_id" << NamespaceStringUtil::serialize(
+                                     fromNss, SerializationContext::stateDefault()));
+            const auto [optRenameCollectionParticipant, _] =
+                RenameParticipantInstance::lookup(opCtx, service, id);
+            if (optRenameCollectionParticipant) {
 
-            // Wait until both persisted critical sections are majority committed
-            WriteConcernResult ignoreResult;
-            const auto latestOpTime =
-                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-            uassertStatusOK(waitForWriteConcern(
-                opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+                auto optUnblockCrudFuture =
+                    optRenameCollectionParticipant.value()->getUnblockCrudFutureFor(
+                        req.getSourceUUID());
+                uassert(ErrorCodes::CommandFailed,
+                        "Provided UUID does not match",
+                        optUnblockCrudFuture.has_value());
+                optUnblockCrudFuture->get(opCtx);
+            }
 
-            auto catalog = Grid::get(opCtx)->catalogCache();
-            uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(opCtx, toNss));
+            // Since no write that generated a retryable write oplog entry with this sessionId
+            // and txnNumber happened, we need to make a dummy write so that the session gets
+            // durably persisted on the oplog. This must be the last operation done on this
+            // command.
+            DBDirectClient client(opCtx);
+            client.update(NamespaceString::kServerConfigurationNamespace,
+                          BSON("_id" << Request::kCommandName),
+                          BSON("$inc" << BSON("count" << 1)),
+                          true /* upsert */,
+                          false /* multi */);
         }
 
     private:
@@ -235,12 +250,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrRenameCollectionUnblockParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrRenameCollectionUnblockParticipantCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

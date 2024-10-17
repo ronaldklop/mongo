@@ -1,13 +1,10 @@
 // Make sure MongoD starts with TLS 1.0 disabled (except w/ old OpenSSL).
 
-(function() {
-'use strict';
-
-load("jstests/ssl/libs/ssl_helpers.js");
+import {detectDefaultTLSProtocol} from "jstests/ssl/libs/ssl_helpers.js";
 
 // There will be cases where a connect is impossible,
 // let the test runner clean those up.
-TestData.failIfUnterminatedProcesses = false;
+TestData.ignoreUnterminatedProcesses = true;
 
 const supportsTLS1_1 = (function() {
     const openssl = getBuildInfo().openssl || {};
@@ -38,33 +35,36 @@ const supportsTLS1_3 = detectDefaultTLSProtocol() !== "TLS1_2";
 function test(serverDP, clientDP, shouldSucceed) {
     const expectLogMessage = !defaultEnableTLS1_0 && (serverDP === null);
     let serverOpts = {
-        sslMode: 'allowSSL',
-        sslPEMKeyFile: 'jstests/libs/server.pem',
-        sslCAFile: 'jstests/libs/ca.pem',
+        tlsMode: 'allowTLS',
+        tlsCertificateKeyFile: 'jstests/libs/server.pem',
+        tlsCAFile: 'jstests/libs/ca.pem',
         waitForConnect: true
     };
     if (serverDP !== null) {
-        serverOpts.sslDisabledProtocols = serverDP;
+        serverOpts.tlsDisabledProtocols = serverDP;
     }
     clearRawMongoProgramOutput();
-    const mongod = MongoRunner.runMongod(serverOpts);
-    if (!mongod) {
+    let mongod;
+    try {
+        mongod = MongoRunner.runMongod(serverOpts);
+    } catch (e) {
         assert(!shouldSucceed);
         return;
     }
+    assert(mongod);
 
     let clientOpts = [];
     if (clientDP !== null) {
-        clientOpts = ['--sslDisabledProtocols', clientDP];
+        clientOpts = ['--tlsDisabledProtocols', clientDP];
     }
     const didSucceed = (0 ==
                         runMongoProgram('mongo',
                                         '--ssl',
                                         '--port',
                                         mongod.port,
-                                        '--sslPEMKeyFile',
+                                        '--tlsCertificateKeyFile',
                                         'jstests/libs/client.pem',
-                                        '--sslCAFile',
+                                        '--tlsCAFile',
                                         'jstests/libs/ca.pem',
                                         ...clientOpts,
                                         '--eval',
@@ -105,4 +105,3 @@ test('TLS1_0', 'TLS1_0', supportsTLS1_1);
 test('TLS1_1,TLS1_2', 'TLS1_0', supportsTLS1_3);
 test('TLS1_1,TLS1_2,TLS1_3', 'TLS1_0', false);
 test('TLS1_0,TLS1_1', 'TLS1_0', supportsTLS1_1);
-})();

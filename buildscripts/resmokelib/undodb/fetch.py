@@ -1,15 +1,15 @@
 """Subcommand for fetching UndoDB recordings from Evergreen."""
+
 import os
-from typing import List, Optional
-import subprocess
-import tempfile
-from urllib.request import urlopen
-from shutil import copyfileobj
 import tarfile
+import tempfile
+from shutil import copyfileobj
+from typing import List, Optional
+from urllib.request import urlopen
 
 import evergreen
-from evergreen import RetryingEvergreenApi
 from buildscripts.resmokelib.plugin import Subcommand
+from evergreen import RetryingEvergreenApi
 
 
 def _is_jira_ticket(asset: str) -> bool:
@@ -36,9 +36,7 @@ class Fetch(Subcommand):
         :return: None
         """
         if self._ticket:
-            # TODO: SERVER-50693
-            print("JIRA tickets not yet implemented")
-            return
+            raise NotImplementedError("Fetching recordings from JIRA tickets not yet implemented")
 
         assert self._task_id
 

@@ -1,19 +1,22 @@
-/*
+/**
  * Tests that nodes in the same region as the primary eventually do not sync across data centers. We
  * do this with a three-node replica set (P, S1, and S2). P and S1 are in the same data center,
  * while S2 is in its own data center. Initially, S1 syncs from S2, and S2 syncs from P. We verify
  * that eventually S1 will decide to sync from P, because it is in the same datacenter as P and thus
  * has a lower ping time.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/sync_source.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    DataCenter,
+    delayMessagesBetweenDataCenters,
+    forceSyncSource
+} from "jstests/replsets/libs/sync_source.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -24,6 +27,7 @@ const rst = new ReplSetTest({
             // Set 'maxNumSyncSourceChangesPerHour' to a high value to remove the limit on how many
             // times nodes change sync sources in an hour.
             maxNumSyncSourceChangesPerHour: 99,
+            writePeriodicNoops: true,
         }
     },
     settings: {
@@ -36,11 +40,15 @@ const rst = new ReplSetTest({
 
 rst.startSet();
 rst.initiateWithHighElectionTimeout();
-rst.awaitReplication();
 
 const primary = rst.getPrimary();
 const testNode = rst.getSecondaries()[0];
 const secondary = rst.getSecondaries()[1];
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 
 const primaryDB = primary.getDB(name);
 const primaryColl = primaryDB["testColl"];
@@ -93,14 +101,14 @@ assert.soon(() => {
     const primaryTimestamp = replSetGetStatus.members[0].optime.ts;
     const receivedPrimaryHb = (bsonWoCompare(primaryTimestamp, advancedTimestamp) >= 0);
 
-    // Wait for enough heartbeats from the test node's current sync source so that our understanding
-    // of the ping time is over 10 ms. This makes it likely to re-evaluate the sync source, since
-    // the latency is most likely greater than 'changeSyncSourceThresholdMillis' over the primary's
-    // ping time.
+    // Wait for enough heartbeats from the test node's current sync source so that the difference
+    // between the sync source's and the primary's ping time is greater than
+    // 'changeSyncSourceThresholdMillis'.
     const syncSourcePingTime = replSetGetStatus.members[2].pingMs;
-    const receivedSyncSourceHb = (syncSourcePingTime > 10);
+    const primaryPingTime = replSetGetStatus.members[0].pingMs;
+    const exceedsChangeSyncSourceThreshold = (syncSourcePingTime - primaryPingTime > 5);
 
-    return (receivedPrimaryHb && receivedSyncSourceHb);
+    return (receivedPrimaryHb && exceedsChangeSyncSourceThreshold);
 });
 
 const replSetGetStatus = assert.commandWorked(testNode.adminCommand({replSetGetStatus: 1}));
@@ -117,4 +125,3 @@ assert.eq(numSyncSourceChanges + 1,
           serverStatus.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode);
 
 rst.stopSet();
-})();

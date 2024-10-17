@@ -1,25 +1,11 @@
 /**
- * Verifies that the _id index cannot be created on a time-series collection.
+ * Verifies that the _id index can be created on a timeseries collection.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
- *     requires_wiredtiger,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/timeseries/libs/timeseries.js");
-
-if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series collection feature flag is disabled");
-    return;
-}
-
 const coll = db.timeseries_id_index;
 coll.drop();
 
@@ -28,7 +14,9 @@ assert.commandWorked(db.createCollection(coll.getName(), {timeseries: {timeField
 
 const bucketsColl = db.getCollection("system.buckets." + coll.getName());
 
-const res = bucketsColl.createIndex({"_id": 1});
-assert.commandFailedWithCode(res, ErrorCodes.CannotCreateIndex);
-assert(res.errmsg.includes("cannot create an _id index on a collection already clustered by _id"));
-})();
+assert.commandWorked(bucketsColl.createIndex({"_id": 1}));
+assert.commandWorked(bucketsColl.createIndex({"_id": 1}, {clustered: true, unique: true}));
+
+// Passing 'clustered' without unique, regardless of the type of clustered collection, is illegal.
+assert.commandFailedWithCode(bucketsColl.createIndex({"_id": 1}, {clustered: true}),
+                             ErrorCodes.CannotCreateIndex);

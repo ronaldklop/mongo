@@ -27,26 +27,66 @@
  *    it in the license file.
  */
 
-#include "mongo/db/concurrency/lock_state.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/shim.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_queue.h"
 #include "mongo/db/pipeline/process_interface/shardsvr_process_interface.h"
-#include "mongo/s/query/sharded_agg_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/s/query/exec/sharded_agg_test_fixture.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-// Use this new name to register these tests under their own unit test suite.
-using ShardedProcessInterfaceTest = ShardedAggTestFixture;
+std::shared_ptr<MongoProcessInterface> MongoProcessInterfaceCreateImpl(OperationContext* opCtx) {
+    return std::make_shared<ShardServerProcessInterface>(
+        Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor());
+}
 
-TEST_F(ShardedProcessInterfaceTest, TestInsert) {
+auto mongoProcessInterfaceCreateRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    MongoProcessInterface::create, MongoProcessInterfaceCreateImpl);
+
+class ShardsvrProcessInterfaceTest : public ShardedAggTestFixture {
+public:
+    void setUp() override {
+        ShardedAggTestFixture::setUp();
+        auto service = expCtx()->opCtx->getServiceContext();
+        repl::ReplSettings settings;
+
+        settings.setReplSetString("lookupTestSet/node1:12345");
+
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceMock>());
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service, settings);
+
+        // Ensure that we are primary.
+        ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        repl::ReplicationCoordinator::set(service, std::move(replCoord));
+    }
+};
+
+TEST_F(ShardsvrProcessInterfaceTest, TestInsert) {
     setupNShards(2);
 
-    // Need a real locker for storage operations.
-    getClient()->swapLockState(std::make_unique<LockerImpl>());
-
-    const NamespaceString kOutNss = NamespaceString{"unittests-out", "sharded_agg_test"};
+    const NamespaceString kOutNss =
+        NamespaceString::createNamespaceString_forTest("unittests-out", "sharded_agg_test");
     auto outStage = DocumentSourceOut::create(kOutNss, expCtx());
 
     // Attach a write concern, and make sure it is forwarded below.
@@ -72,46 +112,92 @@ TEST_F(ShardedProcessInterfaceTest, TestInsert) {
 
     // Mock the response to $out's "listCollections" request.
     onCommand([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("listCollections", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(kOutNss.dbName(), request.dbname);
+        ASSERT_EQ(kOutNss.coll(), request.cmdObj["filter"]["name"].valueStringData());
         return CursorResponse(kTestAggregateNss, CursorId{0}, {listCollectionsResponse})
+            .toBSON(CursorResponse::ResponseType::InitialResponse);
+    });
+
+    // Mock the response to $out's "aggregate" request to config server, that is a part of
+    // getIndexSpecs.
+    onCommand([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("aggregate", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ("collections", request.cmdObj.firstElement().valueStringDataSafe());
+        // Response is empty for the unsharded untracked collection.
+        return CursorResponse(kTestAggregateNss, CursorId{0}, {})
             .toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
     // Mock the response to $out's "listIndexes" request.
     const BSONObj indexBSON = BSON("_id" << 1);
-    const BSONObj listIndexesResponse = BSON("v" << 1 << "key" << indexBSON << "name"
-                                                 << "_id_"
-                                                 << "ns" << kOutNss.toString());
+    const BSONObj listIndexesResponse =
+        BSON("v" << 1 << "key" << indexBSON << "name" << IndexConstants::kIdIndexName << "ns"
+                 << kOutNss.toString_forTest());
     onCommand([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("listIndexes", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(kOutNss.dbName(), request.dbname);
+        ASSERT_EQ(kOutNss.coll(), request.cmdObj.firstElement().valueStringDataSafe());
         return CursorResponse(kTestAggregateNss, CursorId{0}, {listIndexesResponse})
             .toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    // Mock the response to $out's "createCollection" request.
+    // Mock the response to $out's "_shardsvrCreateCollection" request.
+    NamespaceString tempNss;
     onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("_shardsvrCreateCollection", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(kOutNss.dbName(), request.dbname);
         ASSERT(request.cmdObj.hasField("writeConcern")) << request.cmdObj;
         ASSERT_EQ("moderate", request.cmdObj["validationLevel"].str());
+        ASSERT_EQ(true, request.cmdObj["unsplittable"].boolean());
+
+        tempNss = NamespaceString::createNamespaceString_forTest(
+            request.dbname, request.cmdObj.firstElement().valueStringDataSafe());
+        CreateCollectionResponse res;
+        res.setCollectionVersion(ShardVersion{});
+        return res.toBSON();
+    });
+
+    // Mock the response to $out's "aggregate" request to config server, that is a part of
+    // createIndexes.
+    onCommand([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("aggregate", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ("collections", request.cmdObj.firstElement().valueStringDataSafe());
+        // Response is empty for the unsharded untracked collection.
         return CursorResponse(kTestAggregateNss, CursorId{0}, {})
             .toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
     // Mock the response to $out's "createIndexes" request.
     onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("createIndexes", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(tempNss.dbName(), request.dbname);
+        ASSERT_EQ(tempNss.coll(), request.cmdObj.firstElement().valueStringData());
         ASSERT(request.cmdObj.hasField("writeConcern")) << request.cmdObj;
 
         ASSERT(request.cmdObj.hasField("indexes"));
         const std::vector<BSONElement>& indexArray = request.cmdObj["indexes"].Array();
         ASSERT_EQ(1, indexArray.size());
         ASSERT_BSONOBJ_EQ(listIndexesResponse, indexArray.at(0).Obj());
-
-        return CursorResponse(kTestAggregateNss, CursorId{0}, {})
-            .toBSON(CursorResponse::ResponseType::InitialResponse);
+        return BSON("ok" << 1);
     });
 
-    // Mock the response to $out's "renameIfOptionsAndIndexesHaveNotChanged" request.
+    // Mock the response to $out's "internalRenameIfOptionsAndIndexesMatch" request.
     onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("internalRenameIfOptionsAndIndexesMatch",
+                  request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(tempNss.toString_forTest(), request.cmdObj["from"].String());
+        ASSERT_EQ(kOutNss.toString_forTest(), request.cmdObj["to"].String());
         ASSERT(request.cmdObj.hasField("writeConcern")) << request.cmdObj;
-        return CursorResponse(kTestAggregateNss, CursorId{0}, {})
-            .toBSON(CursorResponse::ResponseType::InitialResponse);
+        return BSON("ok" << 1);
+    });
+
+    // Mock the response to the drop of the temporary collection.
+    onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_EQ("_shardsvrDropCollection", request.cmdObj.firstElement().fieldNameStringData());
+        ASSERT_EQ(tempNss.dbName(), request.dbname);
+        ASSERT_EQ(tempNss.coll(), request.cmdObj.firstElement().valueStringData());
+        return BSON("ok" << 1);
     });
 
     future.default_timed_get();

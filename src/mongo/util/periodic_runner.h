@@ -29,13 +29,13 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
-#include <boost/optional.hpp>
-
-#include "mongo/platform/mutex.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -60,8 +60,11 @@ public:
     using JobAnchor = PeriodicJobAnchor;
 
     struct PeriodicJob {
-        PeriodicJob(std::string name, Job callable, Milliseconds period)
-            : name(std::move(name)), job(std::move(callable)), interval(period) {}
+        PeriodicJob(std::string name, Job callable, Milliseconds period, bool isKillableByStepdown)
+            : name(std::move(name)),
+              job(std::move(callable)),
+              interval(period),
+              isKillableByStepdown(isKillableByStepdown) {}
 
         /**
          * name of the job
@@ -77,6 +80,11 @@ public:
          * An interval at which the job should be run.
          */
         Milliseconds interval;
+
+        /**
+         * Whether this job is killable during stepdown.
+         */
+        bool isKillableByStepdown;
     };
 
     /**
@@ -111,7 +119,7 @@ public:
         /**
          * Returns the current period for the job
          */
-        virtual Milliseconds getPeriod() = 0;
+        virtual Milliseconds getPeriod() const = 0;
 
         /**
          * Updates the period of the job.  This takes effect immediately by altering the current
@@ -152,7 +160,7 @@ public:
     explicit PeriodicJobAnchor(std::shared_ptr<Job> handle);
 
     PeriodicJobAnchor() = default;
-    PeriodicJobAnchor(PeriodicJobAnchor &&) = default;
+    PeriodicJobAnchor(PeriodicJobAnchor&&) = default;
     PeriodicJobAnchor& operator=(PeriodicJobAnchor&&) = default;
 
     PeriodicJobAnchor(const PeriodicJobAnchor&) = delete;
@@ -165,7 +173,7 @@ public:
     void resume();
     void stop();
     void setPeriod(Milliseconds ms);
-    Milliseconds getPeriod();
+    Milliseconds getPeriod() const;
 
     /**
      * Abandon responsibility for scheduling the execution of this job

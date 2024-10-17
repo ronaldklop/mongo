@@ -1,10 +1,14 @@
 /**
  * Test error cases when calling prepare on a committed transaction.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   # The test runs commands that are not allowed with security token: endSession,
+ *   # prepareTransaction.
+ *   not_allowed_with_signed_security_token,
+ *   uses_transactions,
+ *   uses_prepare_transaction
+ * ]
  */
-(function() {
-"use strict";
 
 const dbName = "test";
 const collName = "prepare_committed_transaction";
@@ -56,7 +60,7 @@ jsTestLog("Test that calling commit with invalid fields on a committed transacti
 assert.commandFailedWithCode(
     sessionDB.adminCommand(
         {commitTransaction: 1, invalidField: 1, txnNumber: txnNumber, autocommit: false}),
-    40415 /* IDL unknown field error */);
+    ErrorCodes.IDLUnknownField);
 
 // Call abort on committed transaction without shell helper.
 jsTestLog("Test that calling abort on a committed transaction fails.");
@@ -68,7 +72,6 @@ jsTestLog("Test that calling abort with invalid fields on a committed transactio
 assert.commandFailedWithCode(
     sessionDB.adminCommand(
         {abortTransaction: 1, invalidField: 1, txnNumber: txnNumber, autocommit: false}),
-    40415 /* IDL unknown field error */);
+    ErrorCodes.IDLUnknownField);
 
 session.endSession();
-}());

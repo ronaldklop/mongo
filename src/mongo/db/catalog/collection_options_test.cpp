@@ -27,16 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/catalog/collection_options.h"
-
+#include <fmt/format.h>
 #include <limits>
+#include <memory>
+#include <vector>
 
-#include "mongo/db/json.h"
-#include "mongo/unittest/unittest.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/server_options.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
+using namespace fmt::literals;
 using unittest::assertGet;
 
 void checkRoundTrip(const CollectionOptions& options) {
@@ -98,9 +113,12 @@ TEST(CollectionOptions, ErrorBadMax) {
         CollectionOptions::parse(BSON("capped" << true << "max" << (1LL << 31))).getStatus());
 }
 
-TEST(CollectionOptions, CappedSizeRoundsUpForAlignment) {
+TEST(CollectionOptions, CappedSizeNotRoundUpForAlignment) {
+    serverGlobalParams.mutableFCV.setVersion(
+        multiversion::FeatureCompatibilityVersion::kVersion_6_2);
     const long long kUnalignedCappedSize = 1000;
-    const long long kAlignedCappedSize = 1024;
+    const long long kAlignedCappedSize = 1000;
+
     // Check size rounds up to multiple of alignment.
     auto options = assertGet(
         CollectionOptions::parse((BSON("capped" << true << "size" << kUnalignedCappedSize))));
@@ -288,19 +306,19 @@ TEST(CollectionOptions, DuplicateCreateOptionIgnoredIfCreateOptionNotFirst) {
     ASSERT_OK(statusWith.getStatus());
 }
 
-TEST(CollectionOptions, MaxTimeMSWhitelistedOptionIgnored) {
+TEST(CollectionOptions, MaxTimeMSAllowlistedOptionIgnored) {
     auto statusWith = CollectionOptions::parse(fromjson("{maxTimeMS: 1}"));
     ASSERT_OK(statusWith.getStatus());
 }
 
-TEST(CollectionOptions, WriteConcernWhitelistedOptionIgnored) {
+TEST(CollectionOptions, WriteConcernAllowlistedOptionIgnored) {
     auto statusWith = CollectionOptions::parse(fromjson("{writeConcern: 1}"));
     ASSERT_OK(statusWith.getStatus());
 }
 
 TEST(CollectionOptions, ParseUUID) {
     CollectionOptions options;
-    CollectionUUID uuid = CollectionUUID::gen();
+    UUID uuid = UUID::gen();
 
     // Check required parse failures
     ASSERT_FALSE(options.uuid);
@@ -312,7 +330,7 @@ TEST(CollectionOptions, ParseUUID) {
     // Check successful parse and roundtrip.
     options =
         assertGet(CollectionOptions::parse(uuid.toBSON(), CollectionOptions::parseForStorage));
-    ASSERT(options.uuid.get() == uuid);
+    ASSERT(options.uuid.value() == uuid);
 
     // Check that a collection options containing a UUID passes validation.
     ASSERT_OK(options.validateForStorage());
@@ -353,4 +371,695 @@ TEST(CollectionOptions, NExtentsNoError) {
     // Check that $nExtents does not cause an error for backwards compatability
     assertGet(CollectionOptions::parse(fromjson("{$nExtents: 'a'}")));
 }
+
+#define ASSERT_STATUS_CODE(CODE, EXPRESSION) ASSERT_EQUALS(CODE, (EXPRESSION).getStatus().code())
+
+// Duplicate fields are not allowed
+TEST(FLECollectionOptions, MultipleFields) {
+    ASSERT_STATUS_CODE(6338402, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})")));
+}
+
+// Duplicate key ids are bad, it breaks the design
+TEST(FLECollectionOptions, DuplicateKeyIds) {
+    ASSERT_STATUS_CODE(6338401, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "name.last",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})")));
+}
+
+TEST(FLECollectionOptions, NonConflictingPrefixes) {
+    ASSERT_OK(CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "nameOther",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})"))
+                  .getStatus());
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "a.b.c",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "a.b.cde",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})"))
+                  .getStatus());
+}
+
+TEST(FLECollectionOptions, ConflictingPrefixes) {
+    ASSERT_STATUS_CODE(6338403, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})")));
+
+    ASSERT_STATUS_CODE(6338403, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "a.b.c",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "a.b.c.d.e",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})")));
+
+    ASSERT_STATUS_CODE(6338403, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "a.b.c.d.e.f",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "a.b.c.d",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})")));
+}
+
+TEST(FLECollectionOptions, DuplicateQueryTypes) {
+    ASSERT_STATUS_CODE(6338404, CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}, {"queryType": "equality"}]
+            }
+        ]
+    }})")));
+}
+
+TEST(FLECollectionOptions, Equality_AllowedTypes) {
+    std::vector<std::string> typesAllowedIndexed({
+        "string",
+        "binData",
+        "objectId",
+        "bool",
+        "date",
+        "regex",
+        "javascript",
+        "int",
+        "timestamp",
+        "long",
+        "dbPointer",
+        "symbol",
+    });
+
+    std::vector<std::string> typesAllowedUnindexed({
+        "string",
+        "binData",
+        "objectId",
+        "bool",
+        "date",
+        "regex",
+        "javascript",
+        "int",
+        "timestamp",
+        "long",
+        "double",
+        "object",
+        "array",
+        "decimal",
+        "dbPointer",
+        "symbol",
+        "javascriptWithScope",
+    });
+
+    for (const auto& type : typesAllowedIndexed) {
+        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "equality"}
+                }
+            ]
+        }
+    }})"))
+                      .getStatus());
+    }
+
+    for (const auto& type : typesAllowedUnindexed) {
+        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": ")" << type << R"("
+            }
+        ]
+    }})"))
+                      .getStatus());
+    }
+}
+
+
+TEST(FLECollectionOptions, Equality_DisAllowedTypes) {
+    std::vector<std::string> typesDisallowedIndexed({
+        "minKey",
+        "double",
+        "object",
+        "array",
+        "null",
+        "undefined",
+        "javascriptWithScope",
+        "decimal",
+        "maxKey",
+    });
+
+    std::vector<std::string> typesDisallowedUnindexed({
+        "minKey",
+        "null",
+        "undefined",
+        "maxKey",
+    });
+
+    for (const auto& type : typesDisallowedIndexed) {
+        ASSERT_STATUS_CODE(6338405, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "equality"}
+                }
+            ]
+        }
+    }})")));
+    }
+
+    for (const auto& type : typesDisallowedUnindexed) {
+        ASSERT_STATUS_CODE(6338406, CollectionOptions::parse(fromjson(str::stream() << R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": ")" << type << R"("
+            }
+        ]
+    }})")));
+    }
+}
+
+
+TEST(FLECollectionOptions, Range_AllowedTypes) {
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 1, min : 1, max : 2}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "range", "sparsity" : 1, min : {$numberLong: "1"}, max : {$numberLong: "2"}}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    for (const auto& type : std::vector<std::string>{"double", "decimal"}) {
+        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "range", "sparsity" : 1}
+                }
+            ]
+        }
+    }})"))
+                      .getStatus());
+    }
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")"
+                                                              << "double"
+                                                              << R"(",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: 0.000, max: 1.000, precision: 3}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")"
+                                                              << "decimal"
+                                                              << R"(",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: NumberDecimal("0.000"), max: NumberDecimal("1.000"), precision: 3}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    // Validate date works
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "date",
+                    "queries": {"queryType": "range", "sparsity" : 1, min : {"$date": {"$numberLong": "12344"}}, max : {"$date": {"$numberLong": "12345"}}}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+}
+
+
+TEST(FLECollectionOptions, Range_DisAllowedTypes) {
+    std::vector<std::string> typesDisallowedIndexed({
+        "array",
+        "binData",
+        "bool",
+        "dbPointer",
+        "javascript",
+        "javascriptWithScope",
+        "maxKey",
+        "minKey",
+        "null",
+        "object",
+        "objectId",
+        "regex",
+        "string",
+        "symbol",
+        "timestamp",
+    });
+
+    for (const auto& type : typesDisallowedIndexed) {
+        ASSERT_STATUS_CODE(6775201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "range"}
+                }
+            ]
+        }
+    }})")));
+    }
+}
+
+TEST(FLECollectionOptions, Equality_ExtraFields) {
+    ASSERT_STATUS_CODE(6775205, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", sparsity:1}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775206, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", min:1}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775207, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", max:1}
+                }
+            ]
+        }
+    }})")));
+}
+
+
+TEST(FLECollectionOptions, Range_MinMax) {
+    {
+        auto doc = BSON("encryptedFields"
+                        << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                            << "firstName"
+                                                            << "keyId" << UUID::gen() << "bsonType"
+                                                            << "int"
+                                                            << "queries"
+                                                            << BSON("queryType"
+                                                                    << "range"
+                                                                    << "sparsity" << 1 << "min" << 2
+                                                                    << "max" << 1)))));
+
+        ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+    }
+
+    {
+        auto doc = BSON("encryptedFields"
+                        << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                            << "firstName"
+                                                            << "keyId" << UUID::gen() << "bsonType"
+                                                            << "long"
+                                                            << "queries"
+                                                            << BSON("queryType"
+                                                                    << "range"
+                                                                    << "sparsity" << 1 << "min"
+                                                                    << 2LL << "max" << 1LL)))));
+
+        ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+    }
+
+    {
+        auto doc =
+            BSON("encryptedFields" << BSON(
+                     "fields" << BSON_ARRAY(BSON("path"
+                                                 << "firstName"
+                                                 << "keyId" << UUID::gen() << "bsonType"
+                                                 << "double"
+                                                 << "queries"
+                                                 << BSON("queryType"
+                                                         << "range"
+                                                         << "sparsity" << 1 << "min" << 2.0)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields" << BSON(
+                       "fields" << BSON_ARRAY(BSON("path"
+                                                   << "firstName"
+                                                   << "keyId" << UUID::gen() << "bsonType"
+                                                   << "double"
+                                                   << "queries"
+                                                   << BSON("queryType"
+                                                           << "range"
+                                                           << "sparsity" << 1 << "max" << 2.0)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields"
+                           << BSON_ARRAY(BSON("path"
+                                              << "firstName"
+                                              << "keyId" << UUID::gen() << "bsonType"
+                                              << "double"
+                                              << "queries"
+                                              << BSON("queryType"
+                                                      << "range"
+                                                      << "sparsity" << 1 << "precision" << 2)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields" << BSON_ARRAY(
+                               BSON("path"
+                                    << "firstName"
+                                    << "keyId" << UUID::gen() << "bsonType"
+                                    << "decimal"
+                                    << "queries"
+                                    << BSON("queryType"
+                                            << "range"
+                                            << "sparsity" << 1 << "min" << Decimal128(2.0))))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields" << BSON_ARRAY(
+                               BSON("path"
+                                    << "firstName"
+                                    << "keyId" << UUID::gen() << "bsonType"
+                                    << "decimal"
+                                    << "queries"
+                                    << BSON("queryType"
+                                            << "range"
+                                            << "sparsity" << 1 << "max" << Decimal128(2.0))))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields"
+                           << BSON_ARRAY(BSON("path"
+                                              << "firstName"
+                                              << "keyId" << UUID::gen() << "bsonType"
+                                              << "decimal"
+                                              << "queries"
+                                              << BSON("queryType"
+                                                      << "range"
+                                                      << "sparsity" << 1 << "precision" << 2)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+    }
+
+
+    Date_t start = Date_t::now();
+    Date_t end = start;
+    end += Hours(1);
+    auto doc = BSON("encryptedFields"
+                    << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                        << "firstName"
+                                                        << "keyId" << UUID::gen() << "bsonType"
+                                                        << "date"
+                                                        << "queries"
+                                                        << BSON("queryType"
+                                                                << "range"
+                                                                << "sparsity" << 1 << "min" << end
+                                                                << "max" << start)))));
+
+    ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+}
+
+TEST(FLECollectionOptions, Range_BoundTypeMismatch) {
+    ASSERT_STATUS_CODE(7018200, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: {"$numberLong": "12344"}, max: {"$numberLong": "123440"}}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(7018200, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: 1, max: 2}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(7018201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: {$numberLong: "1"}, max: 2}
+                }
+            ]
+        }
+    }})")));
+    ASSERT_STATUS_CODE(7018201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 1, min: 1, max: {"$numberLong": "123440"}}
+                }
+            ]
+        }
+    }})")));
+}
+
+TEST(FLECollectionOptions, Range_Sparsity) {
+    ASSERT(CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range"}
+                }
+            ]
+        }
+    }})"))
+               .isOK());
+    ASSERT(CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 1}
+                }
+            ]
+        }
+    }})"))
+               .isOK());
+    ASSERT(CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 8}
+                }
+            ]
+        }
+    }})"))
+               .isOK());
+    ASSERT_STATUS_CODE(ErrorCodes::BadValue, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 0}
+                }
+            ]
+        }
+    }})")));
+    ASSERT_STATUS_CODE(ErrorCodes::BadValue, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "range", "sparsity" : 9}
+                }
+            ]
+        }
+    }})")));
+}
+
 }  // namespace mongo

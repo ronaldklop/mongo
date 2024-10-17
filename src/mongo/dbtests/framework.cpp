@@ -27,98 +27,108 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/dbtests/framework.h"
 
+#include <cstdlib>
+#include <ctime>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/checked_cast.h"
-#include "mongo/base/status.h"
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_impl.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/db/storage/storage_engine_init.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/dbtests/framework_options.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/periodic_runner.h"
 #include "mongo/util/periodic_runner_factory.h"
-#include "mongo/util/scopeguard.h"
-#include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 namespace dbtests {
 
 int runDbTests(int argc, char** argv) {
+    if (frameworkGlobalParams.suites.empty()) {
+        LOGV2_ERROR(5733802, "The [suite] argument is required for dbtest and not specified here.");
+        return static_cast<int>(ExitCode::fail);
+    }
+
     frameworkGlobalParams.perfHist = 1;
     frameworkGlobalParams.seed = time(nullptr);
     frameworkGlobalParams.runsPerTest = 1;
 
-    registerShutdownTask([] {
-        // We drop the scope cache because leak sanitizer can't see across the
-        // thread we use for proxying MozJS requests. Dropping the cache cleans up
-        // the memory and makes leak sanitizer happy.
+    auto serviceContext = getGlobalServiceContext();
+
+    registerShutdownTask([serviceContext] {
+        // We drop the scope cache because leak sanitizer can't see across the thread we use for
+        // proxying MozJS requests. Dropping the cache cleans up the memory and makes leak sanitizer
+        // happy.
         ScriptEngine::dropScopeCache();
 
-        // We may be shut down before we have a global storage
-        // engine.
-        if (!getGlobalServiceContext()->getStorageEngine())
+        // We may be shut down before we have a global storage engine.
+        if (!serviceContext->getStorageEngine())
             return;
 
-        shutdownGlobalStorageEngineCleanly(getGlobalServiceContext());
+        shutdownGlobalStorageEngineCleanly(serviceContext);
     });
 
-    Client::initThread("testsuite");
-
-    auto globalServiceContext = getGlobalServiceContext();
-    CollectionShardingStateFactory::set(
-        globalServiceContext,
-        std::make_unique<CollectionShardingStateFactoryShard>(globalServiceContext));
-
+    ThreadClient tc("testsuite", serviceContext->getService());
 
     // DBTests run as if in the database, so allow them to create direct clients.
-    DBDirectClientFactory::get(globalServiceContext)
-        .registerImplementation([](OperationContext* opCtx) {
-            return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
-        });
+    DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
+        return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
+    });
 
-    srand((unsigned)frameworkGlobalParams.seed);
+    srand((unsigned)frameworkGlobalParams.seed);  // NOLINT
 
     // Set up the periodic runner for background job execution, which is required by the storage
     // engine to be running beforehand.
-    auto runner = makePeriodicRunner(globalServiceContext);
-    globalServiceContext->setPeriodicRunner(std::move(runner));
+    auto runner = makePeriodicRunner(serviceContext);
+    serviceContext->setPeriodicRunner(std::move(runner));
 
     {
-        auto opCtx = globalServiceContext->makeOperationContext(&cc());
-        initializeStorageEngine(opCtx.get(), StorageEngineInitFlags::kNone);
+        auto initializeStorageEngineOpCtx = serviceContext->makeOperationContext(&cc());
+        shard_role_details::setRecoveryUnit(initializeStorageEngineOpCtx.get(),
+                                            std::make_unique<RecoveryUnitNoop>(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+
+        initializeStorageEngine(initializeStorageEngineOpCtx.get(), StorageEngineInitFlags{});
     }
 
-    StorageControl::startStorageControls(globalServiceContext, true /*forTestOnly*/);
-    DatabaseHolder::set(globalServiceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(globalServiceContext,
-                                  std::make_unique<IndexAccessMethodFactoryImpl>());
-    Collection::Factory::set(globalServiceContext, std::make_unique<CollectionImpl::FactoryImpl>());
-    IndexBuildsCoordinator::set(globalServiceContext,
-                                std::make_unique<IndexBuildsCoordinatorMongod>());
+    StorageControl::startStorageControls(serviceContext, true /*forTestOnly*/);
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
+    IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
     auto registry = std::make_unique<OpObserverRegistry>();
-    globalServiceContext->setOpObserver(std::move(registry));
+    serviceContext->setOpObserver(std::move(registry));
+    ShardingState::create(serviceContext);
+    CollectionShardingStateFactory::set(
+        serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
 
     int ret = unittest::Suite::run(frameworkGlobalParams.suites,
                                    frameworkGlobalParams.filter,
@@ -126,11 +136,10 @@ int runDbTests(int argc, char** argv) {
                                    frameworkGlobalParams.runsPerTest);
 
     // So everything shuts down cleanly
-    CollectionShardingStateFactory::clear(globalServiceContext);
+    CollectionShardingStateFactory::clear(serviceContext);
     exitCleanly((ExitCode)ret);
     return ret;
 }
 
 }  // namespace dbtests
-
 }  // namespace mongo

@@ -1,16 +1,19 @@
 /**
  * Tests that the mongo shell can use a cluster time with a valid signature to advance a server's
  * cluster time.
+ * @tags: [
+ *    # TODO (SERVER-88129): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Setup 2 mongos processes with mongobridge.
 let st = new ShardingTest({shards: 1, mongos: 2, useBridge: true});
 
 // Sever outgoing communications from the second mongos.
 st.s0.disconnect(st.s1);
-st._configServers.forEach(function(configSvr) {
+st.forEachConfigServer(function(configSvr) {
     configSvr.disconnect(st.s1);
 });
 
@@ -41,4 +44,3 @@ assert.eq(lt,
               ", received: " + tojson(res.$clusterTime));
 
 st.stop();
-})();

@@ -17,14 +17,17 @@
  * that it is therefore safe to ignore prepare conflicts during its execution.
  *
  * @tags: [
+ *   disables_test_commands,
  *   uses_prepare_transaction,
  *   uses_transactions,
+ *   # TODO (SERVER-80568): Re-enable this test in multiversion suites once it has been fixed.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   requires_scripting
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // This test completes with a prepared transaction still active, so we cannot enforce an accurate
 // fast count.
@@ -340,4 +343,3 @@ try {
 }
 
 replTest.stopSet();
-}());

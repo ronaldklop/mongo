@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/catalog/database_holder.h"
+#include <boost/none.hpp>
 
 namespace mongo {
 
@@ -37,30 +38,32 @@ class DatabaseHolderMock : public DatabaseHolder {
 public:
     DatabaseHolderMock() = default;
 
-    Database* getDb(OperationContext* opCtx, StringData ns) const override {
+    Database* getDb(OperationContext* opCtx, const DatabaseName& dbName) const override {
         return nullptr;
     }
 
-    std::shared_ptr<const ViewCatalog> getViewCatalog(OperationContext* const opCtx,
-                                                      StringData dbName) const override {
-        return nullptr;
+    bool dbExists(OperationContext* opCtx, const DatabaseName& dbName) const override {
+        return false;
     }
 
-    Database* openDb(OperationContext* opCtx, StringData ns, bool* justCreated = nullptr) override {
+    Database* openDb(OperationContext* opCtx,
+                     const DatabaseName& dbName,
+                     bool* justCreated = nullptr) override {
         return nullptr;
     }
 
     void dropDb(OperationContext* opCtx, Database* db) override {}
 
-    void close(OperationContext* opCtx, StringData ns) override {}
+    void close(OperationContext* opCtx, const DatabaseName& dbName) override {}
 
     void closeAll(OperationContext* opCtx) override {}
 
-    std::set<std::string> getNamesWithConflictingCasing(StringData name) override {
-        return std::set<std::string>();
+    boost::optional<DatabaseName> getNameWithConflictingCasing(
+        const DatabaseName& dbName) override {
+        return boost::none;
     }
 
-    std::vector<std::string> getNames() override {
+    std::vector<DatabaseName> getNames() override {
         return {};
     }
 };

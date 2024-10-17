@@ -12,11 +12,8 @@
 // Confirm that the most up-to-date node becomes primary.
 // Let the highest priority node catchup and then confirm
 // that it becomes primary.
-
-(function() {
-'use strict';
-
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = 'catchup_takeover_one_high_priority';
 var replSet = new ReplSetTest({name: name, nodes: 3, useBridge: true});
@@ -35,6 +32,9 @@ replSet.initiateWithAnyNodeAsPrimary({
 // Wait until node 2 becomes primary.
 replSet.waitForState(2, ReplSetTest.State.PRIMARY, replSet.kDefaultTimeoutMS);
 jsTestLog('node 2 is now primary');
+// The default WC is majority and this test can't test catchup properly if it used majority writes.
+assert.commandWorked(replSet.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 replSet.awaitReplication();
 replSet.waitForConfigReplication(nodes[2]);
@@ -103,4 +103,3 @@ jsTestLog('node 2 performed priority takeover and is now primary');
 replSet.waitForState(0, ReplSetTest.State.SECONDARY, replSet.kDefaultTimeoutMS);
 
 replSet.stopSet();
-})();

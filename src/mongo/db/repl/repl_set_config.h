@@ -29,16 +29,35 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <compare>
+#include <cstddef>
+#include <iosfwd>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config_gen.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
@@ -56,7 +75,7 @@ namespace repl {
 class ConfigVersionAndTerm {
 public:
     ConfigVersionAndTerm() : _version(0), _term(OpTime::kUninitializedTerm) {}
-    ConfigVersionAndTerm(int version, long long term) : _version(version), _term(term) {}
+    ConfigVersionAndTerm(long long version, long long term) : _version(version), _term(term) {}
 
     inline bool operator==(const ConfigVersionAndTerm& rhs) const {
         // If term of either item is uninitialized (-1), then we ignore terms entirely and only
@@ -108,6 +127,9 @@ private:
     long long _term;
 };
 
+class ReplSetConfig;
+using ReplSetConfigPtr = std::shared_ptr<ReplSetConfig>;
+
 /**
  * This class is used for mutating the ReplicaSetConfig.  Call ReplSetConfig::getMutable()
  * to get a mutable copy, mutate it, and use the ReplSetConfig(MutableReplSetConfig&&) constructor
@@ -132,18 +154,9 @@ public:
     void removeNewlyAddedFieldForMember(MemberId memberId);
 
     /**
-     * Sets the member config's 'secondaryDelaySecs' to the value of 'slaveDelay' and removes the
-     * 'slaveDelay' field entirely. If 'slaveDelay' is not set, then sets 'secondaryDelaySecs' to
-     * the default value.
+     * Sets the member config's 'secondaryDelaySecs' field to the default value of 0.
      */
-    void useSecondaryDelaySecsFieldName(MemberId memberId);
-
-    /**
-     * Sets the member config's 'slaveDelay' to the value of 'secondaryDelaySecs' and removes the
-     * 'secondaryDelaySecs' field entirely. If 'secondaryDelaySecs' is not set, then sets
-     * 'slaveDelay' to the default value.
-     */
-    void useSlaveDelayFieldName(MemberId memberId);
+    void setSecondaryDelaySecsFieldDefault(MemberId memberId);
 
 protected:
     MutableReplSetConfig() = default;
@@ -152,6 +165,8 @@ protected:
      * Returns a pointer to a mutable MemberConfig.
      */
     MemberConfig* _findMemberByID(MemberId id);
+
+    ReplSetConfigPtr _recipientConfig;
 };
 
 /**
@@ -161,7 +176,7 @@ class ReplSetConfig : private MutableReplSetConfig {
 public:
     typedef std::vector<MemberConfig>::const_iterator MemberIterator;
 
-    using ReplSetConfigBase::kConfigServerFieldName;
+    using ReplSetConfigBase::kConfigServer_deprecatedFieldName;
     using ReplSetConfigBase::kConfigTermFieldName;
     static constexpr char kMajorityWriteConcernModeName[] = "$majority";
     static constexpr char kVotingMembersWriteConcernModeName[] = "$votingMembers";
@@ -173,11 +188,11 @@ public:
     using ReplSetConfigBase::kRepairedFieldName;
 
     /**
-     * Inline `kMaxMembers` to allow others (e.g, `WriteConcernOptions`) use
+     * Inline `kMaxMembers` and `kMaxVotingMembers` to allow others (e.g, `WriteConcernOptions`) use
      * the constant without linking to `repl_set_config.cpp`.
      */
     inline static const size_t kMaxMembers = 50;
-    static const size_t kMaxVotingMembers = 7;
+    inline static const size_t kMaxVotingMembers = 7;
     static const Milliseconds kInfiniteCatchUpTimeout;
     static const Milliseconds kCatchUpDisabled;
     static const Milliseconds kCatchUpTakeoverDisabled;
@@ -190,14 +205,13 @@ public:
     static const Milliseconds kDefaultCatchUpTakeoverDelay;
 
     // Methods inherited from the base IDL class.  Do not include any setters here.
-    using ReplSetConfigBase::getConfigServer;
+    using ReplSetConfigBase::getConfigServer_deprecated;
     using ReplSetConfigBase::getConfigTerm;
     using ReplSetConfigBase::getConfigVersion;
     using ReplSetConfigBase::getProtocolVersion;
     using ReplSetConfigBase::getReplSetName;
     using ReplSetConfigBase::getWriteConcernMajorityShouldJournal;
     using ReplSetConfigBase::serialize;
-    using ReplSetConfigBase::toBSON;
 
     /**
      * Constructor used for converting a mutable config to an immutable one.
@@ -232,11 +246,9 @@ public:
     static ReplSetConfig parseForInitiate(const BSONObj& cfg, OID newReplicaSetId);
 
     /**
-     * Sets the default delay field name for a member config based on feature compatibility version,
-     * but only if the member config has neither 'secondaryDelaySecs' nor 'slaveDelay' already set.
-     * This function is used when constructing 'ReplSetConfigs' for initiate and reconfig.
+     * Override ReplSetConfigBase::toBSON to conditionally include the recipient config.
      */
-    void setDefaultDelayFieldForMember(MemberConfig mem);
+    BSONObj toBSON() const;
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -322,6 +334,13 @@ public:
             }
         }
         return votingMembers;
+    };
+
+    /**
+     * Returns a count voting members in this ReplSetConfig.
+     */
+    size_t getCountOfVotingMembers() const {
+        return _votingMemberCount;
     };
 
     /**
@@ -439,6 +458,15 @@ public:
     StatusWith<ReplSetTagPattern> findCustomWriteMode(StringData patternName) const;
 
     /**
+     * Returns a pattern constructed from a raw set of tags provided as the `w` value
+     * of a write concern.
+     *
+     * @returns `ErrorCodes::NoSuchKey` if a tag was provided which is not found in
+     * the local tag config.
+     */
+    StatusWith<ReplSetTagPattern> makeCustomWriteMode(const WTags& wTags) const;
+
+    /**
      * Returns the "tags configuration" for this replicaset.
      *
      * NOTE(schwerin): Not clear if this should be used other than for reporting/debugging.
@@ -514,15 +542,49 @@ public:
     bool containsArbiter() const;
 
     /**
-     * Returns true if this replica set has at least one member with 'newlyAdded'
-     * field set to true.
-     */
-    bool containsNewlyAddedMembers() const;
-
-    /**
      * Returns a mutable (but not directly usable) copy of the config.
      */
     MutableReplSetConfig getMutable() const;
+
+    /**
+     * Returns true if implicit default write concern should be majority.
+     */
+    bool isImplicitDefaultWriteConcernMajority() const;
+
+    /**
+     * Returns true if the config consists of a Primary-Secondary-Arbiter (PSA) architecture.
+     */
+    bool isPSASet() const {
+        return getNumMembers() == 3 && getNumDataBearingMembers() == 2;
+    }
+
+    /**
+     * Returns true if the getLastErrorDefaults has been customized.
+     */
+    bool containsCustomizedGetLastErrorDefaults() const;
+
+    /**
+     * Returns Status::OK if write concern is valid for this config, or appropriate status
+     * otherwise.
+     */
+    Status validateWriteConcern(const WriteConcernOptions& writeConcern) const;
+
+    /**
+     * Returns true if this config is a split config, which is determined by checking if it contains
+     * a recipient config for a shard split operation.
+     */
+    bool isSplitConfig() const;
+
+    /**
+     * Returns the config for the recipient during a tenant split operation, if it exists.
+     */
+    ReplSetConfigPtr getRecipientConfig() const;
+
+    /**
+     * Compares the write concern modes with another config and returns 'true' if they are
+     * identical.
+     */
+    bool areWriteConcernModesTheSame(ReplSetConfig* otherConfig) const;
 
 private:
     /**
@@ -572,6 +634,7 @@ private:
     int _writableVotingMembersCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;
+    int _votingMemberCount = 0;
     ReplSetTagConfig _tagConfig;
     StringMap<ReplSetTagPattern> _customWriteConcernModes;
     ConnectionString _connectionString;

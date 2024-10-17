@@ -34,11 +34,17 @@
  */
 
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <cstdint>
+#include <span>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/operation_latency_histogram.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/rpc/message.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -50,15 +56,10 @@ class ServiceContext;
  */
 class Top {
 public:
-    static Top& get(ServiceContext* service);
-
-    Top() = default;
-
     struct UsageData {
-        UsageData() : time(0), count(0) {}
-        UsageData(const UsageData& older, const UsageData& newer);
-        long long time;
-        long long count;
+        UsageData() = default;
+        long long time{0};
+        long long count{0};
 
         void inc(long long micros) {
             count++;
@@ -67,11 +68,7 @@ public:
     };
 
     struct CollectionData {
-        /**
-         * constructs a diff
-         */
-        CollectionData() {}
-        CollectionData(const CollectionData& older, const CollectionData& newer);
+        CollectionData() = default;
 
         UsageData total;
 
@@ -84,7 +81,10 @@ public:
         UsageData update;
         UsageData remove;
         UsageData commands;
+
         OperationLatencyHistogram opLatencyHistogram;
+
+        bool isStatsRecordingAllowed{true};
     };
 
     enum class LockType {
@@ -95,39 +95,70 @@ public:
 
     typedef StringMap<CollectionData> UsageMap;
 
-public:
+    Top() = default;
+
+    static Top& get(ServiceContext* service);
+
     void record(OperationContext* opCtx,
-                StringData ns,
+                const NamespaceString& nss,
                 LogicalOp logicalOp,
                 LockType lockType,
                 long long micros,
                 bool command,
                 Command::ReadWriteType readWriteType);
 
-    void append(BSONObjBuilder& b);
+    /**
+     * Same as the above, but for multiple namespaces.
+     */
+    void record(OperationContext* opCtx,
+                std::span<const NamespaceString> nssSet,
+                LogicalOp logicalOp,
+                LockType lockType,
+                long long micros,
+                bool command,
+                Command::ReadWriteType readWriteType);
 
-    void cloneMap(UsageMap& out) const;
+    /**
+     * Adds the usage stats (time, count) for "name" to builder object "b".
+     */
+    void appendStatsEntry(BSONObjBuilder& b, StringData name, const UsageData& data);
+
+    /**
+     * Adds usage stats for "coll" onto builder object "result".
+     */
+    void appendUsageStatsForCollection(BSONObjBuilder& result, const CollectionData& coll);
+
+    /**
+     * Appends usage statistics for all collections.
+     */
+    void append(BSONObjBuilder& topStatsBuilder);
 
     void collectionDropped(const NamespaceString& nss);
 
     /**
-     * Appends the collection-level latency statistics
+     * Appends the collection-level latency statistics.
      */
     void appendLatencyStats(const NamespaceString& nss,
                             bool includeHistograms,
                             BSONObjBuilder* builder);
 
     /**
+     * Append the collection-level usage statistics.
+     */
+    void appendOperationStats(const NamespaceString& nss, BSONObjBuilder* builder);
+
+    /**
      * Increments the global histogram only if the operation came from a user.
      */
     void incrementGlobalLatencyStats(OperationContext* opCtx,
                                      uint64_t latency,
+                                     uint64_t workingTime,
                                      Command::ReadWriteType readWriteType);
 
     /**
      * Increments the global transactions histogram.
      */
-    void incrementGlobalTransactionLatencyStats(uint64_t latency);
+    void incrementGlobalTransactionLatencyStats(OperationContext* opCtx, uint64_t latency);
 
     /**
      * Appends the global latency statistics.
@@ -136,25 +167,19 @@ public:
                                   bool slowMSBucketsOnly,
                                   BSONObjBuilder* builder);
 
+    /**
+     * Appends the global working time statistics.
+     */
+    void appendWorkingTimeStats(bool includeHistograms,
+                                bool slowMSBucketsOnly,
+                                BSONObjBuilder* builder);
+
 private:
-    void _appendToUsageMap(BSONObjBuilder& b, const UsageMap& map) const;
+    AtomicOperationLatencyHistogram _globalHistogramStats;
+    AtomicOperationLatencyHistogram _workingTimeHistogramStats;
 
-    void _appendStatsEntry(BSONObjBuilder& b, const char* statsName, const UsageData& map) const;
-
-    void _record(OperationContext* opCtx,
-                 CollectionData& c,
-                 LogicalOp logicalOp,
-                 LockType lockType,
-                 long long micros,
-                 Command::ReadWriteType readWriteType);
-
-    void _incrementHistogram(OperationContext* opCtx,
-                             long long latency,
-                             OperationLatencyHistogram* histogram,
-                             Command::ReadWriteType readWriteType);
-
-    mutable SimpleMutex _lock;
-    OperationLatencyHistogram _globalHistogramStats;
+    // _lockUsage should always be acquired before using _usage.
+    stdx::mutex _lockUsage;
     UsageMap _usage;
 };
 

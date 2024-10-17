@@ -32,10 +32,42 @@ global:
     cpp_namespace: "mongo::resharding"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 feature_flags:
-    featureFlagResharding:
-        description: When enabled, allows users to reshard their sharded collections.
-        cpp_varname: gFeatureFlagResharding
+    featureFlagReshardingImprovements:
+        description: "Feature flag for applying improvements on resharding to make it faster and 
+        support same-key resharding."
+        cpp_varname: gFeatureFlagReshardingImprovements
+        default: true
+        version: 7.2
+        shouldBeFCVGated: true
+    featureFlagMoveCollection:
+        description: "Feature flag for implementing online move collection."
+        cpp_varname: gFeatureFlagMoveCollection
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagUnshardCollection:
+        description: "Feature flag for implementing unshard collection."
+        cpp_varname: gFeatureFlagUnshardCollection
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    # TODO SERVER-93149: Enable 'featureFlagReshardingForTimeseries' by default.
+    featureFlagReshardingForTimeseries:
+        description: "Feature flag for enabling resharding a timeseries collection."
+        cpp_varname: gFeatureFlagReshardingForTimeseries
         default: false
+        shouldBeFCVGated: true
+    featureFlagReshardingSpuriousDuplicateKeyErrors:
+        description: "Feature flag to prevent unique: true indexes from falsely creating a duplicate key error during resharding"
+        cpp_varname: gFeatureFlagReshardingSpuriousDuplicateKeyErrors
+        default: false
+        shouldBeFCVGated: true
+    featureFlagRelaxedMode:
+        description: "Feature flag for implmenting relaxed resharding mode."
+        cpp_varname: gFeatureFlagReshardingRelaxedMode
+        default: true
+        version: 8.1
+        shouldBeFCVGated: true

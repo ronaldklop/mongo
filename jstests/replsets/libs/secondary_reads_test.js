@@ -2,11 +2,9 @@
  * This is a library for testing secondary reads against a replica set
  */
 
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/replsets/rslib.js");
-
-function SecondaryReadsTest(name = "secondary_reads_test") {
+export function SecondaryReadsTest(name = "secondary_reads_test") {
     let rst = performStandardSetup();
     let dbName = name;
 
@@ -38,10 +36,10 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
     this.startSecondaryReaders = function(nReaders, readFn) {
         let read = function() {
             db.getMongo().setSecondaryOk();
-            db = db.getSiblingDB(TestData.dbName);
+            const testDb = db.getSiblingDB(TestData.dbName);
             while (true) {
                 readFn();
-                let signalDoc = db.getCollection(TestData.signalColl)
+                let signalDoc = testDb.getCollection(TestData.signalColl)
                                     .find({_id: TestData.testDoneId})
                                     .itcount();
                 if (signalDoc != 0) {
@@ -99,8 +97,8 @@ function SecondaryReadsTest(name = "secondary_reads_test") {
         assert.gt(readers.length, 0, "no readers to stop");
         assert.commandWorked(primaryDB.getCollection(signalColl).insert({_id: testDoneId}));
         for (let i = 0; i < readers.length; i++) {
-            const await = readers[i];
-            await ();
+            const awaitReader = readers[i];
+            awaitReader();
             print("reader " + i + " done");
         }
         readers = [];

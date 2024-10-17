@@ -2,8 +2,7 @@
  * Testing migrations are successful and immediately visible on the secondaries, when
  * secondaryThrottle is used.
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // The mongod secondaries are set to priority 0 to prevent the primaries from stepping down during
 // migrations on slow evergreen builders.
@@ -26,14 +25,15 @@ var s = new ShardingTest({
     }
 });
 
+assert.commandWorked(
+    s.s0.adminCommand({enablesharding: 'TestDB', primaryShard: s.shard0.shardName}));
+
 var bulk = s.s0.getDB('TestDB').TestColl.initializeUnorderedBulkOp();
 for (var i = 0; i < 2100; i++) {
     bulk.insert({_id: i, x: i});
 }
 assert.commandWorked(bulk.execute({w: "majority"}));
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: 'TestDB'}));
-s.ensurePrimaryShard('TestDB', s.shard0.shardName);
 assert.commandWorked(s.s0.adminCommand({shardcollection: 'TestDB.TestColl', key: {_id: 1}}));
 
 for (i = 0; i < 20; i++) {
@@ -62,4 +62,3 @@ assert.eq(2100,
               collPrimary.find().itcount());
 
 s.stop();
-}());

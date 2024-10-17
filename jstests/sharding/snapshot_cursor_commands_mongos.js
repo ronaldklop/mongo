@@ -1,15 +1,15 @@
 // Tests snapshot isolation on readConcern level snapshot reads through mongos.
 // @tags: [requires_sharding, uses_transactions, uses_multi_shard_transaction]
-(function() {
-"use strict";
-
 // This test intentionally runs commands without a logical session id, which is not compatible
 // with implicit sessions.
 TestData.disableImplicitSessions = true;
 
-load("jstests/libs/global_snapshot_reads_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {verifyInvalidGetMoreAttempts} from "jstests/libs/global_snapshot_reads_util.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const shardedCollName = "shardedColl";
@@ -62,7 +62,7 @@ let shardingScenarios = {
         compatibleCollections: [shardedCollName, unshardedCollName],
         name: "singleShard",
         setUp: function(collName) {
-            const st = new ShardingTest({shards: 1, mongos: 1, config: 1});
+            const st = new ShardingTest({shards: 1, mongos: 1});
             return shardingScenarios.allScenarios.setUp(st, collName);
         }
     },
@@ -74,7 +74,7 @@ let shardingScenarios = {
         compatibleCollections: [shardedCollName],
         name: "multiShardAllShardReads",
         setUp: function(collName) {
-            let st = new ShardingTest({shards: 3, mongos: 1, config: 1});
+            let st = new ShardingTest({shards: 3, mongos: 1});
             st = shardingScenarios.allScenarios.setUp(st, collName);
 
             if (st === undefined) {
@@ -118,7 +118,7 @@ let shardingScenarios = {
         compatibleCollections: [shardedCollName],
         name: "multiShardSomeShardReads",
         setUp: function(collName) {
-            let st = new ShardingTest({shards: 3, mongos: 1, config: 1});
+            let st = new ShardingTest({shards: 3, mongos: 1});
             st = shardingScenarios.allScenarios.setUp(st, collName);
 
             if (st === undefined) {
@@ -276,4 +276,3 @@ runScenario(shardingScenarios.multiShardAllShardReads, {useCausalConsistency: fa
 
 runScenario(shardingScenarios.multiShardSomeShardReads,
             {useCausalConsistency: false, collName: shardedCollName});
-})();

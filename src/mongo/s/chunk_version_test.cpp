@@ -27,197 +27,72 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <limits>
 
 #include "mongo/s/chunk_version.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
-
-TEST(ChunkVersionParsing, ToFromBSONRoundtrip) {
-    ChunkVersion version(1, 2, OID::gen(), Timestamp(42));
-    const auto roundTripVersion = assertGet(ChunkVersion::parseWithField(
-        [&] {
-            BSONObjBuilder builder;
-            version.appendWithField(&builder, "testVersionField");
-            return builder.obj();
-        }(),
-        "testVersionField"));
-
-    ASSERT_EQ(version, roundTripVersion);
-}
-
-TEST(ChunkVersionParsing, ToFromBSONLegacyRoundtrip) {
-    ChunkVersion version(1, 2, OID::gen(), Timestamp(42));
-    const auto roundTripVersion = assertGet(ChunkVersion::parseLegacyWithField(
-        [&] {
-            BSONObjBuilder builder;
-            version.appendLegacyWithField(&builder, "testVersionField");
-            return builder.obj();
-        }(),
-        "testVersionField"));
-
-    ASSERT_EQ(version, roundTripVersion);
-}
-
-TEST(ChunkVersionParsing, FromBSONMissingCanThrowaAndTimestamp) {
-    const OID oid = OID::gen();
-    ChunkVersion chunkVersionComplete = assertGet(ChunkVersion::parseWithField(
-        BSON("testVersionField" << BSON_ARRAY(Timestamp(Seconds(2), 3) << oid)),
-        "testVersionField"));
-
-    ASSERT(chunkVersionComplete.epoch().isSet());
-    ASSERT_EQ(oid, chunkVersionComplete.epoch());
-    ASSERT_EQ(2u, chunkVersionComplete.majorVersion());
-    ASSERT_EQ(3u, chunkVersionComplete.minorVersion());
-}
-
-TEST(ChunkVersionParsing, FromBSONMissingTimestamp) {
-    const OID oid = OID::gen();
-    const bool canThrowSSVOnIgnored = true;
-    ChunkVersion chunkVersionComplete = assertGet(ChunkVersion::parseWithField(
-        BSON("testVersionField" << BSON_ARRAY(Timestamp(Seconds(2), 3)
-                                              << oid << canThrowSSVOnIgnored)),
-        "testVersionField"));
-
-    ASSERT(chunkVersionComplete.epoch().isSet());
-    ASSERT_EQ(oid, chunkVersionComplete.epoch());
-    ASSERT_EQ(2u, chunkVersionComplete.majorVersion());
-    ASSERT_EQ(3u, chunkVersionComplete.minorVersion());
-}
-
-TEST(ChunkVersionParsing, FromBSONMissingCanThrow) {
-    const OID oid = OID::gen();
-    const Timestamp timestamp(42);
-    ChunkVersion chunkVersionComplete = assertGet(ChunkVersion::parseWithField(
-        BSON("testVersionField" << BSON_ARRAY(Timestamp(Seconds(2), 3) << oid << timestamp)),
-        "testVersionField"));
-
-    ASSERT(chunkVersionComplete.epoch().isSet());
-    ASSERT_EQ(oid, chunkVersionComplete.epoch());
-    ASSERT_EQ(2u, chunkVersionComplete.majorVersion());
-    ASSERT_EQ(3u, chunkVersionComplete.minorVersion());
-    ASSERT_EQ(timestamp, *chunkVersionComplete.getTimestamp());
-}
-
-TEST(ChunkVersionParsing, FromBSON) {
-    const OID oid = OID::gen();
-    const bool canThrowSSVOnIgnored = true;
-    const Timestamp timestamp(42);
-    ChunkVersion chunkVersionComplete = assertGet(ChunkVersion::parseWithField(
-        BSON("testVersionField" << BSON_ARRAY(Timestamp(Seconds(2), 3)
-                                              << oid << canThrowSSVOnIgnored << timestamp)),
-        "testVersionField"));
-
-    ASSERT(chunkVersionComplete.epoch().isSet());
-    ASSERT_EQ(oid, chunkVersionComplete.epoch());
-    ASSERT_EQ(2u, chunkVersionComplete.majorVersion());
-    ASSERT_EQ(3u, chunkVersionComplete.minorVersion());
-    ASSERT_EQ(timestamp, *chunkVersionComplete.getTimestamp());
-}
-
-TEST(ChunkVersionParsing, FromBSONMissingEpoch) {
-    ASSERT_THROWS_CODE(
-        uassertStatusOK(ChunkVersion::parseWithField(
-            BSON("testVersionField" << BSON_ARRAY(Timestamp(Seconds(2), 3))), "testVersionField")),
-        AssertionException,
-        ErrorCodes::TypeMismatch);
-}
-
-TEST(ChunkVersionParsing, FromBSONMissingMajorAndMinor) {
-    const OID oid = OID::gen();
-    ASSERT_THROWS_CODE(uassertStatusOK(ChunkVersion::parseWithField(BSON("testVersionField" << oid),
-                                                                    "testVersionField")),
-                       AssertionException,
-                       ErrorCodes::TypeMismatch);
-}
-
-TEST(ChunkVersionParsing, FromBSONLegacy) {
-    const OID oid = OID::gen();
-    const Timestamp timestamp(42);
-    ChunkVersion chunkVersionComplete = assertGet(ChunkVersion::parseLegacyWithField(
-        BSON("lastmod" << Timestamp(Seconds(2), 3) << "lastmodEpoch" << oid << "lastmodTimestamp"
-                       << timestamp),
-        "lastmod"));
-
-    ASSERT(chunkVersionComplete.epoch().isSet());
-    ASSERT_EQ(oid, chunkVersionComplete.epoch());
-    ASSERT_EQ(2u, chunkVersionComplete.majorVersion());
-    ASSERT_EQ(3u, chunkVersionComplete.minorVersion());
-}
-
-TEST(ChunkVersionParsing, FromBSONLegacyEpochIsOptional) {
-    ChunkVersion chunkVersionNoEpoch = assertGet(
-        ChunkVersion::parseLegacyWithField(BSON("lastmod" << Timestamp(Seconds(3), 4)), "lastmod"));
-
-    ASSERT(!chunkVersionNoEpoch.epoch().isSet());
-    ASSERT_EQ(3u, chunkVersionNoEpoch.majorVersion());
-    ASSERT_EQ(4u, chunkVersionNoEpoch.minorVersion());
-}
-
-TEST(ChunkVersionComparison, EqualityOperators) {
+TEST(ChunkVersionTest, EqualityOperators) {
     OID epoch = OID::gen();
+    Timestamp timestamp = Timestamp(1);
 
-    ASSERT_EQ(ChunkVersion(3, 1, epoch, boost::none /* timestamp */),
-              ChunkVersion(3, 1, epoch, boost::none /* timestamp */));
-    ASSERT_EQ(ChunkVersion(3, 1, OID(), boost::none /* timestamp */),
-              ChunkVersion(3, 1, OID(), boost::none /* timestamp */));
+    ASSERT_EQ(ChunkVersion({epoch, Timestamp(1, 1)}, {3, 1}),
+              ChunkVersion({epoch, Timestamp(1, 1)}, {3, 1}));
+    ASSERT_EQ(ChunkVersion({OID(), timestamp}, {3, 1}), ChunkVersion({OID(), timestamp}, {3, 1}));
 
-    ASSERT_NE(ChunkVersion(3, 1, epoch, boost::none /* timestamp */),
-              ChunkVersion(3, 1, OID(), boost::none /* timestamp */));
-    ASSERT_NE(ChunkVersion(3, 1, OID(), boost::none /* timestamp */),
-              ChunkVersion(3, 1, epoch, boost::none /* timestamp */));
-    ASSERT_NE(ChunkVersion(4, 2, epoch, boost::none /* timestamp */),
-              ChunkVersion(4, 1, epoch, boost::none /* timestamp */));
+    ASSERT_NE(ChunkVersion({epoch, timestamp}, {3, 1}),
+              ChunkVersion({OID(), Timestamp(1, 1)}, {3, 1}));
+    ASSERT_NE(ChunkVersion({OID(), Timestamp(1, 1)}, {3, 1}),
+              ChunkVersion({epoch, timestamp}, {3, 1}));
+    ASSERT_NE(ChunkVersion({epoch, timestamp}, {4, 2}), ChunkVersion({epoch, timestamp}, {4, 1}));
 }
 
-TEST(ChunkVersionComparison, OlderThan) {
+TEST(ChunkVersionTest, OlderThan) {
     OID epoch = OID::gen();
+    Timestamp timestamp(1);
+    Timestamp newerTimestamp(2);
 
-    ASSERT(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)
-               .isOlderThan(ChunkVersion(4, 1, epoch, boost::none /* timestamp */)));
-    ASSERT(!ChunkVersion(4, 1, epoch, boost::none /* timestamp */)
-                .isOlderThan(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)));
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({epoch, timestamp}, {4, 1})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {4, 1})
+                .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
 
-    ASSERT(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)
-               .isOlderThan(ChunkVersion(3, 2, epoch, boost::none /* timestamp */)));
-    ASSERT(!ChunkVersion(3, 2, epoch, boost::none /* timestamp */)
-                .isOlderThan(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)));
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 2})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {3, 2})
+                .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
 
-    ASSERT(!ChunkVersion(3, 1, epoch, boost::none /* timestamp */)
-                .isOlderThan(ChunkVersion(4, 1, OID(), boost::none /* timestamp */)));
-    ASSERT(!ChunkVersion(4, 1, OID(), boost::none /* timestamp */)
-                .isOlderThan(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)));
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({OID::gen(), newerTimestamp}, {3, 1})));
+    ASSERT(!ChunkVersion({epoch, newerTimestamp}, {3, 1})
+                .isOlderThan(ChunkVersion({OID::gen(), timestamp}, {3, 1})));
 
-    ASSERT(ChunkVersion(3, 2, epoch, boost::none /* timestamp */)
-               .isOlderThan(ChunkVersion(4, 1, epoch, boost::none /* timestamp */)));
-
-    ASSERT(!ChunkVersion(3, 1, epoch, boost::none /* timestamp */)
-                .isOlderThan(ChunkVersion(3, 1, epoch, boost::none /* timestamp */)));
+    ASSERT(!ChunkVersion::UNSHARDED().isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {3, 1}).isOlderThan(ChunkVersion::UNSHARDED()));
 }
 
-TEST(ChunkVersionConstruction, CreateWithLargeValues) {
-    const auto minorVersion = std::numeric_limits<uint32_t>::max();
-    const uint32_t majorVersion = 1 << 24;
+TEST(ChunkVersionTest, CreateWithLargeValues) {
+    const uint32_t majorVersion = std::numeric_limits<uint32_t>::max();
+    const uint32_t minorVersion = std::numeric_limits<uint32_t>::max();
     const auto epoch = OID::gen();
 
-    ChunkVersion version(majorVersion, minorVersion, epoch, boost::none /* timestamp */);
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
     ASSERT_EQ(majorVersion, version.majorVersion());
     ASSERT_EQ(minorVersion, version.minorVersion());
     ASSERT_EQ(epoch, version.epoch());
+    ASSERT_EQ(Timestamp(1, 1), version.getTimestamp());
 }
 
-TEST(ChunkVersionManipulation, ThrowsErrorIfOverflowIsAttemptedForMajorVersion) {
-    const uint32_t minorVersion = 0;
+TEST(ChunkVersionTest, ThrowsErrorIfOverflowIsAttemptedForMajorVersion) {
     const uint32_t majorVersion = std::numeric_limits<uint32_t>::max();
+    const uint32_t minorVersion = 0;
     const auto epoch = OID::gen();
 
-    ChunkVersion version(majorVersion, minorVersion, epoch, boost::none /* timestamp */);
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
     ASSERT_EQ(majorVersion, version.majorVersion());
     ASSERT_EQ(minorVersion, version.minorVersion());
     ASSERT_EQ(epoch, version.epoch());
@@ -225,17 +100,18 @@ TEST(ChunkVersionManipulation, ThrowsErrorIfOverflowIsAttemptedForMajorVersion) 
     ASSERT_THROWS_CODE(version.incMajor(), DBException, 31180);
 }
 
-TEST(ChunkVersionManipulation, ThrowsErrorIfOverflowIsAttemptedForMinorVersion) {
-    const uint32_t minorVersion = std::numeric_limits<uint32_t>::max();
+TEST(ChunkVersionTest, ThrowsErrorIfOverflowIsAttemptedForMinorVersion) {
     const uint32_t majorVersion = 0;
+    const uint32_t minorVersion = std::numeric_limits<uint32_t>::max();
     const auto epoch = OID::gen();
 
-    ChunkVersion version(majorVersion, minorVersion, epoch, boost::none /* timestamp */);
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
     ASSERT_EQ(majorVersion, version.majorVersion());
     ASSERT_EQ(minorVersion, version.minorVersion());
     ASSERT_EQ(epoch, version.epoch());
 
     ASSERT_THROWS_CODE(version.incMinor(), DBException, 31181);
 }
+
 }  // namespace
 }  // namespace mongo

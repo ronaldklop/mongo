@@ -29,17 +29,33 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
 #include <map>
+#include <memory>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults_gen.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/thread_pool_interface.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/invalidating_lru_cache.h"
 #include "mongo/util/read_through_cache.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -76,6 +92,11 @@ public:
     boost::optional<ReadConcern> getDefaultReadConcern(OperationContext* opCtx);
     boost::optional<WriteConcern> getDefaultWriteConcern(OperationContext* opCtx);
 
+    /**
+     * Returns the implicit default read concern.
+     */
+    repl::ReadConcernArgs getImplicitDefaultReadConcern();
+
     class RWConcernDefaultAndTime : public RWConcernDefault {
     public:
         RWConcernDefaultAndTime() = default;
@@ -95,9 +116,7 @@ public:
      * Returns the current set of read/write concern defaults along with the wallclock time when
      * they were cached (for diagnostic purposes).
      */
-    RWConcernDefaultAndTime getDefault(OperationContext* opCtx) {
-        return _getDefault(opCtx).value_or(RWConcernDefaultAndTime());
-    }
+    RWConcernDefaultAndTime getDefault(OperationContext* opCtx);
 
     /**
      * Returns true if the RC level is permissible to use as a default, and false if it cannot be a
@@ -109,7 +128,8 @@ public:
      * Checks if the given RWC is suitable to use as a default, and uasserts if not.
      */
     static void checkSuitabilityAsDefault(const ReadConcern& rc);
-    static void checkSuitabilityAsDefault(const WriteConcern& wc);
+    static void checkSuitabilityAsDefault(const WriteConcern& wc,
+                                          bool writeConcernMajorityShouldJournal);
 
     /**
      * Examines a document key affected by a write to config.settings and will register a WUOW
@@ -127,9 +147,14 @@ public:
      * Will generate and use a new epoch and setTime for the updated defaults, which are returned.
      * Validates the supplied read and write concerns can serve as defaults.
      */
-    RWConcernDefault generateNewConcerns(OperationContext* opCtx,
-                                         const boost::optional<ReadConcern>& rc,
-                                         const boost::optional<WriteConcern>& wc);
+    RWConcernDefault generateNewCWRWCToBeSavedOnDisk(OperationContext* opCtx,
+                                                     const boost::optional<ReadConcern>& rc,
+                                                     const boost::optional<WriteConcern>& wc);
+
+    /**
+     * Returns true if cluster-wide write concern is set.
+     */
+    bool isCWWCSet(OperationContext* opCtx);
 
     /**
      * Invalidates the cached RWC defaults, causing them to be refreshed.
@@ -152,10 +177,30 @@ public:
      */
     void setDefault(OperationContext* opCtx, RWConcernDefault&& rwc);
 
+    /**
+     * Sets implicit default write concern whether it should be majority or not.
+     * Should be called only once on startup (except in testing).
+     */
+    void setImplicitDefaultWriteConcernMajority(bool newImplicitDefaultWCMajority);
+
+    /**
+     * Gets a bool indicating whether the implicit default write concern is majority.
+     * This function should only be used for testing purposes.
+     */
+    bool getImplicitDefaultWriteConcernMajority_forTest();
+
+    /**
+     * Gets the cluster-wide write concern (CWWC) persisted on disk.
+     */
+    boost::optional<WriteConcern> getCWWC(OperationContext* opCtx);
+
 private:
     enum class Type { kReadWriteConcernEntry };
 
-    boost::optional<RWConcernDefaultAndTime> _getDefault(OperationContext* opCtx);
+    /**
+     * Gets cluster wide read and write concerns (CWRWC) persisted on disk.
+     */
+    boost::optional<RWConcernDefaultAndTime> _getDefaultCWRWCFromDisk(OperationContext* opCtx);
 
     class Cache : public ReadThroughCache<Type, RWConcernDefault> {
         Cache(const Cache&) = delete;
@@ -165,12 +210,12 @@ private:
         Cache(ServiceContext* service,
               ThreadPoolInterface& threadPool,
               FetchDefaultsFn fetchDefaultsFn);
-        virtual ~Cache() = default;
+        ~Cache() override = default;
 
         boost::optional<RWConcernDefault> lookup(OperationContext* opCtx);
 
     private:
-        Mutex _mutex = MONGO_MAKE_LATCH("ReadWriteConcernDefaults::Cache");
+        stdx::mutex _mutex;
 
         FetchDefaultsFn _fetchDefaultsFn;
     };
@@ -179,6 +224,9 @@ private:
 
     // Thread pool on which to perform loading of the cached RWC defaults
     ThreadPool _threadPool;
+
+    // Indicate whether implicit default write concern should be majority or not.
+    AtomicWord<bool> _implicitDefaultWriteConcernMajority;
 };
 
 }  // namespace mongo

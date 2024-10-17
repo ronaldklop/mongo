@@ -6,31 +6,44 @@
 //     uses_transactions,
 // ]
 
-(function() {
-'use strict';
+import {
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {waitForCommand} from "jstests/libs/wait_for_command.js";
 
-load("jstests/libs/chunk_manipulation_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/wait_for_command.js");
+// Documents inserted in this test are in the shape {_id: int} so the size is 18 bytes
+const docSizeInBytes = 18;
 
 function ShardStat() {
     this.countDonorMoveChunkStarted = 0;
     this.countRecipientMoveChunkStarted = 0;
     this.countDocsClonedOnRecipient = 0;
     this.countDocsClonedOnDonor = 0;
-    this.countDocsDeletedOnDonor = 0;
+    this.countDocsDeletedByRangeDeleter = 0;
+    this.countBytesDeletedByRangeDeleter = 0;
 }
 
-function incrementStatsAndCheckServerShardStats(donor, recipient, numDocs) {
+function incrementStatsAndCheckServerShardStats(db, donor, recipient, numDocs) {
     ++donor.countDonorMoveChunkStarted;
     donor.countDocsClonedOnDonor += numDocs;
     ++recipient.countRecipientMoveChunkStarted;
     recipient.countDocsClonedOnRecipient += numDocs;
-    donor.countDocsDeletedOnDonor += numDocs;
+    donor.countDocsDeletedByRangeDeleter += numDocs;
+    // The size of each document inserted in this test is 1 byte, so the number of bytes
+    // deleted must be exactly `numDocs`
+    donor.countBytesDeletedByRangeDeleter += numDocs * docSizeInBytes;
     const statsFromServerStatus = shardArr.map(function(shardVal) {
         return shardVal.getDB('admin').runCommand({serverStatus: 1}).shardingStatistics;
     });
     for (let i = 0; i < shardArr.length; ++i) {
+        let countDocsDeleted = statsFromServerStatus[i].hasOwnProperty('countDocsDeletedOnDonor')
+            ? statsFromServerStatus[i].countDocsDeletedOnDonor
+            : statsFromServerStatus[i].countDocsDeletedByRangeDeleter;
         assert(statsFromServerStatus[i]);
         assert(statsFromServerStatus[i].countStaleConfigErrors);
         assert(statsFromServerStatus[i].totalCriticalSectionCommitTimeMillis);
@@ -43,8 +56,14 @@ function incrementStatsAndCheckServerShardStats(donor, recipient, numDocs) {
         assert.eq(stats[i].countDocsClonedOnRecipient,
                   statsFromServerStatus[i].countDocsClonedOnRecipient);
         assert.eq(stats[i].countDocsClonedOnDonor, statsFromServerStatus[i].countDocsClonedOnDonor);
-        assert.eq(stats[i].countDocsDeletedOnDonor,
-                  statsFromServerStatus[i].countDocsDeletedOnDonor);
+        assert.eq(stats[i].countDocsDeletedByRangeDeleter, countDocsDeleted);
+        // TODO SERVER-xyz remove FCV check and `db` argument once v8.0 branches out
+        const fcvDoc = db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+        if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '7.1') >=
+            0) {
+            assert.eq(stats[i].countBytesDeletedByRangeDeleter,
+                      statsFromServerStatus[i].countBytesDeletedByRangeDeleter);
+        }
         assert.eq(stats[i].countRecipientMoveChunkStarted,
                   statsFromServerStatus[i].countRecipientMoveChunkStarted);
     }
@@ -83,7 +102,10 @@ function runConcurrentMoveChunk(host, ns, toShard) {
                            result.code == ErrorCodes.ConflictingOperationInProgress);
         if (shouldRetry) {
             jsTestLog("Retrying moveChunk due to ConflictingOperationInProgress");
+        } else if (!result.ok) {
+            jsTestLog("moveChunk encountered an error: " + tojson(result));
         }
+
         return shouldRetry ? runMoveChunkUntilSuccessOrUnexpectedError() : result;
     }
     // Kick off the recursive helper function.
@@ -116,20 +138,25 @@ const coll = mongos.getCollection(dbName + "." + collName);
 const numDocsToInsert = 3;
 const shardArr = [st.shard0, st.shard1];
 const stats = [new ShardStat(), new ShardStat()];
-const index = {
+const index1 = {
     x: 1
+};
+const index2 = {
+    y: 1
 };
 let numDocsInserted = 0;
 
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB() + "", st.shard0.shardName);
+assert.commandWorked(
+    admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard0.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: 0}}));
+
+const testDB = st.rs0.getPrimary().getDB(dbName);
 
 // Move chunk from shard0 to shard1 without docs.
 assert.commandWorked(
     mongos.adminCommand({moveChunk: coll + '', find: {_id: 1}, to: st.shard1.shardName}));
-incrementStatsAndCheckServerShardStats(stats[0], stats[1], numDocsInserted);
+incrementStatsAndCheckServerShardStats(testDB, stats[0], stats[1], numDocsInserted);
 
 // Insert docs and then move chunk again from shard1 to shard0.
 for (let i = 0; i < numDocsToInsert; ++i) {
@@ -138,17 +165,17 @@ for (let i = 0; i < numDocsToInsert; ++i) {
 }
 assert.commandWorked(mongos.adminCommand(
     {moveChunk: coll + '', find: {_id: 1}, to: st.shard0.shardName, _waitForDelete: true}));
-incrementStatsAndCheckServerShardStats(stats[1], stats[0], numDocsInserted);
+incrementStatsAndCheckServerShardStats(testDB, stats[1], stats[0], numDocsInserted);
 
 // Check that numbers are indeed cumulative. Move chunk from shard0 to shard1.
 assert.commandWorked(mongos.adminCommand(
     {moveChunk: coll + '', find: {_id: 1}, to: st.shard1.shardName, _waitForDelete: true}));
-incrementStatsAndCheckServerShardStats(stats[0], stats[1], numDocsInserted);
+incrementStatsAndCheckServerShardStats(testDB, stats[0], stats[1], numDocsInserted);
 
 // Move chunk from shard1 to shard0.
 assert.commandWorked(mongos.adminCommand(
     {moveChunk: coll + '', find: {_id: 1}, to: st.shard0.shardName, _waitForDelete: true}));
-incrementStatsAndCheckServerShardStats(stats[1], stats[0], numDocsInserted);
+incrementStatsAndCheckServerShardStats(testDB, stats[1], stats[0], numDocsInserted);
 
 //
 // Tests for the count of migrations aborting from lock timeouts.
@@ -242,7 +269,7 @@ moveChunkThread.start();
 waitForMoveChunkStep(donorConn, moveChunkStepNames.startedMoveChunk);
 
 // Run an index command.
-assert.commandWorked(coll.createIndexes([index]));
+assert.commandWorked(coll.createIndexes([index1]));
 
 // Unpause the migration and verify that it gets aborted.
 unpauseMoveChunkAtStep(donorConn, moveChunkStepNames.startedMoveChunk);
@@ -259,8 +286,7 @@ moveChunkThread.start();
 waitForMoveChunkStep(donorConn, moveChunkStepNames.reachedSteadyState);
 
 // Run an index command.
-assert.commandWorked(
-    st.s.getDB(dbName).runCommand({collMod: collName, validator: {x: {$type: "string"}}}));
+assert.commandWorked(coll.createIndexes([index2]));
 
 // Unpause the migration and verify that it gets aborted.
 unpauseMoveChunkAtStep(donorConn, moveChunkStepNames.reachedSteadyState);
@@ -270,4 +296,3 @@ assert.commandFailedWithCode(moveChunkThread.returnData(), ErrorCodes.Interrupte
 checkServerStatusAbortedMigrationCount(donorConn, 2);
 
 st.stop();
-})();

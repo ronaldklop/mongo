@@ -32,8 +32,9 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 struct HostAndPort;
@@ -56,7 +57,7 @@ public:
 
     /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of secondary
     /// replication progress.
-    void forwardSecondaryProgress();
+    void forwardSecondaryProgress(bool prioritized = false);
 
     /**
      * Loops continuously until shutdown() is called, passing updates when they are present. If no
@@ -79,7 +80,7 @@ private:
     Status _updateUpstream(Reporter* reporter);
 
     // protects cond, _shutdownSignaled, _keepAliveInterval, and _positionChanged.
-    Mutex _mtx = MONGO_MAKE_LATCH("SyncSourceFeedback::_mtx");
+    stdx::mutex _mtx;
     // used to alert our thread of changes which need to be passed up the chain
     stdx::condition_variable _cond;
     // used to indicate a position change which has not yet been pushed along

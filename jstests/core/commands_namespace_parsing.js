@@ -2,6 +2,12 @@
 // using the empty string as the out collection name is converted to an error and no longer retains
 // the "code" property.
 // @tags: [
+//   # This test runs commands that are not allowed with security token: cleanupOrphaned,
+//   # cloneCollectionAsCapped, compact, dataSize, enableSharding, godinsert, mapreduce,
+//   # mergeChunks, moveChunk, movePrimary, planCacheClear, planCacheClearFilters,
+//   # planCacheListFilters, planCacheSetFilter, reIndex, shardCollection, split,
+//   # updateZoneKeyRange.
+//   not_allowed_with_signed_security_token,
 //   assumes_unsharded_collection,
 //   does_not_support_stepdowns,
 //   requires_fastcount,
@@ -9,13 +15,16 @@
 //   requires_non_retryable_commands,
 //   uses_testing_only_commands,
 //   uses_map_reduce_with_temp_collections,
+//   no_selinux,
+//   # This test has statements that do not support non-local read concern.
+//   does_not_support_causal_consistency,
+//   uses_compact,
 // ]
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // This file tests that commands namespace parsing rejects embedded null bytes.
 // Note that for each command, a properly formatted command object must be passed to the helper
 // function, regardless of the namespace used in the command object.
-(function() {
-"use strict";
 
 const isFullyQualified = true;
 const isNotFullyQualified = false;
@@ -47,15 +56,14 @@ function assertFailsWithInvalidNamespacesForField(
     }
 
     const dbCmd = isAdminCommand ? db.adminCommand : db.runCommand;
+    const expErrors = [ErrorCodes.InvalidNamespace, ErrorCodes.NamespaceNotFound];
     for (let cmd of cmds) {
         jsTestLog(`running ${tojson(cmd)}`);
-        assert.commandFailedWithCode(dbCmd.apply(db, [cmd]), ErrorCodes.InvalidNamespace);
+        assert.commandFailedWithCode(dbCmd.apply(db, [cmd]), expErrors);
     }
 }
 
-const hello = db.runCommand("hello");
-assert.commandWorked(hello);
-const isMongos = (hello.msg === "isdbgrid");
+const runningOnMongos = FixtureHelpers.isMongos(db);
 
 db.commands_namespace_parsing.drop();
 assert.commandWorked(db.commands_namespace_parsing.insert({a: 1}));
@@ -172,7 +180,7 @@ assertFailsWithInvalidNamespacesForField("collection",
                                          isNotFullyQualified,
                                          isNotAdminCommand);
 
-if (!isMongos) {
+if (!runningOnMongos) {
     // Test godinsert fails with an invalid collection name.
     assertFailsWithInvalidNamespacesForField(
         "godinsert", {godinsert: "", obj: {_id: 1}}, isNotFullyQualified, isNotAdminCommand);
@@ -196,13 +204,13 @@ assertFailsWithInvalidNamespacesForField(
 assertFailsWithInvalidNamespacesForField(
     "planCacheClear", {planCacheClear: ""}, isNotFullyQualified, isNotAdminCommand);
 
-if (!isMongos) {
+if (!runningOnMongos) {
     // Test cleanupOrphaned fails with an invalid collection name.
     assertFailsWithInvalidNamespacesForField(
         "cleanupOrphaned", {cleanupOrphaned: ""}, isFullyQualified, isAdminCommand);
 }
 
-if (isMongos) {
+if (runningOnMongos) {
     // Test enableSharding fails with an invalid database name.
     assertFailsWithInvalidNamespacesForField(
         "enableSharding", {enableSharding: ""}, isNotFullyQualified, isAdminCommand);
@@ -256,7 +264,8 @@ assertFailsWithInvalidNamespacesForField(
 assertFailsWithInvalidNamespacesForField(
     "create", {create: ""}, isNotFullyQualified, isNotAdminCommand);
 
-if (!isMongos) {
+// TODO SERVER-85773: Enale below test for sharded clusters.
+if (!runningOnMongos) {
     // Test cloneCollectionAsCapped fails with an invalid source collection name.
     assertFailsWithInvalidNamespacesForField(
         "cloneCollectionAsCapped",
@@ -269,13 +278,11 @@ if (!isMongos) {
         {cloneCollectionAsCapped: "commands_namespace_parsing", toCollection: "", size: 1024},
         isNotFullyQualified,
         isNotAdminCommand);
-
-    // Test convertToCapped fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField("convertToCapped",
-                                             {convertToCapped: "", size: 1024},
-                                             isNotFullyQualified,
-                                             isNotAdminCommand);
 }
+
+// Test convertToCapped fails with an invalid collection name.
+assertFailsWithInvalidNamespacesForField(
+    "convertToCapped", {convertToCapped: "", size: 1024}, isNotFullyQualified, isNotAdminCommand);
 
 // Test filemd5 fails with an invalid collection name.
 // Note: for this command, it is OK to pass 'root: ""', so do not use the helper function.
@@ -298,7 +305,7 @@ assertFailsWithInvalidNamespacesForField(
 assertFailsWithInvalidNamespacesForField(
     "dropIndexes", {dropIndexes: "", index: "*"}, isNotFullyQualified, isNotAdminCommand);
 
-if (!isMongos) {
+if (!runningOnMongos) {
     // Test compact fails with an invalid collection name.
     assertFailsWithInvalidNamespacesForField(
         "compact", {compact: ""}, isNotFullyQualified, isNotAdminCommand);
@@ -312,7 +319,7 @@ assertFailsWithInvalidNamespacesForField(
     isNotAdminCommand);
 
 // Test reIndex fails with an invalid collection name.
-if (!isMongos) {
+if (!runningOnMongos) {
     assertFailsWithInvalidNamespacesForField(
         "reIndex", {reIndex: ""}, isNotFullyQualified, isNotAdminCommand);
 }
@@ -366,4 +373,3 @@ assertFailsWithInvalidNamespacesForField("explain.update",
 // Test validate fails with an invalid collection name.
 assertFailsWithInvalidNamespacesForField(
     "validate", {validate: ""}, isNotFullyQualified, isNotAdminCommand);
-})();

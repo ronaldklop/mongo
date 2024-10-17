@@ -30,18 +30,30 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
-struct TenantMigrationRecipientInfo {
-    TenantMigrationRecipientInfo(const UUID& in_uuid) : uuid(in_uuid) {}
-    UUID uuid;
-};
-extern const OperationContext::Decoration<boost::optional<TenantMigrationRecipientInfo>>
-    tenantMigrationRecipientInfo;
 
+struct DonorOplogEntryData {
+    DonorOplogEntryData(const OpTime& donorOpTime, const int64_t applyOpsIndex)
+        : donorOpTime(donorOpTime), applyOpsIndex(applyOpsIndex) {}
+    OpTime donorOpTime;
+    int64_t applyOpsIndex;
+};
+
+struct TenantMigrationInfo {
+    TenantMigrationInfo(const UUID& in_uuid) : uuid(in_uuid) {}
+
+    UUID uuid;
+    boost::optional<DonorOplogEntryData> donorOplogEntryData;
+};
+extern const OperationContext::Decoration<boost::optional<TenantMigrationInfo>> tenantMigrationInfo;
 }  // namespace repl
 }  // namespace mongo

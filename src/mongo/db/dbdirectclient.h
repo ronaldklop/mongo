@@ -29,12 +29,28 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_base.h"
-#include "mongo/config.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/lasterror.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/repl/read_concern_gen.h"
+#include "mongo/rpc/message.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
@@ -53,50 +69,64 @@ class DBDirectClient : public DBClientBase {
 public:
     DBDirectClient(OperationContext* opCtx);
 
-    using DBClientBase::query;
+    using DBClientBase::createCollection;
+    using DBClientBase::createIndex;
+    using DBClientBase::createIndexes;
+    using DBClientBase::dropCollection;
+    using DBClientBase::dropDatabase;
+    using DBClientBase::find;
+    using DBClientBase::findOne;
+    using DBClientBase::getCollectionInfos;
+    using DBClientBase::getDatabaseInfos;
+    using DBClientBase::getIndexSpecs;
+    using DBClientBase::insert;
+    using DBClientBase::insertAcknowledged;
+    using DBClientBase::remove;
+    using DBClientBase::removeAcknowledged;
+    using DBClientBase::runCommand;
+    using DBClientBase::update;
+    using DBClientBase::updateAcknowledged;
 
-    virtual std::unique_ptr<DBClientCursor> query(
-        const NamespaceStringOrUUID& nsOrUuid,
-        Query query,
-        int nToReturn = 0,
-        int nToSkip = 0,
-        const BSONObj* fieldsToReturn = nullptr,
-        int queryOptions = 0,
-        int batchSize = 0,
-        boost::optional<BSONObj> readConcernObj = boost::none);
+    std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
+                                         const ReadPreferenceSetting& readPref,
+                                         ExhaustMode exhaustMode) override;
+
+    long long count(NamespaceStringOrUUID nsOrUuid,
+                    const BSONObj& query = BSONObj(),
+                    int options = 0,
+                    int limit = 0,
+                    int skip = 0,
+                    boost::optional<repl::ReadConcernArgs> readConcernObj = boost::none) override;
+
+    /**
+     * The insert, update, and remove commands only check the top level error status. The caller is
+     * responsible for checking the writeErrors element for errors during execution.
+     */
+    write_ops::InsertCommandReply insert(const write_ops::InsertCommandRequest& insert);
+    write_ops::UpdateCommandReply update(const write_ops::UpdateCommandRequest& update);
+    write_ops::DeleteCommandReply remove(const write_ops::DeleteCommandRequest& remove);
 
     write_ops::FindAndModifyCommandReply findAndModify(
         const write_ops::FindAndModifyCommandRequest& findAndModify);
 
-    virtual bool isFailed() const;
+protected:
+    auth::ValidatedTenancyScope _createInnerRequestVTS(
+        const boost::optional<TenantId>& tenantId) const override;
 
-    virtual bool isStillConnected();
+private:
+    bool isFailed() const override;
 
-    virtual std::string toString() const;
+    bool isStillConnected() override;
 
-    virtual std::string getServerAddress() const;
+    std::string toString() const override;
 
-    virtual bool call(Message& toSend,
-                      Message& response,
-                      bool assertOk = true,
-                      std::string* actualServer = nullptr);
+    std::string getServerAddress() const override;
 
-    virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr);
+    void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
 
-    virtual long long count(const NamespaceStringOrUUID nsOrUuid,
-                            const BSONObj& query = BSONObj(),
-                            int options = 0,
-                            int limit = 0,
-                            int skip = 0,
-                            boost::optional<BSONObj> readConcernObj = boost::none);
+    ConnectionString::ConnectionType type() const override;
 
-    virtual ConnectionString::ConnectionType type() const;
-
-    double getSoTimeout() const;
-
-    virtual bool lazySupported() const;
-
-    virtual QueryOptions _lookupAvailableOptions();
+    double getSoTimeout() const override;
 
     int getMinWireVersion() final;
     int getMaxWireVersion() final;
@@ -107,6 +137,10 @@ public:
         return false;
     }
 
+    bool isTLS() final {
+        return false;
+    }
+
 #ifdef MONGO_CONFIG_SSL
     const SSLConfiguration* getSSLConfiguration() override {
         invariant(false);
@@ -114,12 +148,11 @@ public:
     }
 #endif
 
-protected:
     void _auth(const BSONObj& params) override;
 
-private:
+    Message _call(Message& toSend, std::string* actualServer) override;
+
     OperationContext* _opCtx;
-    LastError _lastError;  // This LastError will be used for all operations on this client.
 };
 
 }  // namespace mongo

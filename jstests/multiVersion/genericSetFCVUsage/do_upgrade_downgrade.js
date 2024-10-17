@@ -1,17 +1,14 @@
 // Perform the upgrade/downgrade procedure by first setting the featureCompatibilityVersion and
 // then switching the binary.
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/get_index_helpers.js");
-load("jstests/libs/check_uuids.js");
-load("jstests/libs/check_unique_indexes.js");
+import {checkUniqueIndexFormatVersion} from "jstests/libs/check_unique_indexes.js";
+import {checkCollectionUUIDs} from "jstests/libs/check_uuids.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const latestBinary = "latest";
 
 let setFCV = function(adminDB, version) {
-    assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: version}));
+    assert.commandWorked(adminDB.runCommand(
+        {setFeatureCompatibilityVersion: version, confirm: true, writeConcern: {w: 1}}));
     checkFCV(adminDB, version);
 };
 
@@ -28,7 +25,7 @@ let insertDataForConn = function(conn, dbs, nodeOptions) {
                 assert.commandWorked(
                     conn.getDB(dbs[j]).foo.insert(doc, {writeConcern: {w: "majority"}}));
             } else {
-                assert.commandWorked(conn.getDB(dbs[j]).foo.insert(doc));
+                assert.commandWorked(conn.getDB(dbs[j]).foo.insert(doc, {writeConcern: {w: 1}}));
             }
         }
     }
@@ -40,9 +37,16 @@ let insertDataForConn = function(conn, dbs, nodeOptions) {
         let testDB = conn.getDB(dbs[j]);
         testDB.getCollectionInfos().forEach(function(c) {
             if (c.name === "foo") {
-                let foo = testDB.getCollection(c.name);
-                assert.commandWorked(foo.createIndex({id: 1}, {unique: true}));
-                assert.commandWorked(foo.createIndex({sno: 1}, {unique: true, v: 1}));
+                assert.commandWorked(testDB.runCommand({
+                    createIndexes: "foo",
+                    indexes: [{key: {id: 1}, name: "id_1", unique: true}],
+                    writeConcern: {w: 1}
+                }));
+                assert.commandWorked(testDB.runCommand({
+                    createIndexes: "foo",
+                    indexes: [{key: {sno: 1}, name: "sno_1", unique: true, v: 1}],
+                    writeConcern: {w: 1}
+                }));
             }
         });
     }
@@ -67,15 +71,14 @@ let recreateUniqueIndexes = function(db, secondary) {
             }
 
             currentCollection.getIndexes().forEach(function(spec) {
-                if (!spec.unique) {
+                if (!spec.unique || spec.clustered) {
                     return;
                 }
 
-                const ns = d.name + "." + c.name;
                 if (spec.v === 1) {
-                    unique_idx_v1.push({ns: ns, spec: spec});
+                    unique_idx_v1.push({dbName: d.name, collName: c.name, spec: spec});
                 } else {
-                    unique_idx.push({ns: ns, spec: spec});
+                    unique_idx.push({dbName: d.name, collName: c.name, spec: spec});
                 }
             });
         });
@@ -83,28 +86,32 @@ let recreateUniqueIndexes = function(db, secondary) {
 
     // Drop and create all v:2 indexes
     for (let pair of unique_idx) {
-        const ns = pair.ns;
         const idx = pair.spec;
-        let [dbName, collName] = ns.split(".");
-        let res = db.getSiblingDB(dbName).runCommand({dropIndexes: collName, index: idx.name});
+        const dbName = pair.dbName;
+        const collName = pair.collName;
+        let res = db.getSiblingDB(dbName).runCommand(
+            {dropIndexes: collName, index: idx.name, writeConcern: {w: 1}});
         assert.commandWorked(res);
         res = db.getSiblingDB(dbName).runCommand({
             createIndexes: collName,
-            indexes: [{"key": idx.key, "name": idx.name, "unique": true}]
+            indexes: [{"key": idx.key, "name": idx.name, "unique": true}],
+            writeConcern: {w: 1}
         });
         assert.commandWorked(res);
     }
 
     // Drop and create all v:1 indexes
     for (let pair of unique_idx_v1) {
-        const ns = pair.ns;
         const idx = pair.spec;
-        let [dbName, collName] = ns.split(".");
-        let res = db.getSiblingDB(dbName).runCommand({dropIndexes: collName, index: idx.name});
+        const dbName = pair.dbName;
+        const collName = pair.collName;
+        let res = db.getSiblingDB(dbName).runCommand(
+            {dropIndexes: collName, index: idx.name, writeConcern: {w: 1}});
         assert.commandWorked(res);
         res = db.getSiblingDB(dbName).runCommand({
             createIndexes: collName,
-            indexes: [{"key": idx.key, "name": idx.name, "unique": true, "v": 1}]
+            indexes: [{"key": idx.key, "name": idx.name, "unique": true, "v": 1}],
+            writeConcern: {w: 1}
         });
         assert.commandWorked(res);
     }
@@ -158,8 +165,12 @@ let standaloneTest = function(nodeOptions, downgradeVersion) {
 
         // Transitioning from last-lts to last-continuous is only allowed when
         // setFeatureCompatibilityVersion is called with fromConfigServer: true.
-        assert.commandWorked(adminDB.runCommand(
-            {setFeatureCompatibilityVersion: downgradeFCV, fromConfigServer: true}));
+        assert.commandWorked(adminDB.runCommand({
+            setFeatureCompatibilityVersion: downgradeFCV,
+            confirm: true,
+            fromConfigServer: true,
+            writeConcern: {w: 1}
+        }));
         checkFCV(adminDB, downgradeFCV);
     }
 
@@ -206,12 +217,12 @@ let standaloneTest = function(nodeOptions, downgradeVersion) {
 //
 // Replica set tests.
 //
-let replicaSetTest = function(nodeOptions, downgradeVersion) {
+let replicaSetTest = function(nodeOptions, downgradeVersion, numNodes = 3) {
     jsTestLog("Running replica set test with 'downgradeVersion': " + downgradeVersion);
     const downgradeFCV = binVersionToFCV(downgradeVersion);
     // New latest binary version replica set.
     jsTest.log("Starting a latest binVersion ReplSetTest");
-    let rst = new ReplSetTest({nodes: 3, nodeOptions: nodeOptions});
+    let rst = new ReplSetTest({nodes: numNodes, nodeOptions: nodeOptions});
     rst.startSet();
     rst.initiate();
     let primaryAdminDB = rst.getPrimary().getDB("admin");
@@ -255,8 +266,12 @@ let replicaSetTest = function(nodeOptions, downgradeVersion) {
 
         // Transitioning from last-lts to last-continuous is only allowed when
         // setFeatureCompatibilityVersion is called with fromConfigServer: true.
-        assert.commandWorked(primaryAdminDB.runCommand(
-            {setFeatureCompatibilityVersion: downgradeFCV, fromConfigServer: true}));
+        assert.commandWorked(primaryAdminDB.runCommand({
+            setFeatureCompatibilityVersion: downgradeFCV,
+            confirm: true,
+            fromConfigServer: true,
+            writeConcern: {w: 1}
+        }));
     }
 
     // Ensure featureCompatibilityVersion is 'downgradeVersion' and all collections still have
@@ -344,13 +359,10 @@ standaloneTest({}, 'last-lts');
 replicaSetTest({}, 'last-continuous');
 replicaSetTest({}, 'last-lts');
 
-// Do tests for standalones and replica sets started with --shardsvr.
-standaloneTest({shardsvr: ""}, 'last-continuous');
-standaloneTest({shardsvr: ""}, 'last-lts');
+// Do tests for replica sets started with --shardsvr.
 replicaSetTest({shardsvr: ""}, 'last-continuous');
 replicaSetTest({shardsvr: ""}, 'last-lts');
 
 // Do tests for replica sets started with --configsvr.
 replicaSetTest({configsvr: ""}, 'last-continuous');
 replicaSetTest({configsvr: ""}, 'last-lts');
-})();

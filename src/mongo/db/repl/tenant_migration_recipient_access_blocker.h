@@ -29,13 +29,26 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
 
+#include "tenant_migration_access_blocker.h"
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
-#include "tenant_migration_access_blocker.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -46,13 +59,15 @@ namespace mongo {
  *
  * When data cloning is finished (and therefore a consistent donor optime established) an opObserver
  * that is observing the recipient state document will create a
- * TenantMigrationRecipientAccessBlocker in state `kReject` that will reject all reads (with
- * SnapshotTooOld) for that tenant.
+ * TenantMigrationRecipientAccessBlocker in state `kRejectReadsAndWrites` that will reject all
+ * commands (with IllegalOperation) for that tenant. If a command is received during this
+ * `kRejectReadsAndWrites` phase it suggests that something is wrong with the proxy since traffic
+ * should not be routed to the recipient yet.
  *
  * When oplog application reaches this consistent point, the recipient primary will wait for
  * the earlier state document write to be committed on all recipient nodes before doing the state
- * machine write for the consistent state. The TenantMigrationRecipientAccessBlocker, upon see the
- * write for the consistent state, will transition to `kRejectBefore` state with the
+ * machine write for the consistent state. The TenantMigrationRecipientAccessBlocker, upon seeing
+ * the write for the consistent state, will transition to `kRejectReadsBefore` state with the
  * `rejectBeforeTimestamp` set to the recipient consistent timestamp and will start allowing reads
  * for read concerns which read the latest snapshot, and "atClusterTime" or "majority" read concerns
  * which are after the `rejectBeforeTimestamp`. Reads for older snapshots, except "majority" until
@@ -65,38 +80,41 @@ namespace mongo {
  * recipientSyncData command with a returnAfterReachingTimestamp after the consistent point, the
  * `rejectBeforeTimestamp` will be advanced to the given returnAfterReachingTimestamp.
  *
- * Blocker excludes all operations with 'tenantMigrationRecipientInfo' decoration set, as they are
+ * Blocker excludes all operations with 'tenantMigrationInfo' decoration set, as they are
  * internal.
  */
 class TenantMigrationRecipientAccessBlocker
     : public std::enable_shared_from_this<TenantMigrationRecipientAccessBlocker>,
       public TenantMigrationAccessBlocker {
 public:
-    /**
-     * The access states of an mtab.
-     */
-    enum class State { kReject, kRejectBefore };
-
-    TenantMigrationRecipientAccessBlocker(ServiceContext* serviceContext,
-                                          UUID migrationId,
-                                          std::string tenantId,
-                                          std::string donorConnString);
+    TenantMigrationRecipientAccessBlocker(ServiceContext* serviceContext, const UUID& migrationId);
 
     //
     // Called by all writes and reads against the database.
     //
 
-    Status checkIfCanWrite() final;
-    Status waitUntilCommittedOrAborted(OperationContext* opCtx, OperationType operationType) final;
+    Status checkIfCanWrite(Timestamp writeTs) final;
+    Status waitUntilCommittedOrAborted(OperationContext* opCtx) final;
 
     Status checkIfLinearizableReadWasAllowed(OperationContext* opCtx) final;
-    SharedSemiFuture<void> getCanReadFuture(OperationContext* opCtx) final;
+    SharedSemiFuture<void> getCanRunCommandFuture(OperationContext* opCtx,
+                                                  StringData command) final;
 
     //
     // Called by index build user threads before acquiring an index build slot, and again right
     // after registering the build.
     //
     Status checkIfCanBuildIndex() final;
+
+    /**
+     * Checks if opening a new change stream should block.
+     */
+    Status checkIfCanOpenChangeStream() final;
+
+    /**
+     * Returns error status if "getMore" command of a change stream should fail.
+     */
+    Status checkIfCanGetMoreChangeStream() final;
 
     // @return true if TTL is blocked
     bool checkIfShouldBlockTTL() const final;
@@ -109,15 +127,7 @@ public:
      */
     void onMajorityCommitPointUpdate(repl::OpTime opTime) final;
 
-    std::shared_ptr<executor::TaskExecutor> getAsyncBlockingOperationsExecutor() final {
-        return _asyncBlockingOperationsExecutor;
-    }
-
     void appendInfoForServerStatus(BSONObjBuilder* builder) const final;
-
-    UUID getMigrationId() const;
-
-    BSONObj getDebugInfo() const final;
 
     void recordTenantMigrationError(Status status) final{};
 
@@ -126,30 +136,48 @@ public:
     //
     void startRejectingReadsBefore(const Timestamp& timestamp);
 
-    State getState() const {
-        return _state;
+    bool inStateReject() const {
+        return _state.isRejectReadsAndWrites();
     }
 
 private:
-    std::string _stateToString(State state) const;
+    /**
+     * The access states of an mtab.
+     */
+    class BlockerState {
+    public:
+        void transitionToRejectReadsBefore() {
+            _state = State::kRejectReadsBefore;
+        }
+
+        bool isRejectReadsAndWrites() const {
+            return _state == State::kRejectReadsAndWrites;
+        }
+
+        bool isRejectReadsBefore() const {
+            return _state == State::kRejectReadsBefore;
+        }
+
+        std::string toString() const;
+
+    private:
+        enum class State { kRejectReadsAndWrites, kRejectReadsBefore };
+
+        State _state = State::kRejectReadsAndWrites;
+    };
 
     ServiceContext* _serviceContext;
-    const UUID _migrationId;
-    const std::string _tenantId;
-    const std::string _donorConnString;
 
     // Protects the state below.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationRecipientAccessBlocker::_mutex");
+    mutable stdx::mutex _mutex;
 
-    State _state{State::kReject};
+    BlockerState _state;
 
     boost::optional<Timestamp> _rejectBeforeTimestamp;
 
     // Start with blocked TTL, unblock when the migration document is marked as
     // garbage collectable.
     bool _ttlIsBlocked = true;
-
-    std::shared_ptr<executor::TaskExecutor> _asyncBlockingOperationsExecutor;
 };
 
 }  // namespace mongo

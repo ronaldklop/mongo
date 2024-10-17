@@ -10,10 +10,15 @@
 // test causes failovers on a shard, so the cached connection is not usable.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-'use strict';
-
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {
+    getCoordinatorFailpoints,
+    waitForFailpoint,
+    flushRoutersAndRefreshShardMetadata,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -29,16 +34,13 @@ let lsid = {id: UUID()};
 let txnNumber = 0;
 
 const runTest = function(sameNodeStepsUpAfterFailover) {
-    let stepDownSecs;  // The amount of time the node has to wait before becoming primary again.
     let coordinatorReplSetConfig;
 
     if (sameNodeStepsUpAfterFailover) {
-        stepDownSecs = 1;
         coordinatorReplSetConfig = [{}];
     } else {
         // We are making one of the secondaries non-electable to ensure
         // that elections always result in a winner (see SERVER-42234)
-        stepDownSecs = 3;
         coordinatorReplSetConfig = [{}, {}, {rsConfig: {priority: 0}}];
     }
 
@@ -55,27 +57,36 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
     let participant1 = st.shard1;
     let participant2 = st.shard2;
 
-    const runCommitThroughMongosInParallelShellExpectSuccess = function() {
-        const runCommitExpectSuccessCode = "assert.commandWorked(db.adminCommand({" +
-            "commitTransaction: 1," +
-            "lsid: " + tojson(lsid) + "," +
-            "txnNumber: NumberLong(" + txnNumber + ")," +
-            "stmtId: NumberInt(0)," +
-            "autocommit: false," +
-            "}));";
-        return startParallelShell(runCommitExpectSuccessCode, st.s.port);
+    const runCommitThroughMongosExpectSuccess = function(lsidUUID, txnNumber, mongosHost) {
+        const conn = new Mongo(mongosHost);
+        try {
+            assert.commandWorked(conn.adminCommand({
+                commitTransaction: 1,
+                lsid: {id: UUID(lsidUUID)},
+                txnNumber: NumberLong(txnNumber),
+                stmtId: NumberInt(0),
+                autocommit: false,
+            }));
+        } catch (err) {
+            if ((err.hasOwnProperty('errorLabels') &&
+                 err.errorLabels.includes('TransientTransactionError'))) {
+                quit(err.code);
+            } else {
+                throw err;
+            }
+        }
     };
 
-    const runCommitThroughMongosInParallelShellExpectAbort = function() {
-        const runCommitExpectSuccessCode = "assert.commandFailedWithCode(db.adminCommand({" +
-            "commitTransaction: 1," +
-            "lsid: " + tojson(lsid) + "," +
-            "txnNumber: NumberLong(" + txnNumber + ")," +
-            "stmtId: NumberInt(0)," +
-            "autocommit: false," +
-            "})," +
-            "ErrorCodes.NoSuchTransaction);";
-        return startParallelShell(runCommitExpectSuccessCode, st.s.port);
+    const runCommitThroughMongosExpectAbort = function(lsidUUID, txnNumber, mongosHost) {
+        const conn = new Mongo(mongosHost);
+        assert.commandFailedWithCode(conn.adminCommand({
+            commitTransaction: 1,
+            lsid: {id: UUID(lsidUUID)},
+            txnNumber: NumberLong(txnNumber),
+            stmtId: NumberInt(0),
+            autocommit: false,
+        }),
+                                     ErrorCodes.NoSuchTransaction);
     };
 
     const setUp = function() {
@@ -83,8 +94,8 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
         // shard0: [-inf, 0)
         // shard1: [0, 10)
         // shard2: [10, +inf)
-        assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-        assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: participant0.shardName}));
+        assert.commandWorked(
+            st.s.adminCommand({enableSharding: dbName, primaryShard: participant0.shardName}));
         assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
         assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
         assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -105,6 +116,11 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
             startTransaction: true,
             autocommit: false,
         }));
+    };
+
+    const cleanUp = function() {
+        st.s.getDB(dbName).getCollection(collName).drop();
+        clearRawMongoProgramOutput();
     };
 
     const testCommitProtocol = function(makeAParticipantAbort, failpointData, expectAbortResponse) {
@@ -133,37 +149,41 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
 
         assert.commandWorked(coordPrimary.adminCommand({
             configureFailPoint: failpointData.failpoint,
-            mode: {skip: (failpointData.skip ? failpointData.skip : 0)},
+            mode: "alwaysOn",
+            data: failpointData.data ? failpointData.data : {},
         }));
 
-        // Run commitTransaction through a parallel shell.
-        let awaitResult;
+        // Run commitTransaction through a thread.
+        let commitThread;
         if (expectAbortResponse) {
-            awaitResult = runCommitThroughMongosInParallelShellExpectAbort();
+            commitThread = new Thread(runCommitThroughMongosExpectAbort,
+                                      extractUUIDFromObject(lsid.id),
+                                      txnNumber,
+                                      st.s.host);
         } else {
-            awaitResult = runCommitThroughMongosInParallelShellExpectSuccess();
+            commitThread = new Thread(runCommitThroughMongosExpectSuccess,
+                                      extractUUIDFromObject(lsid.id),
+                                      txnNumber,
+                                      st.s.host);
         }
+        commitThread.start();
 
-        var numTimesShouldBeHit = failpointData.numTimesShouldBeHit;
-        if ((failpointData.failpoint == "hangWhileTargetingLocalHost" &&
-             !failpointData.skip) &&  // We are testing the prepare phase
-            makeAParticipantAbort) {  // A remote participant will vote abort
-            // Wait for the abort to the local host to be scheduled as well.
-            numTimesShouldBeHit++;
-        }
-
-        waitForFailpoint("Hit " + failpointData.failpoint + " failpoint", numTimesShouldBeHit);
+        waitForFailpoint("Hit " + failpointData.failpoint + " failpoint",
+                         failpointData.numTimesShouldBeHit);
 
         // Induce the coordinator primary to step down.
         assert.commandWorked(
-            coordPrimary.adminCommand({replSetStepDown: stepDownSecs, force: true}));
+            coordPrimary.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
+        assert.commandWorked(coordPrimary.adminCommand({replSetFreeze: 0}));
+        assert.commandWorked(coordPrimary.adminCommand({replSetStepUp: 1}));
+
         assert.commandWorked(coordPrimary.adminCommand({
             configureFailPoint: failpointData.failpoint,
             mode: "off",
         }));
 
         // The router should retry commitTransaction against the new primary.
-        awaitResult();
+        commitThread.join();
 
         // Check that the transaction committed or aborted as expected.
         if (expectAbortResponse) {
@@ -180,8 +200,31 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
             });
         }
 
-        st.s.getDB(dbName).getCollection(collName).drop();
-        clearRawMongoProgramOutput();
+        cleanUp();
+    };
+
+    const testCommitProtocolWithRetry = function(
+        makeAParticipantAbort, failpointData, expectAbortResponse) {
+        const maxIterations = 5;
+        var numIterations = 0;
+
+        while (numIterations < maxIterations) {
+            try {
+                testCommitProtocol(makeAParticipantAbort, failpointData, expectAbortResponse);
+                break;
+            } catch (err) {
+                if (numIterations == maxIterations - 1 ||
+                    !(err.message.includes("[0] != [251] are not equal"))) {
+                    throw err;
+                }
+
+                cleanUp();
+                numIterations += 1;
+            }
+
+            jsTest.log("Received an error with label TransientTransactionError. Retry: " +
+                       numIterations);
+        }
     };
 
     //
@@ -189,7 +232,7 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
     //
 
     failpointDataArr.forEach(function(failpointData) {
-        testCommitProtocol(
+        testCommitProtocolWithRetry(
             true /* make a participant abort */, failpointData, true /* expect abort decision */);
     });
 
@@ -203,9 +246,11 @@ const runTest = function(sameNodeStepsUpAfterFailover) {
         // a property of the coordinator only, and would be true even if a participant's
         // in-progress transaction could survive failover.
         let expectAbort = (failpointData.failpoint == "hangBeforeWritingParticipantList") ||
-            (failpointData.failpoint == "hangWhileTargetingLocalHost" && !failpointData.skip) ||
+            (failpointData.failpoint == "hangWhileTargetingLocalHost" &&
+             (failpointData.data.twoPhaseCommitStage == "prepare")) ||
             false;
-        testCommitProtocol(false /* make a participant abort */, failpointData, expectAbort);
+        testCommitProtocolWithRetry(
+            false /* make a participant abort */, failpointData, expectAbort);
     });
     st.stop();
 };
@@ -214,4 +259,3 @@ const failpointDataArr = getCoordinatorFailpoints();
 
 runTest(true /* same node always steps up after stepping down */, false);
 runTest(false /* same node always steps up after stepping down */, false);
-})();

@@ -27,13 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstddef>
+#include <memory>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/db/field_ref_set.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 #include "mongo/db/update/modifier_node.h"
-
-#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_executor.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -171,7 +185,7 @@ UpdateExecutor::ApplyResult ModifierNode::applyToExistingElement(
         BSONObj original = applyParams.element.getDocument().getObject();
         updateResult = updateExistingElement(&applyParams.element,
                                              updateNodeApplyParams.pathTaken->fieldRef());
-        if (updateResult == ModifyResult::kNoOp) {
+        if (updateResult.type == ModifyResult::kNoOp) {
             return ApplyResult::noopResult();
         }
         checkImmutablePathsNotModifiedFromOriginal(applyParams.element,
@@ -181,27 +195,25 @@ UpdateExecutor::ApplyResult ModifierNode::applyToExistingElement(
     } else {
         updateResult = updateExistingElement(&applyParams.element,
                                              updateNodeApplyParams.pathTaken->fieldRef());
-        if (updateResult == ModifyResult::kNoOp) {
+        if (updateResult.type == ModifyResult::kNoOp) {
             return ApplyResult::noopResult();
         }
         checkImmutablePathsNotModified(applyParams.element,
                                        updateNodeApplyParams.pathTaken->fieldRef(),
                                        applyParams.immutablePaths);
     }
-    invariant(updateResult != ModifyResult::kCreated);
+    invariant(updateResult.type != ModifyResult::kCreated);
 
     ApplyResult applyResult;
 
-    if (!applyParams.indexData ||
-        !applyParams.indexData->mightBeIndexed(updateNodeApplyParams.pathTaken->fieldRef())) {
-        applyResult.indexesAffected = false;
-    }
-
-    if (applyParams.validateForStorage) {
-        const uint32_t recursionLevel = updateNodeApplyParams.pathTaken->size();
-        validateUpdate(
-            applyParams.element, leftSibling, rightSibling, recursionLevel, updateResult);
-    }
+    const uint32_t recursionLevel = updateNodeApplyParams.pathTaken->size();
+    validateUpdate(applyParams.element,
+                   leftSibling,
+                   rightSibling,
+                   recursionLevel,
+                   updateResult,
+                   applyParams.validateForStorage,
+                   &applyResult.containsDotsAndDollarsField);
 
     if (auto logBuilder = updateNodeApplyParams.logBuilder) {
         logUpdate(logBuilder,
@@ -248,15 +260,17 @@ UpdateExecutor::ApplyResult ModifierNode::applyToNonexistentElement(
             MONGO_UNREACHABLE;  // The previous uassertStatusOK should always throw.
         }
 
-        if (applyParams.validateForStorage) {
-            const uint32_t recursionLevel = updateNodeApplyParams.pathTaken->size() + 1;
-            mutablebson::ConstElement elementForValidation = statusWithFirstCreatedElem.getValue();
-            validateUpdate(elementForValidation,
-                           elementForValidation.leftSibling(),
-                           elementForValidation.rightSibling(),
-                           recursionLevel,
-                           ModifyResult::kCreated);
-        }
+        ApplyResult applyResult;
+
+        const uint32_t recursionLevel = updateNodeApplyParams.pathTaken->size() + 1;
+        mutablebson::ConstElement elementForValidation = statusWithFirstCreatedElem.getValue();
+        validateUpdate(elementForValidation,
+                       elementForValidation.leftSibling(),
+                       elementForValidation.rightSibling(),
+                       recursionLevel,
+                       ModifyResult::kCreated,
+                       applyParams.validateForStorage,
+                       &applyResult.containsDotsAndDollarsField);
 
         for (auto immutablePath = applyParams.immutablePaths.begin();
              immutablePath != applyParams.immutablePaths.end();
@@ -303,22 +317,6 @@ UpdateExecutor::ApplyResult ModifierNode::applyToNonexistentElement(
             }
         }
         invariant(fullPathTypes.size() == fullPathFr.numParts());
-
-        ApplyResult applyResult;
-
-        // Determine if indexes are affected. If we did not create a new element in an array, check
-        // whether the full path affects indexes. If we did create a new element in an array, check
-        // whether the array itself might affect any indexes. This is necessary because if there is
-        // an index {"a.b": 1}, and we set "a.1.c" and implicitly create an array element in "a",
-        // then we may need to add a null key to the index, even though "a.1.c" does not appear to
-        // affect the index.
-        if (!applyParams.indexData ||
-            !applyParams.indexData->mightBeIndexed(
-                applyParams.element.getType() != BSONType::Array
-                    ? fullPathFr
-                    : updateNodeApplyParams.pathTaken->fieldRef())) {
-            applyResult.indexesAffected = false;
-        }
 
         if (auto logBuilder = updateNodeApplyParams.logBuilder) {
             logUpdate(logBuilder,
@@ -367,9 +365,18 @@ void ModifierNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                   mutablebson::ConstElement leftSibling,
                                   mutablebson::ConstElement rightSibling,
                                   std::uint32_t recursionLevel,
-                                  ModifyResult modifyResult) const {
+                                  ModifyResult modifyResult,
+                                  const bool validateForStorage,
+                                  bool* containsDotsAndDollarsField) const {
     const bool doRecursiveCheck = true;
-    storage_validation::storageValid(updatedElement, doRecursiveCheck, recursionLevel);
+
+    storage_validation::scanDocument(updatedElement,
+                                     doRecursiveCheck,
+                                     recursionLevel,
+                                     false, /* allowTopLevelDollarPrefixedFields */
+                                     validateForStorage,
+                                     false, /* isEmbeddedInIdField */
+                                     containsDotsAndDollarsField);
 }
 
 void ModifierNode::logUpdate(LogBuilderInterface* logBuilder,
@@ -378,9 +385,9 @@ void ModifierNode::logUpdate(LogBuilderInterface* logBuilder,
                              ModifyResult modifyResult,
                              boost::optional<int> createdFieldIdx) const {
     invariant(logBuilder);
-    invariant(modifyResult == ModifyResult::kNormalUpdate ||
-              modifyResult == ModifyResult::kCreated);
-    if (modifyResult == ModifyResult::kCreated) {
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate ||
+              modifyResult.type == ModifyResult::kCreated);
+    if (modifyResult.type == ModifyResult::kCreated) {
         invariant(createdFieldIdx);
         uassertStatusOK(logBuilder->logCreatedField(pathTaken, *createdFieldIdx, element));
     } else {

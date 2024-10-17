@@ -29,20 +29,30 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
- * This is a CoScan PlanStage. It delivers an infinite stream of getNext() calls. Also, it does not
+ * Delivers an infinite stream of getNext() calls, always returning 'ADVANCED'. Also, it does not
  * define any slots; i.e. it does not produce any results.
  *
  * On its face value this does not seem to be very useful but it is handy when we have to construct
- * a data stream when there is not any physical source (i.e. no collection to read from).
- * Typical use cases are: inner side of Traverse, outer side of Nested Loops, constants, etc.
+ * a data stream when there is not any physical source (i.e. no collection to read from).  Typical
+ * use cases are: inner side of traverse stage, the outer side of nested loops, constants, etc.
  */
 class CoScanStage final : public PlanStage {
 public:
-    explicit CoScanStage(PlanNodeId);
+    explicit CoScanStage(PlanNodeId,
+                         PlanYieldPolicy* yieldPolicy = nullptr,
+                         bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -54,5 +64,6 @@ public:
 
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
+    size_t estimateCompileTimeSize() const final;
 };
 }  // namespace mongo::sbe

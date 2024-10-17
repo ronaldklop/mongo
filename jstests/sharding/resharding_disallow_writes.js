@@ -1,14 +1,11 @@
 /**
- * Tests that writes are disallowed while in kCommitted or kRenaming.
+ * Tests that writes are disallowed while in kCommitted.
  *
  * @tags: [
- *   requires_fcv_49,
+ *   multiversion_incompatible,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest();
 reshardingTest.setup();
@@ -29,6 +26,8 @@ const sourceCollection = reshardingTest.createShardedCollection({
 });
 
 assert.commandWorked(sourceCollection.insert({_id: 0, oldKey: -20, newKey: 20, yak: 50}));
+assert.commandWorked(sourceCollection.createIndexes(
+    [{indexToDropDuringResharding: 1}, {indexToDropAfterResharding: 1}]));
 
 const recipientShardNames = reshardingTest.recipientShardNames;
 reshardingTest.withReshardingInBackground(
@@ -36,53 +35,58 @@ reshardingTest.withReshardingInBackground(
         newShardKeyPattern: {newKey: 1},
         newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
     },
-    (tempNs) => {},
+    () => {},
     {
-        postCheckConsistencyFn: (tempNs) => {
+        postCheckConsistencyFn: () => {
             jsTestLog("Attempting insert");
-            assert.commandFailedWithCode(sourceCollection.runCommand({
+            let res = sourceCollection.runCommand({
                 insert: collName,
                 documents: [{_id: 1, oldKey: -10, newKey: 10}],
                 maxTimeMS: 5000
-            }),
-                                         ErrorCodes.MaxTimeMSExpired);
+            });
+            assert(ErrorCodes.isExceededTimeLimitError(res.writeErrors[0].code));
 
             jsTestLog("Attempting update");
-            assert.commandFailedWithCode(sourceCollection.runCommand({
+            res = sourceCollection.runCommand({
                 update: collName,
                 updates: [{q: {_id: 0}, u: {$set: {newKey: 15}}}],
                 maxTimeMS: 5000
-            }),
-                                         ErrorCodes.MaxTimeMSExpired);
+            });
+            assert(ErrorCodes.isExceededTimeLimitError(res.writeErrors[0].code));
 
             jsTestLog("Attempting delete");
-            assert.commandFailedWithCode(sourceCollection.runCommand({
+            res = sourceCollection.runCommand({
                 delete: collName,
                 deletes: [{q: {_id: 0, oldKey: -20}, limit: 1}],
                 maxTimeMS: 5000
-            }),
-                                         ErrorCodes.MaxTimeMSExpired);
+            });
+            assert(ErrorCodes.isExceededTimeLimitError(res.writeErrors[0].code));
 
             jsTestLog("Attempting createIndex");
-            assert.commandFailedWithCode(sourceCollection.runCommand({
+            res = sourceCollection.runCommand({
                 createIndexes: collName,
                 indexes: [{key: {yak: 1}, name: "yak_0"}],
                 maxTimeMS: 5000
-            }),
-                                         ErrorCodes.MaxTimeMSExpired);
+            });
+            assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Attempting collMod");
-            assert.commandFailedWithCode(
-                sourceCollection.runCommand({collMod: sourceCollection.getName(), maxTimeMS: 5000}),
-                ErrorCodes.ReshardCollectionInProgress);
+            // The collMod is serialized with the resharding command, so we explicitly add an
+            // timeout to the command so that it doesn't get blocked and timeout the test.
+            res =
+                sourceCollection.runCommand({collMod: sourceCollection.getName(), maxTimeMS: 5000});
+            assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Attempting drop index");
-            assert.commandFailedWithCode(
-                sourceCollection.runCommand(
-                    {dropIndexes: collName, index: {oldKey: 1}, maxTimeMS: 5000}),
-                ErrorCodes.ReshardCollectionInProgress);
+            res = sourceCollection.runCommand(
+                {dropIndexes: collName, index: {indexToDropDuringResharding: 1}, maxTimeMS: 5000});
+            assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Completed operations");
+        },
+        afterReshardingFn: () => {
+            jsTestLog("Join possible ongoing collMod command");
+            assert.commandWorked(sourceCollection.runCommand("collMod"));
         }
     });
 
@@ -102,9 +106,9 @@ assert.commandWorked(sourceCollection.runCommand(
 
 assert.commandWorked(sourceCollection.runCommand({collMod: sourceCollection.getName()}));
 
-assert.commandWorked(sourceCollection.runCommand({dropIndexes: collName, index: {oldKey: 1}}));
+assert.commandWorked(
+    sourceCollection.runCommand({dropIndexes: collName, index: {indexToDropAfterResharding: 1}}));
 
 assert.commandWorked(sourceCollection.runCommand({drop: collName}));
 
 reshardingTest.teardown();
-})();

@@ -27,26 +27,48 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
-
-#include <functional>
+#include <absl/container/node_hash_map.h>
 #include <memory>
+#include <mutex>
+#include <ostream>
+#include <ratio>
+#include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/task_executor_test_fixture.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 #define ASSERT_REASON_CONTAINS(STATUS, PATTERN)                      \
     do {                                                             \
@@ -79,7 +101,7 @@ protected:
     bool isQuorumCheckDone();
 
 private:
-    void setUp() {
+    void setUp() override {
         executor::ThreadPoolExecutorTest::setUp();
         launchExecutorThread();
     }
@@ -88,7 +110,7 @@ private:
 
     std::unique_ptr<stdx::thread> _quorumCheckThread;
     Status _quorumCheckStatus;
-    Mutex _mutex = MONGO_MAKE_LATCH("CheckQuorumTest::_mutex");
+    stdx::mutex _mutex;
     bool _isQuorumCheckDone;
 };
 
@@ -109,26 +131,26 @@ Status CheckQuorumTest::waitForQuorumCheck() {
 }
 
 bool CheckQuorumTest::isQuorumCheckDone() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _isQuorumCheckDone;
 }
 
 void CheckQuorumTest::_runQuorumCheck(const ReplSetConfig& config, int myIndex) {
     _quorumCheckStatus = _runQuorumCheckImpl(config, myIndex);
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _isQuorumCheckDone = true;
 }
 
 class CheckQuorumForInitiate : public CheckQuorumTest {
 private:
-    virtual Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) {
+    Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) override {
         return checkQuorumForInitiate(&getExecutor(), config, myIndex, 0);
     }
 };
 
 class CheckQuorumForReconfig : public CheckQuorumTest {
 protected:
-    virtual Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) {
+    Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) override {
         return checkQuorumForReconfig(&getExecutor(), config, myIndex, 0);
     }
 };
@@ -185,9 +207,10 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = config.getNumMembers() - 1;
     for (int i = 0; i < numCommandsExpected; ++i) {
-        getNet()->scheduleResponse(getNet()->getNextReadyRequest(),
-                                   startDate + Milliseconds(10),
-                                   {ErrorCodes::HostUnreachable, "No reply"});
+        getNet()->scheduleResponse(
+            getNet()->getNextReadyRequest(),
+            startDate + Milliseconds(10),
+            RemoteCommandResponse::make_forTest(Status(ErrorCodes::HostUnreachable, "No reply")));
     }
     getNet()->runUntil(startDate + Milliseconds(10));
     getNet()->exitNetwork();
@@ -203,7 +226,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     ASSERT_REASON_CONTAINS(status, "h5:1");
 }
 
-const BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
+BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
     const MemberConfig& myConfig = rsConfig.getMemberAt(myConfigIndex);
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setHeartbeatVersion(1);
@@ -232,10 +255,11 @@ executor::RemoteCommandResponse makeHeartbeatResponse(const ReplSetConfig& rsCon
     OpTime opTime(Timestamp(), 0);
     Date_t wallTime = Date_t();
     hbResp.setAppliedOpTimeAndWallTime({opTime, wallTime});
+    hbResp.setWrittenOpTimeAndWallTime({opTime, wallTime});
     hbResp.setDurableOpTimeAndWallTime({opTime, wallTime});
     auto bob = BSONObjBuilder(hbResp.toBSON());
     bob.appendElements(extraFields);
-    return RemoteCommandResponse(bob.obj(), duration_cast<Milliseconds>(millis));
+    return RemoteCommandResponse::make_forTest(bob.obj(), duration_cast<Milliseconds>(millis));
 }
 
 TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
@@ -267,7 +291,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -313,13 +337,15 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToOneDownNode) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
         if (request.target == HostAndPort("h2", 1)) {
-            getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
+            getNet()->scheduleResponse(noi,
+                                       startDate + Milliseconds(10),
+                                       RemoteCommandResponse::make_forTest(
+                                           Status(ErrorCodes::HostUnreachable, "No response")));
         } else {
             getNet()->scheduleResponse(noi,
                                        startDate + Milliseconds(10),
@@ -370,7 +396,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -378,14 +404,15 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
             getNet()->scheduleResponse(
                 noi,
                 startDate + Milliseconds(10),
-                (RemoteCommandResponse(
+                (RemoteCommandResponse::make_forTest(
                     BSON("ok" << 0 << "code" << ErrorCodes::InconsistentReplicaSetNames << "errmsg"
                               << "replica set name doesn't match."),
                     Milliseconds(8))));
         } else {
-            getNet()->scheduleResponse(noi,
-                                       startDate + Milliseconds(10),
-                                       RemoteCommandResponse(BSON("ok" << 1), Milliseconds(8)));
+            getNet()->scheduleResponse(
+                noi,
+                startDate + Milliseconds(10),
+                RemoteCommandResponse::make_forTest(BSON("ok" << 1), Milliseconds(8)));
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -434,7 +461,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
         ASSERT(seenHosts.insert(request.target).second)
@@ -508,7 +535,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWhenOtherNodesHaveHigherVersio
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -555,7 +582,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -563,13 +590,15 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
             getNet()->scheduleResponse(
                 noi,
                 startDate + Milliseconds(10),
-                (RemoteCommandResponse(
+                (RemoteCommandResponse::make_forTest(
                     BSON("ok" << 0 << "code" << ErrorCodes::InconsistentReplicaSetNames << "errmsg"
                               << "replica set name doesn't match."),
                     Milliseconds(8))));
         } else {
-            getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
+            getNet()->scheduleResponse(noi,
+                                       startDate + Milliseconds(10),
+                                       RemoteCommandResponse::make_forTest(
+                                           Status(ErrorCodes::HostUnreachable, "No response")));
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -615,7 +644,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -624,8 +653,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
                                        startDate + Milliseconds(10),
                                        makeHeartbeatResponse(rsConfig, Milliseconds(8)));
         } else {
-            getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
+            getNet()->scheduleResponse(noi,
+                                       startDate + Milliseconds(10),
+                                       RemoteCommandResponse::make_forTest(
+                                           Status(ErrorCodes::HostUnreachable, "No response")));
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -671,7 +702,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -680,8 +711,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
                                        startDate + Milliseconds(10),
                                        makeHeartbeatResponse(rsConfig, Milliseconds(8)));
         } else {
-            getNet()->scheduleResponse(
-                noi, startDate + Milliseconds(10), {ErrorCodes::HostUnreachable, "No response"});
+            getNet()->scheduleResponse(noi,
+                                       startDate + Milliseconds(10),
+                                       RemoteCommandResponse::make_forTest(
+                                           Status(ErrorCodes::HostUnreachable, "No response")));
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));
@@ -723,7 +756,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsIfMinoritySetTimesOut) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -769,7 +802,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckProcessesCallbackCanceledResponse) {
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_BSONOBJ_EQ(hbRequest, request.cmdObj);
         ASSERT(seenHosts.insert(request.target).second)
             << "Already saw " << request.target.toString();
@@ -777,11 +810,13 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckProcessesCallbackCanceledResponse) {
             getNet()->scheduleResponse(
                 noi,
                 startDate + Milliseconds(10),
-                (RemoteCommandResponse(ErrorCodes::CallbackCanceled, "Testing canceled callback")));
+                (RemoteCommandResponse::make_forTest(
+                    Status(ErrorCodes::CallbackCanceled, "Testing canceled callback"))));
         } else {
-            getNet()->scheduleResponse(noi,
-                                       startDate + Milliseconds(10),
-                                       RemoteCommandResponse(BSON("ok" << 0), Milliseconds(8)));
+            getNet()->scheduleResponse(
+                noi,
+                startDate + Milliseconds(10),
+                RemoteCommandResponse::make_forTest(BSON("ok" << 0), Milliseconds(8)));
         }
     }
     getNet()->runUntil(startDate + Milliseconds(10));

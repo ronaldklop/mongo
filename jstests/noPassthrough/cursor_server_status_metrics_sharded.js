@@ -1,12 +1,16 @@
 /**
  * Test the cursor server status "moreThanOneBatch" and "totalOpened" metric on mongoS.
  *
- * @tags: [requires_fcv_49, requires_sharding]
+ * @tags: [
+ *   requires_sharding,
+ * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-const st = new ShardingTest({shards: 2});
+const st = new ShardingTest({
+    shards: 2,
+    mongosOptions: {setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}}
+});
 st.stopBalancer();
 
 const db = st.s.getDB("test");
@@ -21,8 +25,8 @@ function getNumberOfCursorsMoreThanOneBatch() {
 }
 
 coll.drop();
-assert.commandWorked(db.adminCommand({enableSharding: db.getName()}));
-st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
+assert.commandWorked(
+    db.adminCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
 db.adminCommand({shardCollection: coll.getFullName(), key: {_id: 1}});
 assert.commandWorked(db.adminCommand({split: coll.getFullName(), middle: {_id: 0}}));
 
@@ -86,4 +90,3 @@ assert.eq(getNumberOfCursorsOpened() - initialNumCursorsOpened, 3, cmdRes);
 assert.eq(getNumberOfCursorsMoreThanOneBatch() - initialNumCursorsMoreThanOneBatch, 2, cmdRes);
 
 st.stop();
-})();

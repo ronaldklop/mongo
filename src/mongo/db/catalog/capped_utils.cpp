@@ -27,141 +27,115 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/capped_utils.h"
 
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
-#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/unique_collection_name.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
-
-Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionName) {
-    AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
-
-    bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName);
-
-    if (userInitiatedWritesAndNotPrimary) {
-        return Status(ErrorCodes::NotWritablePrimary,
-                      str::stream()
-                          << "Not primary while truncating collection: " << collectionName);
-    }
-
-    Database* db = autoDb.getDb();
-    uassert(ErrorCodes::NamespaceNotFound, "no such database", db);
-
-    CollectionWriter collection(opCtx, collectionName);
-    uassert(ErrorCodes::CommandNotSupportedOnView,
-            str::stream() << "emptycapped not supported on view: " << collectionName.ns(),
-            collection || !ViewCatalog::get(db)->lookup(opCtx, collectionName.ns()));
-    uassert(ErrorCodes::NamespaceNotFound, "no such collection", collection);
-
-    if (collectionName.isSystem() && !collectionName.isSystemDotProfile()) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream() << "Cannot truncate a system collection: " << collectionName);
-    }
-
-    if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-         repl::ReplicationCoordinator::modeNone) &&
-        collectionName.isOplog()) {
-        return Status(ErrorCodes::OplogOperationUnsupported,
-                      str::stream()
-                          << "Cannot truncate a live oplog while replicating: " << collectionName);
-    }
-
-    IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(collection->uuid());
-
-    WriteUnitOfWork wuow(opCtx);
-
-    auto writableCollection = collection.getWritableCollection();
-    Status status = writableCollection->truncate(opCtx);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    opCtx->recoveryUnit()->onCommit([writableCollection](auto commitTime) {
-        // Ban reading from this collection on snapshots before now.
-        if (commitTime) {
-            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
-        }
-    });
-
-    const auto service = opCtx->getServiceContext();
-    service->getOpObserver()->onEmptyCapped(opCtx, collection->ns(), collection->uuid());
-
-    wuow.commit();
-
-    return Status::OK();
-}
 
 void cloneCollectionAsCapped(OperationContext* opCtx,
                              Database* db,
                              const NamespaceString& fromNss,
                              const NamespaceString& toNss,
                              long long size,
-                             bool temp) {
-    CollectionPtr fromCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss);
+                             bool temp,
+                             const boost::optional<UUID>& targetUUID) {
+    CollectionPtr fromCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss));
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
-                str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
-                !ViewCatalog::get(db)->lookup(opCtx, fromNss.ns()));
+                str::stream() << "cloneCollectionAsCapped not supported for views: "
+                              << fromNss.toStringForErrorMsg(),
+                !CollectionCatalog::get(opCtx)->lookupView(opCtx, fromNss));
 
         uasserted(ErrorCodes::NamespaceNotFound,
-                  str::stream() << "source collection " << fromNss << " does not exist");
+                  str::stream() << "source collection " << fromNss.toStringForErrorMsg()
+                                << " does not exist");
     }
 
+    uassert(6367302,
+            "Cannot convert an encrypted collection to a capped collection",
+            !fromCollection->getCollectionOptions().encryptedFieldConfig);
+
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "source collection " << fromNss
+            str::stream() << "source collection " << fromNss.toStringForErrorMsg()
                           << " is currently in a drop-pending state.",
             !fromNss.isDropPendingNamespace());
 
     uassert(ErrorCodes::NamespaceExists,
-            str::stream() << "cloneCollectionAsCapped failed - destination collection " << toNss
-                          << " already exists. source collection: " << fromNss,
+            str::stream() << "cloneCollectionAsCapped failed - destination collection "
+                          << toNss.toStringForErrorMsg() << " already exists. source collection: "
+                          << fromNss.toStringForErrorMsg(),
             !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss));
 
     // create new collection
     {
-        auto options =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, fromCollection->getCatalogId());
+        auto options = fromCollection->getCollectionOptions();
         // The capped collection will get its own new unique id, as the conversion isn't reversible,
         // so it can't be rolled back.
-        options.uuid.reset();
+        options.uuid = targetUUID;
         options.capped = true;
         options.cappedSize = size;
         if (temp)
             options.temp = true;
+        // Capped collections cannot use recordIdsReplicated:true.
+        options.recordIdsReplicated = false;
 
-        BSONObjBuilder cmd;
-        cmd.append("create", toNss.coll());
-        cmd.appendElements(options.toBSON());
-        uassertStatusOK(createCollection(opCtx, toNss.db().toString(), cmd.done()));
+        uassertStatusOK(createCollection(opCtx, toNss, options, BSONObj()));
     }
 
-    CollectionPtr toCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss);
+    CollectionPtr toCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss));
     invariant(toCollection);  // we created above
 
     // how much data to ignore because it won't fit anyway
@@ -175,7 +149,6 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
 
     auto exec =
         InternalPlanner::collectionScan(opCtx,
-                                        fromNss.ns(),
                                         &fromCollection,
                                         PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY,
                                         InternalPlanner::FORWARD);
@@ -185,9 +158,13 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
 
     DisableDocumentValidation validationDisabler(opCtx);
 
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool isOplogDisabledForCappedCollection =
+        replCoord->isOplogDisabledFor(opCtx, toCollection->ns());
+
     int retries = 0;  // non-zero when retrying our last document.
     while (true) {
-        auto beforeGetNextSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
+        auto beforeGetNextSnapshotId = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId();
         PlanExecutor::ExecState state = PlanExecutor::IS_EOF;
         if (!retries) {
             state = exec->getNext(&objToClone, &loc);
@@ -210,7 +187,8 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             // If the snapshot id changed while using the 'PlanExecutor' to retrieve the next
             // document from the collection scan, then it's possible that the document retrieved
             // from the scan may have since been deleted or modified in our current snapshot.
-            if (beforeGetNextSnapshotId != opCtx->recoveryUnit()->getSnapshotId()) {
+            if (beforeGetNextSnapshotId !=
+                shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId()) {
                 // The snapshot has changed. Fetch the document again from the collection in order
                 // to check whether it has been deleted.
                 Snapshotted<BSONObj> snapshottedObj;
@@ -223,22 +201,36 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             }
 
             WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
-            uassertStatusOK(toCollection->insertDocument(
-                opCtx, InsertStatement(objToClone), nullOpDebug, true));
+
+            InsertStatement insertStmt(objToClone);
+
+            // When converting a regular collection into a capped collection, we may start
+            // performing capped deletes during the conversion process. This can occur if the
+            // regular collections data exceeds the capacities set for the capped collection.
+            // Because of that, we acquire an optime for the insert now to ensure that the insert
+            // oplog entry gets logged before any delete oplog entries.
+            if (!isOplogDisabledForCappedCollection) {
+                auto oplogInfo = LocalOplogInfo::get(opCtx);
+                auto oplogSlots = oplogInfo->getNextOpTimes(opCtx, /*batchSize=*/1);
+                insertStmt.oplogSlot = oplogSlots.front();
+            }
+
+            uassertStatusOK(collection_internal::insertDocument(
+                opCtx, toCollection, std::move(insertStmt), nullptr /* OpDebug */, true));
             wunit.commit();
 
             // Go to the next document
             retries = 0;
-        } catch (const WriteConflictException&) {
+        } catch (const StorageUnavailableException& e) {
             CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             retries++;  // logAndBackoff expects this to be 1 on first call.
-            WriteConflictException::logAndBackoff(retries, "cloneCollectionAsCapped", fromNss.ns());
+            logWriteConflictAndBackoff(
+                retries, "cloneCollectionAsCapped", e.reason(), NamespaceStringOrUUID(fromNss));
 
             // Can't use writeConflictRetry since we need to save/restore exec around call to
             // abandonSnapshot.
             exec->saveState();
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
             exec->restoreState(&fromCollection);  // Handles any WCEs internally.
         }
     }
@@ -246,42 +238,79 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-void convertToCapped(OperationContext* opCtx, const NamespaceString& ns, long long size) {
-    StringData dbname = ns.db();
+void convertToCapped(OperationContext* opCtx,
+                     const NamespaceString& ns,
+                     long long size,
+                     const boost::optional<UUID>& targetUUID) {
+    auto dbname = ns.dbName();
     StringData shortSource = ns.coll();
 
     AutoGetCollection coll(opCtx, ns, MODE_X);
+    CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, ns)->checkShardVersionOrThrow(
+        opCtx);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns);
 
     uassert(ErrorCodes::NotWritablePrimary,
-            str::stream() << "Not primary while converting " << ns << " to a capped collection",
+            str::stream() << "Not primary while converting " << ns.toStringForErrorMsg()
+                          << " to a capped collection",
             !userInitiatedWritesAndNotPrimary);
 
     Database* const db = coll.getDb();
-    uassert(
-        ErrorCodes::NamespaceNotFound, str::stream() << "database " << dbname << " not found", db);
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "database " << dbname.toStringForErrorMsg() << " not found",
+            db);
 
     if (coll) {
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
+    }
+
+    if (targetUUID) {
+        // Return if the collection is already capped with the given UUID.
+        if (coll && (coll->uuid() == *targetUUID) && coll->isCapped()) {
+            invariant(coll->getCappedMaxSize() == size);
+            return;
+        }
+
+        // Check if a previous execution left an existing temporary collection with the given
+        // targetUUID. In that case let's drop the temporary collection to be able to proceed with
+        // the creation of a new one.
+        boost::optional<NamespaceString> oldTempNssToDrop;
+        try {
+            AutoGetCollection tempColl(
+                opCtx, NamespaceStringOrUUID{ns.dbName(), *targetUUID}, MODE_S);
+            invariant(!tempColl || (tempColl && tempColl->isTemporary()));
+
+            if (tempColl && tempColl->isTemporary()) {
+                oldTempNssToDrop = tempColl.getNss();
+            }
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        }
+
+        if (oldTempNssToDrop) {
+            DropReply unused;
+            uassertStatusOK(
+                dropCollection(opCtx,
+                               *oldTempNssToDrop,
+                               &unused,
+                               DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops,
+                               false));
+        }
     }
 
     // Generate a temporary collection name that will not collide with any existing collections.
     boost::optional<Lock::CollectionLock> collLock;
     const auto tempNs = [&] {
         while (true) {
-            auto tmpNameResult =
-                db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.convertToCapped." + shortSource);
-            uassertStatusOKWithContext(
-                tmpNameResult,
-                str::stream() << "Cannot generate temporary collection namespace to convert " << ns
-                              << " to a capped collection");
+            auto tmpName = uassertStatusOKWithContext(
+                makeUniqueCollectionName(opCtx, dbname, "tmp%%%%%.convertToCapped." + shortSource),
+                str::stream() << "Cannot generate temporary collection namespace to convert "
+                              << ns.toStringForErrorMsg() << " to a capped collection");
 
-            collLock.emplace(opCtx, tmpNameResult.getValue(), MODE_X);
-            if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-                    opCtx, tmpNameResult.getValue())) {
-                return std::move(tmpNameResult.getValue());
+            collLock.emplace(opCtx, tmpName, MODE_X);
+            if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, tmpName)) {
+                return tmpName;
             }
 
             // The temporary collection was created by someone else between the name being
@@ -291,7 +320,7 @@ void convertToCapped(OperationContext* opCtx, const NamespaceString& ns, long lo
         }
     }();
 
-    cloneCollectionAsCapped(opCtx, db, ns, tempNs, size, true);
+    cloneCollectionAsCapped(opCtx, db, ns, tempNs, size, true /* temp */, targetUUID);
 
     RenameCollectionOptions options;
     options.dropTarget = true;

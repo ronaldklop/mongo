@@ -30,18 +30,26 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <functional>
 #include <memory>
 
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/keys_collection_client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 
 namespace mongo {
 
 class CatalogCache;
 class ConnectionString;
-class OperationContext;
 class ShardFactory;
 class Status;
 class ShardingCatalogClient;
@@ -52,36 +60,40 @@ class TaskExecutor;
 }  // namespace executor
 
 namespace rpc {
-class EgressMetadataHook;
 using ShardingEgressMetadataHookBuilder = std::function<std::unique_ptr<EgressMetadataHook>()>;
 }  // namespace rpc
 
 /**
  * Constructs a TaskExecutor which contains the required configuration for the sharding subsystem.
  */
-std::unique_ptr<executor::TaskExecutor> makeShardingTaskExecutor(
+std::shared_ptr<executor::TaskExecutor> makeShardingTaskExecutor(
     std::unique_ptr<executor::NetworkInterface> net);
+
+std::unique_ptr<rpc::EgressMetadataHookList> makeShardingEgressHooksList(ServiceContext* service);
 
 /**
  * Initializes the global ShardingCatalogClient, ShardingCatalogManager, and Grid objects.
  */
-Status initializeGlobalShardingState(OperationContext* opCtx,
-                                     std::unique_ptr<CatalogCache> catalogCache,
-                                     std::unique_ptr<ShardRegistry> shardRegistry,
-                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder,
-                                     boost::optional<size_t> taskExecutorPoolSize);
+Status initializeGlobalShardingState(
+    OperationContext* opCtx,
+    std::unique_ptr<CatalogCache> catalogCache,
+    std::unique_ptr<ShardRegistry> shardRegistry,
+    rpc::ShardingEgressMetadataHookBuilder hookBuilder,
+    boost::optional<size_t> taskExecutorPoolSize,
+    std::function<std::unique_ptr<KeysCollectionClient>(ShardingCatalogClient*)> initKeysClient);
 
 /**
- * Loads cluster ID and waits for the reload of the Shard Registry.
+ * Loads global settings from config server such as cluster ID and default write concern.
  */
 
-Status waitForShardRegistryReload(OperationContext* opCtx);
+Status loadGlobalSettingsFromConfigServer(OperationContext* opCtx,
+                                          ShardingCatalogClient* catalogClient);
 
 /**
  * Pre-caches mongod routing info for the calling process.
  */
 
-Status preCacheMongosRoutingInfo(OperationContext* opCtx);
+void preCacheMongosRoutingInfo(OperationContext* opCtx);
 
 /**
  * Warms up connections to shards with best effort strategy.

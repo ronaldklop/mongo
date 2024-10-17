@@ -2,8 +2,7 @@
  * Tests that none of the operations in the ReplSetTest consistency checks are affected by
  * changing the default read or write concern during the test itself.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = jsTestName();
 
@@ -25,4 +24,3 @@ assert.commandWorked(rst.getPrimary().adminCommand({
 // It should always be possible to successfully stop the replset (including running consistency
 // checks) even when the default write concern is unsatisfiable.
 rst.stopSet();
-})();

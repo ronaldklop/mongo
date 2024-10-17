@@ -27,10 +27,6 @@
 #
 """Text Writing Utilites."""
 
-import io
-import string
-from typing import List, Mapping, Union
-
 from . import common
 
 # Number of spaces to indent code
@@ -40,9 +36,9 @@ _INDENT_SPACE_COUNT = 4
 def _fill_spaces(count):
     # type: (int) -> str
     """Fill a string full of spaces."""
-    fill = ''
+    fill = ""
     for _ in range(count * _INDENT_SPACE_COUNT):
-        fill += ' '
+        fill += " "
 
     return fill
 
@@ -52,7 +48,7 @@ def _indent_text(count, unindented_text):
     """Indent each line of a multi-line string."""
     lines = unindented_text.splitlines()
     fill = _fill_spaces(count)
-    return '\n'.join(fill + line for line in lines)
+    return "\n".join(fill + line for line in lines)
 
 
 def is_function(name):
@@ -69,27 +65,26 @@ def is_function(name):
 def get_method_name(name):
     # type: (str) -> str
     """Get a method name from a fully qualified method name."""
-    pos = name.rfind('::')
+    pos = name.rfind("::")
     if pos == -1:
         return name
-    return name[pos + 2:]
+    return name[pos + 2 :]
 
 
 def get_method_name_from_qualified_method_name(name):
     # type: (str) -> str
-    # pylint: disable=invalid-name
     """Get a method name from a fully qualified method name."""
     # TODO: in the future, we may want to support full-qualified calls to static methods
     # Strip the global prefix from enum functions
     if name.startswith("::"):
         name = name[2:]
 
-    prefix = 'mongo::'
+    prefix = "mongo::"
     pos = name.find(prefix)
     if pos == -1:
         return name
 
-    return name[len(prefix):]
+    return name[len(prefix) :]
 
 
 class IndentedTextWriter(object):
@@ -245,7 +240,7 @@ class NamespaceScopeBlock(WriterBlock):
         # type: () -> None
         """Write the beginning of the block and do not indent."""
         for namespace in self._namespaces:
-            self._writer.write_unindented_line('namespace %s {' % (namespace))
+            self._writer.write_unindented_line("namespace %s {" % (namespace))
 
     def __exit__(self, *args):
         # type: (*str) -> None
@@ -253,7 +248,7 @@ class NamespaceScopeBlock(WriterBlock):
         self._namespaces.reverse()
 
         for namespace in self._namespaces:
-            self._writer.write_unindented_line('}  // namespace %s' % (namespace))
+            self._writer.write_unindented_line("}  // namespace %s" % (namespace))
 
 
 class UnindentedBlock(WriterBlock):
@@ -296,3 +291,147 @@ class MultiBlock(WriterBlock):
         """And leave each block in reverse."""
         for i in reversed(self._blocks):
             i.__exit__(*args)
+
+
+def _get_common_prefix(words):
+    # type: (List[str]) -> str
+    """Returns a common prefix for a set of strings.
+
+    Returns empty string if there is no prefix or a empty string
+    """
+    empty_words = [lw for lw in words if len(lw) == 0]
+    if empty_words:
+        return ""
+
+    first_letters = {w[0] for w in words}
+
+    if len(first_letters) == 1:
+        short_words = [lw for lw in words if len(lw) == 1]
+        if short_words:
+            return words[0][0]
+
+        suffix_words = [flw[1:] for flw in words]
+
+        return words[0][0] + _get_common_prefix(suffix_words)
+    else:
+        return ""
+
+
+def gen_trie(words, writer, callback):
+    # type: (List[str], IndentedTextWriter, Callable[[str], None]) -> None
+    """
+    Generate a trie for a list of strings.
+
+    Takes a callback function that can used to generate code that processes a specific word in the trie.
+    i.e. for ["abc", "def"], then callback() will be called twice, once for each string.
+    """
+    words = sorted(words)
+
+    _gen_trie("", words, writer, callback)
+
+
+def _gen_trie(prefix, words, writer, callback):
+    # type: (str, List[str], IndentedTextWriter, Callable[[str], None]) -> None
+    """
+    Recursively generate a trie.
+
+    Prefix is a common prefix for all the strings in words, can be empty string.
+    """
+    assert len(words) >= 1
+    # No duplicate strings allowed
+    assert len(words) == len(set(words))
+
+    prefix_len = len(prefix)
+
+    # Base case: one word
+    if len(words) == 1:
+        # Check remaining string is a string match
+        word_to_check = prefix + words[0]
+        suffix = words[0]
+        suffix_len = len(suffix)
+
+        predicate = (
+            f"fieldName.size() == {len(word_to_check)} && "
+            + f'std::char_traits<char>::compare(fieldName.rawData() + {prefix_len}, "{suffix}", {suffix_len}) == 0'
+        )
+
+        # If there is no trailing text, we just need to check length to validate we matched
+        if suffix_len == 0:
+            predicate = f"fieldName.size() == {len(word_to_check)}"
+
+        # Optimization:
+        # Checking strings of length 1 or even length is efficient. Strings of 3 byte length are
+        # inefficient to check as they require two comparisons (1 uint16 and 1 uint8) but 4 byte
+        # length strings require just 1. Since we know the field name is zero terminated, we can
+        # just use memcmp and compare with the trailing null byte.
+        elif suffix_len % 4 == 3:
+            predicate = (
+                f"fieldName.size() == {len(word_to_check)} && "
+                + f' memcmp(fieldName.rawData() + {prefix_len}, "{suffix}\\0", {suffix_len + 1}) == 0'
+            )
+
+        with IndentedScopedBlock(writer, f"if ({predicate}) {{", "}"):
+            callback(word_to_check)
+
+        return
+
+    # Handle the case where one word is a prefix of another
+    # For instance, ["short", "shorter"] will eventually call this function with
+    # (prefix = "short", ["", "er"]) as the tuple of prefix and list of words
+    empty_words = [lw for lw in words if len(lw) == 0]
+    if empty_words:
+        word_to_check = prefix
+        with IndentedScopedBlock(writer, f"if (fieldName.size() == {len(word_to_check)}) {{", "}"):
+            callback(word_to_check)
+
+    # Filter out empty words
+    words = [lw for lw in words if len(lw) > 0]
+
+    # Optimization for a common prefix
+    # Example: ["word1", "word2"]
+    # Instead of generating a trie to check for letters individually (i.e. ["w", "o", "r", "d"]),
+    # we check for the prefix all at once ("word")
+    gcp = _get_common_prefix(words)
+    if len(gcp) > 1:
+        gcp_len = len(gcp)
+        suffix_words = [flw[gcp_len:] for flw in words]
+
+        with IndentedScopedBlock(
+            writer,
+            f"if (fieldName.size() >= {gcp_len} && "
+            + f'std::char_traits<char>::compare(fieldName.rawData() + {prefix_len}, "{gcp}", {gcp_len}) == 0) {{',
+            "}",
+        ):
+            _gen_trie(prefix + gcp, suffix_words, writer, callback)
+
+        return
+
+    # Handle the main case for the trie
+    # We have a list of non-empty words with no common prefix between them,
+    # the first letters among the words may contain duplicates
+    sorted_words = sorted(words)
+    first_letters = sorted(list({w[0] for w in sorted_words}))
+    min_len = len(prefix) + min([len(w) for w in sorted_words])
+
+    with IndentedScopedBlock(writer, f"if (fieldName.size() >= {min_len}) {{", "}"):
+        first_if = True
+
+        for first_letter in first_letters:
+            fl_words = [flw[1:] for flw in words if flw[0] == first_letter]
+
+            ei = "else " if not first_if else ""
+            with IndentedScopedBlock(
+                writer, f"{ei}if (fieldName[{len(prefix)}] == '{first_letter}') {{", "}"
+            ):
+                _gen_trie(prefix + first_letter, fl_words, writer, callback)
+
+            first_if = False
+
+
+def gen_string_table_find_function_block(out, in_str, on_match, on_fail, words):
+    # type: (IndentedTextWriter, str, str, str, list[str]) -> None
+    """Wrap a gen_trie generated block as a function."""
+    index = {word: i for i, word in enumerate(words)}
+    out.write_line(f"StringData fieldName{{{in_str}}};")
+    gen_trie(words, out, lambda w: out.write_line(f"return {on_match.format(index[w])};"))
+    out.write_line(f"return {on_fail};")

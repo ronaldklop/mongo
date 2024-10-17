@@ -27,18 +27,53 @@
  *    it in the license file.
  */
 
+
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <memory>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
+#include "mongo/db/s/resharding/donor_document_gen.h"
+#include "mongo/db/s/resharding/resharding_coordinator_observer.h"
+#include "mongo/db/s/resharding/resharding_coordinator_service.h"
+#include "mongo/db/s/resharding/resharding_op_observer.h"
+#include "mongo/db/s/scoped_collection_metadata.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/resharding/resharding_op_observer.h"
-
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/resharding/donor_document_gen.h"
-#include "mongo/db/s/resharding/resharding_coordinator_service.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -48,19 +83,17 @@ std::shared_ptr<ReshardingCoordinatorObserver> getReshardingCoordinatorObserver(
     OperationContext* opCtx, const BSONObj& reshardingId) {
     auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
     auto service = registry->lookupServiceByName(ReshardingCoordinatorService::kServiceName);
-    auto instance =
-        ReshardingCoordinatorService::ReshardingCoordinator::lookup(opCtx, service, reshardingId);
+    auto [instance, _] = ReshardingCoordinator::lookup(opCtx, service, reshardingId);
 
-    iassert(
-        5400001, "ReshardingCoordinatorService instance does not exist", instance.is_initialized());
+    iassert(5400001, "ReshardingCoordinatorService instance does not exist", instance.has_value());
 
     return (*instance)->getObserver();
 }
 
 boost::optional<Timestamp> parseNewMinFetchTimestampValue(const BSONObj& obj) {
-    auto doc = ReshardingDonorDocument::parse(IDLParserErrorContext("Resharding"), obj);
+    auto doc = ReshardingDonorDocument::parse(IDLParserContext("Resharding"), obj);
     if (doc.getMutableState().getState() == DonorStateEnum::kDonatingInitialData) {
-        return doc.getMutableState().getMinFetchTimestamp().get();
+        return doc.getMutableState().getMinFetchTimestamp().value();
     } else {
         return boost::none;
     }
@@ -70,17 +103,17 @@ void assertCanExtractShardKeyFromDocs(OperationContext* opCtx,
                                       const NamespaceString& nss,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end) {
-    const auto metadata = CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
+    auto collDesc = CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+                        ->getCollectionDescription(opCtx);
+
     // A user can manually create a 'db.system.resharding.' collection that isn't guaranteed to be
-    // sharded outside of running reshardCollection.
-    uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Temporary resharding collection " << nss.toString()
-                          << " is not sharded",
-            metadata && metadata->isSharded());
+    // tracked outside of running reshardCollection.
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Temporary resharding collection metadata for "
+                          << nss.toStringForErrorMsg() << " not found",
+            collDesc.hasRoutingTable());
 
-    auto chunkManager = *metadata->getChunkManager();
-    const auto& shardKeyPattern = chunkManager.getShardKeyPattern();
-
+    const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
     for (auto it = begin; it != end; ++it) {
         shardKeyPattern.extractShardKeyFromDocThrows(it->doc);
     }
@@ -93,29 +126,31 @@ boost::optional<Timestamp> _calculatePin(OperationContext* opCtx) {
     //
     // If there are concurrent transactions updating different keys in the donor collection, there
     // can be write skew resulting in the wrong pin, including leaking a resource. We enforce the
-    // collection is held in exclusive mode to prevent this.
+    // collection is held in exclusive mode to prevent this. However an exception to this is oplog
+    // application, which already serializes these writes.
 
-    // TODO: Uncomment
-    // invariant(opCtx->lockState()->isCollectionLockedForMode(
-    //     NamespaceString::kDonorReshardingOperationsNamespace, LockMode::MODE_X));
+    invariant(!opCtx->isEnforcingConstraints() ||
+              shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                  NamespaceString::kDonorReshardingOperationsNamespace, LockMode::MODE_X));
 
     // If the RecoveryUnit already had an open snapshot, keep the snapshot open. Otherwise abandon
     // the snapshot when exitting the function.
-    auto scopeGuard = makeGuard([&] { opCtx->recoveryUnit()->abandonSnapshot(); });
-    if (opCtx->recoveryUnit()->isActive()) {
+    ScopeGuard scopeGuard([&] { shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot(); });
+    if (shard_role_details::getRecoveryUnit(opCtx)->isActive()) {
         scopeGuard.dismiss();
     }
 
-    AutoGetCollectionForRead autoColl(opCtx, NamespaceString::kDonorReshardingOperationsNamespace);
-    if (!autoColl) {
+    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, NamespaceString::kDonorReshardingOperationsNamespace);
+    if (!collection) {
         return boost::none;
     }
 
     Timestamp ret = Timestamp::max();
-    auto cursor = autoColl->getCursor(opCtx);
+    auto cursor = collection->getCursor(opCtx);
     for (auto doc = cursor->next(); doc; doc = cursor->next()) {
-        if (auto fetchTs = parseNewMinFetchTimestampValue(doc.get().data.toBson()); fetchTs) {
-            ret = std::min(ret, fetchTs.get());
+        if (auto fetchTs = parseNewMinFetchTimestampValue(doc.value().data.toBson()); fetchTs) {
+            ret = std::min(ret, fetchTs.value());
         }
     }
 
@@ -136,9 +171,9 @@ void _doPin(OperationContext* opCtx) {
     }
 
     StatusWith<Timestamp> res = storageEngine->pinOldestTimestamp(
-        opCtx, ReshardingHistoryHook::kName.toString(), pin.get(), false);
+        opCtx, ReshardingHistoryHook::kName.toString(), pin.value(), false);
     if (!res.isOK()) {
-        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::Mode::modeReplSet) {
+        if (!replCoord->getSettings().isReplSet()) {
             // The pin has failed, but we're in standalone mode. Ignore the error.
             return;
         }
@@ -155,7 +190,7 @@ void _doPin(OperationContext* opCtx) {
             // is the most robust path forward. Ignore this case.
             LOGV2_WARNING(5384104,
                           "This node is unable to pin history for resharding",
-                          "requestedTs"_attr = pin.get());
+                          "requestedTs"_attr = pin.value());
         } else {
             // For recovery cases we also ignore the error. The expected scenario is the pin
             // request is no longer needed, but the write to delete the pin was rolled
@@ -164,7 +199,7 @@ void _doPin(OperationContext* opCtx) {
             // consequence to observing this error. Ignore this case.
             LOGV2(5384103,
                   "The requested pin was unavailable, but should also be unnecessary",
-                  "requestedTs"_attr = pin.get());
+                  "requestedTs"_attr = pin.value());
         }
     }
 }
@@ -180,11 +215,15 @@ ReshardingOpObserver::ReshardingOpObserver() = default;
 ReshardingOpObserver::~ReshardingOpObserver() = default;
 
 void ReshardingOpObserver::onInserts(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     OptionalCollectionUUID uuid,
+                                     const CollectionPtr& coll,
                                      std::vector<InsertStatement>::const_iterator begin,
                                      std::vector<InsertStatement>::const_iterator end,
-                                     bool fromMigrate) {
+                                     const std::vector<RecordId>& recordIds,
+                                     std::vector<bool> fromMigrate,
+                                     bool defaultFromMigrate,
+                                     OpStateAccumulator* opAccumulator) {
+    const auto& nss = coll->ns();
+
     if (nss == NamespaceString::kDonorReshardingOperationsNamespace) {
         // If a document is inserted into the resharding donor collection with a
         // `minFetchTimestamp`, we assume the document was inserted as part of initial sync and do
@@ -193,7 +232,7 @@ void ReshardingOpObserver::onInserts(OperationContext* opCtx,
     }
 
     // This is a no-op if either replication is not enabled or this node is a secondary
-    if (!repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() ||
+    if (!repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet() ||
         !opCtx->writesAreReplicated()) {
         return;
     }
@@ -203,43 +242,60 @@ void ReshardingOpObserver::onInserts(OperationContext* opCtx,
     }
 }
 
-void ReshardingOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    if (args.nss == NamespaceString::kDonorReshardingOperationsNamespace) {
+void ReshardingOpObserver::onUpdate(OperationContext* opCtx,
+                                    const OplogUpdateEntryArgs& args,
+                                    OpStateAccumulator* opAccumulator) {
+    if (args.coll->ns() == NamespaceString::kDonorReshardingOperationsNamespace) {
         // Primaries and secondaries should execute pinning logic when observing changes to the
         // donor resharding document.
         _doPin(opCtx);
     }
 
     // This is a no-op if either replication is not enabled or this node is a secondary
-    if (!repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() ||
+    if (!repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet() ||
         !opCtx->writesAreReplicated()) {
         return;
     }
 
-    if (args.nss == NamespaceString::kConfigReshardingOperationsNamespace) {
+    if (args.coll->ns() == NamespaceString::kConfigReshardingOperationsNamespace) {
         auto newCoordinatorDoc = ReshardingCoordinatorDocument::parse(
-            IDLParserErrorContext("reshardingCoordinatorDoc"), args.updateArgs.updatedDoc);
-        auto reshardingId = BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName
-                                 << newCoordinatorDoc.getReshardingUUID());
-        auto observer = getReshardingCoordinatorObserver(opCtx, reshardingId);
-        opCtx->recoveryUnit()->onCommit(
-            [observer = std::move(observer), newCoordinatorDoc = std::move(newCoordinatorDoc)](
-                boost::optional<Timestamp> unusedCommitTime) mutable {
-                observer->onReshardingParticipantTransition(newCoordinatorDoc);
+            IDLParserContext("reshardingCoordinatorDoc"), args.updateArgs->updatedDoc);
+        shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+            [newCoordinatorDoc = std::move(newCoordinatorDoc)](OperationContext* opCtx,
+                                                               boost::optional<Timestamp>) mutable {
+                try {
+                    // It is possible that the ReshardingCoordinatorService is still being rebuilt.
+                    // We must defer calling ReshardingCoordinator::lookup() until after our storage
+                    // transaction has committed to ensure we aren't holding open an oplog hole and
+                    // preventing replication from making progress while we wait.
+                    auto reshardingId = BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName
+                                             << newCoordinatorDoc.getReshardingUUID());
+                    auto observer = getReshardingCoordinatorObserver(opCtx, reshardingId);
+                    observer->onReshardingParticipantTransition(newCoordinatorDoc);
+                } catch (const DBException& ex) {
+                    LOGV2_INFO(6148200,
+                               "Interrupted while waiting for resharding coordinator to be rebuilt;"
+                               " will retry on new primary",
+                               logAttrs(newCoordinatorDoc.getSourceNss()),
+                               "reshardingUUID"_attr = newCoordinatorDoc.getReshardingUUID(),
+                               "error"_attr = redact(ex.toStatus()));
+                }
             });
-    } else if (args.nss.isTemporaryReshardingCollection()) {
-        const std::vector<InsertStatement> updateDoc{InsertStatement{args.updateArgs.updatedDoc}};
-        assertCanExtractShardKeyFromDocs(opCtx, args.nss, updateDoc.begin(), updateDoc.end());
+    } else if (args.coll->ns().isTemporaryReshardingCollection()) {
+        const std::vector<InsertStatement> updateDoc{InsertStatement{args.updateArgs->updatedDoc}};
+        assertCanExtractShardKeyFromDocs(
+            opCtx, args.coll->ns(), updateDoc.begin(), updateDoc.end());
     }
 }
 
 void ReshardingOpObserver::onDelete(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    OptionalCollectionUUID uuid,
+                                    const CollectionPtr& coll,
                                     StmtId stmtId,
-                                    bool fromMigrate,
-                                    const boost::optional<BSONObj>& deletedDoc) {
-    if (nss == NamespaceString::kDonorReshardingOperationsNamespace) {
+                                    const BSONObj& doc,
+                                    const DocumentKey& documentKey,
+                                    const OplogDeleteEntryArgs& args,
+                                    OpStateAccumulator* opAccumulator) {
+    if (coll->ns() == NamespaceString::kDonorReshardingOperationsNamespace) {
         _doPin(opCtx);
     }
 }

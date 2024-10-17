@@ -1,6 +1,8 @@
 // Test that doing secondaryOk reads from secondaries hits all the secondaries evenly
 // @tags: [requires_sharding]
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 function testReadLoadBalancing(numReplicas) {
     var s =
         new ShardingTest({shards: {rs0: {nodes: numReplicas}}, verbose: 2, other: {chunkSize: 1}});
@@ -12,8 +14,8 @@ function testReadLoadBalancing(numReplicas) {
 
     s.getDB("test").foo.insert({a: 123});
 
-    primary = s.rs0.getPrimary();
-    secondaries = s.rs0.getSecondaries();
+    let primary = s.rs0.getPrimary();
+    let secondaries = s.rs0.getSecondaries();
 
     function rsStats() {
         return s.getDB("admin").runCommand("connPoolStats")["replicaSets"][s.rs0.name];
@@ -51,7 +53,7 @@ function testReadLoadBalancing(numReplicas) {
     var connections = [];
 
     for (var i = 0; i < secondaries.length * 10; i++) {
-        conn = new Mongo(s._mongos[0].host);
+        let conn = new Mongo(s._mongos[0].host);
         conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);
@@ -67,10 +69,10 @@ function testReadLoadBalancing(numReplicas) {
                       tojson(profileCollection.find().toArray()));
     }
 
-    db = primary.getDB("test");
+    const db = primary.getDB("test");
 
     printjson(rs.status());
-    c = rs.conf();
+    let c = rs.conf();
     print("config before: " + tojson(c));
     for (i = 0; i < c.members.length; i++) {
         if (c.members[i].host == db.runCommand("hello").primary)
@@ -102,7 +104,7 @@ function testReadLoadBalancing(numReplicas) {
     secondaries = s.rs0.getSecondaries();
 
     for (var i = 0; i < secondaries.length * 10; i++) {
-        conn = new Mongo(s._mongos[0].host);
+        let conn = new Mongo(s._mongos[0].host);
         conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);

@@ -29,37 +29,31 @@
 
 #pragma once
 
-#include "mongo/util/container_size_helper.h"
+#include "mongo/util/duration.h"
+#include <optional>
+#include <set>
 #include <string>
 
+#include "mongo/util/container_size_helper.h"
+
 namespace mongo {
+
+// The precision of 'executionTime'. Note that 'kNanos' precision requires a precise timer which
+// is also slower than the default timer.
+enum class QueryExecTimerPrecision { kNoTiming = 0, kNanos, kMillis };
+
+struct QueryExecTime {
+    // Precision/unit of 'executionTimeEstimate'.
+    QueryExecTimerPrecision precision = QueryExecTimerPrecision::kNoTiming;
+    // Time elapsed while executing this plan.
+    Nanoseconds executionTimeEstimate{0};
+};
 
 /**
  * A container for the summary statistics that the profiler, slow query log, and
  * other non-explain debug mechanisms may want to collect.
  */
 struct PlanSummaryStats {
-    /**
-     * Helper method to accumulate the plan summary stats from the input source.
-     */
-    void accumulate(const PlanSummaryStats& statsIn) {
-        // Attributes replanReason and fromMultiPlanner have been intentionally skipped as they
-        // always describe the left-hand side (or "local") collection.
-        // Consider $lookup case. $lookup runtime plan selection may happen against the foreign
-        // collection an arbitrary number of times. A single value of 'replanReason' and
-        // 'fromMultiPlanner' can't really report correctly on the behavior of arbitrarily many
-        // occurrences of runtime planning for a single query.
-
-        nReturned += statsIn.nReturned;
-        totalKeysExamined += statsIn.totalKeysExamined;
-        totalDocsExamined += statsIn.totalDocsExamined;
-        collectionScans += statsIn.collectionScans;
-        collectionScansNonTailable += statsIn.collectionScansNonTailable;
-        hasSortStage |= statsIn.hasSortStage;
-        usedDisk |= statsIn.usedDisk;
-        planFailed |= statsIn.planFailed;
-        indexesUsed.insert(statsIn.indexesUsed.begin(), statsIn.indexesUsed.end());
-    }
 
     uint64_t estimateObjectSizeInBytes() const {
         auto strSize = [](const std::string& str) {
@@ -90,13 +84,25 @@ struct PlanSummaryStats {
     long long collectionScansNonTailable = 0;
 
     // Time elapsed while executing this plan.
-    long long executionTimeMillisEstimate = 0;
+    QueryExecTime executionTime;
 
     // Did this plan use an in-memory sort stage?
     bool hasSortStage = false;
 
     // Did this plan use disk space?
     bool usedDisk = false;
+
+    // The total number of spills to disk from sort stages
+    long long sortSpills = 0;
+
+    // The total number of bytes spilled to disk from sort stages
+    long long sortSpillBytes = 0;
+
+    // The amount of data we've sorted in bytes
+    size_t sortTotalDataSizeBytes = 0;
+
+    // The number of keys that we've sorted.
+    long long keysSorted = 0;
 
     // Did this plan failed during execution?
     bool planFailed = false;
@@ -108,8 +114,14 @@ struct PlanSummaryStats {
     // candidates?
     bool fromMultiPlanner = false;
 
+    // Was this plan recovered from the cache?
+    bool fromPlanCache = false;
     // Was a replan triggered during the execution of this query?
-    std::optional<std::string> replanReason;
+    boost::optional<std::string> replanReason;
+
+    // Score calculated for the plan by PlanRanker. Only set if there were multiple candidate plans
+    // and allPlansExecution verbosity mode is selected.
+    boost::optional<double> score;
 };
 
 }  // namespace mongo

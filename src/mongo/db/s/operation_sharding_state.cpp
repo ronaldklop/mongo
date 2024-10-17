@@ -27,9 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/s/sharding_api_d_params_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -37,156 +60,132 @@ namespace {
 const OperationContext::Decoration<OperationShardingState> shardingMetadataDecoration =
     OperationContext::declareDecoration<OperationShardingState>();
 
-// Max time to wait for the migration critical section to complete
-const Milliseconds kMaxWaitForMigrationCriticalSection = Minutes(5);
-
-// Max time to wait for the movePrimary critical section to complete
-const Milliseconds kMaxWaitForMovePrimaryCriticalSection = Minutes(5);
-
-// The name of the field in which the client attaches its database version.
-constexpr auto kDbVersionField = "databaseVersion"_sd;
 }  // namespace
 
 OperationShardingState::OperationShardingState() = default;
 
 OperationShardingState::~OperationShardingState() {
-    invariant(!_shardingOperationFailedStatus);
+    tassert(8462311,
+            "Expected to have handled the sharding op failed status",
+            !_shardingOperationFailedStatus);
 }
 
 OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
     return shardingMetadataDecoration(opCtx);
 }
 
-bool OperationShardingState::isOperationVersioned(OperationContext* opCtx) {
+bool OperationShardingState::isComingFromRouter(OperationContext* opCtx) {
     const auto& oss = get(opCtx);
-    return !oss._shardVersions.empty();
+    return !oss._databaseVersions.empty() || !oss._shardVersions.empty();
 }
 
-void OperationShardingState::initializeClientRoutingVersionsFromCommand(NamespaceString nss,
-                                                                        const BSONObj& cmdObj) {
-    boost::optional<ChunkVersion> shardVersion;
-    boost::optional<DatabaseVersion> dbVersion;
-    const auto shardVersionElem = cmdObj.getField(ChunkVersion::kShardVersionField);
-    if (!shardVersionElem.eoo()) {
-        shardVersion = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
-    }
-
-    const auto dbVersionElem = cmdObj.getField(kDbVersionField);
-    if (!dbVersionElem.eoo()) {
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "expected databaseVersion element to be an object, got "
-                              << dbVersionElem,
-                dbVersionElem.type() == BSONType::Object);
-
-        dbVersion = DatabaseVersion(dbVersionElem.Obj());
-    }
-
-    initializeClientRoutingVersions(nss, shardVersion, dbVersion);
+bool OperationShardingState::shouldBeTreatedAsFromRouter(OperationContext* opCtx) {
+    const auto& oss = get(opCtx);
+    return !oss._databaseVersions.empty() || !oss._shardVersions.empty() || oss._treatAsFromRouter;
 }
 
-void OperationShardingState::initializeClientRoutingVersions(
-    NamespaceString nss,
-    const boost::optional<ChunkVersion>& shardVersion,
-    const boost::optional<DatabaseVersion>& dbVersion) {
-    if (shardVersion) {
-        // Changing the shardVersion expected for a namespace is not safe to happen in the
-        // middle of execution, but for the cases where operation is retried on the same
-        // OperationContext it can be set twice to the same value.
-        if (_shardVersionsChecked.contains(nss.ns())) {
-            invariant(_shardVersions[nss.ns()] == *shardVersion,
-                      str::stream()
-                          << "Trying to set " << shardVersion->toString() << " for " << nss.ns()
-                          << " but it already has " << _shardVersions[nss.ns()].toString());
-        } else {
-            _shardVersions.emplace(nss.ns(), *shardVersion);
+void OperationShardingState::setShardRole(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const boost::optional<ShardVersion>& shardVersion,
+                                          const boost::optional<DatabaseVersion>& databaseVersion) {
+    auto& oss = OperationShardingState::get(opCtx);
+
+    if (shardVersion && shardVersion != ShardVersion::UNSHARDED()) {
+        const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+        if (fcvSnapshot.isVersionInitialized() &&
+            feature_flags::gEnforceRoutingByNamespace.isEnabled(fcvSnapshot)) {
+            tassert(6300900,
+                    "Attaching a shard version requires a non db-only namespace",
+                    !nss.isDbOnly());
         }
     }
-    if (dbVersion) {
-        invariant(_databaseVersions.find(nss.db()) == _databaseVersions.end());
-        _databaseVersions[nss.db()] = *dbVersion;
+
+    bool shardVersionInserted = false;
+    bool databaseVersionInserted = false;
+    try {
+        boost::optional<OperationShardingState::ShardVersionTracker&> shardVersionTracker;
+        if (shardVersion) {
+            auto emplaceResult = oss._shardVersions.try_emplace(
+                NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()),
+                *shardVersion);
+            shardVersionInserted = emplaceResult.second;
+            shardVersionTracker = emplaceResult.first->second;
+            if (!shardVersionInserted) {
+                uassert(ErrorCodes::IllegalChangeToExpectedShardVersion,
+                        str::stream() << "Illegal attempt to change the expected shard version for "
+                                      << nss.toStringForErrorMsg() << " from "
+                                      << shardVersionTracker->v << " to " << *shardVersion
+                                      << " at recursion level " << shardVersionTracker->recursion,
+                        shardVersionTracker->v == *shardVersion);
+                invariant(shardVersionTracker->recursion > 0);
+            } else {
+                invariant(shardVersionTracker->recursion == 0);
+            }
+        }
+
+        boost::optional<OperationShardingState::DatabaseVersionTracker&> dbVersionTracker;
+        if (databaseVersion) {
+            auto emplaceResult = oss._databaseVersions.try_emplace(nss.dbName(), *databaseVersion);
+            databaseVersionInserted = emplaceResult.second;
+            dbVersionTracker = emplaceResult.first->second;
+            if (!databaseVersionInserted) {
+                uassert(ErrorCodes::IllegalChangeToExpectedDatabaseVersion,
+                        str::stream()
+                            << "Illegal attempt to change the expected database version for "
+                            << nss.dbName().toStringForErrorMsg() << " from " << dbVersionTracker->v
+                            << " to " << *databaseVersion << " at recursion level "
+                            << dbVersionTracker->recursion,
+                        dbVersionTracker->v == *databaseVersion);
+                invariant(dbVersionTracker->recursion > 0);
+            } else {
+                invariant(dbVersionTracker->recursion == 0);
+            }
+        }
+
+        // Update the recursion at the end to preserve the strong exception guarantee.
+        if (shardVersionTracker) {
+            shardVersionTracker->recursion++;
+        }
+        if (dbVersionTracker) {
+            dbVersionTracker->recursion++;
+        }
+
+    } catch (const DBException&) {
+        // Clean any oss update done within this method on failure to get a strong exception
+        // guarantee on ScopedSetShardRole objects.
+        if (shardVersionInserted) {
+            oss._shardVersions.erase(
+                NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+        }
+        if (databaseVersionInserted) {
+            oss._databaseVersions.erase(nss.dbName());
+        }
+
+        throw;
     }
 }
 
-bool OperationShardingState::hasShardVersion(const NamespaceString& nss) const {
-    return _shardVersions.find(nss.ns()) != _shardVersions.end();
-}
-
-boost::optional<ChunkVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
-    _shardVersionsChecked.insert(nss.ns());
-    const auto it = _shardVersions.find(nss.ns());
+boost::optional<ShardVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
+    const auto it = _shardVersions.find(
+        NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
     if (it != _shardVersions.end()) {
-        return it->second;
+        return it->second.v;
     }
-
     return boost::none;
 }
 
-bool OperationShardingState::hasDbVersion() const {
-    return !_databaseVersions.empty();
-}
-
 boost::optional<DatabaseVersion> OperationShardingState::getDbVersion(
-    const StringData dbName) const {
+    const DatabaseName& dbName) const {
     const auto it = _databaseVersions.find(dbName);
-    if (it == _databaseVersions.end()) {
-        return boost::none;
+    if (it != _databaseVersions.end()) {
+        return it->second.v;
     }
-    return it->second;
-}
-
-bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationContext* opCtx) {
-    // Must not block while holding a lock
-    invariant(!opCtx->lockState()->isLocked());
-
-    if (_migrationCriticalSectionSignal) {
-        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
-            std::min(opCtx->getRemainingMaxTimeMillis(), kMaxWaitForMigrationCriticalSection);
-
-        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
-            _migrationCriticalSectionSignal->wait(opCtx);
-        });
-
-        _migrationCriticalSectionSignal = boost::none;
-        return true;
-    }
-
-    return false;
-}
-
-void OperationShardingState::setMigrationCriticalSectionSignal(
-    boost::optional<SharedSemiFuture<void>> critSecSignal) {
-    invariant(critSecSignal);
-    _migrationCriticalSectionSignal = std::move(critSecSignal);
-}
-
-bool OperationShardingState::waitForMovePrimaryCriticalSectionSignal(OperationContext* opCtx) {
-    // Must not block while holding a lock
-    invariant(!opCtx->lockState()->isLocked());
-
-    if (_movePrimaryCriticalSectionSignal) {
-        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
-            std::min(opCtx->getRemainingMaxTimeMillis(), kMaxWaitForMovePrimaryCriticalSection);
-
-        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
-            _movePrimaryCriticalSectionSignal->wait(opCtx);
-        });
-
-        _movePrimaryCriticalSectionSignal = boost::none;
-        return true;
-    }
-
-    return false;
-}
-
-void OperationShardingState::setMovePrimaryCriticalSectionSignal(
-    boost::optional<SharedSemiFuture<void>> critSecSignal) {
-    invariant(critSecSignal);
-    _movePrimaryCriticalSectionSignal = std::move(critSecSignal);
+    return boost::none;
 }
 
 void OperationShardingState::setShardingOperationFailedStatus(const Status& status) {
     invariant(!_shardingOperationFailedStatus);
-    _shardingOperationFailedStatus = std::move(status);
+    _shardingOperationFailedStatus = status;
 }
 
 boost::optional<Status> OperationShardingState::resetShardingOperationFailedStatus() {
@@ -202,17 +201,137 @@ using ScopedAllowImplicitCollectionCreate_UNSAFE =
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE;
 
 ScopedAllowImplicitCollectionCreate_UNSAFE::ScopedAllowImplicitCollectionCreate_UNSAFE(
-    OperationContext* opCtx)
+    OperationContext* opCtx, bool forceCSRAsUnknownAfterCollectionCreation)
     : _opCtx(opCtx) {
     auto& oss = get(_opCtx);
-    invariant(!oss._allowCollectionCreation);
+    // TODO (SERVER-82066): Re-enable invariant if possible after updating direct connection
+    // handling.
+    // invariant(!oss._allowCollectionCreation);
     oss._allowCollectionCreation = true;
+    oss._forceCSRAsUnknownAfterCollectionCreation = forceCSRAsUnknownAfterCollectionCreation;
 }
 
 ScopedAllowImplicitCollectionCreate_UNSAFE::~ScopedAllowImplicitCollectionCreate_UNSAFE() {
     auto& oss = get(_opCtx);
-    invariant(oss._allowCollectionCreation);
+    // TODO (SERVER-82066): Re-enable invariant if possible after updating direct connection
+    // handling.
+    // invariant(oss._allowCollectionCreation);
     oss._allowCollectionCreation = false;
+    oss._forceCSRAsUnknownAfterCollectionCreation = false;
+}
+
+ScopedSetShardRole::ScopedSetShardRole(OperationContext* opCtx,
+                                       NamespaceString nss,
+                                       boost::optional<ShardVersion> shardVersion,
+                                       boost::optional<DatabaseVersion> databaseVersion)
+    : _opCtx(opCtx),
+      _nss(std::move(nss)),
+      _shardVersion(std::move(shardVersion)),
+      _databaseVersion(std::move(databaseVersion)) {
+    // "Fixed" dbVersions are only used for dbs that don't have the sharding infrastructure set up
+    // to handle real database or shard versions (like config and admin), so we ignore them.
+    if (_databaseVersion && _databaseVersion->isFixed()) {
+        uassert(7331300,
+                "A 'fixed' dbVersion should only be used with an unsharded shard version or none "
+                "at all",
+                !_shardVersion || _shardVersion == ShardVersion::UNSHARDED());
+        _databaseVersion.reset();
+        _shardVersion.reset();
+    }
+
+    OperationShardingState::setShardRole(_opCtx, _nss, _shardVersion, _databaseVersion);
+}
+
+ScopedSetShardRole::ScopedSetShardRole(ScopedSetShardRole&& other)
+    : _opCtx(other._opCtx),
+      _nss(std::move(other._nss)),
+      _shardVersion(std::move(other._shardVersion)),
+      _databaseVersion(std::move(other._databaseVersion)) {
+    // Clear the _shardVersion/_databaseVersion of 'other'; this prevents modifying
+    // OperationShardingState on destruction of the moved from object.
+    other._shardVersion.reset();
+    other._databaseVersion.reset();
+}
+
+ScopedSetShardRole::~ScopedSetShardRole() {
+    auto& oss = OperationShardingState::get(_opCtx);
+
+    if (_shardVersion) {
+        auto it = oss._shardVersions.find(
+            NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+        invariant(it != oss._shardVersions.end());
+        auto& tracker = it->second;
+        invariant(--tracker.recursion >= 0);
+        if (tracker.recursion == 0)
+            oss._shardVersions.erase(it);
+    }
+
+    if (_databaseVersion) {
+        auto it = oss._databaseVersions.find(_nss.dbName());
+        invariant(it != oss._databaseVersions.end());
+        auto& tracker = it->second;
+        invariant(--tracker.recursion >= 0);
+        if (tracker.recursion == 0)
+            oss._databaseVersions.erase(it);
+    }
+}
+
+ScopedStashShardRole::ScopedStashShardRole(OperationContext* opCtx, const NamespaceString& nss)
+    : _opCtx(opCtx), _nss(nss) {
+    auto& oss = OperationShardingState::get(_opCtx);
+
+    const auto shardVersionIt = oss._shardVersions.find(
+        NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+
+    const auto dbVersionIt = oss._databaseVersions.find(_nss.dbName());
+
+    // Check recursion preconditions first. Do the checks before modifying any
+    // OperationShardingState to ensure upholding the strong exception guarantee.
+    if (shardVersionIt != oss._shardVersions.end()) {
+        tassert(8541900,
+                "Cannot unset implicit views shard role if recursion level is greater than 1",
+                shardVersionIt->second.recursion == 1);
+    }
+
+    if (dbVersionIt != oss._databaseVersions.end()) {
+        tassert(8541901,
+                "Cannot unset implicit views shard role if recursion level is greater than 1",
+                dbVersionIt->second.recursion == 1);
+    }
+
+    // Stash shard/db versions.
+    if (shardVersionIt != oss._shardVersions.end()) {
+        _stashedShardVersion.emplace(shardVersionIt->second.v);
+        oss._shardVersions.erase(shardVersionIt);
+    }
+
+    if (dbVersionIt != oss._databaseVersions.end()) {
+        _stashedDatabaseVersion.emplace(dbVersionIt->second.v);
+        oss._databaseVersions.erase(dbVersionIt);
+    }
+}
+
+ScopedStashShardRole::~ScopedStashShardRole() {
+    auto& oss = OperationShardingState::get(_opCtx);
+    const auto shardVersionIt = oss._shardVersions.find(
+        NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+    invariant(shardVersionIt == oss._shardVersions.end());
+
+    if (_stashedShardVersion) {
+        auto emplaceResult = oss._shardVersions.emplace(
+            NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()),
+            *_stashedShardVersion);
+        auto& tracker = emplaceResult.first->second;
+        tracker.recursion = 1;
+    }
+
+    const auto dbVersionIt = oss._databaseVersions.find(_nss.dbName());
+    invariant(dbVersionIt == oss._databaseVersions.end());
+    if (_stashedDatabaseVersion) {
+        auto emplaceResult = oss._databaseVersions.emplace(_nss.dbName(), *_stashedDatabaseVersion);
+        auto& tracker = emplaceResult.first->second;
+        tracker.recursion = 1;
+    }
 }
 
 }  // namespace mongo

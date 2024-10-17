@@ -1,21 +1,29 @@
 //
 // Basic tests for refineCollectionShardKey.
 //
-// Tag this test as 'requires_find_command' to prevent it from running in the legacy passthroughs.
-// @tags: [
-//   requires_find_command,
-// ]
-//
 
-(function() {
-'use strict';
-load('jstests/libs/fail_point_util.js');
-load('jstests/libs/profiler.js');
-load('jstests/sharding/libs/shard_versioning_util.js');
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
-load("jstests/sharding/libs/find_chunks_util.js");
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    WriteWithoutShardKeyTestUtil
+} from "jstests/sharding/updateOne_without_shard_key/libs/write_without_shard_key_test_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-const st = new ShardingTest({mongos: 2, shards: 2, rs: {nodes: 3}});
+const st = new ShardingTest({
+    mongos: 2,
+    shards: 2,
+    rs: {nodes: 3},
+    configOptions:
+        {setParameter: {maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS}}
+});
+
 const mongos = st.s0;
 const staleMongos = st.s1;
 const primaryShard = st.shard0.shardName;
@@ -24,17 +32,9 @@ const kDbName = 'db';
 const kCollName = 'foo';
 const kNsName = kDbName + '.' + kCollName;
 const kConfigCollections = 'config.collections';
-const kConfigChunks = 'config.chunks';
 const kConfigTags = 'config.tags';
-const kConfigChangelog = 'config.changelog';
 const kUnrelatedName = kDbName + '.bar';
 let oldEpoch = null;
-
-function enableShardingAndShardColl(keyDoc) {
-    assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-    st.ensurePrimaryShard(kDbName, primaryShard);
-    assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: keyDoc}));
-}
 
 function dropAndRecreateColl(keyDoc) {
     assert.commandWorked(mongos.getDB(kDbName).runCommand({drop: kCollName}));
@@ -105,29 +105,48 @@ function validateCRUDAfterRefine() {
     assert.commandWorked(sessionDB.getCollection(kCollName).insert({a: 1, b: 1, c: 1, d: 1}));
     assert.commandWorked(sessionDB.getCollection(kCollName).insert({a: -1, b: -1, c: -1, d: -1}));
 
-    // The full shard key is not required in the resulting document when updating. The full shard
-    // key is still required in the query, however.
-    assert.commandFailedWithCode(
-        sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1}, {$set: {b: 2}}), 31025);
-    assert.commandWorked(
-        sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1, d: 1}, {$set: {b: 2}}));
-    assert.commandWorked(
-        sessionDB.getCollection(kCollName).update({a: -1, b: -1, c: -1, d: -1}, {$set: {b: 4}}));
+    // This enables the feature allows writes to omit the shard key in their queries.
+    if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDB)) {
+        assert.commandWorked(
+            sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1}, {$set: {x: 2}}));
+        assert.commandWorked(
+            sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1, d: 1}, {$set: {b: 2}}));
+        assert.commandWorked(sessionDB.getCollection(kCollName).update({a: -1, b: -1, c: -1, d: -1},
+                                                                       {$set: {b: 4}}));
 
-    assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
-    assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).x);
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
+        assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
 
-    // Versioned reads against secondaries should work as expected.
-    mongos.setReadPref("secondary");
-    assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
-    assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
-    mongos.setReadPref(null);
+        // Versioned reads against secondaries should work as expected.
+        mongos.setReadPref("secondary");
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).x);
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
+        assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
+        mongos.setReadPref(null);
+    } else {
+        // The full shard key is not required in the resulting document when updating. The full
+        // shard key is still required in the query, however.
+        assert.commandFailedWithCode(
+            sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1}, {$set: {b: 2}}), 31025);
+        assert.commandWorked(
+            sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1, d: 1}, {$set: {b: 2}}));
+        assert.commandWorked(sessionDB.getCollection(kCollName).update({a: -1, b: -1, c: -1, d: -1},
+                                                                       {$set: {b: 4}}));
 
-    // The full shard key is required when removing documents.
-    assert.writeErrorWithCode(sessionDB.getCollection(kCollName).remove({a: 1, b: 1}, true),
-                              ErrorCodes.ShardKeyNotFound);
-    assert.writeErrorWithCode(sessionDB.getCollection(kCollName).remove({a: -1, b: -1}, true),
-                              ErrorCodes.ShardKeyNotFound);
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
+        assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
+
+        // Versioned reads against secondaries should work as expected.
+        mongos.setReadPref("secondary");
+        assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
+        assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
+        mongos.setReadPref(null);
+    }
+
+    assert.commandWorked(sessionDB.getCollection(kCollName).remove({a: 1, b: 1}, true));
+    assert.commandWorked(sessionDB.getCollection(kCollName).remove({a: -1, b: -1}, true));
+
     assert.commandWorked(sessionDB.getCollection(kCollName).remove({a: 1, b: 2, c: 1, d: 1}, true));
     assert.commandWorked(
         sessionDB.getCollection(kCollName).remove({a: -1, b: 4, c: -1, d: -1}, true));
@@ -194,7 +213,7 @@ function validateConfigChunksAfterRefine(oldEpoch) {
     assert.eq({a: MaxKey, b: MaxKey, c: MaxKey, d: MaxKey}, chunkArr[2].max);
     assert.eq(chunkArr[0].lastmodEpoch, chunkArr[1].lastmodEpoch);
     assert.eq(chunkArr[1].lastmodEpoch, chunkArr[2].lastmodEpoch);
-    assert.neq(oldEpoch, chunkArr[0].lastmodEpoch);
+    assert(!oldEpoch && !chunkArr[0].lastmodEpoch || oldEpoch != chunkArr[0].lastmodEpoch);
 }
 
 function setupConfigTagsBeforeRefine() {
@@ -247,6 +266,8 @@ function validateUnrelatedCollAfterRefine(oldCollArr, oldChunkArr, oldTagsArr) {
 
 jsTestLog('********** SIMPLE TESTS **********');
 
+var result;
+
 // Should fail because arguments 'refineCollectionShardKey' and 'key' are invalid types.
 assert.commandFailedWithCode(
     mongos.adminCommand({refineCollectionShardKey: {_id: 1}, key: {_id: 1, aKey: 1}}),
@@ -266,13 +287,16 @@ assert.commandFailedWithCode(
 
 assert.commandWorked(mongos.getCollection(kNsName).insert({aKey: 1}));
 
-// Should fail because namespace 'db.foo' is not sharded. NOTE: This NamespaceNotSharded error
-// is thrown in RefineCollectionShardKeyCommand by 'getShardedCollectionRoutingInfoWithRefresh'.
+// Should fail because namespace 'db.foo' is not sharded.
 assert.commandFailedWithCode(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}),
     ErrorCodes.NamespaceNotSharded);
 
-enableShardingAndShardColl({_id: 1});
+assert.commandFailedWithCode(
+    mongos.adminCommand({refineCollectionShardKey: "config.collections", key: {_id: 1, aKey: 1}}),
+    ErrorCodes.NamespaceNotSharded);
+
+assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
 
 // Should fail because shard key is invalid (i.e. bad values).
 assert.commandFailedWithCode(
@@ -287,7 +311,8 @@ assert.commandFailedWithCode(
     ErrorCodes.BadValue);
 
 // Should fail because shard key is not specified.
-assert.commandFailedWithCode(mongos.adminCommand({refineCollectionShardKey: kNsName}), 40414);
+assert.commandFailedWithCode(mongos.adminCommand({refineCollectionShardKey: kNsName}),
+                             ErrorCodes.IDLFailedToParse);
 assert.commandFailedWithCode(mongos.adminCommand({refineCollectionShardKey: kNsName, key: {}}),
                              ErrorCodes.BadValue);
 
@@ -306,7 +331,7 @@ assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
 jsTestLog('********** NAMESPACE VALIDATION TESTS **********');
 
-enableShardingAndShardColl({_id: 1});
+assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
 
 // Configure failpoint 'hangRefineCollectionShardKeyAfterRefresh' on staleMongos and run
 // refineCollectionShardKey against this mongos in a parallel thread.
@@ -322,8 +347,7 @@ hangAfterRefreshFailPoint.wait();
 // Drop and re-create namespace 'db.foo' without staleMongos refreshing its metadata.
 dropAndRecreateColl({aKey: 1});
 
-// Should fail because namespace 'db.foo' is not sharded. NOTE: This NamespaceNotSharded error
-// is thrown in ConfigsvrRefineCollectionShardKeyCommand.
+// Should fail because namespace 'db.foo' is not sharded.
 hangAfterRefreshFailPoint.off();
 awaitShellToTriggerNamespaceNotSharded();
 
@@ -331,7 +355,7 @@ assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
 jsTestLog('********** SHARD KEY VALIDATION TESTS **********');
 
-enableShardingAndShardColl({_id: 1});
+assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
 
 // Should fail because new shard key {aKey: 1} does not extend current shard key {_id: 1} of
 // namespace 'db.foo'.
@@ -348,36 +372,46 @@ assert.commandFailedWithCode(
 dropAndReshardColl({_id: 1});
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}, {sparse: true}));
 
-assert.commandFailedWithCode(
-    mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}),
-    ErrorCodes.InvalidOptions);
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is sparse."));
+
+// Should fail because index has a non-simple collation.
+dropAndReshardColl({aKey: 1});
+assert.commandWorked(mongos.getCollection(kNsName).createIndex({aKey: 1, bKey: 1}, {
+    collation: {
+        locale: "en",
+    }
+}));
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {aKey: 1, bKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index has a non-simple collation."));
 
 // Should fail because only a partial index exists for new shard key {_id: 1, aKey: 1}.
 dropAndReshardColl({_id: 1});
 assert.commandWorked(mongos.getCollection(kNsName).createIndex(
     {_id: 1, aKey: 1}, {partialFilterExpression: {aKey: {$gt: 0}}}));
 
-assert.commandFailedWithCode(
-    mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}),
-    ErrorCodes.OperationFailed);
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is partial."));
 
 // Should fail because only a multikey index exists for new shard key {_id: 1, aKey: 1}.
 dropAndReshardColl({_id: 1});
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}));
 assert.commandWorked(mongos.getCollection(kNsName).insert({aKey: [1, 2, 3, 4, 5]}));
 
-assert.commandFailedWithCode(
-    mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}),
-    ErrorCodes.OperationFailed);
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is multikey."));
 
 // Should fail because current shard key {a: 1} is unique, new shard key is {a: 1, b: 1}, and an
 // index only exists on {a: 1, b: 1, c: 1}.
 dropAndReshardCollUnique({a: 1});
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({a: 1, b: 1, c: 1}));
 
-assert.commandFailedWithCode(
-    mongos.adminCommand({refineCollectionShardKey: kNsName, key: {a: 1, b: 1}}),
-    ErrorCodes.InvalidOptions);
+mongos.adminCommand({refineCollectionShardKey: kNsName, key: {a: 1, b: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
 
 // Should work because current shard key {_id: 1} is not unique, new shard key is {_id: 1, aKey:
 // 1}, and an index exists on {_id: 1, aKey: 1, bKey: 1}.
@@ -452,6 +486,43 @@ assert.commandFailedWithCode(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {aKey: 1, bKey: 1}}),
     ErrorCodes.InvalidOptions);
 
+// Should fail because index key is sparse and index has non-simple collation.
+dropAndReshardColl({_id: 1});
+assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}, {
+    sparse: true,
+    collation: {
+        locale: "en",
+    }
+}));
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is sparse.") &&
+       result.errmsg.includes("Index has a non-simple collation."));
+
+// Should fail because index key is multikey and is partial.
+dropAndReshardColl({_id: 1});
+assert.commandWorked(mongos.getCollection(kNsName).createIndex(
+    {_id: 1, aKey: 1}, {name: "index_1_part", partialFilterExpression: {aKey: {$gt: 0}}}));
+assert.commandWorked(
+    mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}, {name: "index_2"}));
+assert.commandWorked(mongos.getCollection(kNsName).insert({aKey: [1, 2, 3, 4, 5]}));
+
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is multikey.") &&
+       result.errmsg.includes("Index key is partial."));
+
+// Should fail because both indexes have keys that are incompatible: partial; sparse
+dropAndReshardColl({_id: 1});
+assert.commandWorked(mongos.getCollection(kNsName).createIndex(
+    {_id: 1, aKey: 1}, {name: "index_1_part", partialFilterExpression: {aKey: {$gt: 0}}}));
+assert.commandWorked(mongos.getCollection(kNsName).createIndex(
+    {_id: 1, aKey: 1}, {name: "index_2_sparse", sparse: true}));
+result = mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}});
+assert.commandFailedWithCode(result, ErrorCodes.InvalidOptions);
+assert(result.errmsg.includes("Index key is partial.") &&
+       result.errmsg.includes("Index key is sparse."));
+
 // Should work because a 'useful' index exists for new shard key {_id: 1, aKey: 1}.
 dropAndReshardColl({_id: 1});
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}));
@@ -501,7 +572,7 @@ assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
 jsTestLog('********** UNIQUENESS PROPERTY TESTS **********');
 
-enableShardingAndShardColl({_id: 1});
+assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}));
 
 // Verify that refineCollectionShardKey cannot modify a unique=false sharded collection.
@@ -515,6 +586,15 @@ assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, aKey: 1}
 
 assert.commandWorked(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}));
+validateConfigCollectionsUnique(true);
+
+// Verify that enforceUniquenessCheck: false allows non-unique indexes.
+assert.commandWorked(mongos.getDB(kDbName).runCommand({drop: kCollName}));
+assert.commandWorked(mongos.getCollection(kNsName).createIndex({a: 1, b: 1}));
+assert.commandWorked(mongos.adminCommand(
+    {shardCollection: kNsName, key: {a: 1}, unique: true, enforceUniquenessCheck: false}));
+assert.commandWorked(mongos.adminCommand(
+    {refineCollectionShardKey: kNsName, key: {a: 1, b: 1}, enforceUniquenessCheck: false}));
 validateConfigCollectionsUnique(true);
 
 assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
@@ -532,7 +612,7 @@ const newKeyDoc = {
     d: 1
 };
 
-enableShardingAndShardColl(oldKeyDoc);
+assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: oldKeyDoc}));
 assert.commandWorked(mongos.getCollection(kNsName).createIndex(newKeyDoc));
 
 // CRUD operations before and after refineCollectionShardKey should work as expected.
@@ -619,124 +699,32 @@ assert.eq(3, oldTagsArr.length);
 assert.commandWorked(mongos.adminCommand({refineCollectionShardKey: kNsName, key: newKeyDoc}));
 validateUnrelatedCollAfterRefine(oldCollArr, oldChunkArr, oldTagsArr);
 
-// Verify that all shards containing chunks in the namespace 'db.foo' eventually refresh (i.e. the
-// secondary shard will not refresh because it does not contain any chunks in 'db.foo'). NOTE: This
-// will only succeed in a linear jstest without failovers.
-dropAndReshardColl(oldKeyDoc);
-assert.commandWorked(mongos.getCollection(kNsName).createIndex(newKeyDoc));
+// Verify that all shards in the namespace 'db.foo' eventually refresh. NOTE: This will only succeed
+// in a linear jstest without failovers.
+const isStepdownSuite = TestData.runningWithConfigStepdowns;
+if (!isStepdownSuite) {
+    dropAndReshardColl(oldKeyDoc);
+    assert.commandWorked(mongos.getCollection(kNsName).createIndex(newKeyDoc));
 
-assert.commandWorked(
-    mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: secondaryShard}));
-assert.commandWorked(
-    mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: primaryShard}));
-
-const oldPrimaryEpoch = st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                            .metadata.shardVersionEpoch.toString();
-const oldSecondaryEpoch = st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                              .metadata.shardVersionEpoch.toString();
-
-assert.commandWorked(mongos.adminCommand({refineCollectionShardKey: kNsName, key: newKeyDoc}));
-
-assert.soon(() => oldPrimaryEpoch !==
-                st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                    .metadata.shardVersionEpoch.toString());
-assert.soon(() => oldSecondaryEpoch ===
-                st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                    .metadata.shardVersionEpoch.toString());
-
-(() => {
-    //
-    // Verify listIndexes and checkShardingIndexes are retried on shard version errors and are sent
-    // with shard versions.
-    //
-
-    // Create a sharded collection with one chunk on shard0.
-    const dbName = "testShardVersions";
-    const collName = "fooShardVersions";
-    const ns = dbName + "." + collName;
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
-    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
-
-    const minKeyShardDB = st.rs0.getPrimary().getDB(dbName);
-    assert.commandWorked(minKeyShardDB.setProfilingLevel(2));
-
-    // Refining the shard key should internally retry on a stale epoch error for listIndexes and
-    // succeed.
-    assert.commandWorked(minKeyShardDB.adminCommand({
-        configureFailPoint: "failCommand",
-        mode: {times: 5},
-        data: {
-            errorCode: ErrorCodes.StaleEpoch,
-            failCommands: ["listIndexes"],
-            failInternalCommands: true
-        }
-    }));
-    assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1}));
-    assert.commandWorked(st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}));
-
-    // Refining the shard key should internally retry on a stale epoch error for checkShardingIndex
-    // and succeed.
-    assert.commandWorked(minKeyShardDB.adminCommand({
-        configureFailPoint: "failCommand",
-        mode: {times: 5},
-        data: {
-            errorCode: ErrorCodes.StaleEpoch,
-            failCommands: ["checkShardingIndex"],
-            failInternalCommands: true
-        }
-    }));
-    assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1, z: 1}));
     assert.commandWorked(
-        st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1, z: 1}}));
+        mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: secondaryShard}));
+    assert.commandWorked(
+        mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: primaryShard}));
 
-    // Verify both commands were sent with shard versions through the profiler.
-    profilerHasAtLeastOneMatchingEntryOrThrow({
-        profileDB: minKeyShardDB,
-        filter: {"command.listIndexes": collName, "command.shardVersion": {"$exists": true}}
-    });
+    const oldPrimaryEpoch = st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                                .metadata.shardVersionEpoch.toString();
+    const oldSecondaryEpoch = st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                                  .metadata.shardVersionEpoch.toString();
 
-    profilerHasAtLeastOneMatchingEntryOrThrow({
-        profileDB: minKeyShardDB,
-        filter: {"command.checkShardingIndex": ns, "command.shardVersion": {"$exists": true}}
-    });
+    assert.commandWorked(mongos.adminCommand({refineCollectionShardKey: kNsName, key: newKeyDoc}));
 
-    // Clean up.
-    assert.commandWorked(minKeyShardDB.setProfilingLevel(0));
-    assert(minKeyShardDB.system.profile.drop());
-})();
-
-(() => {
-    //
-    // Verify refineCollectionShardKey can return a StaleConfig error without crashing the config
-    // server.
-    //
-
-    // Create a sharded collection with one chunk on shard0.
-    const dbName = "testReturnStaleConfig";
-    const ns = dbName + ".fooReturnStaleConfig";
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
-    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
-
-    // Move the last chunk away from shard0 without refreshing shard1 so it will be stale when its
-    // indexes are read during the next refine. Disable refreshes on shard1 so it will repeatedly
-    // return StaleConfig until refineCollectionShardKey runs out of retries.
-    ShardVersioningUtil.moveChunkNotRefreshRecipient(st.s, ns, st.shard0, st.shard1, {x: 1});
-
-    let disableRefreshesFailPoint =
-        configureFailPoint(st.rs1.getPrimary(), "skipShardFilteringMetadataRefresh");
-
-    assert.commandWorked(st.rs1.getPrimary().getCollection(ns).createIndex({x: 1, y: 1}));
-    assert.commandFailedWithCode(
-        st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}),
-        ErrorCodes.StaleConfig);
-
-    disableRefreshesFailPoint.off();
-
-    // The refresh should succeed now.
-    assert.commandWorked(st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}));
-})();
+    assert.soon(() => oldPrimaryEpoch !==
+                    st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                        .metadata.shardVersionEpoch.toString());
+    assert.soon(() => oldSecondaryEpoch !==
+                    st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                        .metadata.shardVersionEpoch.toString());
+}
 
 // Assumes the given arrays are sorted by the max field.
 function compareMinAndMaxFields(shardedArr, refinedArr) {
@@ -778,8 +766,8 @@ function compareBoundaries(conn, shardedNs, refinedNs) {
     const shardedNs = dbName + ".shardedColl";
     const refinedNs = dbName + ".refinedColl";
 
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
     assert.commandWorked(st.s.adminCommand({addShardToZone: st.shard0.shardName, zone: 'zone_1'}));
 
     assert.commandWorked(st.s.adminCommand({shardCollection: shardedNs, key: {a: 1, b: 1, c: 1}}));
@@ -812,14 +800,28 @@ function compareBoundaries(conn, shardedNs, refinedNs) {
     compareBoundaries(st.s, shardedNs, refinedNs);
 })();
 
-// For a shard key with nested fields.
+// Make sure split  is correctly disabled for unsplittable collection
+(() => {
+    if (FeatureFlagUtil.isPresentAndEnabled(mongos, "TrackUnshardedCollectionsUponCreation")) {
+        jsTest.log("Make sure refine shard key for unsplittable collection is correctly disabled");
+        const kCollNameUnsplittable = "unsplittable_bar";
+        const kNsNameUnsplittable = kDbName + "." + kCollNameUnsplittable;
+        assert.commandWorked(mongos.getDB(kDbName).runCommand(
+            {createUnsplittableCollection: kCollNameUnsplittable}));
+        assert.commandFailedWithCode(
+            mongos.adminCommand({refineCollectionShardKey: kNsNameUnsplittable, key: {a: 1, b: 1}}),
+            ErrorCodes.NamespaceNotSharded);
+    }
+})();
+
+// For a shard key with nested fields .
 (() => {
     const dbName = "compareDBNested";
     const shardedNs = dbName + ".shardedColl";
     const refinedNs = dbName + ".refinedColl";
 
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
     assert.commandWorked(st.s.adminCommand({addShardToZone: st.shard0.shardName, zone: 'zone_1'}));
 
     assert.commandWorked(
@@ -854,4 +856,3 @@ function compareBoundaries(conn, shardedNs, refinedNs) {
 })();
 
 st.stop();
-})();

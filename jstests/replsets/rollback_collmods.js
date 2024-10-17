@@ -1,12 +1,11 @@
 /**
  * Tests that collMod commands during every stage of rollback are tracked correctly.
  * This especially targets collection validators that begin partially or fully uninitialized.
+ *
+ * @tags: [requires_fcv_53]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/rollback_test_deluxe.js");
+import {RollbackTestDeluxe} from "jstests/replsets/libs/rollback_test_deluxe.js";
 
 const testName = "rollback_collmods";
 const dbName = testName;
@@ -105,4 +104,3 @@ SteadyStateOps(rollbackTest.getPrimary());
 printCollectionOptions(rollbackTest, "at completion");
 
 rollbackTest.stop();
-})();

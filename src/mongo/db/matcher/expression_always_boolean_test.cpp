@@ -26,10 +26,14 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 
@@ -48,7 +52,7 @@ TEST(AlwaysFalseMatchExpression, RejectsAllObjects) {
 TEST(AlwaysFalseMatchExpression, EquivalentReturnsCorrectResults) {
     auto falseExpr = std::make_unique<AlwaysFalseMatchExpression>();
     ASSERT_TRUE(falseExpr->equivalent(falseExpr.get()));
-    ASSERT_TRUE(falseExpr->equivalent(falseExpr->shallowClone().get()));
+    ASSERT_TRUE(falseExpr->equivalent(falseExpr->clone().get()));
 
     AlwaysTrueMatchExpression trueExpr;
     ASSERT_FALSE(falseExpr->equivalent(&trueExpr));
@@ -67,10 +71,28 @@ TEST(AlwaysTrueMatchExpression, AcceptsAllObjects) {
 TEST(AlwaysTrueMatchExpression, EquivalentReturnsCorrectResults) {
     auto trueExpr = std::make_unique<AlwaysTrueMatchExpression>();
     ASSERT_TRUE(trueExpr->equivalent(trueExpr.get()));
-    ASSERT_TRUE(trueExpr->equivalent(trueExpr->shallowClone().get()));
+    ASSERT_TRUE(trueExpr->equivalent(trueExpr->clone().get()));
 
     AlwaysFalseMatchExpression falseExpr;
     ASSERT_FALSE(trueExpr->equivalent(&falseExpr));
+}
+
+DEATH_TEST_REGEX(AlwaysTrueMatchExpression,
+                 GetChildFailsIndexGreaterThanZero,
+                 "Tripwire assertion.*6400202") {
+    auto trueExpr = std::make_unique<AlwaysTrueMatchExpression>();
+
+    ASSERT_EQ(trueExpr->numChildren(), 0);
+    ASSERT_THROWS_CODE(trueExpr->getChild(0), AssertionException, 6400202);
+}
+
+DEATH_TEST_REGEX(AlwaysFalseMatchExpression,
+                 GetChildFailsIndexGreaterThanZero,
+                 "Tripwire assertion.*6400202") {
+    auto falseExpr = std::make_unique<AlwaysFalseMatchExpression>();
+
+    ASSERT_EQ(falseExpr->numChildren(), 0);
+    ASSERT_THROWS_CODE(falseExpr->getChild(0), AssertionException, 6400202);
 }
 
 }  // namespace

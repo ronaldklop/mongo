@@ -26,20 +26,60 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
-#include "mongo/unittest/unittest.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/s/stale_exception.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -50,18 +90,17 @@ const Status kShardNotFoundStatus{ErrorCodes::ShardNotFound, "dummy"};
 const Status kError1Status{ErrorCodes::HostUnreachable, "dummy"};
 const Status kError2Status{ErrorCodes::HostUnreachable, "dummy"};
 
-const Status kStaleConfigErrorStatus{ErrorCodes::StaleShardVersion, "dummy"};
-
 const Status kWriteConcernError1Status{ErrorCodes::WriteConcernFailed, "dummy"};
 const Status kWriteConcernError2Status{ErrorCodes::UnsatisfiableWriteConcern, "dummy"};
 
-executor::RemoteCommandResponse kOkResponse{BSON("ok" << 1), Milliseconds(0)};
+executor::RemoteCommandResponse kOkResponse =
+    executor::RemoteCommandResponse::make_forTest(BSON("ok" << 1), Milliseconds(0));
 
 executor::RemoteCommandResponse makeErrorResponse(const Status& errorStatus) {
     invariant(!errorStatus.isOK());
     BSONObjBuilder res;
     CommandHelpers::appendCommandStatusNoThrow(res, errorStatus);
-    return {res.obj(), Milliseconds(0)};
+    return executor::RemoteCommandResponse::make_forTest(res.obj(), Milliseconds(0));
 }
 
 executor::RemoteCommandResponse makeWriteConcernErrorResponse(
@@ -72,7 +111,7 @@ executor::RemoteCommandResponse makeWriteConcernErrorResponse(
     wcError.setStatus(writeConcernErrorStatus);
     res.append("ok", 1);
     res.append("writeConcernError", wcError.toBSON());
-    return {res.obj(), Milliseconds(0)};
+    return executor::RemoteCommandResponse::make_forTest(res.obj(), Milliseconds(0));
 }
 
 HostAndPort makeHostAndPort(const ShardId& shardId) {
@@ -81,7 +120,7 @@ HostAndPort makeHostAndPort(const ShardId& shardId) {
 
 class AppendRawResponsesTest : public ShardingTestFixture {
 protected:
-    void setUp() {
+    void setUp() override {
         ShardingTestFixture::setUp();
 
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
@@ -167,7 +206,9 @@ protected:
             StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : _shardIds) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(
@@ -194,6 +235,19 @@ protected:
     const ShardId kShard5{"s5"};
 
     const std::vector<ShardId> kShardIdList{kShard1, kShard2, kShard3, kShard4, kShard5};
+
+    const Status kStaleConfigErrorStatus{
+        [] {
+            OID epoch{OID::gen()};
+            Timestamp timestamp{1, 0};
+            return StaleConfigInfo(
+                NamespaceString::createNamespaceString_forTest("Foo.Bar"),
+                ShardVersionFactory::make(ChunkVersion({epoch, timestamp}, {1, 0}),
+                                          boost::optional<CollectionIndexes>(boost::none)),
+                boost::none,
+                ShardId{"dummy"});
+        }(),
+        "dummy"};
 
 private:
     static void _assertShardIdsMatch(const std::set<ShardId>& expectedShardIds,

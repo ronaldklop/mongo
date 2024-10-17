@@ -1,8 +1,17 @@
-(function() {
-'use strict';
-
 // create
-var s = new ShardingTest({shards: 2});
+// @tags: [
+//   # TODO (SERVER-88127): Re-enable this test or add an explanation why it is incompatible.
+//   embedded_router_incompatible,
+// ]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+var s = new ShardingTest({
+    shards: 2,
+    other: {
+        mongosOptions:
+            {setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}}
+    }
+});
 var db = s.getDB("test");
 var ss = db.serverStatus();
 
@@ -23,8 +32,8 @@ for (i = 0; i < numSplits; i++) {
     assert.commandWorked(s.s0.adminCommand({split: "test.foo", middle: midKey}));
 }
 
-// restart mongos
-s.restartMongos(0);
+// restart the router
+s.restartRouterNode(0);
 db = s.getDB("test");
 
 // check for # refreshes started
@@ -32,9 +41,12 @@ ss = db.serverStatus();
 assert.eq(1, ss.shardingStatistics.catalogCache.countFullRefreshesStarted);
 
 // does not pre cache when set parameter is disabled
-s.restartMongos(0, {
+s.restartRouterNode(0, {
     restart: true,
-    setParameter: {loadRoutingTableOnStartup: false},
+    setParameter: {
+        loadRoutingTableOnStartup: false,
+        'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"
+    },
 });
 db = s.getDB("test");
 
@@ -43,4 +55,3 @@ ss = db.serverStatus();
 assert.eq(0, ss.shardingStatistics.catalogCache.countFullRefreshesStarted);
 
 s.stop();
-})();

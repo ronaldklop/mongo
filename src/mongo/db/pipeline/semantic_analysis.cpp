@@ -27,11 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <list>
+#include <set>
+#include <vector>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/semantic_analysis.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo::semantic_analysis {
 
@@ -77,7 +97,7 @@ boost::optional<std::string> findRename(const StringMap<std::string>& renamedPat
  * maps the path to itself.
  */
 StringMap<std::string> computeNamesAssumingAnyPathsNotRenamedAreUnmodified(
-    const StringMap<std::string>& renamedPaths, const std::set<std::string>& pathsOfInterest) {
+    const StringMap<std::string>& renamedPaths, const OrderedPathSet& pathsOfInterest) {
     StringMap<std::string> renameOut;
     for (auto&& ofInterest : pathsOfInterest) {
         if (auto name = findRename(renamedPaths, ofInterest)) {
@@ -98,55 +118,236 @@ StringMap<std::string> invertRenameMap(const StringMap<std::string>& originalMap
     return reversedMap;
 }
 
+const ReplaceRootTransformation* isReplaceRoot(const DocumentSource* source) {
+    // We have to use getSourceName() since DocumentSourceReplaceRoot is never materialized - it
+    // uses DocumentSourceSingleDocumentTransformation.
+    auto singleDocTransform =
+        dynamic_cast<const DocumentSourceSingleDocumentTransformation*>(source);
+    if (!singleDocTransform) {
+        return nullptr;
+    }
+    return dynamic_cast<const ReplaceRootTransformation*>(&singleDocTransform->getTransformer());
+}
+
 /**
- * Computes and returns a rename mapping for 'pathsOfInterest' over multiple aggregation pipeline
- * stages. The range of pipeline stages we compute renames over is represented by the iterators
- * 'start' and 'end'. If both 'start' and 'end' are reverse iterators, then 'start' should come
- * after 'end' in the pipeline, 'traversalDir' should be "kBackward," 'pathsOfInterest' should be
- * valid path names after stage 'start,' and this template will compute a mapping from the given
- * names of 'pathsOfInterest' to their names as they were directly after stage 'end.'If both 'start'
- * and 'end' are forwards iterators, then 'start' should come before 'end' in the pipeline,
- * 'traversalDir' should be "kForward," 'pathsOfInterest' should be valid path names before stage
- * 'start,' and this template will compute a mapping from the given names of 'pathsOfInterest' to
- * their names as they are directly before stage 'end.'
+ * Detects if 'replaceRootTransform' represents the nesting of a field path. If it does, returns
+ * the name of that field path. For example, if 'replaceRootTransform' represents the transformation
+ * associated with {$replaceWith: {nested: "$$ROOT"}} or {$replaceRoot: {newRoot: {nested:
+ * "$$ROOT"}}}, returns "nested".
+ */
+boost::optional<std::string> replaceRootNestsRoot(
+    const ReplaceRootTransformation* replaceRootTransform) {
+    auto expressionObject =
+        dynamic_cast<ExpressionObject*>(replaceRootTransform->getExpression().get());
+    if (!expressionObject) {
+        return boost::none;
+    }
+    auto children = expressionObject->getChildExpressions();
+    if (children.size() != 1u) {
+        return boost::none;
+    }
+    auto&& [nestedName, expression] = children[0];
+    if (!dynamic_cast<ExpressionFieldPath*>(expression.get()) ||
+        !dynamic_cast<ExpressionFieldPath*>(expression.get())->isROOT()) {
+        return boost::none;
+    }
+    return nestedName;
+}
+
+/**
+ * Detects if 'replaceRootTransform' represents the unnesting of a field path. If it does, returns
+ * the name of that field path. For example, if 'replaceRootTransform' represents the transformation
+ * associated with {$replaceWith: "$x"} or {$replaceRoot: {newRoot: "$x"}}, returns "x".
+ */
+boost::optional<std::string> replaceRootUnnestsPath(
+    const ReplaceRootTransformation* replaceRootTransform) {
+    auto expressionFieldPath =
+        dynamic_cast<ExpressionFieldPath*>(replaceRootTransform->getExpression().get());
+    if (!expressionFieldPath) {
+        return boost::none;
+    }
+    return expressionFieldPath->getFieldPathWithoutCurrentPrefix().fullPath();
+}
+
+/**
+ * Looks for a pattern where the user temporarily nests the whole object, does some computation,
+ * then unnests the object. Like so:
+ * [{$replaceWith: {nested: "$$ROOT"}}, ..., {$replaceWith: "$nested"}].
  *
- * This should only be used internally; callers who need to track path renames through an
- * aggregation pipeline should use one of the publically exposed options availible in the header.
+ * If this pattern is detected, returns an iterator to the 'second' replace root, whichever is later
+ * according to the traversal order.
  */
 template <class Iterator>
-boost::optional<StringMap<std::string>> multiStageRenamedPaths(
+boost::optional<Iterator> lookForNestUnnestPattern(
     Iterator start,
     Iterator end,
-    std::set<std::string> pathsOfInterest,
-    const Direction& traversalDir) {
-    // The keys to this map will always be the original names of 'pathsOfInterest'. The values will
-    // be updated as we loop through the pipeline's stages to always be the most up-to-date name we
-    // know of for that path.
+    OrderedPathSet pathsOfInterest,
+    const Direction& traversalDir,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback,
+    const UnpreservedPathPolicy& unpreservedPathPolicy = UnpreservedPathPolicy::Fail) {
+    auto replaceRootTransform = isReplaceRoot((*start).get());
+    if (!replaceRootTransform) {
+        return boost::none;
+    }
+
+    auto targetName = traversalDir == Direction::kForward
+        ? replaceRootNestsRoot(replaceRootTransform)
+        : replaceRootUnnestsPath(replaceRootTransform);
+    if (!targetName || targetName->find(".") != std::string::npos) {
+        // Bail out early on dotted paths - we don't intend to deal with that complexity here,
+        // though we could in the future.
+        return boost::none;
+    }
+    auto nameTestCallback =
+        traversalDir == Direction::kForward ? replaceRootUnnestsPath : replaceRootNestsRoot;
+
+    ++start;  // Advance one to go past the first $replaceRoot we just looked at.
+    for (; start != end; ++start) {
+        replaceRootTransform = isReplaceRoot((*start).get());
+        if (!replaceRootTransform) {
+            if (additionalStageValidatorCallback &&
+                !((*additionalStageValidatorCallback)((*start).get()))) {
+                // There was an additional condition which failed - bail out.
+                return boost::none;
+            }
+
+            auto renames =
+                renamedPaths({*targetName}, **start, traversalDir, unpreservedPathPolicy);
+            if (!renames ||
+                (renames->find(*targetName) != renames->end() &&
+                 (*renames)[*targetName] != *targetName)) {
+                // This stage is not a $replaceRoot - and it modifies our nested path
+                // ('targetName') somehow.
+                return boost::none;
+            }
+            // This is not a $replaceRoot - but it doesn't impact the nested path, so we continue
+            // searching for the unnester.
+            continue;
+        }
+        if (auto nestName = nameTestCallback(replaceRootTransform);
+            nestName && *nestName == *targetName) {
+            if (additionalStageValidatorCallback &&
+                !((*additionalStageValidatorCallback)((*start).get()))) {
+                // There was an additional condition which failed - bail out.
+                return boost::none;
+            }
+            return start;
+        } else {
+            // If we have a replaceRoot which is not the one we're looking for - then it modifies
+            // the path we're trying to preserve. As a future enhancement, we maybe could recurse
+            // here.
+            return boost::none;
+        }
+    }
+    return boost::none;
+}
+
+/**
+ * Computes and returns a rename mapping for 'pathsOfInterest' over multiple aggregation
+ * pipeline stages. The range of pipeline stages we consider renames over is represented by the
+ * iterators 'start' and 'end'.
+ *
+ * If both 'start' and 'end' are reverse iterators, then 'start' should come after 'end' in the
+ * pipeline, and 'traversalDir' should be "kBackward," 'pathsOfInterest' should be valid path names
+ * after stage 'start.'
+ *
+ * If both 'start' and 'end' are forwards iterators, then 'start' should come before 'end' in the
+ * pipeline, 'traversalDir' should be "kForward," and 'pathsOfInterest' should be valid path names
+ * before stage 'start.'
+ *
+ * This function will compute an iterator pointing to the "last" stage (farthest in the given
+ * direction, not included) which preserves 'pathsOfInterest' allowing renames, and returns that
+ * iterator and a mapping from the given names of 'pathsOfInterest' to their names as they were
+ * directly "before" (just previous to, according to the direction) the result iterator. If all
+ * stages preserve the paths of interest, returns 'end.'
+ *
+ * An optional 'additionalStageValidatorCallback' function can be provided to short-circuit this
+ * process and return an iterator to the first stage which either (a) does not preserve
+ * 'pathsOfInterest,' as before, or (b) does not meet this callback function's criteria.
+ *
+ * This should only be used internally; callers who need to track path renames through an
+ * aggregation pipeline should use one of the publically exposed options available in the header.
+ */
+template <class Iterator>
+std::pair<Iterator, StringMap<std::string>> multiStageRenamedPaths(
+    Iterator start,
+    Iterator end,
+    OrderedPathSet pathsOfInterest,
+    const Direction& traversalDir,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback =
+        boost::none,
+    const UnpreservedPathPolicy& unpreservedPathPolicy = UnpreservedPathPolicy::Fail) {
+    // The keys to this map will always be the original names of 'pathsOfInterest'. The values
+    // will be updated as we loop through the pipeline's stages to always be the most up-to-date
+    // name we know of for that path.
     StringMap<std::string> renameMap;
     for (auto&& path : pathsOfInterest) {
         renameMap[path] = path;
     }
     for (; start != end; ++start) {
-        auto renamed = renamedPaths(pathsOfInterest, **start, traversalDir);
-        if (!renamed) {
-            return boost::none;
+        if (additionalStageValidatorCallback &&
+            !((*additionalStageValidatorCallback)((*start).get()))) {
+            // There was an additional condition which failed - bail out.
+            return {start, renameMap};
         }
-        //'pathsOfInterest' always holds the current names of the paths we're interested in, so it
-        // needs to be updated after each stage.
+
+        auto renamed = renamedPaths(pathsOfInterest, **start, traversalDir, unpreservedPathPolicy);
+        if (!renamed) {
+            if (auto finalReplaceRoot =
+                    lookForNestUnnestPattern<Iterator>(start,
+                                                       end,
+                                                       pathsOfInterest,
+                                                       traversalDir,
+                                                       additionalStageValidatorCallback,
+                                                       unpreservedPathPolicy)) {
+                // We've just detected a pattern where the user temporarily nests the whole
+                // object, does some computation, then unnests the object. Like so:
+                // [{$replaceWith: {nested: "$$ROOT"}}, ..., {$replaceWith: "$nested"}].
+                // This analysis makes sure that the middle stages don't modify 'nested' or
+                // whatever the nesting field path is and the additional callback function's
+                // criteria is met. In this case, we can safely skip over all intervening stages and
+                // continue on our way.
+                start = *finalReplaceRoot;
+                continue;
+            }
+            return {start, renameMap};
+        }
+        //'pathsOfInterest' always holds the current names of the paths we're interested in, so
+        // it needs to be updated after each stage.
         pathsOfInterest.clear();
         for (auto it = renameMap.cbegin(); it != renameMap.cend(); ++it) {
             renameMap[it->first] = (*renamed)[it->second];
             pathsOfInterest.emplace(it->second);
         }
     }
+    return {end, renameMap};
+}
+template <class Iterator>
+boost::optional<StringMap<std::string>> renamedPathsFullPipeline(
+    Iterator start,
+    Iterator end,
+    OrderedPathSet pathsOfInterest,
+    const Direction& traversalDir,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback =
+        boost::none,
+    const UnpreservedPathPolicy& unpreservedPathPolicy = UnpreservedPathPolicy::Fail) {
+    auto [itr, renameMap] = multiStageRenamedPaths(start,
+                                                   end,
+                                                   pathsOfInterest,
+                                                   traversalDir,
+                                                   additionalStageValidatorCallback,
+                                                   unpreservedPathPolicy);
+    if (itr != end) {
+        return boost::none;  // The paths were not preserved to the very end.
+    }
     return renameMap;
 }
 
 }  // namespace
 
-std::set<std::string> extractModifiedDependencies(const std::set<std::string>& dependencies,
-                                                  const std::set<std::string>& preservedPaths) {
-    std::set<std::string> modifiedDependencies;
+PartitionedDependencies extractModifiedDependencies(const OrderedPathSet& dependencies,
+                                                    const OrderedPathSet& preservedPaths) {
+    PartitionedDependencies res;
 
     // The modified dependencies is *almost* the set difference 'dependencies' - 'preservedPaths',
     // except that if p in 'preservedPaths' is a "path prefix" of d in 'dependencies', then 'd'
@@ -166,35 +367,59 @@ std::set<std::string> extractModifiedDependencies(const std::set<std::string>& d
                 break;
             }
         }
-        if (!preserved) {
-            modifiedDependencies.insert(dependency);
-        }
+        (preserved ? res.preserved : res.modified).insert(dependency);
     }
-    return modifiedDependencies;
+    return res;
 }
 
-boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>& pathsOfInterest,
-                                                     const DocumentSource& stage,
-                                                     const Direction& traversalDir) {
+boost::optional<StringMap<std::string>> renamedPaths(
+    const OrderedPathSet& pathsOfInterest,
+    const DocumentSource& stage,
+    const Direction& traversalDir,
+    const UnpreservedPathPolicy& unpreservedPathPolicy) {
     auto modifiedPathsRet = stage.getModifiedPaths();
     switch (modifiedPathsRet.type) {
         case DocumentSource::GetModPathsReturn::Type::kNotSupported:
         case DocumentSource::GetModPathsReturn::Type::kAllPaths:
             return boost::none;
         case DocumentSource::GetModPathsReturn::Type::kFiniteSet: {
-            for (auto&& modified : modifiedPathsRet.paths) {
-                for (auto&& ofInterest : pathsOfInterest) {
+            if (traversalDir == Direction::kForward) {
+                // Stages use `modifiedPathsRet.paths` to report fields which will be altered by
+                // this stage, meaning optimisations cannot reorder operations which rely on these
+                // paths.
+                // When traversing forwards, renames effectively overwrite the "destination"
+                // name.
+                //   e.g., {"$addFields": {"a": "$b"}}.
+                // While path "a" is logically _not_ preserved, is also not in `paths`.
+                // Traversing backwards relies on this, as the rename can be followed backwards to
+                // "b"; the same value _does_ exist on the "other side" of this stage. Therefore,
+                // for forwards traversal only, rename destinations are added to `paths` to
+                // correctly consider them modified.
+                for (auto&& [newName, oldName] : modifiedPathsRet.renames) {
+                    modifiedPathsRet.paths.insert(newName);
+                }
+            }
+
+            OrderedPathSet unmodifiedPaths;
+            switch (unpreservedPathPolicy) {
+                case UnpreservedPathPolicy::Fail:
                     // Any overlap of the path means the path of interest is not preserved. For
                     // example, if the path of interest is "a.b", then a modified path of "a",
                     // "a.b", or "a.b.c" would all signal that "a.b" is not preserved.
-                    if (ofInterest == modified ||
-                        expression::isPathPrefixOf(ofInterest, modified) ||
-                        expression::isPathPrefixOf(modified, ofInterest)) {
-                        // This stage modifies at least one of the fields which the caller is
-                        // interested in, bail out.
+                    if (!expression::areIndependent(modifiedPathsRet.paths, pathsOfInterest)) {
                         return boost::none;
                     }
-                }
+                    break;
+                case UnpreservedPathPolicy::Discard:
+                    // UnpreservedPathPolicy::Discard - remove any path which have been modified.
+                    unmodifiedPaths =
+                        expression::makeIndependent(pathsOfInterest, modifiedPathsRet.paths);
+
+                    if (unmodifiedPaths.empty()) {
+                        // _All_ paths are modified, no need to create a rename map.
+                        return boost::none;
+                    }
+                    break;
             }
 
             // None of the paths of interest were modified, construct the result map, mapping
@@ -202,7 +427,10 @@ boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>
             auto renameMap = (traversalDir == Direction::kForward)
                 ? invertRenameMap(modifiedPathsRet.renames)
                 : modifiedPathsRet.renames;
-            return computeNamesAssumingAnyPathsNotRenamedAreUnmodified(renameMap, pathsOfInterest);
+            return computeNamesAssumingAnyPathsNotRenamedAreUnmodified(
+                renameMap,
+                unpreservedPathPolicy == UnpreservedPathPolicy::Fail ? pathsOfInterest
+                                                                     : unmodifiedPaths);
         }
         case DocumentSource::GetModPathsReturn::Type::kAllExcept: {
             auto preservedPaths = modifiedPathsRet.paths;
@@ -215,15 +443,33 @@ boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>
                 auto preservedPath = (traversalDir == Direction::kForward) ? oldName : newName;
                 preservedPaths.insert(preservedPath);
             }
-            auto modifiedPaths = extractModifiedDependencies(pathsOfInterest, preservedPaths);
-            if (modifiedPaths.empty()) {
-                auto renameMap = (traversalDir == Direction::kForward)
-                    ? invertRenameMap(modifiedPathsRet.renames)
-                    : modifiedPathsRet.renames;
-                return computeNamesAssumingAnyPathsNotRenamedAreUnmodified(renameMap,
-                                                                           pathsOfInterest);
+            // Note that unmodifiedPaths != preservedPaths. unmodifiedPaths contains the requested
+            // pathsOfInterest which _were_ preserved, but preservedPaths may only contain a prefix
+            // of these paths.
+            // e.g., pathsOfInterest: {a.b, a.c, b}
+            //       preservedPaths : {a}
+            //    -> modifiedPaths  : {b}
+            //    -> unmodifiedPaths: {a.b, a.c}
+            auto [modifiedPaths, unmodifiedPaths] =
+                extractModifiedDependencies(pathsOfInterest, preservedPaths);
+            switch (unpreservedPathPolicy) {
+                case UnpreservedPathPolicy::Fail:
+                    if (!modifiedPaths.empty()) {
+                        return boost::none;
+                    }
+                    break;
+                case UnpreservedPathPolicy::Discard:;  // Do nothing.
             }
-            return boost::none;
+
+            if (unmodifiedPaths.empty()) {
+                // _All_ paths are modified, no need to create a rename map.
+                return boost::none;
+            }
+
+            auto renameMap = (traversalDir == Direction::kForward)
+                ? invertRenameMap(modifiedPathsRet.renames)
+                : modifiedPathsRet.renames;
+            return computeNamesAssumingAnyPathsNotRenamedAreUnmodified(renameMap, unmodifiedPaths);
         }
     }
     MONGO_UNREACHABLE;
@@ -232,15 +478,47 @@ boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>
 boost::optional<StringMap<std::string>> renamedPaths(
     const Pipeline::SourceContainer::const_iterator start,
     const Pipeline::SourceContainer::const_iterator end,
-    const std::set<std::string>& pathsOfInterest) {
-    return multiStageRenamedPaths(start, end, pathsOfInterest, Direction::kForward);
+    const OrderedPathSet& pathsOfInterest,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback) {
+    return renamedPathsFullPipeline(
+        start, end, pathsOfInterest, Direction::kForward, additionalStageValidatorCallback);
 }
 
 boost::optional<StringMap<std::string>> renamedPaths(
     const Pipeline::SourceContainer::const_reverse_iterator start,
     const Pipeline::SourceContainer::const_reverse_iterator end,
-    const std::set<std::string>& pathsOfInterest) {
-    return multiStageRenamedPaths(start, end, pathsOfInterest, Direction::kBackward);
+    const OrderedPathSet& pathsOfInterest,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback) {
+    return renamedPathsFullPipeline(
+        start, end, pathsOfInterest, Direction::kBackward, additionalStageValidatorCallback);
 }
 
+OrderedPathSet traceOriginatingPaths(const Pipeline::SourceContainer& pipeline,
+                                     const OrderedPathSet& pathsOfInterest) {
+    const auto optMap = renamedPathsFullPipeline(std::rbegin(pipeline),
+                                                 std::rend(pipeline),
+                                                 pathsOfInterest,
+                                                 Direction::kBackward,
+                                                 boost::none,
+                                                 UnpreservedPathPolicy::Discard);
+    if (!optMap) {
+        return {};
+    }
+    const auto& renameMap = *optMap;
+    OrderedPathSet res;
+    for (const auto& path : pathsOfInterest) {
+        res.insert(renameMap.at(path));
+    }
+    return res;
+}
+
+std::pair<Pipeline::SourceContainer::const_iterator, StringMap<std::string>>
+findLongestViablePrefixPreservingPaths(
+    const Pipeline::SourceContainer::const_iterator start,
+    const Pipeline::SourceContainer::const_iterator end,
+    const OrderedPathSet& pathsOfInterest,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback) {
+    return multiStageRenamedPaths(
+        start, end, pathsOfInterest, Direction::kForward, additionalStageValidatorCallback);
+}
 }  // namespace mongo::semantic_analysis

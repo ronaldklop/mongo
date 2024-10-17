@@ -27,23 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
-#include "mongo/db/index/wildcard_access_method.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/storage/key_format.h"
 
 namespace mongo {
 
 WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
                                            std::unique_ptr<SortedDataInterface> btree)
-    : AbstractIndexAccessMethod(wildcardState, std::move(btree)),
-      _keyGen(_descriptor->keyPattern(),
-              _descriptor->pathProjection(),
-              _indexCatalogEntry->getCollator(),
+    : SortedDataIndexAccessMethod(wildcardState, std::move(btree)),
+      _keyGen(wildcardState->descriptor()->keyPattern(),
+              wildcardState->descriptor()->pathProjection(),
+              wildcardState->getCollator(),
               getSortedDataInterface()->getKeyStringVersion(),
-              getSortedDataInterface()->getOrdering()) {}
+              getSortedDataInterface()->getOrdering(),
+              getSortedDataInterface()->rsKeyFormat()) {}
 
 bool WildcardAccessMethod::shouldMarkIndexAsMultikey(size_t numberOfKeys,
                                                      const KeyStringSet& multikeyMetadataKeys,
@@ -51,13 +58,29 @@ bool WildcardAccessMethod::shouldMarkIndexAsMultikey(size_t numberOfKeys,
     return !multikeyMetadataKeys.empty();
 }
 
-void WildcardAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+void WildcardAccessMethod::doGetKeys(OperationContext* opCtx,
+                                     const CollectionPtr& collection,
+                                     const IndexCatalogEntry* entry,
+                                     SharedBufferFragmentBuilder& pooledBufferBuilder,
                                      const BSONObj& obj,
                                      GetKeysContext context,
                                      KeyStringSet* keys,
                                      KeyStringSet* multikeyMetadataKeys,
                                      MultikeyPaths* multikeyPaths,
-                                     boost::optional<RecordId> id) const {
+                                     const boost::optional<RecordId>& id) const {
     _keyGen.generateKeys(pooledBufferBuilder, obj, keys, multikeyMetadataKeys, id);
+}
+
+Ordering WildcardAccessMethod::makeOrdering(const BSONObj& pattern) {
+    BSONObjBuilder newPattern;
+    for (auto elem : pattern) {
+        const auto fieldName = elem.fieldNameStringData();
+        if (WildcardNames::isWildcardFieldName(fieldName)) {
+            newPattern.append("$_path", 1);  // "$_path" should always be in ascending order.
+        }
+        newPattern.append(elem);
+    }
+
+    return Ordering::make(newPattern.obj());
 }
 }  // namespace mongo

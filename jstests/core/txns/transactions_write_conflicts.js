@@ -29,12 +29,11 @@
  * arbitrarily interleave operations between two different transactions, simulating the execution of
  * two "truly" concurrent transactions.
  *
- *  @tags: [uses_transactions]
+ *  @tags: [
+ *    uses_transactions,
+ *  ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/write_conflicts.js");  // for 'WriteConflictHelpers'.
+import {WriteConflictHelpers} from "jstests/core/txns/libs/write_conflicts.js";
 
 const dbName = "test";
 const collName = "transactions_write_conflicts";
@@ -260,4 +259,3 @@ WriteConflictHelpers.writeConflictTest(
 expectedDocs2 = [{_id: 1}];
 WriteConflictHelpers.writeConflictTest(
     coll, t1Op, t2Op, expectedDocs2, WriteConflictHelpers.T2StartsSecondAndWins, initOp);
-}());

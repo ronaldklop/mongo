@@ -3,8 +3,7 @@
  * the new primary.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({
     nodes: 3,
@@ -30,4 +29,3 @@ assert.commandWorked(newPrimary.adminCommand({setParameter: 1, writePeriodicNoop
 replSet.awaitSyncSource(secondary, newPrimary);
 
 replSet.stopSet();
-})();

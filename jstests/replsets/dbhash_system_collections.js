@@ -1,7 +1,5 @@
-// Test that the dbhash command checks system collections that are replicated.
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-(function() {
 var rst = new ReplSetTest({name: 'dbhash_system_collections', nodes: 2});
 rst.startSet();
 rst.initiate();
@@ -38,11 +36,11 @@ function checkDbHash(mongo) {
 
     var res = testDB.runCommand('dbhash');
     assert.commandWorked(res);
-    assert.docEq(Object.keys(res.collections), replicatedSystemCollections, tojson(res));
+    assert.docEq(replicatedSystemCollections, Object.keys(res.collections), tojson(res));
 
     res = adminDB.runCommand('dbhash');
     assert.commandWorked(res);
-    assert.docEq(Object.keys(res.collections), replicatedAdminSystemCollections, tojson(res));
+    assert.docEq(replicatedAdminSystemCollections, Object.keys(res.collections), tojson(res));
 
     return res.md5;
 }
@@ -51,4 +49,3 @@ var primaryMd5 = checkDbHash(primary);
 var secondaryMd5 = checkDbHash(secondary);
 assert.eq(primaryMd5, secondaryMd5, 'dbhash is different on the primary and the secondary');
 rst.stopSet();
-})();

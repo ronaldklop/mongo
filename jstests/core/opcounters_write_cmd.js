@@ -1,16 +1,23 @@
 // Test that opcounters get incremented properly.
 // @tags: [
+//   # unrecognized command "invalid" is not allowed with security tolen.
+//   not_allowed_with_signed_security_token,
 //   uses_multiple_connections,
 //   assumes_standalone_mongod,
+//   # The config fuzzer may run logical session cache refreshes in the background, which modifies
+//   # some serverStatus metrics read in this test.
+//   does_not_support_config_fuzzer,
+//   inspects_command_opcounters,
+//   does_not_support_repeated_reads,
 // ]
-// Legacy write mode test also available at jstests/gle.
-
-(function() {
-'use strict';
 
 var mongo = new Mongo(db.getMongo().host);
 
 var newdb = mongo.getDB(db.toString());
+
+// Deletes in the system.profile collection can interfere with the opcounters tests below.
+newdb.setProfilingLevel(0);
+newdb.system.profile.drop();
 
 var t = newdb.opcounters;
 var opCounters;
@@ -44,27 +51,25 @@ res = t.insert([{_id: 1}, {_id: 2}]);
 assert.commandWorked(res);
 assert.eq(opCounters.insert + 2, newdb.serverStatus().opcounters.insert);
 
-// Test is not run when in compatibility mode as errors are not counted
-if (t.getMongo().writeMode() != "compatibility") {
-    // Single insert, with error.
-    opCounters = newdb.serverStatus().opcounters;
-    res = t.insert({_id: 0});
-    assert.writeError(res);
-    assert.eq(opCounters.insert + 1, newdb.serverStatus().opcounters.insert);
+// Single insert, with error.
+opCounters = newdb.serverStatus().opcounters;
+res = t.insert({_id: 0});
+assert.writeError(res);
+assert.eq(opCounters.insert + 1, newdb.serverStatus().opcounters.insert);
 
-    // Bulk insert, with error, ordered.
-    opCounters = newdb.serverStatus().opcounters;
-    res = t.insert([{_id: 3}, {_id: 3}, {_id: 4}]);
-    assert.writeError(res);
-    assert.eq(opCounters.insert + 2, newdb.serverStatus().opcounters.insert);
+// Bulk insert, with error, ordered.
+opCounters = newdb.serverStatus().opcounters;
+res = t.insert([{_id: 3}, {_id: 3}, {_id: 4}]);
+assert.writeError(res);
+assert.eq(opCounters.insert + 2, newdb.serverStatus().opcounters.insert);
 
-    // Bulk insert, with error, unordered.
-    var continueOnErrorFlag = 1;
-    opCounters = newdb.serverStatus().opcounters;
-    res = t.insert([{_id: 5}, {_id: 5}, {_id: 6}], continueOnErrorFlag);
-    assert.writeError(res);
-    assert.eq(opCounters.insert + 3, newdb.serverStatus().opcounters.insert);
-}
+// Bulk insert, with error, unordered.
+var continueOnErrorFlag = 1;
+opCounters = newdb.serverStatus().opcounters;
+res = t.insert([{_id: 5}, {_id: 5}, {_id: 6}], continueOnErrorFlag);
+assert.writeError(res);
+assert.eq(opCounters.insert + 3, newdb.serverStatus().opcounters.insert);
+
 //
 // 2. Update.
 //
@@ -121,6 +126,20 @@ assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
 opCounters = newdb.serverStatus().opcounters;
 assert.throws(function() {
     t.findOne({_id: {$invalidOp: 1}});
+});
+assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
+
+t.drop();
+t.insert([{_id: 0}, {_id: 1}, {_id: 2}]);
+
+opCounters = newdb.serverStatus().opcounters;
+t.aggregate({$match: {_id: 1}});
+assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
+
+// Query, with error.
+opCounters = newdb.serverStatus().opcounters;
+assert.throws(function() {
+    t.aggregate({$match: {$invalidOp: 1}});
 });
 assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
 
@@ -199,4 +218,3 @@ assert.eq(opCounters.command + 8,
           newdb.serverStatus().opcounters.command);  // "serverStatus" counted
 assert.eq(null, newdb.serverStatus().metrics.commands.invalid);
 assert.eq(metricsObj['<UNKNOWN>'] + 1, newdb.serverStatus().metrics.commands['<UNKNOWN>']);
-})();

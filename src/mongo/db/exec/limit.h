@@ -30,8 +30,14 @@
 #pragma once
 
 
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
@@ -49,7 +55,7 @@ public:
                long long limit,
                WorkingSet* ws,
                std::unique_ptr<PlanStage> child);
-    ~LimitStage();
+    ~LimitStage() override;
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;

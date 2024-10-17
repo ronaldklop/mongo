@@ -27,14 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/pipeline/granularity_rounder.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/exec/document_value/document.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/granularity_rounder.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -60,7 +74,7 @@ void testEquals(Value actual, Value expected, double delta = DELTA) {
     }
 }
 
-const vector<double> getSeries(intrusive_ptr<GranularityRounder> rounder) {
+vector<double> getSeries(intrusive_ptr<GranularityRounder> rounder) {
     const auto* preferredNumbersRounder =
         dynamic_cast<GranularityRounderPreferredNumbers*>(rounder.get());
     ASSERT(preferredNumbersRounder != nullptr);
@@ -73,7 +87,7 @@ const vector<double> getSeries(intrusive_ptr<GranularityRounder> rounder) {
  * Decimal128. This helps with testing that the GranularityRounders work with the Decimal128
  * datatype.
  */
-const vector<Decimal128> getSeriesDecimal(intrusive_ptr<GranularityRounder> rounder) {
+vector<Decimal128> getSeriesDecimal(intrusive_ptr<GranularityRounder> rounder) {
     const auto* preferredNumbersRounder =
         dynamic_cast<GranularityRounderPreferredNumbers*>(rounder.get());
     ASSERT(preferredNumbersRounder != nullptr);

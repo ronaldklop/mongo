@@ -27,14 +27,37 @@
  *    it in the license file.
  */
 
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <initializer_list>
+#include <list>
+#include <memory>
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_provenance.h"
+#include "mongo/db/read_write_concern_provenance_base_gen.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/read_write_concern_defaults.h"
-
-#include "mongo/db/vector_clock.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -87,17 +110,27 @@ void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const ReadConcern& rc) 
             !rc.getProvenance().hasSource());
 }
 
-void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const WriteConcern& wc) {
+void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const WriteConcern& wc,
+                                                         bool writeConcernMajorityShouldJournal) {
     uassert(ErrorCodes::BadValue,
             "Unacknowledged write concern is not suitable for the default write concern",
-            !(wc.wMode.empty() && wc.wNumNodes < 1));
+            !wc.isUnacknowledged());
     uassert(ErrorCodes::BadValue,
             str::stream() << "'" << ReadWriteConcernProvenance::kSourceFieldName
                           << "' must be unset in default write concern",
             !wc.getProvenance().hasSource());
+    if (writeConcernMajorityShouldJournal && wc.syncMode == WriteConcern::SyncMode::NONE &&
+        wc.isMajority()) {
+        LOGV2_WARNING(
+            8668501,
+            "Default write concern mode is majority but non-journaled, but the configuration has "
+            "'writeConcernMajorityJournalDefault' enabled.  The write concern journal setting will "
+            "be ignored; writes with default write concern will be journaled.",
+            "writeConcern"_attr = wc);
+    }
 }
 
-RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
+RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
     OperationContext* opCtx,
     const boost::optional<ReadConcern>& rc,
     const boost::optional<WriteConcern>& wc) {
@@ -108,13 +141,19 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
                           << "\" fields must be present",
             rc || wc);
 
+    uassert(ErrorCodes::BadValue,
+            "Default write concern must have 'w' field.",
+            !wc || !wc->isExplicitWithoutWField());
+
     RWConcernDefault rwc;
+
     if (rc && !rc->isEmpty()) {
         checkSuitabilityAsDefault(*rc);
         rwc.setDefaultReadConcern(rc);
     }
-    if (wc && !wc->usedDefault) {
-        checkSuitabilityAsDefault(*wc);
+    if (wc && !wc->usedDefaultConstructedWC) {
+        auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+        checkSuitabilityAsDefault(*wc, replCoord->getWriteConcernMajorityShouldJournal());
         rwc.setDefaultWriteConcern(wc);
     }
 
@@ -123,15 +162,30 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
     rwc.setUpdateOpTime(currentTime.clusterTime().asTimestamp());
     rwc.setUpdateWallClockTime(serviceContext->getFastClockSource()->now());
 
-    auto current = _getDefault(opCtx);
+    auto current = _getDefaultCWRWCFromDisk(opCtx);
     if (!rc && current) {
         rwc.setDefaultReadConcern(current->getDefaultReadConcern());
     }
     if (!wc && current) {
         rwc.setDefaultWriteConcern(current->getDefaultWriteConcern());
     }
+    // If the setDefaultRWConcern command tries to unset the global default write concern when it
+    // has already been set, throw an error.
+    // wc->usedDefaultConstructedWC indicates that the defaultWriteConcern given in the
+    // setDefaultRWConcern command was empty (i.e. {defaultWriteConcern: {}})
+    // If current->getDefaultWriteConcern exists, that means the global default write concern has
+    // already been set.
+    if (wc && wc->usedDefaultConstructedWC && current) {
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "The global default write concern cannot be unset once it is set.",
+                !current->getDefaultWriteConcern());
+    }
 
     return rwc;
+}
+
+bool ReadWriteConcernDefaults::isCWWCSet(OperationContext* opCtx) {
+    return getCWWC(opCtx) ? true : false;
 }
 
 void ReadWriteConcernDefaults::observeDirectWriteToConfigSettings(OperationContext* opCtx,
@@ -146,18 +200,18 @@ void ReadWriteConcernDefaults::observeDirectWriteToConfigSettings(OperationConte
     // no new defaults document and the RWConcern will be default constructed, which matches the
     // behavior when lookup discovers a non-existent defaults document.
     auto newDefaultsDoc = newDoc
-        ? RWConcernDefault::parse(IDLParserErrorContext("RWDefaultsWriteObserver"),
-                                  newDoc->getOwned())
+        ? RWConcernDefault::parse(IDLParserContext("RWDefaultsWriteObserver"), newDoc->getOwned())
         : RWConcernDefault();
 
-    opCtx->recoveryUnit()->onCommit([this, opCtx, newDefaultsDoc = std::move(newDefaultsDoc)](
-                                        boost::optional<Timestamp> unusedCommitTime) mutable {
-        setDefault(opCtx, std::move(newDefaultsDoc));
-    });
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [this, newDefaultsDoc = std::move(newDefaultsDoc)](OperationContext* opCtx,
+                                                           boost::optional<Timestamp>) mutable {
+            setDefault(opCtx, std::move(newDefaultsDoc));
+        });
 }
 
 void ReadWriteConcernDefaults::invalidate() {
-    _defaults.invalidate(Type::kReadWriteConcernEntry);
+    _defaults.invalidateKey(Type::kReadWriteConcernEntry);
 }
 
 void ReadWriteConcernDefaults::setDefault(OperationContext* opCtx, RWConcernDefault&& rwc) {
@@ -177,13 +231,31 @@ void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
         (possibleNewDefaults->getUpdateOpTime() > currentDefaultsHandle->getUpdateOpTime())) {
         // Use the new defaults if they have a higher epoch, if there are no defaults in the cache,
         // or if the found defaults have no epoch, meaning there are no defaults in config.settings.
-        LOGV2(20997, "Refreshed RWC defaults", "newDefaults"_attr = possibleNewDefaults->toBSON());
+        auto possibleNewDefaultsBSON = possibleNewDefaults->toBSON();
+        auto defaultsBefore = currentDefaultsHandle ? *currentDefaultsHandle : RWConcernDefault();
+
         setDefault(opCtx, std::move(*possibleNewDefaults));
+
+        auto postUpdateDefaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
+        auto defaultsAfter =
+            postUpdateDefaultsHandle ? *postUpdateDefaultsHandle : RWConcernDefault();
+
+        // Log only if we updated the read- or write-concern defaults themselves.
+        if (defaultsBefore.getDefaultWriteConcern() != defaultsAfter.getDefaultWriteConcern() ||
+            (defaultsBefore.getDefaultReadConcern() && defaultsAfter.getDefaultReadConcern() &&
+             (defaultsBefore.getDefaultReadConcern().value().getLevel() !=
+              defaultsAfter.getDefaultReadConcern().value().getLevel()))) {
+            LOGV2(20997, "Refreshed RWC defaults", "newDefaults"_attr = possibleNewDefaultsBSON);
+        }
     }
 }
 
+repl::ReadConcernArgs ReadWriteConcernDefaults::getImplicitDefaultReadConcern() {
+    return repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+}
+
 boost::optional<ReadWriteConcernDefaults::RWConcernDefaultAndTime>
-ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
+ReadWriteConcernDefaults::_getDefaultCWRWCFromDisk(OperationContext* opCtx) {
     auto defaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
     if (defaultsHandle) {
         // Since CWRWC is ok with continuing to use a value well after it has been invalidated
@@ -196,6 +268,58 @@ ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
     return boost::none;
 }
 
+ReadWriteConcernDefaults::RWConcernDefaultAndTime ReadWriteConcernDefaults::getDefault(
+    OperationContext* opCtx) {
+    auto cached = _getDefaultCWRWCFromDisk(opCtx).value_or(RWConcernDefaultAndTime());
+
+    // Only overwrite the default read concern and its source if it has already been set on mongos.
+    if (!cached.getDefaultReadConcernSource()) {
+        if (!cached.getDefaultReadConcern() || cached.getDefaultReadConcern().value().isEmpty()) {
+            auto rcDefault = getImplicitDefaultReadConcern();
+            cached.setDefaultReadConcern(rcDefault);
+            cached.setDefaultReadConcernSource(DefaultReadConcernSourceEnum::kImplicit);
+        } else {
+            cached.setDefaultReadConcernSource(DefaultReadConcernSourceEnum::kGlobal);
+        }
+    }
+
+    // If the config hasn't yet been loaded on the node, the default will be w:1, since we have no
+    // way of calculating the implicit default. This means that after we have loaded our config,
+    // nodes could change their implicit write concern default. This is safe since we shouldn't be
+    // accepting writes that need a write concern before we have loaded our config.
+    // This prevents overriding the default write concern and its source on mongos if it has
+    // already been set through the config server.
+    if (!cached.getDefaultWriteConcernSource()) {
+        const bool isCWWCSet = cached.getDefaultWriteConcern() &&
+            !cached.getDefaultWriteConcern().value().usedDefaultConstructedWC;
+        if (isCWWCSet) {
+            cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
+        } else {
+            cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+            if (_implicitDefaultWriteConcernMajority.loadRelaxed()) {
+                cached.setDefaultWriteConcern(
+                    WriteConcernOptions(WriteConcernOptions::kMajority,
+                                        WriteConcernOptions::SyncMode::UNSET,
+                                        WriteConcernOptions::kNoTimeout));
+            }
+        }
+    }
+
+    return cached;
+}
+
+void ReadWriteConcernDefaults::setImplicitDefaultWriteConcernMajority(
+    bool newImplicitDefaultWCMajority) {
+    LOGV2(7063400,
+          "Updating implicit default writeConcern majority",
+          "newImplicitDefaultWCMajority"_attr = newImplicitDefaultWCMajority);
+    _implicitDefaultWriteConcernMajority.store(newImplicitDefaultWCMajority);
+}
+
+bool ReadWriteConcernDefaults::getImplicitDefaultWriteConcernMajority_forTest() {
+    return _implicitDefaultWriteConcernMajority.loadRelaxed();
+}
+
 boost::optional<ReadWriteConcernDefaults::ReadConcern>
 ReadWriteConcernDefaults::getDefaultReadConcern(OperationContext* opCtx) {
     auto current = getDefault(opCtx);
@@ -206,6 +330,17 @@ boost::optional<ReadWriteConcernDefaults::WriteConcern>
 ReadWriteConcernDefaults::getDefaultWriteConcern(OperationContext* opCtx) {
     auto current = getDefault(opCtx);
     return current.getDefaultWriteConcern();
+}
+
+boost::optional<ReadWriteConcernDefaults::WriteConcern> ReadWriteConcernDefaults::getCWWC(
+    OperationContext* opCtx) {
+    auto cached = _getDefaultCWRWCFromDisk(opCtx);
+    if (cached && cached.value().getDefaultWriteConcern() &&
+        !cached.value().getDefaultWriteConcern().value().usedDefaultConstructedWC) {
+        return cached.value().getDefaultWriteConcern().value();
+    }
+
+    return boost::none;
 }
 
 ReadWriteConcernDefaults& ReadWriteConcernDefaults::get(ServiceContext* service) {
@@ -222,14 +357,16 @@ void ReadWriteConcernDefaults::create(ServiceContext* service, FetchDefaultsFn f
 
 ReadWriteConcernDefaults::ReadWriteConcernDefaults(ServiceContext* service,
                                                    FetchDefaultsFn fetchDefaultsFn)
-    : _defaults(service, _threadPool, std::move(fetchDefaultsFn)), _threadPool([] {
+    : _defaults(service, _threadPool, std::move(fetchDefaultsFn)),
+      _threadPool([] {
           ThreadPool::Options options;
           options.poolName = "ReadWriteConcernDefaults";
           options.minThreads = 0;
           options.maxThreads = 1;
 
           return options;
-      }()) {
+      }()),
+      _implicitDefaultWriteConcernMajority(false) {
     _threadPool.startup();
 }
 
@@ -238,13 +375,14 @@ ReadWriteConcernDefaults::~ReadWriteConcernDefaults() = default;
 ReadWriteConcernDefaults::Cache::Cache(ServiceContext* service,
                                        ThreadPoolInterface& threadPool,
                                        FetchDefaultsFn fetchDefaultsFn)
-    : ReadThroughCache(_mutex,
-                       service,
-                       threadPool,
-                       [this](OperationContext* opCtx, Type, const ValueHandle& unusedCachedValue) {
-                           return LookupResult(lookup(opCtx));
-                       },
-                       1 /* cacheSize */),
+    : ReadThroughCache(
+          _mutex,
+          service->getService(),
+          threadPool,
+          [this](OperationContext* opCtx, Type, const ValueHandle& unusedCachedValue) {
+              return LookupResult(lookup(opCtx));
+          },
+          1 /* cacheSize */),
       _fetchDefaultsFn(std::move(fetchDefaultsFn)) {}
 
 boost::optional<RWConcernDefault> ReadWriteConcernDefaults::Cache::lookup(OperationContext* opCtx) {

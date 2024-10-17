@@ -11,10 +11,9 @@
  * 6. B rejoins the set and goes through the rollback process.
  * 7. The contents of A and B are compare to ensure the rollback results in consistent nodes.
  */
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {awaitOpTime} from "jstests/replsets/rslib.js";
 
-(function() {
-"use strict";
 // helper function for verifying contents at the end of the test
 var checkFinalResults = function(db) {
     assert.eq(2, db.b.getIndexes().length);
@@ -53,6 +52,12 @@ replTest.initiate({
 // Make sure we have a primary and that that primary is node A
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
 var primary = replTest.getPrimary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
+
 var a_conn = conns[0];
 a_conn.setSecondaryOk();
 var A = a_conn.getDB("admin");
@@ -171,4 +176,3 @@ replTest.checkReplicatedDataHashes();
 replTest.checkOplogs();
 
 replTest.stopSet(15);
-}());

@@ -1,16 +1,18 @@
 // Tests that an aggregate sent with batchSize: 0 will still obey the write concern sent on the
 // original request, even though the writes happen in the getMore.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For withEachKindOfWriteStage.
-load("jstests/libs/write_concern_util.js");           // For [stop|restart]ServerReplication.
+import {withEachKindOfWriteStage} from "jstests/aggregation/extras/merge_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 // Start a replica set with two nodes: one with the default configuration and one with priority
 // zero to ensure we don't have any elections.
 const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
 rst.initiate();
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const testDB = rst.getPrimary().getDB("test");
 const source = testDB.agg_write_concern_zero_batch_size;
@@ -61,17 +63,6 @@ try {
         assert(error instanceof Error);
         assert(tojson(error).indexOf("writeConcernError") != -1, tojson(error));
 
-        // Now switch to legacy OP_GET_MORE read mode. We should get a different error indicating
-        // that using writeConcern in this way is unsupported.
-        source.getDB().getMongo().forceReadMode("legacy");
-        error = assert.throws(
-            () => source
-                      .aggregate([stageSpec],
-                                 {cursor: {batchSize: 0}, writeConcern: {w: 2, wtimeout: 100}})
-                      .itcount());
-        assert.eq(error.code, 31124);
-        source.getDB().getMongo().forceReadMode("commands");
-
         restartServerReplication(rst.getSecondary());
     });
 } finally {
@@ -79,4 +70,3 @@ try {
 }
 
 rst.stopSet();
-}());

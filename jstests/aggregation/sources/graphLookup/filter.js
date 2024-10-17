@@ -1,14 +1,5 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [
-//   assumes_unsharded_collection,
-// ]
-
 // In SERVER-24714, the 'restrictSearchWithMatch' option was added to $graphLookup. In this file,
 // we test the functionality and correctness of the option.
-
-(function() {
-"use strict";
 
 var local = db.local;
 var foreign = db.foreign;
@@ -25,34 +16,34 @@ assert.commandWorked(local.insert({starting: 0}));
 
 // Assert that the graphLookup only retrieves ten documents, with _id from 0 to 9.
 var res = local
-                  .aggregate({
-                      $graphLookup: {
-                          from: "foreign",
-                          startWith: "$starting",
-                          connectFromField: "neighbors",
-                          connectToField: "_id",
-                          as: "integers",
-                          restrictSearchWithMatch: {_id: {$lt: 10}}
-                      }
-                  })
-                  .toArray()[0];
+                .aggregate({
+                    $graphLookup: {
+                        from: "foreign",
+                        startWith: "$starting",
+                        connectFromField: "neighbors",
+                        connectToField: "_id",
+                        as: "integers",
+                        restrictSearchWithMatch: {_id: {$lt: 10}}
+                    }
+                })
+                .toArray()[0];
 
 assert.eq(res.integers.length, 10);
 
 // Assert that the graphLookup doesn't retrieve any documents, as to do so it would need to
 // traverse nodes in the graph that don't match the 'restrictSearchWithMatch' predicate.
 res = local
-              .aggregate({
-                  $graphLookup: {
-                      from: "foreign",
-                      startWith: "$starting",
-                      connectFromField: "neighbors",
-                      connectToField: "_id",
-                      as: "integers",
-                      restrictSearchWithMatch: {_id: {$gt: 10}}
-                  }
-              })
-              .toArray()[0];
+            .aggregate({
+                $graphLookup: {
+                    from: "foreign",
+                    startWith: "$starting",
+                    connectFromField: "neighbors",
+                    connectToField: "_id",
+                    as: "integers",
+                    restrictSearchWithMatch: {_id: {$gt: 10}}
+                }
+            })
+            .toArray()[0];
 
 assert.eq(res.integers.length, 0);
 
@@ -117,4 +108,16 @@ res = local
                 .toArray()[0];
 
 assert.eq(res.array[0].results.length, 1);
-})();
+
+// Geo operators are not allowed within a $match as they require a sort on the data.
+assert.throwsWithCode(() => local
+                .aggregate([{
+                        $graphLookup: {
+                            from: "foreign",
+                            startWith: "$starting",
+                            connectFromField: "neighbors",
+                            connectToField: "_id",
+                            as: "integers",
+                            restrictSearchWithMatch: {neighbors: {$near: [10, 20]}}
+                            }
+                        }]), 5626500);

@@ -1,12 +1,16 @@
 // Confirms that the dbStats command returns expected content.
 //
 // @tags: [
+//   # Asserts on the total number of indexes in dbStats.
+//   assumes_no_implicit_index_creation,
 //   requires_dbstats,
-//   requires_fcv_47,
+//   requires_fcv_53,
+//   # The `dbstats` command builds in-memory structures that are not causally consistent.
+//   does_not_support_causal_consistency,
 // ]
-
-(function() {
-"use strict";
+import {
+    ClusteredCollectionUtil
+} from "jstests/libs/clustered_collections/clustered_collection_util.js";
 
 function serverIsMongos() {
     const res = db.runCommand("hello");
@@ -34,7 +38,7 @@ const doc = {
 };
 assert.commandWorked(coll.insert(doc));
 
-let dbStats = testDB.runCommand({dbStats: 1});
+let dbStats = testDB.runCommand({dbStats: 1, freeStorage: 1});
 assert.commandWorked(dbStats);
 
 assert.eq(1, dbStats.objects, tojson(dbStats));  // Includes testColl only
@@ -45,6 +49,9 @@ assert.eq(dataSize, dbStats.dataSize, tojson(dbStats));
 // Index count will vary on mongoS if an additional index is needed to support sharding.
 if (isMongoS) {
     assert(dbStats.hasOwnProperty("indexes"), tojson(dbStats));
+} else if (ClusteredCollectionUtil.areAllCollectionsClustered(db.getMongo())) {
+    // A clustered collection has no actual index on _id.
+    assert.eq(1, dbStats.indexes, tojson(dbStats));
 } else {
     assert.eq(2, dbStats.indexes, tojson(dbStats));
 }
@@ -61,6 +68,13 @@ if (isUsingPersistentStorage) {
 
     assert(dbStats.hasOwnProperty("fsUsedSize"), tojson(dbStats));
     assert(dbStats.hasOwnProperty("fsTotalSize"), tojson(dbStats));
+
+    // Make sure free storage size is not included by default
+    const defaultStats = testDB.runCommand({dbStats: 1});
+    assert.commandWorked(defaultStats);
+    assert(!defaultStats.hasOwnProperty("freeStorageSize"), tojson(defaultStats));
+    assert(!defaultStats.hasOwnProperty("indexFreeStorageSize"), tojson(defaultStats));
+    assert(!defaultStats.hasOwnProperty("totalFreeStorageSize"), tojson(defaultStats));
 }
 
 // Confirm collection and view counts on mongoD
@@ -77,4 +91,16 @@ if (!isMongoS) {
     assert.eq(2, dbStats.collections, tojson(dbStats));  // testColl + system.views
     assert.eq(1, dbStats.views, tojson(dbStats));
 }
-})();
+
+// Check that the output for non-existing database and  the output for empty database
+// have the same fields.
+const testEmptyAndNonExistingDB = db.getSiblingDB(jsTestName() + "_non_existing_and_empty");
+testEmptyAndNonExistingDB.dropDatabase();
+
+const statsNonExistingDB = testEmptyAndNonExistingDB.runCommand({dbStats: 1, freeStorage: 1});
+testEmptyAndNonExistingDB.runCommand({create: "test_empty_collection"});
+
+const statsEmptyDB = testEmptyAndNonExistingDB.runCommand({dbStats: 1, freeStorage: 1});
+assert.sameMembers(Object.keys(statsNonExistingDB),
+                   Object.keys(statsEmptyDB),
+                   "dbStats for non-existing and empty dbs should return the same fields");

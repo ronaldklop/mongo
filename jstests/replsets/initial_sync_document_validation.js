@@ -2,7 +2,8 @@
  * Tests that initial sync does not fail if it inserts documents which don't validate.
  */
 
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var name = 'initial_sync_document_validation';
 var replSet = new ReplSetTest({
     name: name,
@@ -26,4 +27,3 @@ assert.eq(1, secondary.getDB("test")[name].count());
 assert.docEq({_id: 0, x: 1}, secondary.getDB("test")[name].findOne());
 
 replSet.stopSet();
-})();

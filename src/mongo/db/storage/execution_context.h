@@ -29,11 +29,12 @@
 
 #pragma once
 
+#include <vector>
+
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/util/auto_clear_ptr.h"
-#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
@@ -53,10 +54,6 @@ public:
     StorageExecutionContext& operator=(const StorageExecutionContext&) = delete;
     StorageExecutionContext& operator=(StorageExecutionContext&&) = delete;
 
-    SharedBufferFragmentBuilder& pooledBufferBuilder() {
-        return _pooledBufferBuilder;
-    }
-
     AutoClearPtr<KeyStringSet> keys() {
         return makeAutoClearPtr(&_keys);
     }
@@ -68,7 +65,6 @@ public:
     }
 
 private:
-    SharedBufferFragmentBuilder _pooledBufferBuilder;
     KeyStringSet _keys;
     KeyStringSet _multikeyMetadataKeys;
     MultikeyPaths _multikeyPaths;

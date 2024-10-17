@@ -8,13 +8,17 @@
           "a:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "hosts": [
               "a:27017",
               "b:27017"
             ],
             "me": "a:27017",
             "setName": "rs",
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            },
             "minWireVersion": 0,
             "maxWireVersion": 6
           }
@@ -42,13 +46,17 @@
           "a:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "hosts": [
               "c:27017",
               "d:27017"
             ],
             "me": "c:27017",
             "setName": "rs",
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            },
             "minWireVersion": 0,
             "maxWireVersion": 6
           }

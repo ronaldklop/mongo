@@ -1,7 +1,6 @@
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-(function() {
-"use strict";
+import {assertErrCodeAndErrMsgContains} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.date_to_string;
 coll.drop();
@@ -130,6 +129,26 @@ assert.eq(
         .toArray());
 
 /* --------------------------------------------------------------------------------------- */
+coll.drop();
+
+assert.commandWorked(coll.insert([
+    {_id: 0, date: new ISODate("2017-01-01T15:08:51.911Z")},
+    {_id: 1, date: new ISODate("2017-07-04T15:09:12.911Z")},
+    {_id: 2, date: new ISODate("2017-12-04T15:09:14.911Z")},
+]));
+
+assert.eq(
+    [
+        {_id: 0, date: "Jan (January) 01, 2017"},
+        {_id: 1, date: "Jul (July) 04, 2017"},
+        {_id: 2, date: "Dec (December) 04, 2017"},
+    ],
+    coll.aggregate([
+            {$project: {date: {$dateToString: {format: "%b (%B) %d, %Y", date: "$date"}}}},
+            {$sort: {_id: 1}}
+        ])
+        .toArray());
+/* --------------------------------------------------------------------------------------- */
 /* Test that missing expressions, turn into BSON null values */
 coll.drop();
 
@@ -168,7 +187,11 @@ assert.eq(
         .toArray());
 
 /* --------------------------------------------------------------------------------------- */
-/* Test that the default format is "%Y-%m-%dT%H:%M:%S.%LZ" if none specified. */
+/* Test that the default format is
+/*   "%Y-%m-%dT%H:%M:%S.%LZ" if no timezone is specified or UTC is explicitly specified
+/*   "%Y-%m-%dT%H:%M:%S.%L"  if a non-UTC timezone is explicitly specified
+/* The last case also verifies the Daylight Savings Time change versus UTC.
+ */
 coll.drop();
 
 assert.commandWorked(coll.insert([
@@ -177,11 +200,35 @@ assert.commandWorked(coll.insert([
     {_id: 2, date: new ISODate("2017-12-04T15:09:14.911Z")},
 ]));
 
+// No timezone specified. Defaults to UTC time, and the format includes the 'Z' (UTC) suffix.
 assert.eq(
     [
-        {_id: 0, date: "2017-01-04T10:08:51.911Z"},
-        {_id: 1, date: "2017-07-04T11:09:12.911Z"},
-        {_id: 2, date: "2017-12-04T10:09:14.911Z"},
+        {_id: 0, date: "2017-01-04T15:08:51.911Z"},
+        {_id: 1, date: "2017-07-04T15:09:12.911Z"},
+        {_id: 2, date: "2017-12-04T15:09:14.911Z"},
+    ],
+    coll.aggregate([{$project: {date: {$dateToString: {date: "$date"}}}}, {$sort: {_id: 1}}])
+        .toArray());
+
+// UTC timezone explicitly specified. Gives UTC time, and the format includes the 'Z' (UTC) suffix.
+assert.eq(
+    [
+        {_id: 0, date: "2017-01-04T15:08:51.911Z"},
+        {_id: 1, date: "2017-07-04T15:09:12.911Z"},
+        {_id: 2, date: "2017-12-04T15:09:14.911Z"},
+    ],
+    coll.aggregate([
+            {$project: {date: {$dateToString: {date: "$date", timezone: "UTC"}}}},
+            {$sort: {_id: 1}}
+        ])
+        .toArray());
+
+// Non-UTC timezone explicitly specified. Gives the requested time, and the format omits 'Z'.
+assert.eq(
+    [
+        {_id: 0, date: "2017-01-04T10:08:51.911"},
+        {_id: 1, date: "2017-07-04T11:09:12.911"},
+        {_id: 2, date: "2017-12-04T10:09:14.911"},
     ],
     coll.aggregate([
             {$project: {date: {$dateToString: {date: "$date", timezone: "America/New_York"}}}},
@@ -230,14 +277,13 @@ assert.eq([{_id: 0, date: null}],
                   }
               })
               .toArray());
-
 /* --------------------------------------------------------------------------------------- */
 
 let pipeline = [
     {$project: {date: {$dateToString: {date: new ISODate("2017-01-04T15:08:51.911Z"), format: 5}}}}
 ];
-assertErrCodeAndErrMsgContains(
-    coll, pipeline, 18533, "$dateToString requires that 'format' be a string");
+let res = coll.runCommand("aggregate", {pipeline: pipeline, cursor: {}});
+assert.commandFailedWithCode(res, 18533);
 
 pipeline = [{$project: {date: {$dateToString: {format: "%Y-%m-%d %H:%M:%S", timezone: "$tz"}}}}];
 assertErrCodeAndErrMsgContains(coll, pipeline, 18628, "Missing 'date' parameter to $dateToString");
@@ -253,11 +299,12 @@ pipeline = [{
         }
     }
 }];
-assertErrCodeAndErrMsgContains(coll, pipeline, 40517, "timezone must evaluate to a string");
+res = coll.runCommand("aggregate", {pipeline: pipeline, cursor: {}});
+assert.commandFailedWithCode(res, 40517);
 
 pipeline = [{$project: {date: {$dateToString: {format: "%Y-%m-%d %H:%M:%S", date: 42}}}}];
-assertErrCodeAndErrMsgContains(
-    coll, pipeline, 16006, "can't convert from BSON type double to Date");
+res = coll.runCommand("aggregate", {pipeline: pipeline, cursor: {}});
+assert.commandFailedWithCode(res, 16006);
 
 pipeline = [{
     $project: {
@@ -270,7 +317,9 @@ pipeline = [{
         }
     }
 }];
-assertErrCodeAndErrMsgContains(coll, pipeline, 40485, "unrecognized time zone identifier");
+
+res = coll.runCommand("aggregate", {pipeline: pipeline, cursor: {}});
+assert.commandFailedWithCode(res, 40485);
 
 pipeline = [{
     $project: {date: {$dateToString: {date: new ISODate("2017-01-04T15:08:51.911Z"), format: "%"}}}
@@ -283,4 +332,3 @@ pipeline = [{
 }];
 assertErrCodeAndErrMsgContains(
     coll, pipeline, 18536, "Invalid format character '%n' in format string");
-})();

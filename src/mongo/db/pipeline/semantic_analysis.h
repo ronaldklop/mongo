@@ -29,25 +29,46 @@
 
 #pragma once
 
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <set>
 #include <string>
+#include <utility>
 
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::semantic_analysis {
 
 enum class Direction { kForward, kBackward };
 
 /**
+ * Action to take when `renamedPaths` finds that a path of interest has been modified.
+ */
+enum class UnpreservedPathPolicy {
+    // Stop when _any_ field of interest has been modified (not by a simple rename), returning
+    // boost::none.
+    Fail,
+    // Discard any modified fields from the set of interested paths.
+    Discard
+};
+
+/**
  * Takes in a set of paths the caller is interested in, a pipeline stage, and a direction.  If the
  * direction is "forward", the paths given must exist before the stage is executed in the pipeline.
  * If the direction is "backward," the paths must exist after the stage is executed in the pipeline.
- * Returns boost::none if any of the pathsOfInterest are modified by the current stage. If all of
- * the pathsOfInterest are preserved (but possibly renamed), we return a mapping from
+ * If all of the pathsOfInterest are preserved (but possibly renamed), we return a mapping from
  * [pathOfInterest] --> [newName], where "newName" is the name of "pathOfInterest" on the "other
  * side" of the stage with respect to the given direction.
+ *
+ * If any of the pathsOfInterest are modified by the current stage:
+ *  * UnpreservedPathPolicy::Fail, returns boost::none
+ *  * UnpreservedPathPolicy::Discard, returns a mapping, excluding the paths which have been
+ *        modified (i.e., acts as if that field was not included in pathsOfInterest).
  *
  * For example, say pathsOfInterest contains "a", a path name that exists before nextStage is run in
  * the pipeline, and direction is forward. Say nextStage preserves all the paths but renames "a" to
@@ -57,9 +78,11 @@ enum class Direction { kForward, kBackward };
  * the pipeline, and direction is backward. Say nextStage preserves all the paths but renamed "a" to
  * "b"; we would return a mapping b-->a.
  */
-boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>& pathsOfInterest,
-                                                     const DocumentSource& stage,
-                                                     const Direction& traversalDir);
+boost::optional<StringMap<std::string>> renamedPaths(
+    const OrderedPathSet& pathsOfInterest,
+    const DocumentSource& stage,
+    const Direction& traversalDir,
+    const UnpreservedPathPolicy& unpreservedPathPolicy = UnpreservedPathPolicy::Fail);
 /**
  * Tracks renames by walking a pipeline forwards. Takes two forward iterators that represent two
  * stages in an aggregation pipeline, with 'start' coming before 'end,' as well as a set of path
@@ -70,9 +93,11 @@ boost::optional<StringMap<std::string>> renamedPaths(const std::set<std::string>
  * 'end' should be an iterator referring to the past-the-end stage.
  */
 boost::optional<StringMap<std::string>> renamedPaths(
-    const Pipeline::SourceContainer::const_iterator start,
-    const Pipeline::SourceContainer::const_iterator end,
-    const std::set<std::string>& pathsOfInterest);
+    Pipeline::SourceContainer::const_iterator start,
+    Pipeline::SourceContainer::const_iterator end,
+    const OrderedPathSet& pathsOfInterest,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback =
+        boost::none);
 
 /**
  * Tracks renames by walking a pipeline backwards. Takes two reverse iterators that represent two
@@ -85,10 +110,31 @@ boost::optional<StringMap<std::string>> renamedPaths(
  * (the 'reverse end').
  */
 boost::optional<StringMap<std::string>> renamedPaths(
-    const Pipeline::SourceContainer::const_reverse_iterator start,
-    const Pipeline::SourceContainer::const_reverse_iterator end,
-    const std::set<std::string>& pathsOfInterest);
+    Pipeline::SourceContainer::const_reverse_iterator start,
+    Pipeline::SourceContainer::const_reverse_iterator end,
+    const OrderedPathSet& pathsOfInterest,
+    boost::optional<std::function<bool(DocumentSource*)>> additionalStageValidatorCallback =
+        boost::none);
 
+/**
+ * Attempts to find a maximal prefix of the pipeline given by 'start' and 'end' which will preserve
+ * all paths in 'pathsOfInterest' and also have each DocumentSource satisfy
+ * 'additionalStageValidatorCallback'.
+ *
+ * Returns an iterator to the first stage which modifies one of the paths in 'pathsOfInterest' or
+ * fails 'additionalStageValidatorCallback', or returns 'end' if no such stage exists.
+ */
+std::pair<Pipeline::SourceContainer::const_iterator, StringMap<std::string>>
+findLongestViablePrefixPreservingPaths(Pipeline::SourceContainer::const_iterator start,
+                                       Pipeline::SourceContainer::const_iterator end,
+                                       const OrderedPathSet& pathsOfInterest,
+                                       boost::optional<std::function<bool(DocumentSource*)>>
+                                           additionalStageValidatorCallback = boost::none);
+
+struct PartitionedDependencies {
+    OrderedPathSet modified;
+    OrderedPathSet preserved;
+};
 /**
  * Given a set of paths 'dependencies', determines which of those paths will be modified if all
  * paths except those in 'preservedPaths' are modified.
@@ -96,7 +142,18 @@ boost::optional<StringMap<std::string>> renamedPaths(
  * For example, extractModifiedDependencies({'a', 'b', 'c.d', 'e'}, {'a', 'b.c', c'}) returns
  * {'b', 'e'}, since 'b' and 'e' are not preserved (only 'b.c' is preserved).
  */
-std::set<std::string> extractModifiedDependencies(const std::set<std::string>& dependencies,
-                                                  const std::set<std::string>& preservedPaths);
+PartitionedDependencies extractModifiedDependencies(const OrderedPathSet& dependencies,
+                                                    const OrderedPathSet& preservedPaths);
+
+bool pathSetContainsOverlappingPath(const OrderedPathSet& paths, const std::string& targetPath);
+
+/**
+ * Given a set of paths which exist at the end of the provided pipeline, find the
+ * paths these existed as at the start of the pipeline.
+ *
+ * If any of the paths were added or overwritten by intermediate stages, the result will be empty.
+ */
+OrderedPathSet traceOriginatingPaths(const Pipeline::SourceContainer& pipeline,
+                                     const OrderedPathSet& pathsOfInterest);
 
 }  // namespace mongo::semantic_analysis

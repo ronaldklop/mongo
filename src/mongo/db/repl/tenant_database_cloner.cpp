@@ -27,21 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <list>
+#include <mutex>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbmessage.h"
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/database_cloner_gen.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 namespace repl {
@@ -49,6 +79,10 @@ namespace repl {
 // Failpoint which the tenant database cloner to hang after it has successully run listCollections
 // and recorded the results and the operationTime.
 MONGO_FAIL_POINT_DEFINE(tenantDatabaseClonerHangAfterGettingOperationTime);
+// Failpoint to skip comparing the list of collections that are already cloned, instead it will
+// resume the cloning from the beginning of the list, that's provided by
+// TenantDatabaseCloner::listCollectionsStage.
+MONGO_FAIL_POINT_DEFINE(skiplistExistingCollectionsStage);
 
 TenantDatabaseCloner::TenantDatabaseCloner(const std::string& dbName,
                                            TenantMigrationSharedData* sharedData,
@@ -73,7 +107,7 @@ BaseCloner::ClonerStages TenantDatabaseCloner::getStages() {
 }
 
 void TenantDatabaseCloner::preStage() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _stats.start = getSharedData()->getClock()->now();
 }
 
@@ -81,8 +115,9 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
     // This will be set after a successful listCollections command.
     _operationTime = Timestamp();
 
-    auto collectionInfos =
-        getClient()->getCollectionInfos(_dbName, ListCollectionsFilter::makeTypeCollectionFilter());
+    auto collectionInfos = getClient()->getCollectionInfos(
+        DatabaseNameUtil::deserialize(boost::none, _dbName, SerializationContext::stateDefault()),
+        ListCollectionsFilter::makeTypeCollectionFilter());
 
     // Do a majority read on the sync source to make sure the collections listed exist on a majority
     // of nodes in the set. We do not check the rollbackId - rollback would lead to the sync source
@@ -109,7 +144,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
 
     BSONObj readResult;
     BSONObj cmd = ClonerUtils::buildMajorityWaitRequest(_operationTime);
-    getClient()->runCommand("admin", cmd, readResult, QueryOption_SecondaryOk);
+    getClient()->runCommand(DatabaseName::kAdmin, cmd, readResult, QueryOption_SecondaryOk);
     uassertStatusOKWithContext(
         getStatusFromCommandResult(readResult),
         "TenantDatabaseCloner failed to get listCollections result majority-committed");
@@ -132,7 +167,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
         ListCollectionResult result;
         try {
             result = ListCollectionResult::parse(
-                IDLParserErrorContext("TenantDatabaseCloner::listCollectionsStage"), info);
+                IDLParserContext("TenantDatabaseCloner::listCollectionsStage"), info);
         } catch (const DBException& e) {
             uasserted(
                 ErrorCodes::FailedToParse,
@@ -140,12 +175,13 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
                     .withContext(str::stream() << "Collection info could not be parsed : " << info)
                     .reason());
         }
-        NamespaceString collectionNamespace(_dbName, result.getName());
+        const auto collectionNamespace = NamespaceStringUtil::deserialize(
+            boost::none, _dbName, result.getName(), SerializationContext::stateDefault());
         if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(4881602,
                         1,
                         "Database cloner skipping 'system' collection",
-                        "namespace"_attr = collectionNamespace.ns(),
+                        logAttrs(collectionNamespace),
                         "tenantId"_attr = _tenantId);
             continue;
         }
@@ -173,19 +209,32 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
 }
 
 BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStage() {
+    if (MONGO_unlikely(skiplistExistingCollectionsStage.shouldFail())) {
+        LOGV2(6312900,
+              "skiplistExistingCollectionsStage failpoint is enabled. "
+              "Tenant DatabaseCloner resumes cloning",
+              "migrationId"_attr = getSharedData()->getMigrationId(),
+              "tenantId"_attr = _tenantId,
+              "resumeFrom"_attr = _collections.front().first);
+        return kContinueNormally;
+    }
     auto opCtx = cc().makeOperationContext();
     DBDirectClient client(opCtx.get());
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
+    tenantMigrationInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationInfo>(getSharedData()->getMigrationId());
+
+    long long sizeOfCurrCollOnDisk = 0;
+    long long approxTotalDBSizeOnDisk = 0;
 
     std::vector<UUID> clonedCollectionUUIDs;
-    auto collectionInfos =
-        client.getCollectionInfos(_dbName, ListCollectionsFilter::makeTypeCollectionFilter());
+    auto collectionInfos = client.getCollectionInfos(
+        DatabaseNameUtil::deserialize(boost::none, _dbName, SerializationContext::stateDefault()),
+        ListCollectionsFilter::makeTypeCollectionFilter());
     for (auto&& info : collectionInfos) {
         ListCollectionResult result;
         try {
             result = ListCollectionResult::parse(
-                IDLParserErrorContext("TenantDatabaseCloner::listExistingCollectionsStage"), info);
+                IDLParserContext("TenantDatabaseCloner::listExistingCollectionsStage"), info);
         } catch (const DBException& e) {
             uasserted(
                 ErrorCodes::FailedToParse,
@@ -193,20 +242,40 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
                     .withContext(str::stream() << "Collection info could not be parsed : " << info)
                     .reason());
         }
-        NamespaceString collectionNamespace(_dbName, result.getName());
+        const auto collectionNamespace = NamespaceStringUtil::deserialize(
+            boost::none, _dbName, result.getName(), SerializationContext::stateDefault());
         if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(5271600,
                         1,
                         "Tenant database cloner skipping 'system' collection",
                         "migrationId"_attr = getSharedData()->getMigrationId(),
                         "tenantId"_attr = _tenantId,
-                        "namespace"_attr = collectionNamespace.ns());
+                        logAttrs(collectionNamespace));
             continue;
         }
         clonedCollectionUUIDs.emplace_back(result.getInfo().getUuid());
+
+        BSONObj res;
+        client.runCommand(DatabaseNameUtil::deserialize(
+                              boost::none, _dbName, SerializationContext::stateDefault()),
+                          BSON("collStats" << result.getName()),
+                          res);
+        if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
+            LOGV2_WARNING(5522901,
+                          "Skipping recording of data size metrics for database due to failure "
+                          "in the 'collStats' command, tenant migration stats may be inaccurate.",
+                          "db"_attr = _dbName,
+                          "coll"_attr = result.getName(),
+                          "migrationId"_attr = getSharedData()->getMigrationId(),
+                          "tenantId"_attr = _tenantId,
+                          "status"_attr = status);
+        } else {
+            sizeOfCurrCollOnDisk = res.getField("size").safeNumberLong();
+            approxTotalDBSizeOnDisk += sizeOfCurrCollOnDisk;
+        }
     }
 
-    if (!getSharedData()->isResuming()) {
+    if (getSharedData()->getResumePhase() == ResumePhase::kNone) {
         uassert(ErrorCodes::NamespaceExists,
                 str::stream() << "Tenant '" << _tenantId
                               << "': collections already exist prior to data sync",
@@ -224,12 +293,18 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
             lastClonedCollectionUUID,
             [](const auto& collection, const auto& uuid) { return collection.second.uuid < uuid; });
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             if (startingCollection != _collections.end() &&
                 startingCollection->second.uuid == lastClonedCollectionUUID) {
                 _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size() - 1;
+
+                // When the last collection is partially cloned, we exclude it from the total size
+                // on disk, as the partially cloned collections stats will be added by the cloner
+                // on demand.
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk - sizeOfCurrCollOnDisk;
             } else {
                 _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size();
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk;
             }
         }
         _collections.erase(_collections.begin(), startingCollection);
@@ -257,19 +332,20 @@ bool TenantDatabaseCloner::isMyFailPoint(const BSONObj& data) const {
 
 void TenantDatabaseCloner::postStage() {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _stats.collections = _collections.size();
         _stats.collectionStats.reserve(_collections.size());
         for (const auto& coll : _collections) {
             _stats.collectionStats.emplace_back();
-            _stats.collectionStats.back().ns = coll.first.ns();
+            _stats.collectionStats.back().ns =
+                NamespaceStringUtil::serialize(coll.first, SerializationContext::stateDefault());
         }
     }
     for (const auto& coll : _collections) {
         auto& sourceNss = coll.first;
         auto& collectionOptions = coll.second;
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _currentCollectionCloner =
                 std::make_unique<TenantCollectionCloner>(sourceNss,
                                                          collectionOptions,
@@ -285,22 +361,21 @@ void TenantDatabaseCloner::postStage() {
             LOGV2_DEBUG(4881600,
                         1,
                         "Tenant collection clone finished",
-                        "namespace"_attr = sourceNss,
+                        logAttrs(sourceNss),
                         "tenantId"_attr = _tenantId);
         } else {
             LOGV2_ERROR(4881601,
                         "Tenant collection clone failed",
-                        "namespace"_attr = sourceNss,
+                        logAttrs(sourceNss),
                         "error"_attr = collStatus.toString(),
                         "tenantId"_attr = _tenantId);
-            setSyncFailedStatus({collStatus.code(),
-                                 collStatus
-                                     .withContext(str::stream() << "Error cloning collection '"
-                                                                << sourceNss.toString() << "'")
-                                     .toString()});
+            auto message =
+                collStatus.withContext(str::stream() << "Error cloning collection '"
+                                                     << sourceNss.toStringForErrorMsg() << "'");
+            setSyncFailedStatus(collStatus.withReason(message.toString()));
         }
         {
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
             _stats.approxTotalBytesCopied +=
                 _stats.collectionStats[_stats.clonedCollections].approxTotalBytesCopied;
@@ -311,12 +386,12 @@ void TenantDatabaseCloner::postStage() {
             _stats.clonedCollections++;
         }
     }
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _stats.end = getSharedData()->getClock()->now();
 }
 
 TenantDatabaseCloner::Stats TenantDatabaseCloner::getStats() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     TenantDatabaseCloner::Stats stats = _stats;
     if (_currentCollectionCloner) {
         stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();

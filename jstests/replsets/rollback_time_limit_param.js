@@ -5,9 +5,7 @@
  * entries.
  */
 
-(function() {
-
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "rollback_time_limit_param";
 
@@ -50,4 +48,3 @@ assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTime
                              ErrorCodes.BadValue);
 
 rst.stopSet();
-})();

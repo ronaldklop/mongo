@@ -3,11 +3,11 @@
  * to primary (for replica set nodes).
  * Note: test will deliberately cause a mongod instance to terminate abruptly and mongod instance
  * without journaling will complain about unclean shutdown.
- * @tags: [requires_persistence, requires_journaling]
+ * @tags: [requires_persistence]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var waitForPrimary = function(conn) {
     assert.soon(function() {
@@ -25,10 +25,6 @@ var waitForPrimary = function(conn) {
  * initial write to the admin.system.version collection is fully flushed out of the oplog before
  * restarting.  That allows our standalone corrupting update to see the write (and cause us to
  * fail on startup).
- *
- * TODO: Remove awaitVersionUpdate after SERVER-41005, where we figure out how to wait until
- *       after replication is started before reading our shard identity from
- *       admin.system.version
  */
 var runTest = function(mongodConn, configConnStr, awaitVersionUpdate) {
     var shardIdentityDoc = {
@@ -166,13 +162,7 @@ var runTest = function(mongodConn, configConnStr, awaitVersionUpdate) {
 var st = new ShardingTest({shards: 1});
 
 {
-    var mongod = MongoRunner.runMongod({shardsvr: ''});
-    runTest(mongod, st.configRS.getURL(), function() {});
-    MongoRunner.stopMongod(mongod);
-}
-
-{
-    var replTest = new ReplSetTest({nodes: 1});
+    const replTest = new ReplSetTest({nodes: 1});
     replTest.startSet({shardsvr: ''});
     replTest.initiate();
     runTest(replTest.getPrimary(), st.configRS.getURL(), function() {
@@ -182,4 +172,3 @@ var st = new ShardingTest({shards: 1});
 }
 
 st.stop();
-})();

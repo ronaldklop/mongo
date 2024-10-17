@@ -8,14 +8,15 @@
  * and the prepare oplog entry will be inserted as the oplog seed. We then make sure the oplog seed
  * entry is visible and the prepared transaction is properly reconstructed.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -30,6 +31,10 @@ replTest.initiate(config);
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "reconstruct_prepared_transactions_initial_sync_on_oplog_seed";
@@ -126,4 +131,3 @@ replTest.awaitReplication();
 assert.eq(secondaryColl.findOne({_id: 1}), {_id: 1, a: 1});
 
 replTest.stopSet();
-})();

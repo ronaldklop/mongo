@@ -27,7 +27,18 @@
  *    it in the license file.
  */
 #pragma once
+#include <memory>
+#include <string>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/oid.h"
+#include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/server_description.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo::sdam {
 
@@ -46,16 +57,16 @@ public:
 
     // server identity
     ServerDescriptionBuilder& withAddress(const HostAndPort& address);
-    ServerDescriptionBuilder& withType(const ServerType type);
+    ServerDescriptionBuilder& withType(ServerType type);
     ServerDescriptionBuilder& withMe(const HostAndPort& me);
-    ServerDescriptionBuilder& withTag(const std::string key, const std::string value);
-    ServerDescriptionBuilder& withSetName(const std::string setName);
+    ServerDescriptionBuilder& withTag(std::string key, std::string value);
+    ServerDescriptionBuilder& withSetName(std::string setName);
 
     // network attributes
     ServerDescriptionBuilder& withRtt(const HelloRTT& rtt);
     ServerDescriptionBuilder& withError(const std::string& error);
     ServerDescriptionBuilder& withLogicalSessionTimeoutMinutes(
-        const boost::optional<int> logicalSessionTimeoutMinutes);
+        boost::optional<int> logicalSessionTimeoutMinutes);
 
     // server capabilities
     ServerDescriptionBuilder& withMinWireVersion(int minVersion);
@@ -63,7 +74,7 @@ public:
 
     // server 'time'
     ServerDescriptionBuilder& withLastWriteDate(const Date_t& lastWriteDate);
-    ServerDescriptionBuilder& withOpTime(const repl::OpTime opTime);
+    ServerDescriptionBuilder& withOpTime(repl::OpTime opTime);
     ServerDescriptionBuilder& withLastUpdateTime(const Date_t& lastUpdateTime);
 
     // topology membership
@@ -71,13 +82,13 @@ public:
     ServerDescriptionBuilder& withHost(const HostAndPort& host);
     ServerDescriptionBuilder& withPassive(const HostAndPort& passive);
     ServerDescriptionBuilder& withArbiter(const HostAndPort& arbiter);
-    ServerDescriptionBuilder& withSetVersion(const int setVersion);
+    ServerDescriptionBuilder& withSetVersion(int setVersion);
     ServerDescriptionBuilder& withElectionId(const OID& electionId);
     ServerDescriptionBuilder& withTopologyVersion(TopologyVersion topologyVersion);
 
 private:
     constexpr static auto kHostAndPortNotSet = "address.not.set:1234";
     ServerDescriptionPtr _instance =
-        std::shared_ptr<ServerDescription>(new ServerDescription(HostAndPort(kHostAndPortNotSet)));
+        std::make_shared<ServerDescription>(HostAndPort(kHostAndPortNotSet));
 };
 }  // namespace mongo::sdam

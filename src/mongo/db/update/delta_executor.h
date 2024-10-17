@@ -29,11 +29,15 @@
 
 #pragma once
 
-#include "mongo/db/update/update_executor.h"
+#include <utility>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/update/document_diff_applier.h"
 #include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_executor.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -46,9 +50,10 @@ public:
     /**
      * Initializes the executor with the diff to apply.
      */
-    explicit DeltaExecutor(doc_diff::Diff diff)
+    explicit DeltaExecutor(doc_diff::Diff diff, bool mustCheckExistenceForInsertOperations)
         : _diff(std::move(diff)),
-          _outputOplogEntry(update_oplog_entry::makeDeltaOplogEntry(_diff)) {}
+          _outputOplogEntry(update_oplog_entry::makeDeltaOplogEntry(_diff)),
+          _mustCheckExistenceForInsertOperations(mustCheckExistenceForInsertOperations) {}
 
     ApplyResult applyUpdate(ApplyParams applyParams) const final;
 
@@ -65,6 +70,8 @@ private:
     // still needs to produce an oplog entry from the applyUpdate() method so that OpObservers may
     // handle the event appropriately.
     BSONObj _outputOplogEntry;
+
+    const bool _mustCheckExistenceForInsertOperations;
 };
 
 }  // namespace mongo

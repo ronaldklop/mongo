@@ -35,11 +35,10 @@
  * of restarts.
  */
 
-"use strict";
-
-load("jstests/hooks/validate_collections.js");
-load("jstests/replsets/libs/two_phase_drops.js");
-load("jstests/replsets/rslib.js");
+import {CollectionValidator} from "jstests/hooks/validate_collections.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {TwoPhaseDropCollectionTest} from "jstests/replsets/libs/two_phase_drops.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 Random.setRandomSeed();
 
@@ -55,8 +54,10 @@ Random.setRandomSeed();
  *
  * @param {string} [optional] name the name of the test being run
  * @param {Object} [optional] replSet the ReplSetTest instance to adopt
+ * @param {Object} [optional] nodeOptions command-line options to apply to all nodes in the replica
+ *     set. Ignored if 'replSet' is provided.
  */
-function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
+export function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet, nodeOptions) {
     const State = {
         kStopped: "kStopped",
         kRollbackOps: "kRollbackOps",
@@ -96,7 +97,7 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
     let lastStandbySecondaryRBID;
 
     // Make sure we have a replica set up and running.
-    replSet = (replSet === undefined) ? performStandardSetup() : replSet;
+    replSet = (replSet === undefined) ? performStandardSetup(nodeOptions) : replSet;
     validateAndUseSetup(replSet);
 
     /**
@@ -143,16 +144,16 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
     function performStandardSetup() {
         let nodeOptions = {};
         if (TestData.logComponentVerbosity) {
-            nodeOptions["setParameter"] = {
-                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
-            };
+            nodeOptions["setParameter"] = nodeOptions["setParameter"] || {};
+            nodeOptions["setParameter"]["logComponentVerbosity"] =
+                tojsononeline(TestData.logComponentVerbosity);
         }
         if (TestData.syncdelay) {
             nodeOptions["syncdelay"] = TestData.syncdelay;
         }
 
         let replSet = new ReplSetTest({name, nodes: 5, useBridge: true, nodeOptions: nodeOptions});
-        replSet.startSet();
+        replSet.startSet({setParameter: {allowMultipleArbiters: true}});
 
         const nodes = replSet.nodeList();
         replSet.initiate({
@@ -188,6 +189,10 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
         // Make sure we have a primary.
         curPrimary = replSet.getPrimary();
 
+        // The default WC is majority and we must use w:1 to be able to properly test rollback.
+        assert.commandWorked(curPrimary.adminCommand(
+            {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+        replSet.awaitReplication();
         // Extract the other nodes and wait for them to be ready.
         arbiters = replSet.getArbiters();
         arbiters.forEach(arbiter => waitForState(arbiter, ReplSetTest.State.ARBITER));
@@ -221,12 +226,6 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
         });
 
         const name = rst.name;
-        // Check collection counts except when unclean shutdowns are allowed, as such a shutdown is
-        // not guaranteed to preserve accurate collection counts. This count check must occur before
-        // collection validation as the validate command will fix incorrect counts.
-        if (!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) {
-            rst.checkCollectionCounts(name);
-        }
         rst.checkOplogs(name);
         rst.checkReplicatedDataHashes(name);
         collectionValidator.validateNodes(rst.nodeList());
@@ -297,12 +296,13 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
             case RollbackTestDeluxe.RoleCycleMode.kFixedRollbackSecondary:
                 [standbySecondary, curPrimary] = [curPrimary, standbySecondary];
                 break;
-            case RollbackTestDeluxe.RoleCycleMode.kRandom:
+            case RollbackTestDeluxe.RoleCycleMode.kRandom: {
                 let oldStandbySecondary = standbySecondary;
                 [standbySecondary, rollbackSecondary] =
                     Array.shuffle([curPrimary, rollbackSecondary]);
                 curPrimary = oldStandbySecondary;
                 break;
+            }
             default:
                 throw new Error(`Unknown role cycle mode ${curRoleCycleMode}`);
         }

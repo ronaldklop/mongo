@@ -27,26 +27,53 @@
  *    it in the license file.
  */
 
+
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/apply_ops_command_info.h"
+#include "mongo/db/repl/oplog_applier_batcher.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/tenant_oplog_batcher.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/tenant_oplog_batcher.h"
-
-#include "mongo/db/repl/apply_ops.h"
-#include "mongo/db/repl/oplog_batcher.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
-TenantOplogBatcher::TenantOplogBatcher(const std::string& tenantId,
+TenantOplogBatcher::TenantOplogBatcher(const UUID& migrationUuid,
                                        RandomAccessOplogBuffer* oplogBuffer,
                                        std::shared_ptr<executor::TaskExecutor> executor,
-                                       Timestamp resumeBatchingTs)
-    : AbstractAsyncComponent(executor.get(), std::string("TenantOplogBatcher_") + tenantId),
+                                       Timestamp resumeBatchingTs,
+                                       OpTime beginApplyingAfterOpTime)
+    : AbstractAsyncComponent(executor.get(),
+                             std::string("TenantOplogBatcher_") + migrationUuid.toString()),
       _oplogBuffer(oplogBuffer),
       _executor(executor),
-      _resumeBatchingTs(resumeBatchingTs) {}
+      _resumeBatchingTs(resumeBatchingTs),
+      _beginApplyingAfterOpTime(beginApplyingAfterOpTime) {}
 
 TenantOplogBatcher::~TenantOplogBatcher() {
     shutdown();
@@ -62,15 +89,21 @@ void TenantOplogBatcher::_pushEntry(OperationContext* opCtx,
             !op.isPreparedCommit() &&
                 (op.getCommandType() != OplogEntry::CommandType::kApplyOps || !op.shouldPrepare()));
     if (op.isTerminalApplyOps()) {
+        if (op.getOpTime() <= _beginApplyingAfterOpTime &&
+            op.getMultiOpType() != MultiOplogEntryType::kApplyOpsAppliedSeparately) {
+            // Fetched for the sake of retryable commitTransaction, don't need to apply.
+            return;
+        }
         // All applyOps entries are expanded and the expansions put in the batch expansion array.
         // The original applyOps is kept in the batch ops array.
-        // This applies to both multi-document transactions and atomic applyOps.
+        // This applies to multi-document transactions.
         auto expansionsIndex = batch->expansions.size();
         auto& curExpansion = batch->expansions.emplace_back();
         auto lastOpInTransactionBson = op.getEntry().toBSON();
         repl::ApplyOps::extractOperationsTo(op, lastOpInTransactionBson, &curExpansion);
         auto oplogPrevTsOption = op.getPrevWriteOpTimeInTransaction();
-        if (oplogPrevTsOption && !oplogPrevTsOption->isNull()) {
+        if (op.applyOpsIsLinkedTransactionally() && oplogPrevTsOption &&
+            !oplogPrevTsOption->isNull()) {
             // Since 'extractOperationsTo' adds the operations to 'curExpansion' in chronological
             // order, but we traverse the oplog chain in reverse chronological order, we need to
             // reverse each set of operations from each 'applyOps', including the one in 'op', then
@@ -111,9 +144,21 @@ void TenantOplogBatcher::_pushEntry(OperationContext* opCtx,
                         "Tenant Oplog Batcher reordering pre- or post- image for oplog entry",
                         "opTime"_attr = op.getOpTime(),
                         "imageOpTime"_attr = imageOpTime);
-            auto imageOp = OplogEntry(
-                uassertStatusOK(_oplogBuffer->findByTimestamp(opCtx, imageOpTime.getTimestamp())));
-            batch->ops.emplace_back(TenantOplogEntry(std::move(imageOp)));
+            auto swImageOp = _oplogBuffer->findByTimestamp(opCtx, imageOpTime.getTimestamp());
+            if (swImageOp.getStatus() == ErrorCodes::NoSuchKey) {
+                // If we don't find the pre/post image in the buffer, it means that the pre/post
+                // image has an optime less than the startFetchingDonorOpTime and was never
+                // fetched. This implies that there was a newer transaction number started in
+                // the same session on the donor when the retryable write pre-fetch stage tried
+                // to fetch oplog entries with optime less than the startFetchingDonorOpTime. In
+                // that case, we don't need to support retrying the current findAndModify.
+                // Therefore, use a dummy pre/post image.
+                LOGV2(5535301,
+                      "Tenant Oplog Batcher cannot find pre- or post- image",
+                      "imageOpTime"_attr = imageOpTime);
+            } else {
+                batch->ops.emplace_back(TenantOplogEntry(uassertStatusOK(swImageOp)));
+            }
         }
         batch->ops.emplace_back(TenantOplogEntry(std::move(op)));
     } else {
@@ -132,6 +177,19 @@ void TenantOplogBatcher::_consume(OperationContext* opCtx) {
     invariant(_oplogBuffer->tryPop(opCtx, &opToPopAndDiscard) || _isShuttingDown() || !isActive());
 }
 
+bool TenantOplogBatcher::_mustProcessIndividually(const OplogEntry& entry) {
+    // See the comment of OplogApplierBatcher::_getBatchActionForEntry() for details. The conditions
+    // here are similar to the kProcessIndividually case in that function.
+    if (entry.isCommand()) {
+        return (entry.getCommandType() != OplogEntry::CommandType::kApplyOps) ||
+            entry.shouldPrepare() || entry.isSingleOplogEntryTransactionWithCommand() ||
+            entry.isEndOfLargeTransaction();
+    }
+
+    const auto nss = entry.getNss();
+    return nss.mustBeAppliedInOwnOplogBatch();
+}
+
 StatusWith<TenantOplogBatch> TenantOplogBatcher::_readNextBatch(BatchLimits limits) {
     auto opCtx = cc().makeOperationContext();
     TenantOplogBatch batch;
@@ -140,7 +198,7 @@ StatusWith<TenantOplogBatch> TenantOplogBatcher::_readNextBatch(BatchLimits limi
         while (!hasData) {
             hasData = _oplogBuffer->waitForData(Seconds(1));
             stdx::lock_guard lk(_mutex);
-            if (!_isActive_inlock() || _isShuttingDown_inlock()) {
+            if (!_isActive(lk) || _isShuttingDown(lk)) {
                 return {ErrorCodes::CallbackCanceled, "Tenant oplog batcher shut down"};
             }
         }
@@ -155,7 +213,7 @@ StatusWith<TenantOplogBatch> TenantOplogBatcher::_readNextBatch(BatchLimits limi
         std::uint32_t totalBytes = 0;
         while (_oplogBuffer->peek(opCtx.get(), &op)) {
             auto entry = OplogEntry(op);
-            if (OplogBatcher::mustProcessIndividually(entry)) {
+            if (_mustProcessIndividually(entry)) {
                 if (batch.ops.empty()) {
                     _pushEntry(opCtx.get(), &batch, std::move(entry));
                     _consume(opCtx.get());
@@ -165,7 +223,7 @@ StatusWith<TenantOplogBatch> TenantOplogBatcher::_readNextBatch(BatchLimits limi
                 // batch.
                 break;
             }
-            auto opCount = OplogBatcher::getOpCount(entry);
+            auto opCount = OplogApplierBatcher::getOpCount(entry);
             auto opBytes = entry.getRawObjSizeBytes();
             if (totalOps > 0 &&
                 (totalOps + opCount > limits.ops || totalBytes + opBytes > limits.bytes)) {
@@ -186,8 +244,9 @@ StatusWith<TenantOplogBatch> TenantOplogBatcher::_readNextBatch(BatchLimits limi
     return batch;
 }
 
-SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, BatchLimits limits) {
-    if (!_isActive_inlock() || _isShuttingDown_inlock()) {
+SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock lk,
+                                                                    BatchLimits limits) {
+    if (!_isActive(lk) || _isShuttingDown(lk)) {
         return SemiFuture<TenantOplogBatch>::makeReady(
             Status(ErrorCodes::CallbackCanceled, "Tenant oplog batcher has been shut down."));
     }
@@ -198,7 +257,12 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, Ba
         _executor->scheduleWork([this, limits, taskCompletionPromise, self = shared_from_this()](
                                     const executor::TaskExecutor::CallbackArgs& args) {
             if (!args.status.isOK()) {
+                stdx::lock_guard lk(_mutex);
+                _batchRequested = false;
                 taskCompletionPromise->setError(args.status);
+                if (_isShuttingDown(lk)) {
+                    _transitionToComplete(lk);
+                }
                 return;
             }
 
@@ -212,8 +276,8 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, Ba
             // oplog fetcher batch".
             _batchRequested = false;
             taskCompletionPromise->setFrom(std::move(result));
-            if (_isShuttingDown_inlock()) {
-                _transitionToComplete_inlock();
+            if (_isShuttingDown(lk)) {
+                _transitionToComplete(lk);
             }
         });
 
@@ -222,8 +286,8 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, Ba
         stdx::lock_guard lk(_mutex);
         _batchRequested = false;
         taskCompletionPromise->setError(statusWithCbh.getStatus());
-        if (_isShuttingDown_inlock()) {
-            _transitionToComplete_inlock();
+        if (_isShuttingDown(lk)) {
+            _transitionToComplete(lk);
         }
     }
     return std::move(pf.future).semi();
@@ -237,7 +301,7 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::getNextBatch(BatchLimits limits
     return _scheduleNextBatch(lk, limits);
 }
 
-Status TenantOplogBatcher::_doStartup_inlock() noexcept {
+void TenantOplogBatcher::_doStartup(WithLock) {
     LOGV2_DEBUG(
         4885604, 1, "Tenant Oplog Batcher starting up", "component"_attr = _getComponentName());
     if (!_resumeBatchingTs.isNull()) {
@@ -261,14 +325,13 @@ Status TenantOplogBatcher::_doStartup_inlock() noexcept {
                     "Tenant Oplog Batcher will resume batching from after timestamp",
                     "timestamp"_attr = _resumeBatchingTs);
     }
-    return Status::OK();
 }
 
-void TenantOplogBatcher::_doShutdown_inlock() noexcept {
+void TenantOplogBatcher::_doShutdown(WithLock lk) noexcept {
     LOGV2_DEBUG(
         4885605, 1, "Tenant Oplog Batcher shutting down", "component"_attr = _getComponentName());
     if (!_batchRequested) {
-        _transitionToComplete_inlock();
+        _transitionToComplete(lk);
     }
     // If _batchRequested was true, we handle the _transitionToComplete when it becomes false.
 }

@@ -32,7 +32,7 @@ global:
         - "mongo/util/uuid.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ErrorReplyElement:
@@ -41,13 +41,14 @@ structs:
             shard:
                 type: string
                 optional: true
-            ns: string
+            ns: namespacestring
             code: int
             codeName: string
             errmsg: string
 
     ValidateDBMetadataCommandReply:
         description: "The validateDBMetadata command's reply."
+        is_command_reply: true
         fields:
             apiVersionErrors:
                 type: array<ErrorReplyElement>

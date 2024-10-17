@@ -1,16 +1,8 @@
 // Validates the expected behaviour of direct writes against the `config.transactions` collection
-(function() {
-'use strict';
-
 // Direct writes to config.transactions cannot be part of a session.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 TestData.disableImplicitSessions = true;
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
 
 var replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -90,4 +82,3 @@ assert.eq(0, res.nModified);
 assert.eq(1, db.user.find({_id: 1}).toArray()[0].x);
 
 replTest.stopSet();
-})();

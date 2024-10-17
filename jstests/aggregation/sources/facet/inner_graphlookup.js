@@ -1,13 +1,8 @@
-// Cannot implicitly shard accessed collections because unsupported use of sharded collection
-// for target collection of $lookup and $graphLookup.
-// @tags: [assumes_unsharded_collection]
-
 /**
  * Tests that using a $graphLookup stage inside of a $facet stage will yield the same results as
  * using the $graphLookup stage outside of the $facet stage.
  */
-(function() {
-"use strict";
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 // We will only use one collection, the $graphLookup will look up from the same collection.
 var graphColl = db.facetGraphLookup;
@@ -38,7 +33,7 @@ const projectStage = {
 const normalResults = graphColl.aggregate([graphLookupStage, projectStage]).toArray();
 const facetedResults =
     graphColl.aggregate([{$facet: {nested: [graphLookupStage, projectStage]}}]).toArray();
-assert.eq(facetedResults, [{nested: normalResults}]);
+arrayEq(facetedResults, [{nested: normalResults}]);
 
 const sortStage = {
     $sort: {_id: 1, "connected._id": 1}
@@ -50,5 +45,4 @@ const facetedResultsUnwound =
     graphColl
         .aggregate([{$facet: {nested: [graphLookupStage, {$unwind: "$connected"}, sortStage]}}])
         .toArray();
-assert.eq(facetedResultsUnwound, [{nested: normalResultsUnwound}]);
-}());
+arrayEq(facetedResultsUnwound, [{nested: normalResultsUnwound}]);

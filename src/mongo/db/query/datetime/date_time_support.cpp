@@ -27,30 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
+#include <absl/container/flat_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <ostream>
+#include <ratio>
 #include <timelib.h>
+#include <utility>
 
-#include "mongo/db/query/datetime/date_time_support.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/parse_number.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/ctype.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
 namespace {
 
-const auto getTimeZoneDatabase =
+const auto getTimeZoneDatabaseDecorable =
     ServiceContext::declareDecoration<std::unique_ptr<TimeZoneDatabase>>();
 
 std::unique_ptr<_timelib_time, TimeZone::TimelibTimeDeleter> createTimelibTime() {
@@ -74,9 +86,12 @@ long long seconds(Date_t date) {
 // Format specifier map when parsing a date from a string with a required format.
 //
 const std::vector<timelib_format_specifier> kDateFromStringFormatMap = {
+    {'b', TIMELIB_FORMAT_TEXTUAL_MONTH_3_LETTER},
+    {'B', TIMELIB_FORMAT_TEXTUAL_MONTH_FULL},
     {'d', TIMELIB_FORMAT_DAY_TWO_DIGIT},
     {'G', TIMELIB_FORMAT_YEAR_ISO},
     {'H', TIMELIB_FORMAT_HOUR_TWO_DIGIT_24_MAX},
+    {'j', TIMELIB_FORMAT_DAY_OF_YEAR},
     {'L', TIMELIB_FORMAT_MILLISECOND_THREE_DIGIT},
     {'m', TIMELIB_FORMAT_MONTH_TWO_DIGIT},
     {'M', TIMELIB_FORMAT_MINUTE_TWO_DIGIT},
@@ -92,6 +107,8 @@ const std::vector<timelib_format_specifier> kDateFromStringFormatMap = {
 // Format specifier map when converting a date to a string.
 //
 const std::vector<timelib_format_specifier> kDateToStringFormatMap = {
+    {'b', TIMELIB_FORMAT_TEXTUAL_MONTH_3_LETTER},
+    {'B', TIMELIB_FORMAT_TEXTUAL_MONTH_FULL},
     {'d', TIMELIB_FORMAT_DAY_TWO_DIGIT},
     {'G', TIMELIB_FORMAT_YEAR_ISO},
     {'H', TIMELIB_FORMAT_HOUR_TWO_DIGIT_24_MAX},
@@ -108,38 +125,56 @@ const std::vector<timelib_format_specifier> kDateToStringFormatMap = {
     {'z', TIMELIB_FORMAT_TIMEZONE_OFFSET},
     {'Z', TIMELIB_FORMAT_TIMEZONE_OFFSET_MINUTES}};
 
-
 // Verifies that any '%' is followed by a valid format character as indicated by 'allowedFormats',
 // and that the 'format' string ends with an even number of '%' symbols.
-void validateFormat(StringData format,
-                    const std::vector<timelib_format_specifier>& allowedFormats) {
+template <bool UserErrorMessage>
+bool checkFormatString(StringData format,
+                       const std::vector<timelib_format_specifier>& allowedFormats) {
     for (auto it = format.begin(); it != format.end(); ++it) {
         if (*it != '%') {
             continue;
         }
 
         ++it;  // next character must be format modifier
-        uassert(18535, "Unmatched '%' at end of format string", it != format.end());
+        if constexpr (UserErrorMessage) {
+            uassert(18535, "Unmatched '%' at end of format string", it != format.end());
+        } else if (it == format.end()) {
+            return false;
+        }
 
         const bool validSpecifier = (*it == '%') ||
             std::find_if(allowedFormats.begin(), allowedFormats.end(), [=](const auto& format) {
                 return format.specifier == *it;
             }) != allowedFormats.end();
-        uassert(18536,
-                str::stream() << "Invalid format character '%" << *it << "' in format string",
-                validSpecifier);
+        if constexpr (UserErrorMessage) {
+            uassert(18536,
+                    str::stream() << "Invalid format character '%" << *it << "' in format string",
+                    validSpecifier);
+        } else if (!validSpecifier) {
+            return false;
+        }
     }
+    return true;
+}
+
+bool isValidFormat(StringData format, const std::vector<timelib_format_specifier>& allowedFormats) {
+    return checkFormatString<false>(format, allowedFormats);
+}
+
+void validateFormat(StringData format,
+                    const std::vector<timelib_format_specifier>& allowedFormats) {
+    checkFormatString<true>(format, allowedFormats);
 }
 
 }  // namespace
 
 const TimeZoneDatabase* TimeZoneDatabase::get(ServiceContext* serviceContext) {
-    return getTimeZoneDatabase(serviceContext).get();
+    return getTimeZoneDatabaseDecorable(serviceContext).get();
 }
 
 void TimeZoneDatabase::set(ServiceContext* serviceContext,
                            std::unique_ptr<TimeZoneDatabase> dateTimeSupport) {
-    getTimeZoneDatabase(serviceContext) = std::move(dateTimeSupport);
+    getTimeZoneDatabaseDecorable(serviceContext) = std::move(dateTimeSupport);
 }
 
 TimeZoneDatabase::TimeZoneDatabase() {
@@ -162,6 +197,12 @@ void TimeZoneDatabase::TimelibErrorContainerDeleter::operator()(
     timelib_error_container_dtor(errorContainer);
 }
 
+void TimeZoneDatabase::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
+    if (tzInfo) {
+        timelib_tzinfo_dtor(tzInfo);
+    }
+}
+
 void TimeZoneDatabase::loadTimeZoneInfo(
     std::unique_ptr<timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase) {
     invariant(timeZoneDatabase);
@@ -170,7 +211,7 @@ void TimeZoneDatabase::loadTimeZoneInfo(
     auto timezone_identifier_list =
         timelib_timezone_identifiers_list(_timeZoneDatabase.get(), &nTimeZones);
     for (int i = 0; i < nTimeZones; ++i) {
-        auto entry = timezone_identifier_list[i];
+        const auto& entry = timezone_identifier_list[i];
         int errorCode = TIMELIB_ERROR_NO_ERROR;
         auto tzInfo = timelib_parse_tzfile(entry.id, _timeZoneDatabase.get(), &errorCode);
         if (!tzInfo) {
@@ -182,8 +223,17 @@ void TimeZoneDatabase::loadTimeZoneInfo(
                                << entry.id << "\": " << timelib_get_error_message(errorCode)});
         }
 
-        invariant(errorCode == TIMELIB_ERROR_NO_ERROR);
-        _timeZones[entry.id] = TimeZone{tzInfo};
+        invariant(errorCode == TIMELIB_ERROR_NO_ERROR ||
+                  errorCode == TIMELIB_ERROR_EMPTY_POSIX_STRING);
+
+        if (strcmp(entry.id, "UTC") == 0) {
+            _timeZones[entry.id] = TimeZone{nullptr};
+            timelib_tzinfo_dtor(tzInfo);
+        } else {
+            _timeZoneInfos.emplace_back(
+                std::unique_ptr<_timelib_tzinfo, TimelibTZInfoDeleter>(tzInfo));
+            _timeZones[entry.id] = TimeZone{tzInfo};
+        }
     }
 }
 
@@ -191,7 +241,7 @@ TimeZone TimeZoneDatabase::utcZone() {
     return TimeZone{nullptr};
 }
 
-static timelib_tzinfo* timezonedatabase_gettzinfowrapper(char* tz_id,
+static timelib_tzinfo* timezonedatabase_gettzinfowrapper(const char* tz_id,
                                                          const _timelib_tzdb* db,
                                                          int* error) {
     return nullptr;
@@ -384,7 +434,7 @@ std::vector<std::string> TimeZoneDatabase::getTimeZoneStrings() const {
 
 void TimeZone::adjustTimeZone(timelib_time* timelibTime) const {
     if (isTimeZoneIDZone()) {
-        timelib_set_timezone(timelibTime, _tzInfo.get());
+        timelib_set_timezone(timelibTime, _tzInfo);
     } else if (isUtcOffsetZone()) {
         timelib_set_timezone_from_offset(timelibTime, durationCount<Seconds>(_utcOffset));
     }
@@ -477,14 +527,7 @@ TimeZone::Iso8601DateParts::Iso8601DateParts(const timelib_time& timelib_time, D
 }
 
 
-void TimeZone::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
-    if (tzInfo) {
-        timelib_tzinfo_dtor(tzInfo);
-    }
-}
-
-TimeZone::TimeZone(timelib_tzinfo* tzInfo)
-    : _tzInfo(tzInfo, TimelibTZInfoDeleter()), _utcOffset(0) {}
+TimeZone::TimeZone(timelib_tzinfo* tzInfo) : _tzInfo(tzInfo), _utcOffset(0) {}
 
 TimeZone::TimeZone(Seconds utcOffsetSeconds) : _tzInfo(nullptr), _utcOffset(utcOffsetSeconds) {}
 
@@ -496,9 +539,12 @@ std::unique_ptr<timelib_time, TimeZone::TimelibTimeDeleter> TimeZone::getTimelib
     Date_t date) const {
     auto time = createTimelibTime();
 
-    timelib_unixtime2gmt(time.get(), seconds(date));
-    adjustTimeZone(time.get());
-    timelib_unixtime2local(time.get(), seconds(date));
+    if (isUtcZone()) {
+        timelib_unixtime2gmt(time.get(), seconds(date));
+    } else {
+        adjustTimeZone(time.get());
+        timelib_unixtime2local(time.get(), seconds(date));
+    }
 
     return time;
 }
@@ -566,14 +612,75 @@ long long TimeZone::isoYear(Date_t date) const {
 
 Seconds TimeZone::utcOffset(Date_t date) const {
     if (isTimeZoneIDZone()) {
-        auto* offset = timelib_get_time_zone_info(
-            durationCount<Seconds>(date.toDurationSinceEpoch()), _tzInfo.get());
-        auto timezoneOffsetFromUTC = Seconds(offset->offset);
-        timelib_time_offset_dtor(offset);
-        return timezoneOffsetFromUTC;
+        int32_t timezoneOffsetFromUTC = 0;
+        int result =
+            timelib_get_time_zone_offset_info(durationCount<Seconds>(date.toDurationSinceEpoch()),
+                                              _tzInfo,
+                                              &timezoneOffsetFromUTC,
+                                              nullptr,
+                                              nullptr);
+        uassert(6828900, "Failed to obtain timezone offset", result);
+        return Seconds(timezoneOffsetFromUTC);
     } else {
         return _utcOffset;
     }
+}
+
+// A mapping from months to full string representations of the month.
+static const absl::flat_hash_map<int, std::string> monthToFullMonthNameMap{
+    {1, "January"},
+    {2, "February"},
+    {3, "March"},
+    {4, "April"},
+    {5, "May"},
+    {6, "June"},
+    {7, "July"},
+    {8, "August"},
+    {9, "September"},
+    {10, "October"},
+    {11, "November"},
+    {12, "December"},
+};
+
+// A mapping from months to three letter string representations of the month.
+static const absl::flat_hash_map<int, std::string> monthToThreeLetterMonthNameMap{
+    {1, "Jan"},
+    {2, "Feb"},
+    {3, "Mar"},
+    {4, "Apr"},
+    {5, "May"},
+    {6, "Jun"},
+    {7, "Jul"},
+    {8, "Aug"},
+    {9, "Sep"},
+    {10, "Oct"},
+    {11, "Nov"},
+    {12, "Dec"},
+};
+
+std::string TimeZone::fullMonthName(int monthNum) const {
+    auto iterator = monthToFullMonthNameMap.find(monthNum);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown month value: " << monthNum,
+            iterator != monthToFullMonthNameMap.end());
+    return iterator->second;
+}
+
+std::string TimeZone::threeLetterMonthName(int monthNum) const {
+    auto iterator = monthToThreeLetterMonthNameMap.find(monthNum);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown month value: " << monthNum,
+            iterator != monthToThreeLetterMonthNameMap.end());
+    return iterator->second;
+}
+
+
+bool TimeZone::isValidToStringFormat(StringData format) {
+    return isValidFormat(format, kDateToStringFormatMap);
+}
+
+bool TimeZone::isValidFromStringFormat(StringData format) {
+    return isValidFormat(format, kDateFromStringFormatMap);
 }
 
 void TimeZone::validateToStringFormat(StringData format) {
@@ -592,6 +699,20 @@ StatusWith<std::string> TimeZone::formatDate(StringData format, Date_t date) con
         return formatted.str();
 }
 
+std::string TimeZone::toString() const {
+    std::stringstream ss;
+    ss << "TimeZone(";
+    if (isTimeZoneIDZone()) {
+        ss << "name=" << _tzInfo->name;
+    } else if (_utcOffset != Seconds::zero()) {
+        ss << "utcOffset=" << _utcOffset;
+    } else {
+        ss << "UTC";
+    }
+    ss << ")";
+    return ss.str();
+}
+
 namespace {
 constexpr auto kMonthsInOneYear = 12LL;
 constexpr auto kDaysInNonLeapYear = 365LL;
@@ -602,6 +723,7 @@ constexpr auto kMillisecondsPerSecond = 1000LL;
 constexpr int kDaysPerWeek = 7;
 constexpr auto kQuartersPerYear = 4LL;
 constexpr auto kQuarterLengthInMonths = 3LL;
+constexpr auto kDaysInTypicalMonth = 30LL;
 constexpr long kMillisecondsPerDay{kHoursPerDay * kMinutesPerHour * kSecondsPerMinute *
                                    kMillisecondsPerSecond};
 constexpr long kLeapYearReferencePoint = -1000000000L;
@@ -634,7 +756,8 @@ inline long leapYearsSinceReferencePoint(long year) {
 
 /**
  * Sums the number of days in the Gregorian calendar in years: 'startYear',
- * 'startYear'+1, .., 'endYear'-1.
+ * 'startYear'+1, .., 'endYear'-1. 'startYear' and 'endYear' are expected to be from the range
+ * (-1000'000'000; +1000'000'000).
  */
 inline long long daysBetweenYears(long startYear, long endYear) {
     return leapYearsSinceReferencePoint(endYear - 1) - leapYearsSinceReferencePoint(startYear - 1) +
@@ -643,14 +766,28 @@ inline long long daysBetweenYears(long startYear, long endYear) {
 
 /**
  * Determines a correction needed in number of hours when calculating passed hours between two time
- * instants 'startInstant' and 'endInstant' due to the Daylight Savings Time. Returns 0, if both
- * time instants 'startInstant' and 'endInstant' are either in Standard Time (ST) or in Daylight
- * Saving Time (DST); returns 1, if 'endInstant' is in ST and 'startInstant' is in DST and
- * 'endInstant' > 'startInstant' or 'endInstant' is in DST and 'startInstant' is in ST and
- * 'endInstant' < 'startInstant'; otherwise returns -1.
+ * instants 'startInstant' and 'endInstant' due to different UTC offsets.
  */
-inline long long dstCorrection(timelib_time* startInstant, timelib_time* endInstant) {
+inline long long utcOffsetCorrectionForHours(timelib_time* startInstant, timelib_time* endInstant) {
     return (startInstant->z - endInstant->z) / (kMinutesPerHour * kSecondsPerMinute);
+}
+
+/**
+ * Determines a correction needed in number of minutes when calculating passed minutes between two
+ * time instants 'startInstant' and 'endInstant' due to different UTC offsets.
+ */
+inline long long utcOffsetCorrectionForMinutes(timelib_time* startInstant,
+                                               timelib_time* endInstant) {
+    return (startInstant->z - endInstant->z) / kSecondsPerMinute;
+}
+
+/**
+ * Determines a correction needed in number of seconds when calculating passed seconds between two
+ * time instants 'startInstant' and 'endInstant' due to different UTC offsets.
+ */
+inline long long utcOffsetCorrectionForSeconds(timelib_time* startInstant,
+                                               timelib_time* endInstant) {
+    return startInstant->z - endInstant->z;
 }
 inline long long dateDiffYear(Date startInstant, Date endInstant) {
     return endInstant.year - startInstant.year;
@@ -697,25 +834,27 @@ inline long long dateDiffWeek(Date startInstant, Date endInstant, DayOfWeek star
             dayOfWeek(endInstant, startOfWeek)) /
         kDaysPerWeek;
 }
+inline long long dateDiffHourWithoutUTCOffsetCorrection(timelib_time* startInstant,
+                                                        timelib_time* endInstant) {
+    return endInstant->h - startInstant->h + dateDiffDay(*startInstant, *endInstant) * kHoursPerDay;
+}
 inline long long dateDiffHour(timelib_time* startInstant, timelib_time* endInstant) {
-    return endInstant->h - startInstant->h +
-        dateDiffDay(*startInstant, *endInstant) * kHoursPerDay +
-        dstCorrection(startInstant, endInstant);
+    return dateDiffHourWithoutUTCOffsetCorrection(startInstant, endInstant) +
+        utcOffsetCorrectionForHours(startInstant, endInstant);
+}
+inline long long dateDiffMinuteWithoutUTCOffsetCorrection(timelib_time* startInstant,
+                                                          timelib_time* endInstant) {
+    return endInstant->i - startInstant->i +
+        dateDiffHourWithoutUTCOffsetCorrection(startInstant, endInstant) * kMinutesPerHour;
 }
 inline long long dateDiffMinute(timelib_time* startInstant, timelib_time* endInstant) {
-    return endInstant->i - startInstant->i +
-        dateDiffHour(startInstant, endInstant) * kMinutesPerHour;
+    return dateDiffMinuteWithoutUTCOffsetCorrection(startInstant, endInstant) +
+        utcOffsetCorrectionForMinutes(startInstant, endInstant);
 }
 inline long long dateDiffSecond(timelib_time* startInstant, timelib_time* endInstant) {
     return endInstant->s - startInstant->s +
-        dateDiffMinute(startInstant, endInstant) * kSecondsPerMinute;
-}
-inline long long dateDiffMillisecond(Date_t startDate, Date_t endDate) {
-    long long result;
-    uassert(5166308,
-            "dateDiff overflowed",
-            !overflow::sub(endDate.toMillisSinceEpoch(), startDate.toMillisSinceEpoch(), &result));
-    return result;
+        dateDiffMinuteWithoutUTCOffsetCorrection(startInstant, endInstant) * kSecondsPerMinute +
+        utcOffsetCorrectionForSeconds(startInstant, endInstant);
 }
 
 // A mapping from a string expression of TimeUnit to TimeUnit.
@@ -748,6 +887,7 @@ static const StringMap<DayOfWeek> dayOfWeekNameToDayOfWeekMap{
     {"sunday", DayOfWeek::sunday},
     {"sun", DayOfWeek::sunday},
 };
+
 }  // namespace
 
 long long dateDiff(Date_t startDate,
@@ -762,6 +902,13 @@ long long dateDiff(Date_t startDate,
     // Translate the time instants to the given timezone.
     auto startDateInTimeZone = timezone.getTimelibTime(startDate);
     auto endDateInTimeZone = timezone.getTimelibTime(endDate);
+    return dateDiff(startDateInTimeZone.get(), endDateInTimeZone.get(), unit, startOfWeek);
+}
+
+long long dateDiff(_timelib_time* startDateInTimeZone,
+                   _timelib_time* endDateInTimeZone,
+                   TimeUnit unit,
+                   DayOfWeek startOfWeek) {
     switch (unit) {
         case TimeUnit::year:
             return dateDiffYear(*startDateInTimeZone, *endDateInTimeZone);
@@ -774,14 +921,22 @@ long long dateDiff(Date_t startDate,
         case TimeUnit::day:
             return dateDiffDay(*startDateInTimeZone, *endDateInTimeZone);
         case TimeUnit::hour:
-            return dateDiffHour(startDateInTimeZone.get(), endDateInTimeZone.get());
+            return dateDiffHour(startDateInTimeZone, endDateInTimeZone);
         case TimeUnit::minute:
-            return dateDiffMinute(startDateInTimeZone.get(), endDateInTimeZone.get());
+            return dateDiffMinute(startDateInTimeZone, endDateInTimeZone);
         case TimeUnit::second:
-            return dateDiffSecond(startDateInTimeZone.get(), endDateInTimeZone.get());
+            return dateDiffSecond(startDateInTimeZone, endDateInTimeZone);
         default:
             MONGO_UNREACHABLE;
     }
+}
+
+long long dateDiffMillisecond(Date_t startDate, Date_t endDate) {
+    long long result;
+    uassert(5166308,
+            "dateDiff overflowed",
+            !overflow::sub(endDate.toMillisSinceEpoch(), startDate.toMillisSinceEpoch(), &result));
+    return result;
 }
 
 TimeUnit parseTimeUnit(StringData unitName) {
@@ -817,7 +972,7 @@ StringData serializeTimeUnit(TimeUnit unit) {
         case TimeUnit::millisecond:
             return "millisecond"_sd;
     }
-    MONGO_UNREACHABLE_TASSERT(5339900);
+    MONGO_UNREACHABLE_TASSERT(5339903);
 }
 
 DayOfWeek parseDayOfWeek(StringData dayOfWeek) {
@@ -920,6 +1075,9 @@ std::pair<long long, long long> addMonths(long long year, long long month, long 
  * needed
  */
 boost::optional<long long> daysToAdd(timelib_time* tm, TimeUnit unit, long long amount) {
+    if (unit != TimeUnit::year && unit != TimeUnit::quarter && unit != TimeUnit::month) {
+        return boost::none;
+    }
     if (tm->d <= 28 && tm->z == 0) {
         return boost::none;
     }
@@ -941,28 +1099,6 @@ boost::optional<long long> daysToAdd(timelib_time* tm, TimeUnit unit, long long 
 }
 
 /**
- * A helper function that computes DST correction in seconds for start and end seconds-since-epoch
- * for the given timezone argument.
- */
-long long dateAddDSTCorrection(long long startSse, long long endSse, const TimeZone& timezone) {
-    auto tz = timezone.getTzInfo();
-    if (!tz) {
-        return 0;
-    }
-    auto startOffset = timelib_get_time_zone_info(startSse, tz.get());
-    auto endOffset = timelib_get_time_zone_info(endSse, tz.get());
-    long long corr = startOffset->offset - endOffset->offset;
-    // If the result date falls into the missing hour during Standard to DST time
-    // change, forward the clock with 1 hour.
-    if (endOffset->is_dst && endSse - endOffset->transition_time <= 3600) {
-        corr += 3600;
-    }
-    timelib_time_offset_dtor(startOffset);
-    timelib_time_offset_dtor(endOffset);
-    return corr;
-}
-
-/**
  * Determines a distance of 'value' to the lower bound of a bin 'value' falls into. It assumes that
  * there is a set of bins with following bounds .., [-'binSize', 0), [0, 'binSize'), ['binSize',
  * 2*'binSize'), ..
@@ -978,13 +1114,172 @@ inline long long distanceToBinLowerBound(long long value, long long binSize) {
     return remainder;
 }
 
+inline long long binSizeInMillis(unsigned long long binSize, unsigned long millisPerUnit) {
+    long long binSizeInMillis;
+    uassert(
+        5439002, "dateTrunc overflowed", !overflow::mul(binSize, millisPerUnit, &binSizeInMillis));
+    return binSizeInMillis;
+}
+
 /**
- * An optimized version of date truncation algorithm that works with bins in milliseconds, seconds,
- * minutes and hours.
+ * Determines if function 'dateAdd()' parameter 'amount' and 'unit' values are valid - the
+ * amount roughly fits the range of Date_t type.
  */
-inline Date_t truncateDateMillis(Date_t date,
-                                 Date_t referencePoint,
-                                 unsigned long long binSizeMillis) {
+bool isDateAddAmountValid(long long amount, TimeUnit unit) {
+    constexpr long long maxDays{
+        std::numeric_limits<unsigned long long>::max() / kMillisecondsPerDay + 1};
+    constexpr auto maxYears = maxDays / 365 /* minimum number of days per year*/ + 1;
+    constexpr auto maxQuarters = maxYears * kQuartersPerYear;
+    constexpr auto maxMonths = maxYears * kMonthsInOneYear;
+    constexpr auto maxWeeks = maxDays / kDaysPerWeek;
+    constexpr auto maxHours = maxDays * kHoursPerDay;
+    constexpr auto maxMinutes = maxHours * kMinutesPerHour;
+    constexpr auto maxSeconds = maxMinutes * kSecondsPerMinute;
+    const auto maxAbsoluteAmountValue = [&](TimeUnit unit) {
+        switch (unit) {
+            case TimeUnit::year:
+                return maxYears;
+            case TimeUnit::quarter:
+                return maxQuarters;
+            case TimeUnit::month:
+                return maxMonths;
+            case TimeUnit::week:
+                return maxWeeks;
+            case TimeUnit::day:
+                return maxDays;
+            case TimeUnit::hour:
+                return maxHours;
+            case TimeUnit::minute:
+                return maxMinutes;
+            case TimeUnit::second:
+                return maxSeconds;
+            default:
+                MONGO_UNREACHABLE_TASSERT(5976501);
+        }
+    }(unit);
+    return -maxAbsoluteAmountValue < amount && amount < maxAbsoluteAmountValue;
+}
+}  // namespace
+
+Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone) {
+    if (unit == TimeUnit::millisecond) {
+        return date + Milliseconds(amount);
+    }
+
+    // Check that 'amount' value is within an acceptable range. If the value is within acceptable
+    // range, then the addition algorithm is expected to not overflow. The final determination if
+    // the result can be represented as Date_t is done after the addition result is computed.
+    uassert(5976500,
+            str::stream() << "invalid dateAdd 'amount' parameter value: " << amount << " "
+                          << serializeTimeUnit(unit),
+            isDateAddAmountValid(amount, unit));
+
+    auto localTime = timezone.getTimelibTime(date);
+    auto microSec = durationCount<Microseconds>(Milliseconds(date.toMillisSinceEpoch() % 1000));
+    localTime->us = microSec;
+
+    // Check if an adjustment for the last day of month is necessary.
+    auto intervalInDays = daysToAdd(localTime.get(), unit, amount);
+    if (intervalInDays) {
+        unit = TimeUnit::day;
+        amount = intervalInDays.value();
+    }
+
+    auto interval = getTimelibRelTime(unit, amount);
+
+    timelib_time* timeAfterAddition;
+    // For time units of day or larger perform the computation in the local timezone. This
+    // keeps the values of hour, minute, second, and millisecond components from the input date
+    // the same in the result date regardless of transitions from DST to Standard Time and vice
+    // versa that may happen between the input date and the result.
+    if (timezone.isUtcZone() || timezone.isUtcOffsetZone() || interval->d || interval->m ||
+        interval->y) {
+        timeAfterAddition = timelib_add(localTime.get(), interval.get());
+    } else {
+        // For time units of hour or smaller and a timezone different from UTC perform the
+        // computation in UTC. In this case we don't want to apply the DST correction to the return
+        // date, which would happen by default if we used the timelib_add() function with local
+        // time. For example:
+        //    {$dateAdd: { startDate: ISODate("2020-11-01T05:50:02Z"),
+        //     unit: "hour", amount: 1, timezone: "America/New_York"}}
+        // returns ISODate("2020-11-01T07:50:02Z") when we call timelib_add(localTime ...)
+        // and ISODate("2020-11-01T06:50:02Z") when we call timelib_add(utcTime ...).
+        auto utcTime = createTimelibTime();
+        timelib_unixtime2gmt(utcTime.get(), seconds(date));
+        utcTime->us = microSec;
+        timeAfterAddition = timelib_add(utcTime.get(), interval.get());
+    }
+
+    long long res;
+    if (overflow::mul(timeAfterAddition->sse, 1000L, &res)) {
+        timelib_time_dtor(timeAfterAddition);
+        uasserted(5166406, "dateAdd overflowed");
+    }
+
+    auto returnDate = Date_t::fromMillisSinceEpoch(
+        durationCount<Milliseconds>(Seconds(timeAfterAddition->sse)) +
+        durationCount<Milliseconds>(Microseconds(timeAfterAddition->us)));
+    timelib_time_dtor(timeAfterAddition);
+    return returnDate;
+}
+
+long long timeUnitValueInSeconds(TimeUnit unit) {
+    tassert(7823404,
+            "Cannot return an integer value for the number of seconds in a millisecond.",
+            unit != TimeUnit::millisecond);
+    return timeUnitTypicalMilliseconds(unit) / kMillisecondsPerSecond;
+}
+
+long long timeUnitTypicalMilliseconds(TimeUnit unit) {
+    auto constexpr millisecond = 1;
+    auto constexpr second = millisecond * kMillisecondsPerSecond;
+    auto constexpr minute = second * kSecondsPerMinute;
+    auto constexpr hour = minute * kMinutesPerHour;
+    auto constexpr day = hour * kHoursPerDay;
+    auto constexpr week = day * kDaysPerWeek;
+    auto constexpr month = day * kDaysInTypicalMonth;
+
+    switch (unit) {
+        case TimeUnit::millisecond:
+            return millisecond;
+        case TimeUnit::second:
+            return second;
+        case TimeUnit::minute:
+            return minute;
+        case TimeUnit::hour:
+            return hour;
+        case TimeUnit::day:
+            return day;
+        case TimeUnit::week:
+            return week;
+        case TimeUnit::month:
+            return month;
+        case TimeUnit::quarter:
+            return month * kQuarterLengthInMonths;
+        case TimeUnit::year:
+            return day * kDaysInNonLeapYear;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(7823401);
+}
+
+long long getBinSizeInMillis(unsigned long long binSize, TimeUnit unit) {
+    switch (unit) {
+        case TimeUnit::millisecond:
+            return binSize;
+        case TimeUnit::second:
+            return binSizeInMillis(binSize, kMillisecondsPerSecond);
+        case TimeUnit::minute:
+            return binSizeInMillis(binSize, kSecondsPerMinute * kMillisecondsPerSecond);
+        case TimeUnit::hour:
+            return binSizeInMillis(binSize,
+                                   kMinutesPerHour * kSecondsPerMinute * kMillisecondsPerSecond);
+        default:
+            MONGO_UNREACHABLE_TASSERT(8854200);
+    }
+}
+
+Date_t truncateDateMillis(Date_t date, Date_t referencePoint, unsigned long long binSizeMillis) {
     tassert(5439020,
             "expected binSizeMillis to be convertable to a 64-bit signed integer",
             binSizeMillis <=
@@ -1003,43 +1298,27 @@ inline Date_t truncateDateMillis(Date_t date,
     return Date_t::fromMillisSinceEpoch(result);
 }
 
-inline long long binSizeInMillis(unsigned long long binSize, unsigned long millisPerUnit) {
-    long long binSizeInMillis;
-    uassert(
-        5439002, "dateTrunc overflowed", !overflow::mul(binSize, millisPerUnit, &binSizeInMillis));
-    return binSizeInMillis;
-}
-
-/**
- * The same as 'truncateDate(Date_t, TimeUnit, unsigned long long binSize, const TimeZone&,
- * DayOfWeek)', but additionally accepts a reference point 'referencePoint', that is expected to be
- * aligned to the given time unit.
- *
- * referencePoint - a reference point for bins. It is a pair of two different representations -
- * milliseconds since Unix epoch and date component based to avoid the cost of converting from one
- * representation to another.
- */
 Date_t truncateDate(Date_t date,
                     TimeUnit unit,
                     unsigned long long binSize,
-                    std::pair<Date_t, Date> referencePoint,
+                    DateReferencePoint referencePoint,
                     const TimeZone& timezone,
                     DayOfWeek startOfWeek) {
     switch (unit) {
         case TimeUnit::millisecond:
-            return truncateDateMillis(date, referencePoint.first, binSize);
+            return truncateDateMillis(date, referencePoint.dateMillis, binSize);
         case TimeUnit::second:
             return truncateDateMillis(
-                date, referencePoint.first, binSizeInMillis(binSize, kMillisecondsPerSecond));
+                date, referencePoint.dateMillis, binSizeInMillis(binSize, kMillisecondsPerSecond));
         case TimeUnit::minute:
             return truncateDateMillis(
                 date,
-                referencePoint.first,
+                referencePoint.dateMillis,
                 binSizeInMillis(binSize, kSecondsPerMinute * kMillisecondsPerSecond));
         case TimeUnit::hour:
             return truncateDateMillis(
                 date,
-                referencePoint.first,
+                referencePoint.dateMillis,
                 binSizeInMillis(binSize,
                                 kMinutesPerHour * kSecondsPerMinute * kMillisecondsPerSecond));
         default: {
@@ -1052,24 +1331,30 @@ Date_t truncateDate(Date_t date,
             long long distanceFromReferencePoint;
             switch (unit) {
                 case TimeUnit::day:
-                    distanceFromReferencePoint =
-                        dateDiffDay(referencePoint.second, *dateInTimeZone);
+                    distanceFromReferencePoint = dateDiffDay(
+                        {referencePoint.year, referencePoint.month, referencePoint.dayOfMonth},
+                        *dateInTimeZone);
                     break;
                 case TimeUnit::week:
-                    distanceFromReferencePoint =
-                        dateDiffWeek(referencePoint.second, *dateInTimeZone, startOfWeek);
+                    distanceFromReferencePoint = dateDiffWeek(
+                        {referencePoint.year, referencePoint.month, referencePoint.dayOfMonth},
+                        *dateInTimeZone,
+                        startOfWeek);
                     break;
                 case TimeUnit::month:
-                    distanceFromReferencePoint =
-                        dateDiffMonth(referencePoint.second, *dateInTimeZone);
+                    distanceFromReferencePoint = dateDiffMonth(
+                        {referencePoint.year, referencePoint.month, referencePoint.dayOfMonth},
+                        *dateInTimeZone);
                     break;
                 case TimeUnit::quarter:
-                    distanceFromReferencePoint =
-                        dateDiffQuarter(referencePoint.second, *dateInTimeZone);
+                    distanceFromReferencePoint = dateDiffQuarter(
+                        {referencePoint.year, referencePoint.month, referencePoint.dayOfMonth},
+                        *dateInTimeZone);
                     break;
                 case TimeUnit::year:
-                    distanceFromReferencePoint =
-                        dateDiffYear(referencePoint.second, *dateInTimeZone);
+                    distanceFromReferencePoint = dateDiffYear(
+                        {referencePoint.year, referencePoint.month, referencePoint.dayOfMonth},
+                        *dateInTimeZone);
                     break;
                 default:
                     MONGO_UNREACHABLE_TASSERT(5439021);
@@ -1085,7 +1370,7 @@ Date_t truncateDate(Date_t date,
                                    &binLowerBoundFromRefPoint));
 
             // Determine the lower bound of a bin the 'date' falls into.
-            return dateAdd(referencePoint.first, unit, binLowerBoundFromRefPoint, timezone);
+            return dateAdd(referencePoint.dateMillis, unit, binLowerBoundFromRefPoint, timezone);
         }
     }
 }
@@ -1095,13 +1380,13 @@ Date_t truncateDate(Date_t date,
  * must be aligned to time unit 'unit'. This function returns a pair of representations of the
  * reference point.
  */
-std::pair<Date_t, Date> defaultReferencePointForDateTrunc(const TimeZone& timezone,
-                                                          TimeUnit unit,
-                                                          DayOfWeek startOfWeek) {
+DateReferencePoint defaultReferencePointForDateTrunc(const TimeZone& timezone,
+                                                     TimeUnit unit,
+                                                     DayOfWeek startOfWeek) {
     // We use a more resource efficient way than 'TimeZone::createFromDateParts()' to get reference
     // point value in 'timezone'.
     constexpr long long kReferencePointInUTCMillis = 946684800000LL;  // 2000-01-01T00:00:00.000Z
-    Date referencePoint{2000, 1, 1};
+    int dayOfMonth = 1;
     long long referencePointMillis = kReferencePointInUTCMillis -
         durationCount<Milliseconds>(timezone.utcOffset(
             Date_t::fromMillisSinceEpoch(kReferencePointInUTCMillis)));
@@ -1125,88 +1410,9 @@ std::pair<Date_t, Date> defaultReferencePointForDateTrunc(const TimeZone& timezo
         // half of January in year 2000, it is correct to just add a number of milliseconds in
         // 'daysToAdjustBy' days.
         referencePointMillis += daysToAdjustBy * kMillisecondsPerDay;
-        referencePoint.dayOfMonth += daysToAdjustBy;
+        dayOfMonth += daysToAdjustBy;
     }
-    return {Date_t::fromMillisSinceEpoch(referencePointMillis), referencePoint};
-}
-}  // namespace
-
-Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone) {
-    auto utcTime = createTimelibTime();
-    timelib_unixtime2gmt(utcTime.get(), seconds(date));
-
-    // Check if an adjustment for the last day of month is necessary.
-    if (unit == TimeUnit::year || unit == TimeUnit::quarter || unit == TimeUnit::month) {
-        auto intervalInDays = [&]() {
-            if (timezone.isUtcZone()) {
-                return daysToAdd(utcTime.get(), unit, amount);
-            }
-            // If a timezone is provided, the last day adjustment is computed in this timezone.
-            auto localTime = timezone.getTimelibTime(date);
-            return daysToAdd(localTime.get(), unit, amount);
-        }();
-        if (intervalInDays) {
-            unit = TimeUnit::day;
-            amount = intervalInDays.get();
-        }
-    }
-
-    auto interval = getTimelibRelTime(unit, amount);
-
-    // Compute the result date in UTC and if needed later perform a DST correction for a timezone.
-    // The alternative computation in the associated timezone gives incorrect results when the
-    // computed date falls into the missing hour during the standard time-to-DST transition or
-    // falls into the repeated hour during the DST-to-standard time transition.
-    auto newTime = timelib_add(utcTime.get(), interval.get());
-
-    // Check the DST offsets in the given timezone and compute a correction if the time unit is
-    // a day or a larger unit. UTC and offset-based timezones do not have DST and do not need
-    // this correction.
-    if ((interval->d || interval->m || interval->y) && timezone.isTimeZoneIDZone()) {
-        newTime->sse += dateAddDSTCorrection(utcTime->sse, newTime->sse, timezone);
-    }
-
-    long long res;
-    if (overflow::mul(newTime->sse, 1000L, &res)) {
-        timelib_time_dtor(newTime);
-        uasserted(5166406, "dateAdd overflowed");
-    }
-
-    auto returnDate =
-        Date_t::fromMillisSinceEpoch(durationCount<Milliseconds>(Seconds(newTime->sse)) +
-                                     durationCount<Milliseconds>(Microseconds(newTime->us)));
-    timelib_time_dtor(newTime);
-    return returnDate;
-}
-
-StatusWith<long long> timeUnitTypicalMilliseconds(TimeUnit unit) {
-    auto constexpr millisecond = 1;
-    auto constexpr second = millisecond * kMillisecondsPerSecond;
-    auto constexpr minute = second * kSecondsPerMinute;
-    auto constexpr hour = minute * kMinutesPerHour;
-    auto constexpr day = hour * kHoursPerDay;
-    auto constexpr week = day * kDaysPerWeek;
-
-    switch (unit) {
-        case TimeUnit::millisecond:
-            return millisecond;
-        case TimeUnit::second:
-            return second;
-        case TimeUnit::minute:
-            return minute;
-        case TimeUnit::hour:
-            return hour;
-        case TimeUnit::day:
-            return day;
-        case TimeUnit::week:
-            return week;
-        case TimeUnit::month:
-        case TimeUnit::quarter:
-        case TimeUnit::year:
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "TimeUnit is too big: " << serializeTimeUnit(unit));
-    }
-    MONGO_UNREACHABLE_TASSERT(5423303);
+    return {Date_t::fromMillisSinceEpoch(referencePointMillis), 2000, 1, dayOfMonth};
 }
 
 Date_t truncateDate(Date_t date,

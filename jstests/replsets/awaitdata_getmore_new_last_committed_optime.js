@@ -3,18 +3,8 @@
 // while a tailable awaitData query is running. See SERVER-35239. This also tests that when the
 // client's lastKnownCommittedOpTime is behind the node's lastCommittedOpTime, getMore returns early
 // with an empty batch.
-//
-// The test runs a secondary read (getMore) that is blocked on a failpoint while waiting for
-// replication. If the storage engine supports snapshot reads, secondary reads do not acquire PBWM
-// locks. So in order to not block secondary oplog application while the secondary read is blocked
-// on a failpoint, we only run this test with storage engine that supports snapshot read.
-// @tags: [
-//   requires_snapshot_read,
-// ]
-
-(function() {
-'use strict';
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const name = 'awaitdata_getmore_new_last_committed_optime';
 const replSet = new ReplSetTest({name: name, nodes: 5, settings: {chainingAllowed: false}});
@@ -30,6 +20,9 @@ const secondaries = replSet.getSecondaries();
 const secondary = secondaries[0];
 
 const primaryDB = primary.getDB(dbName);
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Create capped collection on primary and allow it to be committed.
 assert.commandWorked(primaryDB.createCollection(collName, {capped: true, size: 2048}));
@@ -52,8 +45,9 @@ jsTestLog('Secondary has replicated data');
 
 jsTestLog('Starting parallel shell');
 // Start a parallel shell because we'll be enabling a failpoint that will make the thread hang.
-let waitForGetMoreToFinish = startParallelShell(() => {
-    load('jstests/replsets/rslib.js');
+let waitForGetMoreToFinish = startParallelShell(async () => {
+    const {getLastOpTime} = await import("jstests/replsets/rslib.js");
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
 
     const secondary = db.getMongo();
     secondary.setSecondaryOk();
@@ -128,4 +122,3 @@ waitForGetMoreToFinish();
 jsTestLog('Parallel shell successfully exited');
 
 replSet.stopSet();
-})();

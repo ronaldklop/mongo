@@ -29,12 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/read_write_concern_provenance_base_gen.h"
-#include "mongo/idl/basic_types_gen.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
@@ -70,6 +75,11 @@ namespace mongo {
  *     Only applicable to write concern, and indicates that it originated from the (deprecated)
  *     'settings.getLastErrorDefaults' field of the replica set configuration.
  *
+ *   - "internalWriteDefault":
+ *     Only applicable to write concern on internal writes, and indicates that the internal client
+ *     did not supply an explicit write concern, so this write concern represents the corresponding
+ *     server default for internal writes, ie. {w: 1, wtimeout: 0}.
+ *
  * A ReadWriteConcernProvenance object may only have a single Source value throughout its lifetime;
  * once the Source has been set, attempting to change it will trigger an invariant.  This ensures
  * the integrity of the provenance value as the operation makes its way through the server (and
@@ -83,6 +93,7 @@ public:
     static constexpr StringData kImplicitDefault = "implicitDefault"_sd;
     static constexpr StringData kCustomDefault = "customDefault"_sd;
     static constexpr StringData kGetLastErrorDefaults = "getLastErrorDefaults"_sd;
+    static constexpr StringData kInternalWriteDefault = "internalWriteDefault"_sd;
 
     ReadWriteConcernProvenance() = default;
 
@@ -96,7 +107,7 @@ public:
     /**
      * Returns true if this provenance has been set to an actual source, or false if it is unset.
      */
-    const bool hasSource() const {
+    bool hasSource() const {
         return static_cast<bool>(getSource());
     }
 
@@ -105,8 +116,22 @@ public:
      * either unset (the client specified RWC but without provenance) or explicitly the
      * "clientSupplied" source.
      */
-    const bool isClientSupplied() const {
+    bool isClientSupplied() const {
         return !hasSource() || *getSource() == Source::clientSupplied;
+    }
+
+    /**
+     * Returns true if the RWC was an implicit default.
+     */
+    bool isImplicitDefault() const {
+        return hasSource() && *getSource() == Source::implicitDefault;
+    }
+
+    /**
+     * Returns true if the RWC was a custom default.
+     */
+    bool isCustomDefault() const {
+        return hasSource() && *getSource() == Source::customDefault;
     }
 
     /**
@@ -124,7 +149,7 @@ public:
     /**
      * Creates a provenance with source according to the given object's 'provenance' field.
      */
-    static ReadWriteConcernProvenance parse(const IDLParserErrorContext& ctxt,
+    static ReadWriteConcernProvenance parse(const IDLParserContext& ctxt,
                                             const BSONObj& bsonObject);
 
     /**

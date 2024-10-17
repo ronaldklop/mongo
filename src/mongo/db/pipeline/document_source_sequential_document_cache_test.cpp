@@ -27,17 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <vector>
 
-#include "mongo/bson/bson_depth.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonmisc.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -73,6 +77,28 @@ TEST_F(DocumentSourceSequentialDocumentCacheTest, ReturnsEOFAfterCacheExhausted)
     ASSERT(documentCache->getNext().isAdvanced());
     ASSERT(documentCache->getNext().isEOF());
     ASSERT(documentCache->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceSequentialDocumentCacheTest, Redaction) {
+    SequentialDocumentCache cache(kDefaultMaxCacheSize);
+    cache.add(DOC("_id" << 0));
+    cache.add(DOC("_id" << 1));
+    auto documentCache = DocumentSourceSequentialDocumentCache::create(getExpCtx(), &cache);
+    std::vector<Value> vals;
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kBuilding"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    cache.freeze();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kServing"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    cache.abandon();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kAbandoned"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
 }
 }  // namespace
 }  // namespace mongo

@@ -6,11 +6,8 @@
  * shutdown. See SERVER-50140 for more details.
  * @tags: [requires_persistence]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -95,10 +92,11 @@ beforeFinishFailPoint.wait();
 const res = assert.commandWorked(initialSyncNode.adminCommand({replSetGetStatus: 1}));
 // The initial sync should have failed.
 assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 1, () => tojson(res.initialSyncStatus));
+beforeFinishFailPoint.off();
 
-// Get rid of the failed node so the fixture can stop properly.
-rst.stop(initialSyncNode);
+// Get rid of the failed node so the fixture can stop properly.  We expect it to stop with
+// an fassert.
+assert.eq(MongoRunner.EXIT_ABRUPT, waitMongoProgram(initialSyncNode.port));
 rst.remove(initialSyncNode);
 
 rst.stopSet();
-})();

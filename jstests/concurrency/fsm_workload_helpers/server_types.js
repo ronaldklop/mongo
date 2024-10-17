@@ -1,10 +1,8 @@
-'use strict';
-
 /**
  * Returns true if the process is a mongos, and false otherwise.
  *
  */
-function isMongos(db) {
+export function isMongos(db) {
     // Run isMaster directly on the database's session's client to bypass any session machinery.
     const res = assert.commandWorked(db.getSession().getClient().adminCommand('ismaster'));
     return 'isdbgrid' === res.msg;
@@ -14,7 +12,7 @@ function isMongos(db) {
  * Returns true if the process is a mongod, and false otherwise.
  *
  */
-function isMongod(db) {
+export function isMongod(db) {
     return !isMongos(db);
 }
 
@@ -22,7 +20,7 @@ function isMongod(db) {
  * Returns true if the process is a mongod configsvr, and false otherwise.
  *
  */
-function isMongodConfigsvr(db) {
+export function isMongodConfigsvr(db) {
     if (!isMongod(db)) {
         return false;
     }
@@ -33,11 +31,25 @@ function isMongodConfigsvr(db) {
 }
 
 /**
+ * Returns true if the process is a mongod and is part of a sharded cluster (either a config server,
+ * a shard, or both)
+ */
+export function isClusterNode(db) {
+    if (!isMongod(db)) {
+        return false;
+    }
+    var res = db.adminCommand('getCmdLineOpts');
+    assert.commandWorked(res);
+
+    return res.parsed && res.parsed.hasOwnProperty('sharding');
+}
+
+/**
  * Returns the name of the current storage engine.
  *
  * Throws an error if db is connected to a mongos, or if there is no reported storage engine.
  */
-function getStorageEngineName(db) {
+export function getStorageEngineName(db) {
     var status = db.serverStatus();
     assert.commandWorked(status);
 
@@ -51,23 +63,16 @@ function getStorageEngineName(db) {
 /**
  * Returns true if the current storage engine is wiredTiger, and false otherwise.
  */
-function isWiredTiger(db) {
+export function isWiredTiger(db) {
     return getStorageEngineName(db) === 'wiredTiger';
-}
-
-/**
- * Returns true if the current storage engine is ephemeralForTest, and false otherwise.
- */
-function isEphemeralForTest(db) {
-    return getStorageEngineName(db) === 'ephemeralForTest';
 }
 
 /**
  * Returns true if the current storage engine is ephemeral, and false otherwise.
  */
-function isEphemeral(db) {
+export function isEphemeral(db) {
     var engine = getStorageEngineName(db);
-    return (engine === 'inMemory') || (engine === 'ephemeralForTest');
+    return engine === 'inMemory';
 }
 
 /**
@@ -75,7 +80,7 @@ function isEphemeral(db) {
  *
  * Throws an error if db is connected to a mongos, or if there is no reported storage engine.
  */
-function supportsCommittedReads(db) {
+export function supportsCommittedReads(db) {
     var status = db.serverStatus();
     assert.commandWorked(status);
 

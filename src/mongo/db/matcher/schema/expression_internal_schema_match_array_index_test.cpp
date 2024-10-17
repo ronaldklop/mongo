@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_match_array_index.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -112,7 +116,7 @@ TEST(InternalSchemaMatchArrayIndexMatchExpression, EquivalentToClone) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
-    auto clone = expr.getValue()->shallowClone();
+    auto clone = expr.getValue()->clone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
 }
 
@@ -129,8 +133,8 @@ TEST(InternalSchemaMatchArrayIndexMatchExpression, HasSingleChild) {
 }
 
 DEATH_TEST_REGEX(InternalSchemaMatchArrayIndexMatchExpression,
-                 GetChildFailsIndexGreaterThanZero,
-                 "Invariant failure.*i == 0") {
+                 GetChildFailsIndexGreaterThanOne,
+                 "Tripwire assertion.*6400214") {
     auto query = fromjson(
         "{foo: {$_internalSchemaMatchArrayIndex:"
         "{index: 0, namePlaceholder: 'i', expression: {i: {$type: 'number'}}}}}");
@@ -138,7 +142,8 @@ DEATH_TEST_REGEX(InternalSchemaMatchArrayIndexMatchExpression,
     auto objMatch = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(objMatch.getStatus());
 
-    objMatch.getValue()->getChild(1);
+    ASSERT_EQ(objMatch.getValue()->numChildren(), 1);
+    ASSERT_THROWS_CODE(objMatch.getValue()->getChild(1), AssertionException, 6400214);
 }
 }  // namespace
 }  // namespace mongo

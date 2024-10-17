@@ -1,5 +1,6 @@
-(function() {
-'use strict';
+// Requires no shards.
+// @tags: [config_shard_incompatible]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2});
 var config = st.s.getDB('config');
@@ -32,14 +33,12 @@ jsTest.log('Only system.sessions may be sharded');
 
 st.stop();
 
-// Cannot shard things in config without shards.
 {
-    var st = new ShardingTest({shards: 0});
-    var admin = st.s.getDB('admin');
+    let st = new ShardingTest({shards: 0});
+    let admin = st.s.getDB('admin');
 
     assert.commandFailed(
         admin.runCommand({shardCollection: "config.system.sessions", key: {_id: 1}}));
 
     st.stop();
 }
-})();

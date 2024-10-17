@@ -1,29 +1,30 @@
 /**
  * Test the rank based window functions.
  */
-(function() {
-"use strict";
+import {assertErrCodeAndErrMsgContains} from "jstests/aggregation/extras/utils.js";
 
-load("jstests/aggregation/extras/utils.js");  // documentEq
-const featureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1}))
-        .featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
 const coll = db[jsTestName()];
-for (let i = 0; i < 12; i++) {
-    coll.insert({_id: i, double: Math.floor(i / 2)});
+const numDoc = 12;
+for (let i = 0; i < numDoc; i++) {
+    const doc = {_id: i, double: Math.floor(i / 2)};
+    if (i % 4 === 1) {
+        doc.nullOrMissing = null;
+    } else if (i % 4 === 2) {
+        doc.nullOrMissing = [null];
+    } else if (i % 4 === 3) {
+        doc.nullOrMissing = ["abc", null];
+    }
+    coll.insert(doc);
 }
 
 let origDocs = coll.find().sort({_id: 1});
 function verifyResults(results, valueFunction) {
     for (let i = 0; i < results.length; i++) {
         const correctDoc = valueFunction(i, Object.assign({}, origDocs[i]));
-        assert(documentEq(correctDoc, results[i]),
-               "Got: " + tojson(results[i]) + "\nExpected: " + tojson(correctDoc) +
-                   "\n at position " + i + "\n");
+        assert.eq(correctDoc.rank,
+                  results[i].rank,
+                  "Got: " + tojson(results[i]) + "\nExpected: " + tojson(correctDoc) +
+                      "\n at position " + i + "\n");
     }
 }
 
@@ -60,6 +61,15 @@ assert.commandFailedWithCode(coll.runCommand({
     cursor: {}
 }),
                              5371603);
+
+// This test validates the error message displays $rank correctly.
+let pipeline = [{
+    $setWindowFields: {
+        sortBy: {_id: 1},
+        output: {rank: {$rank: "$_id"}},
+    }
+}];
+assertErrCodeAndErrMsgContains(coll, pipeline, 5371603, "$rank");
 
 // Rank based accumulators must have a sortBy.
 assert.commandFailedWithCode(coll.runCommand({
@@ -116,4 +126,15 @@ verifyResults(result, function(num, baseObj) {
 });
 result = runRankBasedAccumulator({double: 1}, {$documentNumber: {}});
 verifyResults(result, noTieFunc);
-})();
+
+// Check results with null or missing fields.
+result = runRankBasedAccumulator({nullOrMissing: 1}, {$rank: {}});
+verifyResults(result, function(num, baseObj) {
+    baseObj.rank = 1;
+    return baseObj;
+});
+result = runRankBasedAccumulator({nullOrMissing: 1}, {$denseRank: {}});
+verifyResults(result, function(num, baseObj) {
+    baseObj.rank = 1;
+    return baseObj;
+});

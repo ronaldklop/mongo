@@ -3,17 +3,10 @@
  * recipient.
  *
  * @tags: [
- *   requires_fcv_49,
- *   uses_atclustertime,
+ *   uses_atclustertime
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
-load("jstests/sharding/libs/resharding_test_util.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest({numDonors: 2, numRecipients: 1});
 reshardingTest.setup();
@@ -51,36 +44,25 @@ assert.commandWorked(inputCollection.insert([
 const mongos = inputCollection.getMongo();
 const recipientShardNames = reshardingTest.recipientShardNames;
 
-const topology = DiscoverTopology.findConnectedNodes(mongos);
-const recipient0 = new Mongo(topology.shards[recipientShardNames[0]].primary);
-const configsvr = new Mongo(topology.configsvr.nodes[0]);
+reshardingTest.withReshardingInBackground({
+    newShardKeyPattern: {newKey: 1},
+    newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
+},
+                                          () => {},
+                                          {expectedErrorCode: ErrorCodes.DuplicateKey});
 
-const fp = configureFailPoint(recipient0, "removeRecipientDocFailpoint");
-
-reshardingTest.withReshardingInBackground(
-    {
-        newShardKeyPattern: {newKey: 1},
-        newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
-    },
-    () => {
-        // TODO SERVER-51696: Review if these checks can be made in a cpp unittest instead.
-        ReshardingTestUtil.assertRecipientAbortsLocally(recipient0,
-                                                        recipientShardNames[0],
-                                                        inputCollection.getFullName(),
-                                                        ErrorCodes.DuplicateKey);
-        fp.off();
-        ReshardingTestUtil.assertAllParticipantsReportAbortToCoordinator(
-            configsvr, inputCollection.getFullName(), ErrorCodes.DuplicateKey);
-    },
-    {expectedErrorCode: ErrorCodes.DuplicateKey});
-
-const idleCursors = mongos.getDB("admin")
-                        .aggregate([
-                            {$currentOp: {allUsers: true, idleCursors: true}},
-                            {$match: {type: "idleCursor", ns: inputCollection.getFullName()}},
-                        ])
-                        .toArray();
-assert.eq([], idleCursors, "expected cloning cursors to be cleaned up, but they weren't");
+const timeout = 5000;
+assert.soon(() => {
+    const idleCursors = mongos.getDB("admin")
+                            .aggregate([
+                                {$currentOp: {allUsers: true, idleCursors: true}},
+                                {$match: {type: "idleCursor", ns: inputCollection.getFullName()}},
+                            ])
+                            .toArray();
+    if (idleCursors.length > 0) {
+        jsonTestLog(idleCursors);
+    }
+    return idleCursors.length == 0;
+}, "timed out awaiting cloning cursors to be cleaned up", timeout);
 
 reshardingTest.teardown();
-})();

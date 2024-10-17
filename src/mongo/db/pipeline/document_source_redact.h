@@ -29,8 +29,26 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/redact_processor.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -39,6 +57,10 @@ public:
     static constexpr StringData kStageName = "$redact"_sd;
     const char* getSourceName() const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kRedact;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
@@ -49,7 +71,7 @@ public:
                 TransactionRequirement::kAllowed,
                 LookupRequirement::kAllowed,
                 UnionRequirement::kAllowed,
-                ChangeStreamRequirement::kWhitelist};
+                ChangeStreamRequirement::kAllowlist};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
@@ -66,24 +88,28 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    RedactProcessor* getRedactProcessor() {
+        return _redactProcessor.get_ptr();
+    }
 
     boost::intrusive_ptr<Expression> getExpression() {
-        return _expression;
+        return _redactProcessor->getExpression();
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        expression::addVariableRefs(_redactProcessor->getExpression().get(), refs);
     }
 
 private:
     DocumentSourceRedact(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                         const boost::intrusive_ptr<Expression>& previsit);
+                         const boost::intrusive_ptr<Expression>& previsit,
+                         Variables::Id currentId);
 
     GetNextResult doGetNext() final;
 
-    // These both work over pExpCtx->variables.
-    boost::optional<Document> redactObject(const Document& root);  // redacts CURRENT
-    Value redactValue(const Value& in, const Document& root);
-
-    Variables::Id _currentId;
-    boost::intrusive_ptr<Expression> _expression;
+    boost::optional<RedactProcessor> _redactProcessor;
 };
 
 }  // namespace mongo

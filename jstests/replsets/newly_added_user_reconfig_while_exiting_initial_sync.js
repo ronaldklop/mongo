@@ -4,14 +4,16 @@
  * than one party having to retry).
  *
  * @tags: [
- *   requires_fcv_47,
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertVoteCount,
+    isMemberNewlyAdded,
+    waitForNewlyAddedRemovalForNodeToBeCommitted,
+} from "jstests/replsets/rslib.js";
 
 const testName = jsTestName();
 const dbName = "testdb";
@@ -99,4 +101,3 @@ assert.commandWorked(primaryColl.insert({"steady": "state"}, {writeConcern: {w: 
 
 rst.awaitReplication();
 rst.stopSet();
-})();

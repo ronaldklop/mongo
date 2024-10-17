@@ -1,15 +1,8 @@
 /**
  * Tests that the transaction table is properly updated on secondaries through oplog replay.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {RetryableWritesUtil} from "jstests/libs/retryable_writes_util.js";
 
 /**
  * Runs each command on the primary, awaits replication then asserts the secondary's transaction
@@ -19,6 +12,8 @@ if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().s
 function runCommandsWithDifferentIds(primary, secondary, cmds) {
     // Disable oplog application to ensure the oplog entries come in the same batch.
     secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"});
+    checkLog.contains(secondary,
+                      "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
     let responseTimestamps = [];
     cmds.forEach(function(cmd) {
@@ -51,6 +46,8 @@ function runCommandsWithDifferentIds(primary, secondary, cmds) {
 function runCommandsWithSameId(primary, secondary, cmds) {
     // Disable oplog application to ensure the oplog entries come in the same batch.
     secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"});
+    checkLog.contains(secondary,
+                      "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
     let latestOpTimeTs = Timestamp();
     let highestTxnNumber = NumberLong(-1);
@@ -81,6 +78,10 @@ replTest.initiate();
 let primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
 
+// The default WC is majority and rsSyncApplyStop failpoint will prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 ////////////////////////////////////////////////////////////////////////
 // Test insert command
 
@@ -202,4 +203,3 @@ deleteCommands = deleteCommands.map(function(cmd) {
 runCommandsWithSameId(primary, secondary, deleteCommands);
 
 replTest.stopSet();
-})();

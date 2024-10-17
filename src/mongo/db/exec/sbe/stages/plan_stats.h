@@ -30,7 +30,19 @@
 #pragma once
 
 #include "mongo/db/exec/plan_stats.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <list>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/plan_stats_visitor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/db/query/tree_walker.h"
 
 namespace mongo::sbe {
 struct CommonStats {
@@ -52,13 +64,12 @@ struct CommonStats {
     // PlanStages corresponds to an MQL operation specified by the user.
     const PlanNodeId nodeId;
 
-    // Time elapsed while working inside this stage. When this field is set to boost::none,
-    // timing info will not be collected during query execution.
+    // Time elapsed while working inside this stage.
     //
     // The field must be populated when running explain or when running with the profiler on. It
     // must also be populated when multi planning, in order to gather stats stored in the plan
-    // cache.
-    boost::optional<long long> executionTimeMillis;
+    // cache.  This struct includes the execution time and its precision/unit.
+    QueryExecTime executionTime;
 
     size_t advances{0};
     size_t opens{0};
@@ -79,8 +90,12 @@ struct ScanStats final : public SpecificStats {
         return sizeof(*this);
     }
 
-    void accumulate(PlanSummaryStats& stats) const final {
-        stats.totalDocsExamined += numReads;
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
     size_t numReads{0};
@@ -91,16 +106,22 @@ struct IndexScanStats final : public SpecificStats {
         return std::make_unique<IndexScanStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
-    void accumulate(PlanSummaryStats& stats) const final {
-        stats.totalKeysExamined += numReads;
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
-    size_t numReads{0};
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
     size_t seeks{0};
+    size_t keysExamined{0};
+    size_t keyCheckSkipped{0};
+    size_t numReads{0};
 };
 
 struct FilterStats final : public SpecificStats {
@@ -110,6 +131,14 @@ struct FilterStats final : public SpecificStats {
 
     uint64_t estimateObjectSizeInBytes() const final {
         return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
     size_t numTested{0};
@@ -122,6 +151,14 @@ struct LimitSkipStats final : public SpecificStats {
 
     uint64_t estimateObjectSizeInBytes() const final {
         return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
     boost::optional<long long> limit;
@@ -137,6 +174,14 @@ struct UniqueStats : public SpecificStats {
         return sizeof(*this);
     }
 
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
     size_t dupsTested = 0;
     size_t dupsDropped = 0;
 };
@@ -148,6 +193,14 @@ struct BranchStats final : public SpecificStats {
 
     uint64_t estimateObjectSizeInBytes() const final {
         return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
     size_t numTested{0};
@@ -166,6 +219,14 @@ struct CheckBoundsStats final : public SpecificStats {
         return sizeof(*this);
     }
 
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
     size_t seeks{0};
 };
 
@@ -176,6 +237,14 @@ struct LoopJoinStats final : public SpecificStats {
 
     uint64_t estimateObjectSizeInBytes() const final {
         return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
     }
 
     size_t innerOpens{0};
@@ -191,8 +260,200 @@ struct TraverseStats : public SpecificStats {
         return sizeof(*this);
     }
 
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
     size_t innerOpens{0};
     size_t innerCloses{0};
+};
+
+struct HashAggStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<HashAggStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    bool usedDisk{false};
+    // The number of times that the entire hash table was spilled.
+    long long spills{0};
+    // The number of individual records spilled to disk.
+    long long spilledRecords{0};
+    // The number of total bytes spilled to disk.
+    long long spilledBytes{0};
+    // An estimate, in bytes, of the size of the final spill table after all spill events have taken
+    // place.
+    long long spilledDataStorageSize{0};
+};
+
+struct BlockHashAggStats : public HashAggStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<BlockHashAggStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const final {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    /*
+     * We use block accumulators (which do bulk operations) when the groupby keys for BlockHashAgg
+     * don't have many unique values. If there are lots of unique values (ie highly partitioned), we
+     * prefer an element-wise approach, applying the accumulator to each data point one at a time.
+     *
+     * These metrics keep track of how many times each type of accumulator is used.
+     * `blockAccumulations` and `elementWiseAccumulations` indicate how many times we chose the
+     * corresponding accumulation method per block. `blockAccumulatorTotalCalls` indicates how many
+     * times the block accumulators were invoked, which may be more than once per block depending
+     * on how many partitions there are.
+     */
+    long long blockAccumulations{0};
+    long long blockAccumulatorTotalCalls{0};
+    long long elementWiseAccumulations{0};
+};
+
+struct HashLookupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<HashLookupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const final {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    long long getSpilledRecords() const {
+        return spilledHtRecords + spilledBuffRecords;
+    }
+
+    long long getSpilledBytesApprox() const {
+        return spilledHtBytesOverAllRecords + spilledBuffBytesOverAllRecords;
+    }
+
+    bool usedDisk{false};
+    long long spilledHtRecords{0};
+    long long spilledHtBytesOverAllRecords{0};
+    long long spilledBuffRecords{0};
+    long long spilledBuffBytesOverAllRecords{0};
+};
+
+struct WindowStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<WindowStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const final {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Whether the window buffer was spilled.
+    bool usedDisk{false};
+    // The number of times that the entire window buffer was spilled.
+    long long spills{0};
+    // The number of bytes that the entire window buffer was spilled.
+    long long spilledBytes{0};
+    // The number of individual records spilled to disk.
+    long long spilledRecords{0};
+    // An estimate, in bytes, of the size of the final spill table after all spill events have taken
+    // place.
+    long long spilledDataStorageSize{0};
+};
+
+/**
+ * Visitor for calculating the number of storage reads during plan execution.
+ */
+struct PlanStatsNumReadsVisitor : PlanStatsVisitorBase<true> {
+    // To avoid overloaded-virtual warnings.
+    using PlanStatsConstVisitor::visit;
+
+    void visit(tree_walker::MaybeConstPtr<true, sbe::ScanStats> stats) final {
+        numReads += stats->numReads;
+    }
+    void visit(tree_walker::MaybeConstPtr<true, sbe::IndexScanStats> stats) final {
+        numReads += stats->numReads;
+    }
+
+    size_t numReads = 0;
+};
+
+struct SearchStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<SearchStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const final {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    long long msWaitingForMongot{0};
+    long long batchNum{0};
+};
+
+struct TsBucketToBlockStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TsBucketToBlockStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const final {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t numStorageBlocksDecompressed = 0;
+    size_t numStorageBlocks = 0;
+    size_t numCellBlocksProduced = 0;
 };
 
 /**
@@ -200,4 +461,9 @@ struct TraverseStats : public SpecificStats {
  * a physical read (e.g. COLLSCAN or IXSCAN), then its 'numReads' stats is added to the total.
  */
 size_t calculateNumberOfReads(const PlanStageStats* root);
+
+/**
+ * Accumulates the summary of all execution statistics by walking over the specific-stats of stages.
+ */
+PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats& root);
 }  // namespace mongo::sbe

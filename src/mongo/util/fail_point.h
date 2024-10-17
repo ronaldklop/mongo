@@ -29,15 +29,21 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <type_traits>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
@@ -52,6 +58,10 @@ namespace mongo {
  * A FailPoint is a hook mechanism allowing testing behavior to occur at prearranged
  * execution points in the server code. They can be activated and deactivated, and
  * configured to hold data.
+ *
+ * Failpoints are only available when set on the command line with
+ * '--setParameter enableTestCommands=1'.
+ * See FailPointRegistry::registerAllFailPointsAsServerParameters & docs/test_commands.md.
  *
  * A FailPoint is usually defined by the MONGO_FAIL_POINT_DEFINE(name) macro,
  * which arranges for it to be added to the global failpoint registry.
@@ -325,7 +335,7 @@ private:
         const std::string _name;
 
         // protects _mode, _modeValue, _data
-        mutable Mutex _modMutex = MONGO_MAKE_LATCH("FailPoint::_modMutex");
+        mutable stdx::mutex _modMutex;
     };
 
 public:

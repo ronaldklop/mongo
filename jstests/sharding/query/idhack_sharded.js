@@ -1,3 +1,8 @@
+// Remove operations leave orphaned documents.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+TestData.skipCheckOrphans = true;
+
 // Test that idhack queries with projections obey the sharding filter.  SERVER-14032, SERVER-14034.
 
 var st = new ShardingTest({shards: 2});
@@ -6,8 +11,8 @@ var coll = st.s0.getCollection("test.foo");
 //
 // Pre-split collection: shard 0 takes {x: {$lt: 0}}, shard 1 takes {x: {$gte: 0}}.
 //
-assert.commandWorked(coll.getDB().adminCommand({enableSharding: coll.getDB().getName()}));
-st.ensurePrimaryShard(coll.getDB().toString(), st.shard0.shardName);
+assert.commandWorked(coll.getDB().adminCommand(
+    {enableSharding: coll.getDB().getName(), primaryShard: st.shard0.shardName}));
 assert.commandWorked(coll.getDB().adminCommand({shardCollection: coll.getFullName(), key: {x: 1}}));
 assert.commandWorked(coll.getDB().adminCommand({split: coll.getFullName(), middle: {x: 0}}));
 assert.commandWorked(coll.getDB().adminCommand(

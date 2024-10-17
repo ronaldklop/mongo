@@ -27,18 +27,57 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <set>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
+#include "mongo/db/client.h"
 #include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -54,7 +93,7 @@ public:
 
     CollectionModCmd() : BasicCommandWithRequestParser() {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -66,11 +105,17 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-        return auth::checkAuthForCollMod(AuthorizationSession::get(client), nss, cmdObj, true);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* client = opCtx->getClient();
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+        return auth::checkAuthForCollMod(client->getOperationContext(),
+                                         AuthorizationSession::get(client),
+                                         nss,
+                                         cmdObj,
+                                         true,
+                                         SerializationContext::stateCommandRequest());
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -78,45 +123,52 @@ public:
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& db,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) final {
-        auto cmd = requestParser.request();
+        const auto& cmd = requestParser.request();
         auto nss = cmd.getNamespace();
-        LOGV2_DEBUG(22748,
-                    1,
-                    "collMod: {namespace} cmd: {command}",
-                    "CMD: collMod",
-                    "namespace"_attr = nss,
-                    "command"_attr = redact(cmdObj));
+        LOGV2_DEBUG(22748, 1, "CMD: collMod", logAttrs(nss), "command"_attr = redact(cmdObj));
 
-        auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
-            opCtx,
-            cmd.getDbName(),
-            nss,
-            routingInfo,
-            applyReadWriteConcern(
-                opCtx,
-                this,
-                CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON(BSONObj()))),
-            ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kNoRetry,
-            BSONObj() /* query */,
-            BSONObj() /* collation */);
-        std::string errmsg;
-        auto ok = appendRawResponses(opCtx, &errmsg, &result, std::move(shardResponses)).responseOK;
-        if (!errmsg.empty()) {
-            CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
+        auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, cmd.getDbName());
+        if (swDbInfo == ErrorCodes::NamespaceNotFound) {
+            uassert(
+                CollectionUUIDMismatchInfo(
+                    cmd.getDbName(), *cmd.getCollectionUUID(), nss.coll().toString(), boost::none),
+                "Database does not exist",
+                !cmd.getCollectionUUID());
+        }
+        const auto dbInfo = uassertStatusOK(swDbInfo);
+
+        if (cmd.getValidator() || cmd.getValidationLevel() || cmd.getValidationAction()) {
+            // Check for config.settings in the user command since a validator is allowed
+            // internally on this collection but the user may not modify the validator.
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Document validators not allowed on system collection "
+                                  << nss.toStringForErrorMsg(),
+                    nss != NamespaceString::kConfigSettingsNamespace);
         }
 
-        return ok;
+        ShardsvrCollMod collModCommand(nss);
+        collModCommand.setCollModRequest(cmd.getCollModRequest());
+        generic_argument_util::setMajorityWriteConcern(collModCommand, &opCtx->getWriteConcern());
+        auto cmdResponse =
+            uassertStatusOK(executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                                opCtx,
+                                dbName,
+                                dbInfo,
+                                collModCommand.toBSON(),
+                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                Shard::RetryPolicy::kIdempotent)
+                                .swResponse);
+
+        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.data, &result);
+        return cmdResponse.isOK();
     }
 
     void validateResult(const BSONObj& resultObj) final {
-        auto ctx = IDLParserErrorContext("CollModReply");
+        auto ctx = IDLParserContext("CollModReply");
         if (checkIsErrorStatus(resultObj, ctx)) {
             return;
         }
@@ -137,7 +189,7 @@ public:
             return;
         }
 
-        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        auto rawCtx = IDLParserContext(kRawFieldName, &ctx);
         for (const auto& element : rawData.Obj()) {
             if (!rawCtx.checkAndAssertType(element, Object)) {
                 return;
@@ -154,7 +206,8 @@ public:
     const AuthorizationContract* getAuthorizationContract() const final {
         return &::mongo::CollMod::kAuthorizationContract;
     }
-} collectionModCmd;
+};
+MONGO_REGISTER_COMMAND(CollectionModCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

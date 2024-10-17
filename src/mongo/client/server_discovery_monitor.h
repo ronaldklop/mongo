@@ -26,14 +26,34 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/client/mongo_uri.h"
-#include "mongo/client/sdam/sdam.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/stdx/unordered_map.h"
-#include "mongo/util/net/hostandport.h"
 
-namespace mongo {
-using namespace sdam;
+#pragma once
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/replica_set_monitor_stats.h"
+#include "mongo/client/sdam/election_id_set_version_pair.h"
+#include "mongo/client/sdam/sdam.h"
+#include "mongo/client/sdam/sdam_configuration.h"
+#include "mongo/client/sdam/sdam_datatypes.h"
+#include "mongo/client/sdam/topology_listener.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+
+namespace mongo::sdam {
 
 class SingleServerDiscoveryMonitor
     : public std::enable_shared_from_this<SingleServerDiscoveryMonitor> {
@@ -43,7 +63,8 @@ public:
                                           boost::optional<TopologyVersion> topologyVersion,
                                           const SdamConfiguration& sdamConfig,
                                           TopologyEventsPublisherPtr eventListener,
-                                          std::shared_ptr<executor::TaskExecutor> executor);
+                                          std::shared_ptr<executor::TaskExecutor> executor,
+                                          std::shared_ptr<ReplicaSetMonitorStats> stats);
 
     void init();
     void shutdown();
@@ -83,8 +104,8 @@ private:
     // request.
     StatusWith<executor::TaskExecutor::CallbackHandle> _scheduleSingleHello();
 
-    void _onHelloSuccess(const BSONObj bson);
-    void _onHelloFailure(const Status& status, const BSONObj bson);
+    void _onHelloSuccess(BSONObj bson);
+    void _onHelloFailure(const Status& status, BSONObj bson);
 
     Milliseconds _overrideRefreshPeriod(Milliseconds original);
     Milliseconds _currentRefreshPeriod(WithLock, bool scheduleImmediately);
@@ -94,9 +115,10 @@ private:
 
     static constexpr auto kLogLevel = 0;
 
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(4), "SingleServerDiscoveryMonitor::mutex");
-    HostAndPort _host;
+    const HostAndPort _host;
+    const std::shared_ptr<ReplicaSetMonitorStats> _stats;
+
+    stdx::mutex _mutex;
     boost::optional<TopologyVersion> _topologyVersion;
     TopologyEventsPublisherPtr _eventListener;
     std::shared_ptr<executor::TaskExecutor> _executor;
@@ -121,9 +143,10 @@ public:
                            const SdamConfiguration& sdamConfiguration,
                            TopologyEventsPublisherPtr eventsPublisher,
                            TopologyDescriptionPtr initialTopologyDescription,
+                           std::shared_ptr<ReplicaSetMonitorStats> stats,
                            std::shared_ptr<executor::TaskExecutor> executor = nullptr);
 
-    virtual ~ServerDiscoveryMonitor() {}
+    ~ServerDiscoveryMonitor() override {}
 
     void shutdown();
 
@@ -150,8 +173,9 @@ private:
 
     static constexpr auto kLogLevel = 0;
 
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(5), "ServerDiscoveryMonitor::mutex");
+    const std::shared_ptr<ReplicaSetMonitorStats> _stats;
+
+    stdx::mutex _mutex;
     SdamConfiguration _sdamConfiguration;
     TopologyEventsPublisherPtr _eventPublisher;
     std::shared_ptr<executor::TaskExecutor> _executor;
@@ -160,4 +184,4 @@ private:
     MongoURI _setUri;
 };
 using ServerDiscoveryMonitorPtr = std::shared_ptr<ServerDiscoveryMonitor>;
-}  // namespace mongo
+}  // namespace mongo::sdam

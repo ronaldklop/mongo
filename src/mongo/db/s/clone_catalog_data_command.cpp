@@ -27,23 +27,77 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/db/auth/action_set.h"
+#include <set>
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/write_block_bypass.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/clone_catalog_data_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
+
+void cloneDatabase(OperationContext* opCtx,
+                   const DatabaseName& dbName,
+                   StringData from,
+                   BSONObjBuilder& result) {
+    std::vector<NamespaceString> trackedColls;
+    auto const catalogClient = Grid::get(opCtx)->catalogClient();
+    trackedColls = catalogClient->getShardedCollectionNamespacesForDb(
+        opCtx, dbName, repl::ReadConcernLevel::kMajorityReadConcern, {});
+    const auto databasePrimary =
+        catalogClient->getDatabase(opCtx, dbName, repl::ReadConcernLevel::kMajorityReadConcern)
+            .getPrimary()
+            .toString();
+    auto unsplittableCollections = catalogClient->getUnsplittableCollectionNamespacesForDb(
+        opCtx, dbName, repl::ReadConcernLevel::kMajorityReadConcern, {});
+
+    std::move(unsplittableCollections.begin(),
+              unsplittableCollections.end(),
+              std::back_inserter(trackedColls));
+
+    DisableDocumentValidation disableValidation(opCtx);
+
+    // Clone the non-ignored collections.
+    std::set<std::string> clonedColls;
+    Cloner cloner;
+    uassertStatusOK(cloner.copyDb(opCtx, dbName, from.toString(), trackedColls, &clonedColls));
+    {
+        BSONArrayBuilder cloneBarr = result.subarrayStart("clonedColls");
+        cloneBarr.append(clonedColls);
+    }
+}
 
 /**
  * Currently, _shardsvrCloneCatalogData will clone all data (including metadata). In the second part
@@ -55,23 +109,34 @@ class CloneCatalogDataCommand : public BasicCommand {
 public:
     CloneCatalogDataCommand() : BasicCommand("_shardsvrCloneCatalogData", "_cloneCatalogData") {}
 
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    bool supportsRetryableWrite() const override {
+        return true;
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
@@ -79,36 +144,30 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname_unused,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-
         auto shardingState = ShardingState::get(opCtx);
-        uassertStatusOK(shardingState->canAcceptShardedCommands());
+        shardingState->assertCanAcceptShardedCommands();
 
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "_shardsvrCloneCatalogData can only be run on shard servers",
-                serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream()
-                    << "_shardsvrCloneCatalogData must be called with majority writeConcern, got "
-                    << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+        CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
         const auto cloneCatalogDataRequest =
-            CloneCatalogData::parse(IDLParserErrorContext("_shardsvrCloneCatalogData"), cmdObj);
-        const auto dbname = cloneCatalogDataRequest.getCommandParameter().toString();
+            CloneCatalogData::parse(IDLParserContext("_shardsvrCloneCatalogData"), cmdObj);
+        const auto dbName = cloneCatalogDataRequest.getCommandParameter().dbName();
 
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << dbname,
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "invalid db name specified: " << dbName.toStringForErrorMsg(),
+                DatabaseName::isValid(dbName, DatabaseName::DollarInDbNameBehavior::Allow));
 
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "Can't clone catalog data for " << dbname << " database",
-                dbname != NamespaceString::kAdminDb && dbname != NamespaceString::kConfigDb &&
-                    dbname != NamespaceString::kLocalDb);
+                str::stream() << "Can't clone catalog data for " << dbName.toStringForErrorMsg()
+                              << " database",
+                !dbName.isAdminDB() && !dbName.isConfigDB() && !dbName.isLocalDB());
 
         auto from = cloneCatalogDataRequest.getFrom();
 
@@ -116,27 +175,43 @@ public:
                 str::stream() << "Can't run _shardsvrCloneCatalogData without a source",
                 !from.empty());
 
-        auto const catalogClient = Grid::get(opCtx)->catalogClient();
-        const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
-            opCtx, dbname, repl::ReadConcernLevel::kMajorityReadConcern);
+        // For newer versions, execute the operation in another operation context with local write
+        // concern to prevent doing waits while we're holding resources (we have a session checked
+        // out).
+        if (TransactionParticipant::get(opCtx)) {
+            {
+                // Use ACR to have a thread holding the session while we do the cloning.
+                auto newClient = opCtx->getServiceContext()
+                                     ->getService(ClusterRole::ShardServer)
+                                     ->makeClient("SetAllowMigrations");
+                AlternativeClientRegion acr(newClient);
+                auto executor =
+                    Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
+                auto newOpCtxPtr = CancelableOperationContext(
+                    cc().makeOperationContext(), opCtx->getCancellationToken(), executor);
 
-        DisableDocumentValidation disableValidation(opCtx);
-
-        // Clone the non-ignored collections.
-        std::set<std::string> clonedColls;
-        Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
-
-        Cloner cloner;
-        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), shardedColls, &clonedColls));
-        {
-            BSONArrayBuilder cloneBarr = result.subarrayStart("clonedColls");
-            cloneBarr.append(clonedColls);
+                AuthorizationSession::get(newOpCtxPtr.get()->getClient())
+                    ->grantInternalAuthorization();
+                newOpCtxPtr->setWriteConcern(ShardingCatalogClient::kLocalWriteConcern);
+                WriteBlockBypass::get(newOpCtxPtr.get()).set(true);
+                cloneDatabase(newOpCtxPtr.get(), dbName, from, result);
+            }
+            // Since no write happened on this txnNumber, we need to make a dummy write to protect
+            // against older requests with old txnNumbers.
+            DBDirectClient client(opCtx);
+            client.update(NamespaceString::kServerConfigurationNamespace,
+                          BSON("_id"
+                               << "CloneCatalogDataStats"),
+                          BSON("$inc" << BSON("count" << 1)),
+                          true /* upsert */,
+                          false /* multi */);
+        } else {
+            cloneDatabase(opCtx, dbName, from, result);
         }
-
         return true;
     }
-
-} cloneCatalogDataCmd;
+};
+MONGO_REGISTER_COMMAND(CloneCatalogDataCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

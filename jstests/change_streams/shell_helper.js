@@ -6,12 +6,15 @@
 // the oplog entry. When operations get bundled into a transaction, their operationTime is instead
 // based on the commit oplog entry, which would cause this test to fail.
 // @tags: [change_stream_does_not_expect_txns]
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
-load("jstests/libs/change_stream_util.js");        // For assertInvalidateOp.
+import {
+    assertDropAndRecreateCollection,
+    assertDropCollection
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    assertChangeStreamEventEq,
+    assertInvalidateOp
+} from "jstests/libs/query/change_stream_util.js";
 
 const coll = assertDropAndRecreateCollection(db, "change_stream_shell_helper");
 
@@ -73,7 +76,8 @@ resumeToken = change._id;
 // Remove the fields we cannot predict, then test that the change is as expected.
 delete change._id;
 delete change.clusterTime;
-assert.docEq(change, expected);
+delete change.wallTime;
+assert.docEq(expected, change);
 
 jsTestLog("Testing watch() with pipeline");
 changeStreamCursor = coll.watch([{$project: {clusterTime: 1, docId: "$documentKey._id"}}]);
@@ -123,17 +127,21 @@ checkNextChange(changeStreamCursor, expected);
 jsTestLog("Testing watch() with batchSize");
 // Only test mongod because mongos uses batch size 0 for aggregate commands internally to
 // establish cursors quickly. GetMore on mongos doesn't respect batch size due to SERVER-31992.
-const isMongos = FixtureHelpers.isMongos(db);
-if (!isMongos) {
+if (!FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Increase a field by 5 times and verify the batch size is respected.
     for (let i = 0; i < 5; i++) {
         assert.commandWorked(coll.update({_id: 1}, {$inc: {x: 1}}));
     }
 
     // Only watch the "update" changes of the specific doc since the beginning.
-    changeStreamCursor = coll.watch([{$match: {documentKey: {_id: 1}, operationType: "update"}}],
-                                    {resumeAfter: resumeToken, batchSize: 2});
+    changeStreamCursor = coll.watch(
+        [{$match: {$or: [{_id: resumeToken}, {documentKey: {_id: 1}, operationType: "update"}]}}],
+        {resumeAfter: resumeToken, batchSize: 2});
 
+    if (TestData.testingReplicaSetEndpoint) {
+        // GetMore on mongos doesn't respect batch size due to SERVER-31992.
+        assert(changeStreamCursor.hasNext());
+    }
     // Check the first batch.
     assert.eq(changeStreamCursor.objsLeftInBatch(), 2);
     // Consume the first batch.
@@ -220,4 +228,3 @@ if (invalidateDoc) {
 
     assert.eq(firstChangeAfterDrop.documentKey._id, "After drop", tojson(change));
 }
-}());

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2022-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,99 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/type_shard_database.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
-const BSONField<std::string> ShardDatabaseType::name("_id");
-const BSONField<DatabaseVersion> ShardDatabaseType::version("version");
-const BSONField<std::string> ShardDatabaseType::primary("primary");
-const BSONField<bool> ShardDatabaseType::partitioned("partitioned");
-const BSONField<int> ShardDatabaseType::enterCriticalSectionCounter("enterCriticalSectionCounter");
-
-ShardDatabaseType::ShardDatabaseType(const std::string dbName,
-                                     DatabaseVersion version,
-                                     const ShardId primary,
-                                     bool partitioned)
-    : _name(dbName), _version(version), _primary(primary), _partitioned(partitioned) {}
-
-StatusWith<ShardDatabaseType> ShardDatabaseType::fromBSON(const BSONObj& source) {
-    std::string dbName;
-    {
-        Status status = bsonExtractStringField(source, name.name(), &dbName);
-        if (!status.isOK())
-            return status;
-    }
-
-    BSONObj versionField = source.getObjectField("version");
-    if (versionField.isEmpty()) {
-        return Status{ErrorCodes::InternalError,
-                      str::stream() << "DatabaseVersion doesn't exist in database entry " << source
-                                    << " despite the shard being in binary version 4.2 or "
-                                       "later."};
-    }
-    DatabaseVersion dbVersion(versionField);
-
-    std::string dbPrimary;
-    {
-        Status status = bsonExtractStringField(source, primary.name(), &dbPrimary);
-        if (!status.isOK())
-            return status;
-    }
-
-    bool dbPartitioned;
-    {
-        Status status =
-            bsonExtractBooleanFieldWithDefault(source, partitioned.name(), false, &dbPartitioned);
-        if (!status.isOK())
-            return status;
-    }
-
-    ShardDatabaseType shardDatabaseType(dbName, dbVersion, dbPrimary, dbPartitioned);
-
-    return shardDatabaseType;
-}
-
-BSONObj ShardDatabaseType::toBSON() const {
-    BSONObjBuilder builder;
-
-    builder.append(name.name(), _name);
-    builder.append(version.name(), _version.toBSON());
-    builder.append(primary.name(), _primary.toString());
-    builder.append(partitioned.name(), _partitioned);
-
-    return builder.obj();
-}
-
-std::string ShardDatabaseType::toString() const {
-    return toBSON().toString();
-}
-
-void ShardDatabaseType::setDbVersion(DatabaseVersion version) {
-    _version = version;
-}
-
-void ShardDatabaseType::setDbName(const std::string& dbName) {
-    invariant(!dbName.empty());
-    _name = dbName;
-}
-
-void ShardDatabaseType::setPrimary(const ShardId& primary) {
-    invariant(primary.isValid());
-    _primary = primary;
-}
-
-void ShardDatabaseType::setPartitioned(bool partitioned) {
-    _partitioned = partitioned;
+ShardDatabaseType::ShardDatabaseType(const BSONObj& obj) {
+    ShardDatabaseTypeBase::parseProtected(IDLParserContext("ShardDatabaseTypeBase"), obj);
 }
 
 }  // namespace mongo

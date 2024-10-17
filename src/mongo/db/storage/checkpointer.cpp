@@ -27,18 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <chrono>
+#include <cstdint>
+#include <mutex>
+#include <utility>
 
-#include "mongo/db/storage/checkpointer.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/checkpointer.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_proxy.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -68,28 +84,36 @@ void Checkpointer::set(ServiceContext* serviceCtx, std::unique_ptr<Checkpointer>
 }
 
 void Checkpointer::run() {
-    ThreadClient tc(name(), getGlobalServiceContext());
+    ThreadClient tc(name(), getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     LOGV2_DEBUG(22307, 1, "Starting thread", "threadName"_attr = name());
+
+    {
+        stdx::lock_guard<Client> lk(*tc.get());
+        tc.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
 
     while (true) {
         auto opCtx = tc->makeOperationContext();
 
         {
-            stdx::unique_lock<Latch> lock(_mutex);
+            stdx::unique_lock<stdx::mutex> lock(_mutex);
             MONGO_IDLE_THREAD_BLOCK;
 
-            // Wait for 'storageGlobalParams.checkpointDelaySecs' seconds; or until either shutdown
-            // is signaled or a checkpoint is triggered.
-            _sleepCV.wait_for(lock,
-                              stdx::chrono::seconds(static_cast<std::int64_t>(
-                                  storageGlobalParams.checkpointDelaySecs)),
-                              [&] { return _shuttingDown || _triggerCheckpoint; });
+            // Wait for 'storageGlobalParams.syncdelay' seconds; or until either shutdown is
+            // signaled or a checkpoint is triggered.
+            LOGV2_DEBUG(7702900,
+                        1,
+                        "Checkpoint thread sleeping",
+                        "duration"_attr = static_cast<std::int64_t>(storageGlobalParams.syncdelay));
+            _sleepCV.wait_for(
+                lock,
+                stdx::chrono::seconds(static_cast<std::int64_t>(storageGlobalParams.syncdelay)),
+                [&] { return _shuttingDown || _triggerCheckpoint; });
 
-            // If the checkpointDelaySecs is set to 0, that means we should skip checkpointing.
-            // However, checkpointDelaySecs is adjustable by a runtime server parameter, so we
-            // need to wake up to check periodically. The wakeup to check period is arbitrary.
-            while (storageGlobalParams.checkpointDelaySecs == 0 && !_shuttingDown &&
-                   !_triggerCheckpoint) {
+            // If the syncdelay is set to 0, that means we should skip checkpointing. However,
+            // syncdelay is adjustable by a runtime server parameter, so we need to wake up to check
+            // periodically. The wakeup to check period is arbitrary.
+            while (storageGlobalParams.syncdelay == 0 && !_shuttingDown && !_triggerCheckpoint) {
                 _sleepCV.wait_for(lock, stdx::chrono::seconds(static_cast<std::int64_t>(3)), [&] {
                     return _shuttingDown || _triggerCheckpoint;
                 });
@@ -112,9 +136,7 @@ void Checkpointer::run() {
         pauseCheckpointThread.pauseWhileSet();
 
         const Date_t startTime = Date_t::now();
-
-        // TODO SERVER-50861: Access the storage engine via the ServiceContext.
-        _kvEngine->checkpoint();
+        opCtx->getServiceContext()->getStorageEngine()->checkpoint();
 
         const auto secondsElapsed = durationCount<Seconds>(Date_t::now() - startTime);
         if (secondsElapsed >= 30) {
@@ -129,7 +151,7 @@ void Checkpointer::run() {
 void Checkpointer::triggerFirstStableCheckpoint(Timestamp prevStable,
                                                 Timestamp initialData,
                                                 Timestamp currStable) {
-    stdx::unique_lock<Latch> lock(_mutex);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
     invariant(!_hasTriggeredFirstStableCheckpoint);
     if (prevStable < initialData && currStable >= initialData) {
         LOGV2(22310,
@@ -144,7 +166,7 @@ void Checkpointer::triggerFirstStableCheckpoint(Timestamp prevStable,
 }
 
 bool Checkpointer::hasTriggeredFirstStableCheckpoint() {
-    stdx::unique_lock<Latch> lock(_mutex);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
     return _hasTriggeredFirstStableCheckpoint;
 }
 
@@ -152,7 +174,7 @@ void Checkpointer::shutdown(const Status& reason) {
     LOGV2(22322, "Shutting down checkpoint thread");
 
     {
-        stdx::unique_lock<Latch> lock(_mutex);
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
         _shuttingDown = true;
         _shutdownReason = reason;
 

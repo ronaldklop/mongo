@@ -29,8 +29,13 @@
 
 #include "mongo/executor/async_timer_mock.h"
 
+#include <functional>
 #include <memory>
+#include <utility>
 
+#include <absl/container/node_hash_set.h>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/system_error.h"
 
 namespace mongo {
@@ -48,7 +53,7 @@ void AsyncTimerMockImpl::cancel() {
 
 void AsyncTimerMockImpl::asyncWait(AsyncTimerInterface::Handler handler) {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         if (_timeLeft != kZeroMilliseconds) {
             _handlers.push_back(handler);
             return;
@@ -66,7 +71,7 @@ void AsyncTimerMockImpl::fastForward(Milliseconds time) {
     // While holding the lock, change the time and remove
     // handlers that have expired
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         if (time >= _timeLeft) {
             _timeLeft = kZeroMilliseconds;
             tmp.swap(_handlers);
@@ -82,7 +87,7 @@ void AsyncTimerMockImpl::fastForward(Milliseconds time) {
 }
 
 Milliseconds AsyncTimerMockImpl::timeLeft() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _timeLeft;
 }
 
@@ -91,7 +96,7 @@ void AsyncTimerMockImpl::expireAfter(Milliseconds expiration) {
 
     // While holding the lock, reset the time and remove all handlers
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _timeLeft = expiration;
         tmp.swap(_handlers);
     }
@@ -103,14 +108,14 @@ void AsyncTimerMockImpl::expireAfter(Milliseconds expiration) {
 }
 
 int AsyncTimerMockImpl::jobs() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _handlers.size();
 }
 
 void AsyncTimerMockImpl::_callAllHandlers(std::error_code ec) {
     std::vector<AsyncTimerInterface::Handler> tmp;
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         tmp.swap(_handlers);
     }
 

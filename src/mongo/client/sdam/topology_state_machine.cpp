@@ -26,17 +26,28 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 #include "mongo/client/sdam/topology_state_machine.h"
 
-#include <ostream>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <set>
 
-#include "mongo/client/sdam/sdam_test_base.h"
+#include "mongo/client/sdam/election_id_set_version_pair.h"
+#include "mongo/client/sdam/server_description.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo::sdam {
 namespace {
-static constexpr auto kLogLevel = 2;
+static constexpr auto kLogLevel = 0;
 }  // namespace
 
 TopologyStateMachine::TopologyStateMachine(const SdamConfiguration& config) : _config(config) {
@@ -55,7 +66,11 @@ inline int idx(T enumType) {
  * https://github.com/mongodb/specifications/blob/master/source/server-discovery-and-monitoring/server-discovery-and-monitoring.rst#topologytype-table
  */
 void mongo::sdam::TopologyStateMachine::initTransitionTable() {
-    auto bindThis = [&](auto&& pmf) { return [=](auto&&... a) { (this->*pmf)(a...); }; };
+    auto bindThis = [&](auto&& pmf) {
+        return [=, this](auto&&... a) {
+            (this->*pmf)(a...);
+        };
+    };
 
     // init the table to No-ops
     _stt.resize(allTopologyTypes().size() + 1);
@@ -150,11 +165,11 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
 void TopologyStateMachine::onServerDescription(TopologyDescription& topologyDescription,
                                                const ServerDescriptionPtr& serverDescription) {
     if (!topologyDescription.containsServerAddress(serverDescription->getAddress())) {
+        const auto& setName = topologyDescription.getSetName();
         LOGV2_DEBUG(20219,
                     kLogLevel,
-                    "Ignoring isMaster reply from server that is not in the topology: "
-                    "{serverAddress}",
-                    "Ignoring isMaster reply from server that is not in the topology",
+                    "Ignoring 'hello' reply from server that is not in the topology",
+                    "replicaSet"_attr = setName ? *setName : std::string(""),
                     "serverAddress"_attr = serverDescription->getAddress());
         return;
     }
@@ -274,28 +289,24 @@ void TopologyStateMachine::updateRSFromPrimary(TopologyDescription& topologyDesc
         return;
     }
 
-    auto serverDescSetVersion = serverDescription->getSetVersion();
-    auto serverDescElectionId = serverDescription->getElectionId();
-    auto topologyMaxSetVersion = topologyDescription.getMaxSetVersion();
-    auto topologyMaxElectionId = topologyDescription.getMaxElectionId();
-    if (serverDescSetVersion && serverDescElectionId) {
-        if (topologyMaxSetVersion && topologyMaxElectionId &&
-            ((topologyMaxSetVersion > serverDescSetVersion) ||
-             (topologyMaxSetVersion == serverDescSetVersion &&
-              (*topologyMaxElectionId).compare(*serverDescElectionId) > 0))) {
-            // stale primary
-            installServerDescription(
-                topologyDescription, std::make_shared<ServerDescription>(serverDescAddress), false);
-            checkIfHasPrimary(topologyDescription, serverDescription);
-            return;
-        }
-        modifyMaxElectionId(topologyDescription, *serverDescription->getElectionId());
+    const ElectionIdSetVersionPair incomingElectionIdSetVersion =
+        serverDescription->getElectionIdSetVersionPair();
+    const ElectionIdSetVersionPair currentMaxElectionIdSetVersion =
+        topologyDescription.getMaxElectionIdSetVersionPair();
+
+    if (incomingElectionIdSetVersion < currentMaxElectionIdSetVersion) {
+        LOGV2(5940901,
+              "Stale primary detected, marking its state as unknown",
+              "primary"_attr = serverDescription->getAddress(),
+              "incomingElectionIdSetVersion"_attr = incomingElectionIdSetVersion,
+              "currentMaxElectionIdSetVersion"_attr = currentMaxElectionIdSetVersion);
+        installServerDescription(
+            topologyDescription, std::make_shared<ServerDescription>(serverDescAddress), false);
+        checkIfHasPrimary(topologyDescription, serverDescription);
+        return;
     }
 
-    if (serverDescSetVersion &&
-        (!topologyMaxSetVersion || (serverDescSetVersion > topologyMaxSetVersion))) {
-        modifyMaxSetVersion(topologyDescription, *serverDescSetVersion);
-    }
+    topologyDescription.updateMaxElectionIdSetVersionPair(incomingElectionIdSetVersion);
 
     auto oldPrimaries = topologyDescription.findServers(
         [serverDescAddress](const ServerDescriptionPtr& description) {
@@ -383,9 +394,9 @@ void TopologyStateMachine::removeServerDescription(TopologyDescription& topology
     topologyDescription.removeServerDescription(serverAddress);
     LOGV2_DEBUG(20220,
                 kLogLevel,
-                "Server '{serverAddress}' was removed from the topology",
                 "Server was removed from the topology",
-                "serverAddress"_attr = serverAddress);
+                "serverAddress"_attr = serverAddress,
+                "topologyDescription"_attr = topologyDescription.toBSON());
 }
 
 void TopologyStateMachine::modifyTopologyType(TopologyDescription& topologyDescription,
@@ -402,15 +413,5 @@ void TopologyStateMachine::installServerDescription(TopologyDescription& topolog
                                                     ServerDescriptionPtr newServerDescription,
                                                     bool newServer) {
     topologyDescription.installServerDescription(newServerDescription);
-}
-
-void TopologyStateMachine::modifyMaxElectionId(TopologyDescription& topologyDescription,
-                                               const OID& newMaxElectionId) {
-    topologyDescription._maxElectionId = newMaxElectionId;
-}
-
-void TopologyStateMachine::modifyMaxSetVersion(TopologyDescription& topologyDescription,
-                                               int& newMaxSetVersion) {
-    topologyDescription._maxSetVersion = newMaxSetVersion;
 }
 }  // namespace mongo::sdam

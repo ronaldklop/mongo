@@ -3,11 +3,11 @@
  * replica set. We have two replica sets, A and B, where A has two nodes, A_0 and A_1, and B has one
  * node, B_0. Adding B_0 to replica set A should fail on detecting an inconsistent replica set ID in
  * the heartbeat response metadata from B_0.
- * @tags: [requires_fcv_49]
+ * @tags: [
+ * ]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = jsTestName();
 const replSetA = new ReplSetTest({
@@ -92,4 +92,3 @@ assert.eq(ReplSetTest.State.PRIMARY, statusB.members[0].state);
 
 replSetB.stopSet();
 replSetA.stopSet();
-})();

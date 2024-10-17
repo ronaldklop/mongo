@@ -27,27 +27,147 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
 #include <cmath>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
 #include <memory>
+#include <queue>
+#include <string>
+#include <utility>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
+#include "mongo/db/pipeline/accumulator_js_reduce.h"
+#include "mongo/db/pipeline/accumulator_multi.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/random.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
 namespace AccumulatorTests {
 
-using boost::intrusive_ptr;
-using std::numeric_limits;
-using std::string;
+/**
+ * Asserts that all elements contained in the array 'result' are contained in the array 'expected'
+ * and vice versa.
+ */
+static void assertArrayValueEqualityWithoutOrdering(ExpressionContext* const expCtx,
+                                                    Value result,
+                                                    Value expected) {
+    ASSERT(result.isArray());
+    ASSERT(expected.isArray());
+    ASSERT_EQUALS(result.getArrayLength(), expected.getArrayLength());
+
+    std::vector<Value> resultArray = result.getArray();
+    std::sort(resultArray.begin(), resultArray.end(), expCtx->getValueComparator().getLessThan());
+
+    std::vector<Value> expectedArray = expected.getArray();
+    std::sort(
+        expectedArray.begin(), expectedArray.end(), expCtx->getValueComparator().getLessThan());
+
+    ASSERT_VALUE_EQ(Value(resultArray), Value(expectedArray));
+}
+
+/**
+ * Takes a list of pairs of arguments and expected results, and creates an AccumulatorState using
+ * the provided lambda. It then asserts that for the given AccumulatorState the input returns
+ * the expected results.
+ */
+using OperationsType = std::vector<std::pair<std::vector<Value>, Value>>;
+
+static void assertExpectedResults(
+    ExpressionContext* const expCtx,
+    OperationsType operations,
+    std::function<boost::intrusive_ptr<AccumulatorState>(ExpressionContext* const)>
+        initializeAccumulator,
+    bool skipMerging = false,
+    bool ignoreArrayOrdering = false) {
+    for (auto&& op : operations) {
+        try {
+            // Asserts that result equals expected result when not sharded.
+            {
+                auto accum = initializeAccumulator(expCtx);
+                for (auto&& val : op.first) {
+                    accum->process(val, false);
+                }
+                Value result = accum->getValue(false);
+                if (result.isArray() && ignoreArrayOrdering) {
+                    assertArrayValueEqualityWithoutOrdering(expCtx, op.second, result);
+                } else {
+                    ASSERT_VALUE_EQ(op.second, result);
+                }
+                ASSERT_EQUALS(op.second.getType(), result.getType());
+            }
+
+            // Asserts that result equals expected result when all input is on one shard.
+            if (!skipMerging) {
+                auto accum = initializeAccumulator(expCtx);
+                auto shard = initializeAccumulator(expCtx);
+                for (auto&& val : op.first) {
+                    shard->process(val, false);
+                }
+                auto val = shard->getValue(true);
+                accum->process(val, true);
+                Value result = accum->getValue(false);
+                if (result.isArray() && ignoreArrayOrdering) {
+                    assertArrayValueEqualityWithoutOrdering(expCtx, op.second, result);
+                } else {
+                    ASSERT_VALUE_EQ(op.second, result);
+                }
+                ASSERT_EQUALS(op.second.getType(), result.getType());
+            }
+
+            // Asserts that result equals expected result when each input is on a separate shard.
+            if (!skipMerging) {
+                auto accum = initializeAccumulator(expCtx);
+                for (auto&& val : op.first) {
+                    auto shard = initializeAccumulator(expCtx);
+                    shard->process(val, false);
+                    accum->process(shard->getValue(true), true);
+                }
+                Value result = accum->getValue(false);
+                if (result.isArray() && ignoreArrayOrdering) {
+                    assertArrayValueEqualityWithoutOrdering(expCtx, op.second, result);
+                } else {
+                    ASSERT_VALUE_EQ(op.second, result);
+                }
+                ASSERT_EQUALS(op.second.getType(), result.getType());
+            }
+        } catch (...) {
+            LOGV2(24180, "failed", "argument"_attr = Value(op.first));
+            throw;
+        }
+    }
+}
 
 /**
  * Takes the name of an AccumulatorState as its template argument and a list of pairs of arguments
@@ -58,50 +178,17 @@ template <typename AccName>
 static void assertExpectedResults(
     ExpressionContext* const expCtx,
     std::initializer_list<std::pair<std::vector<Value>, Value>> operations,
-    bool skipMerging = false) {
-    for (auto&& op : operations) {
-        try {
-            // Asserts that result equals expected result when not sharded.
-            {
-                auto accum = AccName::create(expCtx);
-                for (auto&& val : op.first) {
-                    accum->process(val, false);
-                }
-                Value result = accum->getValue(false);
-                ASSERT_VALUE_EQ(op.second, result);
-                ASSERT_EQUALS(op.second.getType(), result.getType());
-            }
-
-            // Asserts that result equals expected result when all input is on one shard.
-            if (!skipMerging) {
-                auto accum = AccName::create(expCtx);
-                auto shard = AccName::create(expCtx);
-                for (auto&& val : op.first) {
-                    shard->process(val, false);
-                }
-                accum->process(shard->getValue(true), true);
-                Value result = accum->getValue(false);
-                ASSERT_VALUE_EQ(op.second, result);
-                ASSERT_EQUALS(op.second.getType(), result.getType());
-            }
-
-            // Asserts that result equals expected result when each input is on a separate shard.
-            if (!skipMerging) {
-                auto accum = AccName::create(expCtx);
-                for (auto&& val : op.first) {
-                    auto shard = AccName::create(expCtx);
-                    shard->process(val, false);
-                    accum->process(shard->getValue(true), true);
-                }
-                Value result = accum->getValue(false);
-                ASSERT_VALUE_EQ(op.second, result);
-                ASSERT_EQUALS(op.second.getType(), result.getType());
-            }
-        } catch (...) {
-            LOGV2(24180, "failed", "argument"_attr = Value(op.first));
-            throw;
+    bool skipMerging = false,
+    boost::optional<Value> newGroupValue = boost::none) {
+    auto initializeAccumulator =
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+        auto accum = AccName::create(expCtx);
+        if (newGroupValue) {
+            accum->startNewGroup(*newGroupValue);
         }
-    }
+        return accum;
+    };
+    assertExpectedResults(expCtx, OperationsType(operations), initializeAccumulator, skipMerging);
 }
 
 TEST(Accumulators, Avg) {
@@ -136,11 +223,12 @@ TEST(Accumulators, Avg) {
             {{Value(1), Value(2LL), Value(6.0)}, Value(3.0)},
 
             // Unlike $sum, two ints do not overflow in the 'total' portion of the average.
-            {{Value(numeric_limits<int>::max()), Value(numeric_limits<int>::max())},
-             Value(static_cast<double>(numeric_limits<int>::max()))},
+            {{Value(std::numeric_limits<int>::max()), Value(std::numeric_limits<int>::max())},
+             Value(static_cast<double>(std::numeric_limits<int>::max()))},
             // Two longs do overflow in the 'total' portion of the average.
-            {{Value(numeric_limits<long long>::max()), Value(numeric_limits<long long>::max())},
-             Value(static_cast<double>(numeric_limits<long long>::max()))},
+            {{Value(std::numeric_limits<long long>::max()),
+              Value(std::numeric_limits<long long>::max())},
+             Value(static_cast<double>(std::numeric_limits<long long>::max()))},
 
             // Averaging two decimals.
             {{Value(Decimal128("-1234567890.1234567889")),
@@ -177,6 +265,62 @@ TEST(Accumulators, First) {
          {{Value(), Value(7)}, Value()}});
 }
 
+TEST(Accumulators, FirstN) {
+    auto expCtx = ExpressionContextForTest{};
+    auto n = Value(2);
+
+    assertExpectedResults<AccumulatorFirstN>(
+        &expCtx,
+        {
+            // Basic test involving no values.
+            {{}, Value(std::vector<Value>{})},
+            // Basic test: testing 1 value.
+            {{Value(3)}, Value(std::vector<Value>{Value(3)})},
+            // Basic test involving 2 values.
+            {{Value(3), Value(4)}, Value(std::vector<Value>{Value(3), Value(4)})},
+
+            // Test that processes more than 'n' total values.
+            {{Value(4), Value(5), Value(6), Value(3), Value(2), Value(1)},
+             Value(std::vector<Value>{Value(4), Value(5)})},
+
+            // Null and missing values should NOT be ignored (missing gets upconverted to null).
+            {{Value(), Value(BSONNULL), Value(4), Value(), Value(BSONNULL), Value(5), Value(6)},
+             Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL)})},
+
+            // Testing mixed types.
+            {{Value(4), Value("str"_sd), Value(3.2), Value(4.0)},
+             Value(std::vector<Value>{Value(4), Value("str"_sd)})},
+
+            // Testing duplicate values.
+            {{Value("std"_sd), Value("std"_sd), Value("test"_sd)},
+             Value(std::vector<Value>{Value("std"_sd), Value("std"_sd)})},
+
+            {{Value(9.1), Value(4.22), Value(4.22)},
+             Value(std::vector<Value>{Value(9.1), Value(4.22)})},
+        },
+        false, /* skipMerging */
+        n);
+
+    // Additional test partition where N = 1.
+    n = Value(1);
+    assertExpectedResults<AccumulatorFirstN>(
+        &expCtx,
+        {
+            // Basic test involving no values.
+            {{}, Value(std::vector<Value>{})},
+            // Basic test: testing 1 value.
+            {{Value(3)}, Value(std::vector<Value>{Value(3)})},
+            // Basic test involving 2 values.
+            {{Value(3), Value(4)}, Value(std::vector<Value>{Value(3)})},
+
+            // Test that processes more than 'n' total values.
+            {{Value(4), Value(5), Value(6), Value(3), Value(2), Value(1)},
+             Value(std::vector<Value>{Value(4)})},
+        },
+        false, /* skipMerging */
+        n);
+}
+
 TEST(Accumulators, Last) {
     auto expCtx = ExpressionContextForTest{};
     assertExpectedResults<AccumulatorLast>(
@@ -193,6 +337,79 @@ TEST(Accumulators, Last) {
          {{Value(5), Value(7)}, Value(7)},
          // The accumulator evaluates two documents and retains the missing value in the last.
          {{Value(7), Value()}, Value()}});
+}
+
+TEST(Accumulators, LastN) {
+    auto expCtx = ExpressionContextForTest{};
+    auto n = Value(2);
+    assertExpectedResults<AccumulatorLastN>(
+        &expCtx,
+        {
+            // Basic test involving no values.
+            {{}, Value(std::vector<Value>{})},
+            // Basic test: testing 1 value.
+            {{Value(3)}, Value(std::vector<Value>{Value(3)})},
+            // Basic test involving 2 values.
+            {{Value(3), Value(4)}, Value(std::vector<Value>{Value(3), Value(4)})},
+
+            // Test that processes more than 'n' total values.
+            {{Value(4), Value(5), Value(6), Value(3), Value(2), Value(1)},
+             Value(std::vector<Value>{Value(2), Value(1)})},
+
+            // Null and missing values should NOT be ignored (missing gets upconverted to null).
+            {{Value(), Value(BSONNULL), Value(4), Value(), Value(BSONNULL), Value(5), Value(6)},
+             Value(std::vector<Value>{Value(5), Value(6)})},
+
+            {{Value(),
+              Value(BSONNULL),
+              Value(),
+              Value(),
+              Value(),
+              Value(BSONNULL),
+              Value(BSONNULL)},
+             Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL)})},
+
+            {{Value(),
+              Value(BSONNULL),
+              Value(BSONNULL),
+              Value(BSONNULL),
+              Value(),
+              Value(),
+              Value()},
+             Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL)})},
+
+            // Testing mixed types.
+            {{Value(4), Value("str"_sd), Value(3.2), Value(4.0)},
+             Value(std::vector<Value>{Value(3.2), Value(4.0)})},
+
+            // Testing duplicate values.
+            {{Value("std"_sd), Value("std"_sd), Value("test"_sd)},
+             Value(std::vector<Value>{Value("std"_sd), Value("test"_sd)})},
+
+            {{Value(9.1), Value(4.22), Value(4.22)},
+             Value(std::vector<Value>{Value(4.22), Value(4.22)})},
+        },
+        false, /* skipMerging */
+        n);
+
+    // Additional test partition where N = 1.
+    n = Value(1);
+    assertExpectedResults<AccumulatorLastN>(
+        &expCtx,
+        {
+            // Basic test involving no values.
+            {{}, Value(std::vector<Value>{})},
+            // Basic test: testing 1 value.
+            {{Value(3)}, Value(std::vector<Value>{Value(3)})},
+            // Basic test involving 2 values.
+            {{Value(3), Value(4)}, Value(std::vector<Value>{Value(4)})},
+
+            // Test that processes more than 'n' total values.
+            {{Value(4), Value(5), Value(6), Value(3), Value(2), Value(1)},
+             Value(std::vector<Value>{Value(1)})},
+        },
+        false, /* skipMerging */
+        n);
 }
 
 TEST(Accumulators, Min) {
@@ -220,6 +437,100 @@ TEST(Accumulators, MinRespectsCollation) {
     expCtx.setCollator(std::move(collator));
     assertExpectedResults<AccumulatorMin>(&expCtx,
                                           {{{Value("abc"_sd), Value("cba"_sd)}, Value("cba"_sd)}});
+}
+
+TEST(Accumulators, MinN) {
+    auto expCtx = ExpressionContextForTest{};
+    const auto n = Value(3);
+    assertExpectedResults<AccumulatorMinN>(
+        &expCtx,
+        {
+            // Basic tests.
+            {{Value(3), Value(4), Value(5), Value(100)},
+             {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}},
+            {{Value(10), Value(8), Value(9), Value(7), Value(1)},
+             {Value(std::vector<Value>{Value(1), Value(7), Value(8)})}},
+            {{Value(11.32), Value(91.0), Value(2), Value(701), Value(101)},
+             {Value(std::vector<Value>{Value(2), Value(11.32), Value(91.0)})}},
+
+            // 3 or fewer values results in those values being returned.
+            {{Value(10), Value(8), Value(9)},
+             {Value(std::vector<Value>{Value(8), Value(9), Value(10)})}},
+            {{Value(10)}, {Value(std::vector<Value>{Value(10)})}},
+
+            // Ties are broken arbitrarily.
+            {{Value(10), Value(10), Value(1), Value(10), Value(1), Value(10)},
+             {Value(std::vector<Value>{Value(1), Value(1), Value(10)})}},
+
+            // Null/missing cases (missing and null both get ignored).
+            {{Value(100), Value(BSONNULL), Value(), Value(4), Value(3)},
+             {Value(std::vector<Value>{Value(3), Value(4), Value(100)})}},
+            {{Value(100), Value(), Value(BSONNULL), Value(), Value(3)},
+             {Value(std::vector<Value>{Value(3), Value(100)})}},
+        },
+        false /*skipMerging*/,
+        n);
+}
+
+TEST(Accumulators, MinNRespectsCollation) {
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx.setCollator(std::move(collator));
+    const auto n = Value(2);
+    assertExpectedResults<AccumulatorMinN>(
+        &expCtx,
+        {{{Value("abc"_sd), Value("cba"_sd), Value("cca"_sd)},
+          Value(std::vector<Value>{Value("cba"_sd), Value("cca"_sd)})}},
+        false /* skipMerging */,
+        n);
+}
+
+TEST(Accumulators, MaxN) {
+    auto expCtx = ExpressionContextForTest{};
+    const auto n = Value(3);
+    assertExpectedResults<AccumulatorMaxN>(
+        &expCtx,
+        {
+            // Basic tests.
+            {{Value(3), Value(4), Value(5), Value(100)},
+             {Value(std::vector<Value>{Value(100), Value(5), Value(4)})}},
+            {{Value(10), Value(8), Value(9), Value(7), Value(1)},
+             {Value(std::vector<Value>{Value(10), Value(9), Value(8)})}},
+            {{Value(11.32), Value(91.0), Value(2), Value(701), Value(101)},
+             {Value(std::vector<Value>{Value(701), Value(101), Value(91.0)})}},
+
+            // 3 or fewer values results in those values being returned.
+            {{Value(10), Value(8), Value(9)},
+             {Value(std::vector<Value>{Value(10), Value(9), Value(8)})}},
+            {{Value(10)}, {Value(std::vector<Value>{Value(10)})}},
+
+            // Ties are broken arbitrarily.
+            {{Value(1), Value(1), Value(1), Value(10), Value(1), Value(10)},
+             {Value(std::vector<Value>{Value(10), Value(10), Value(1)})}},
+
+            // Null/missing cases (missing and null both get ignored).
+            {{Value(100), Value(BSONNULL), Value(), Value(4), Value(3)},
+             {Value(std::vector<Value>{Value(100), Value(4), Value(3)})}},
+            {{Value(100), Value(), Value(BSONNULL), Value(), Value(3)},
+             {Value(std::vector<Value>{Value(100), Value(3)})}},
+        },
+        false /*skipMerging*/,
+        n);
+}
+
+TEST(Accumulators, MaxNRespectsCollation) {
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx.setCollator(std::move(collator));
+    const auto n = Value(2);
+    assertExpectedResults<AccumulatorMaxN>(
+        &expCtx,
+        {{{Value("abc"_sd), Value("cba"_sd), Value("cca"_sd)},
+          Value(std::vector<Value>{Value("abc"_sd), Value("cca"_sd)})}},
+        false /* skipMerging */,
+        n);
 }
 
 TEST(Accumulators, Max) {
@@ -268,7 +579,8 @@ TEST(Accumulators, Sum) {
          // A non integer valued double.
          {{Value(7.5)}, Value(7.5)},
          // A nan double.
-         {{Value(numeric_limits<double>::quiet_NaN())}, Value(numeric_limits<double>::quiet_NaN())},
+         {{Value(std::numeric_limits<double>::quiet_NaN())},
+          Value(std::numeric_limits<double>::quiet_NaN())},
 
          // Two ints are summed.
          {{Value(4), Value(5)}, Value(9)},
@@ -300,47 +612,1087 @@ TEST(Accumulators, Sum) {
          {{Value(5LL), Value(-6)}, Value(-1LL)},
 
          // Two ints do not overflow.
-         {{Value(numeric_limits<int>::max()), Value(10)}, Value(numeric_limits<int>::max() + 10LL)},
+         {{Value(std::numeric_limits<int>::max()), Value(10)},
+          Value(std::numeric_limits<int>::max() + 10LL)},
          // Two negative ints do not overflow.
-         {{Value(-numeric_limits<int>::max()), Value(-10)},
-          Value(-numeric_limits<int>::max() - 10LL)},
+         {{Value(-std::numeric_limits<int>::max()), Value(-10)},
+          Value(-std::numeric_limits<int>::max() - 10LL)},
          // An int and a long do not trigger an int overflow.
-         {{Value(numeric_limits<int>::max()), Value(1LL)},
-          Value(static_cast<long long>(numeric_limits<int>::max()) + 1)},
+         {{Value(std::numeric_limits<int>::max()), Value(1LL)},
+          Value(static_cast<long long>(std::numeric_limits<int>::max()) + 1)},
          // An int and a double do not trigger an int overflow.
-         {{Value(numeric_limits<int>::max()), Value(1.0)},
-          Value(static_cast<long long>(numeric_limits<int>::max()) + 1.0)},
+         {{Value(std::numeric_limits<int>::max()), Value(1.0)},
+          Value(static_cast<long long>(std::numeric_limits<int>::max()) + 1.0)},
          // An int and a long overflow into a double.
-         {{Value(1), Value(numeric_limits<long long>::max())},
-          Value(-static_cast<double>(numeric_limits<long long>::min()))},
+         {{Value(1), Value(std::numeric_limits<long long>::max())},
+          Value(-static_cast<double>(std::numeric_limits<long long>::min()))},
          // Two longs overflow into a double.
-         {{Value(numeric_limits<long long>::max()), Value(numeric_limits<long long>::max())},
-          Value(static_cast<double>(numeric_limits<long long>::max()) * 2)},
+         {{Value(std::numeric_limits<long long>::max()),
+           Value(std::numeric_limits<long long>::max())},
+          Value(static_cast<double>(std::numeric_limits<long long>::max()) * 2)},
          // A long and a double do not trigger a long overflow.
-         {{Value(numeric_limits<long long>::max()), Value(1.0)},
-          Value(numeric_limits<long long>::max() + 1.0)},
+         {{Value(std::numeric_limits<long long>::max()), Value(1.0)},
+          Value(std::numeric_limits<long long>::max() + 1.0)},
          // Two doubles overflow to infinity.
-         {{Value(numeric_limits<double>::max()), Value(numeric_limits<double>::max())},
-          Value(numeric_limits<double>::infinity())},
+         {{Value(std::numeric_limits<double>::max()), Value(std::numeric_limits<double>::max())},
+          Value(std::numeric_limits<double>::infinity())},
          // Two large integers do not overflow if a double is added later.
-         {{Value(numeric_limits<long long>::max()),
-           Value(numeric_limits<long long>::max()),
+         {{Value(std::numeric_limits<long long>::max()),
+           Value(std::numeric_limits<long long>::max()),
            Value(1.0)},
-          Value(static_cast<double>(numeric_limits<long long>::max()) +
-                static_cast<double>(numeric_limits<long long>::max()))},
+          Value(static_cast<double>(std::numeric_limits<long long>::max()) +
+                static_cast<double>(std::numeric_limits<long long>::max()))},
 
          // An int and a NaN double.
-         {{Value(4), Value(numeric_limits<double>::quiet_NaN())},
-          Value(numeric_limits<double>::quiet_NaN())},
+         {{Value(4), Value(std::numeric_limits<double>::quiet_NaN())},
+          Value(std::numeric_limits<double>::quiet_NaN())},
          // Null values are ignored.
          {{Value(5), Value(BSONNULL)}, Value(5)},
          // Missing values are ignored.
          {{Value(9), Value()}, Value(9)}});
 }
 
+TEST(Accumulators, TopBottomNRespectsCollation) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    expCtx->setCollator(std::move(collator));
+    const auto n = Value(2);
+    auto mkdoc = [](Value a) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << a << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+
+    OperationsType bottomCasesAscending{
+        {{mkdoc(Value("abc"_sd)), mkdoc(Value("cba"_sd)), mkdoc(Value("cca"_sd))},
+         Value(std::vector<Value>{Value("cca"_sd), Value("abc"_sd)})}};
+
+    assertExpectedResults(
+        expCtx.get(),
+        bottomCasesAscending,
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                expCtx, BSON("a" << 1));
+            acc->startNewGroup(n);
+            return acc;
+        });
+
+    OperationsType bottomCasesDescending{
+        {{mkdoc(Value("abc"_sd)), mkdoc(Value("cba"_sd)), mkdoc(Value("cca"_sd))},
+         Value(std::vector<Value>{Value("cca"_sd), Value("cba"_sd)})}};
+    assertExpectedResults(
+        expCtx.get(),
+        bottomCasesDescending,
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                expCtx, BSON("a" << -1));
+            acc->startNewGroup(n);
+            return acc;
+        });
+
+    OperationsType topCasesAscending{
+        {{mkdoc(Value("abc"_sd)), mkdoc(Value("cba"_sd)), mkdoc(Value("cca"_sd))},
+         Value(std::vector<Value>{Value("cba"_sd), Value("cca"_sd)})}};
+    assertExpectedResults(
+        expCtx.get(),
+        topCasesAscending,
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc =
+                AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(expCtx, BSON("a" << 1));
+            acc->startNewGroup(n);
+            return acc;
+        });
+
+    OperationsType topCasesDescending{
+        {{mkdoc(Value("abc"_sd)), mkdoc(Value("cba"_sd)), mkdoc(Value("cca"_sd))},
+         Value(std::vector<Value>{Value("abc"_sd), Value("cca"_sd)})}};
+    assertExpectedResults(
+        expCtx.get(),
+        topCasesDescending,
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc =
+                AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(expCtx, BSON("a" << -1));
+            acc->startNewGroup(n);
+            return acc;
+        });
+}
+
+TEST(Accumulators, TopNDescendingBottomNAscending) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    const auto n3 = Value(3);
+    const auto n1 = Value(1);
+    auto mkdoc = [](Value a) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << a << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+    auto mkdoc2 = [](int a, Value b) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << b << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+    OperationsType cases{
+        // Basic tests.
+        {{mkdoc(Value(3)), mkdoc(Value(4)), mkdoc(Value(5)), mkdoc(Value(100))},
+         {Value(std::vector<Value>{Value(4), Value(5), Value(100)})}},
+        {{mkdoc(Value(10)), mkdoc(Value(8)), mkdoc(Value(9)), mkdoc(Value(7)), mkdoc(Value(1))},
+         {Value(std::vector<Value>{Value(8), Value(9), Value(10)})}},
+        {{mkdoc(Value(11.32)),
+          mkdoc(Value(91.0)),
+          mkdoc(Value(2)),
+          mkdoc(Value(701)),
+          mkdoc(Value(101))},
+         {Value(std::vector<Value>{Value(91.0), Value(101), Value(701)})}},
+
+        // 3 or fewer values results in those values being returned.
+        {{mkdoc(Value(10)), mkdoc(Value(8)), mkdoc(Value(9))},
+         {Value(std::vector<Value>{Value(8), Value(9), Value(10)})}},
+        {{mkdoc(Value(10))}, {Value(std::vector<Value>{Value(10)})}},
+
+        // Ties are broken arbitrarily.
+        {{mkdoc(Value(10)),
+          mkdoc(Value(1)),
+          mkdoc(Value(1)),
+          mkdoc(Value(1)),
+          mkdoc(Value(1)),
+          mkdoc(Value(10))},
+         {Value(std::vector<Value>{Value(1), Value(10), Value(10)})}},
+
+        // Null/missing cases (missing and null are NOT ignored, but missing is converted to null).
+        {{mkdoc(Value(BSONNULL)), mkdoc(Value()), mkdoc(Value(BSONNULL)), mkdoc(Value(3))},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(3)})}},
+
+        {{mkdoc(Value()), mkdoc(Value(BSONNULL)), mkdoc(Value()), mkdoc(Value(3))},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(3)})}},
+
+        // Output values different than sortBy.
+        {{mkdoc2(5, Value(7)), mkdoc2(4, Value(2)), mkdoc2(3, Value(3)), mkdoc2(1, Value(3))},
+         {Value(std::vector<Value>{Value(3), Value(2), Value(7)})}},
+        {{mkdoc2(5, Value(BSONNULL)), mkdoc2(4, Value()), mkdoc2(3, Value(3))},
+         {Value(std::vector<Value>{Value(3), Value(BSONNULL), Value(BSONNULL)})}}};
+
+    OperationsType bottomSpecificCases = {
+        // All 10s encountered once map is full.
+        {{mkdoc2(1, Value(1)),
+          mkdoc2(1, Value(2)),
+          mkdoc2(10, Value(3)),
+          mkdoc2(10, Value(4)),
+          mkdoc2(10, Value(5))},
+         {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}},
+
+        // All 10s encountered before map is full.
+        {{mkdoc2(10, Value(1)),
+          mkdoc2(10, Value(2)),
+          mkdoc2(1, Value(3)),
+          mkdoc2(1, Value(4)),
+          mkdoc2(1, Value(5))},
+         {Value(std::vector<Value>{Value(3), Value(1), Value(2)})}},
+
+        // All 10s encountered when the map is full.
+        {{mkdoc2(10, Value(3)),
+          mkdoc2(10, Value(4)),
+          mkdoc2(10, Value(5)),
+          mkdoc2(1, Value(1)),
+          mkdoc2(1, Value(2))},
+         {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}}};
+
+    try {
+        auto accumInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                expCtx, BSON("a" << 1));
+            acc->startNewGroup(n3);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accumInit);
+        assertExpectedResults(expCtx.get(), bottomSpecificCases, accumInit);
+
+    } catch (...) {
+        LOGV2(5788006, "bottom3 a: 1");
+        throw;
+    }
+
+    // topN descending will return same results, but in reverse order.
+    for (auto& [input, expected] : cases) {
+        tassert(6078100, "expected should be an array", expected.isArray());
+        auto arr = expected.getArray();
+        std::reverse(std::begin(arr), std::end(arr));
+        expected = Value(arr);
+    }
+
+    OperationsType topSpecificCases = {// All 10s encountered once map is full.
+                                       {{mkdoc2(1, Value(1)),
+                                         mkdoc2(1, Value(2)),
+                                         mkdoc2(10, Value(3)),
+                                         mkdoc2(10, Value(4)),
+                                         mkdoc2(10, Value(5))},
+                                        {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}},
+
+                                       // All 10s encountered before map is full.
+                                       {{mkdoc2(10, Value(1)),
+                                         mkdoc2(10, Value(2)),
+                                         mkdoc2(1, Value(3)),
+                                         mkdoc2(1, Value(4)),
+                                         mkdoc2(1, Value(5))},
+                                        {Value(std::vector<Value>{Value(1), Value(2), Value(3)})}},
+
+                                       // All 10s encountered when the map is full.
+                                       {{mkdoc2(10, Value(3)),
+                                         mkdoc2(10, Value(4)),
+                                         mkdoc2(10, Value(5)),
+                                         mkdoc2(1, Value(1)),
+                                         mkdoc2(1, Value(2))},
+                                        {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}}};
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc =
+                AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(expCtx, BSON("a" << -1));
+            acc->startNewGroup(n3);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accInit);
+        assertExpectedResults(expCtx.get(), topSpecificCases, accInit);
+    } catch (...) {
+        LOGV2(5788007, "top3 a: -1");
+        throw;
+    }
+}
+
+TEST(Accumulators, TopNAscendingBottomNDescending) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    const auto n3 = Value(3);
+    const auto n1 = Value(1);
+    auto mkdoc = [](Value a) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << a << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+    auto mkdoc2 = [](int a, Value b) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << b << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+    OperationsType cases{
+        // Basic tests.
+        {{mkdoc(Value(3)), mkdoc(Value(4)), mkdoc(Value(5)), mkdoc(Value(100))},
+         {Value(std::vector<Value>{Value(5), Value(4), Value(3)})}},
+        {{mkdoc(Value(10)), mkdoc(Value(8)), mkdoc(Value(9)), mkdoc(Value(7)), mkdoc(Value(1))},
+         {Value(std::vector<Value>{Value(8), Value(7), Value(1)})}},
+        {{mkdoc(Value(11.32)),
+          mkdoc(Value(91.0)),
+          mkdoc(Value(2)),
+          mkdoc(Value(701)),
+          mkdoc(Value(101))},
+         {Value(std::vector<Value>{Value(91.0), Value(11.32), Value(2)})}},
+
+        // 3 or fewer values results in those values being returned.
+        {{mkdoc(Value(10)), mkdoc(Value(8)), mkdoc(Value(9))},
+         {Value(std::vector<Value>{Value(10), Value(9), Value(8)})}},
+        {{mkdoc(Value(10))}, {Value(std::vector<Value>{Value(10)})}},
+
+        // Ties are broken arbitrarily.
+        {{mkdoc(Value(10)),
+          mkdoc(Value(10)),
+          mkdoc(Value(1)),
+          mkdoc(Value(10)),
+          mkdoc(Value(1)),
+          mkdoc(Value(10))},
+         {Value(std::vector<Value>{Value(10), Value(1), Value(1)})}},
+
+        // Null/missing cases (missing and null are NOT ignored, but missing is upconverted to
+        // null).
+        {{mkdoc(Value(100)),
+          mkdoc(Value(BSONNULL)),
+          mkdoc(Value()),
+          mkdoc(Value(BSONNULL)),
+          mkdoc(Value())},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(BSONNULL)})}},
+        {{mkdoc(Value(100)),
+          mkdoc(Value()),
+          mkdoc(Value(BSONNULL)),
+          mkdoc(Value()),
+          mkdoc(Value())},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(BSONNULL)})}},
+
+        // Output values different than sortBy.
+        {{mkdoc2(5, Value(7)), mkdoc2(6, Value(5)), mkdoc2(4, Value(2)), mkdoc2(3, Value(3))},
+         {Value(std::vector<Value>{Value(7), Value(2), Value(3)})}},
+        {{mkdoc2(5, Value(BSONNULL)), mkdoc2(4, Value()), mkdoc2(3, Value(3))},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(3)})}}};
+
+    OperationsType bottomSpecificCases = {
+        // One 1 encountered once map is full.
+        {{mkdoc2(1, Value(1)),
+          mkdoc2(10, Value(3)),
+          mkdoc2(10, Value(4)),
+          mkdoc2(1, Value(2)),
+          mkdoc2(10, Value(5))},
+         {Value(std::vector<Value>{Value(4), Value(1), Value(2)})}},
+
+        // All 1s encountered before map is full.
+        {{mkdoc2(1, Value(1)),
+          mkdoc2(1, Value(2)),
+          mkdoc2(10, Value(3)),
+          mkdoc2(10, Value(4)),
+          mkdoc2(10, Value(5))},
+         {Value(std::vector<Value>{Value(3), Value(1), Value(2)})}},
+
+        // All 1s encountered when the map is full.
+        {{mkdoc2(10, Value(3)),
+          mkdoc2(10, Value(4)),
+          mkdoc2(10, Value(5)),
+          mkdoc2(1, Value(1)),
+          mkdoc2(1, Value(2))},
+         {Value(std::vector<Value>{Value(5), Value(1), Value(2)})}}};
+
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                expCtx, BSON("a" << -1));
+            acc->startNewGroup(n3);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accInit);
+        assertExpectedResults(expCtx.get(), bottomSpecificCases, accInit);
+    } catch (...) {
+        LOGV2(5788008, "bottom3 a: -1");
+        throw;
+    }
+
+    // topN ascending will return same results, but in reverse order.
+    for (auto& [input, expected] : cases) {
+        tassert(6078101, "expected should be an array", expected.isArray());
+        auto arr = expected.getArray();
+        std::reverse(std::begin(arr), std::end(arr));
+        expected = Value(arr);
+    }
+
+    OperationsType topSpecifcCases{// One 10 encountered once map is full.
+                                   {{mkdoc2(1, Value(1)),
+                                     mkdoc2(10, Value(3)),
+                                     mkdoc2(10, Value(4)),
+                                     mkdoc2(1, Value(2)),
+                                     mkdoc2(10, Value(5))},
+                                    {Value(std::vector<Value>{Value(1), Value(2), Value(3)})}},
+
+                                   // All 10s encountered before map is full.
+                                   {{mkdoc2(1, Value(1)),
+                                     mkdoc2(1, Value(2)),
+                                     mkdoc2(10, Value(3)),
+                                     mkdoc2(10, Value(4)),
+                                     mkdoc2(10, Value(5))},
+                                    {Value(std::vector<Value>{Value(1), Value(2), Value(3)})}},
+
+                                   // All 10s encountered when the map is full.
+                                   {{mkdoc2(1, Value(3)),
+                                     mkdoc2(1, Value(4)),
+                                     mkdoc2(1, Value(5)),
+                                     mkdoc2(10, Value(1)),
+                                     mkdoc2(10, Value(2))},
+                                    {Value(std::vector<Value>{Value(3), Value(4), Value(5)})}}};
+
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc =
+                AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(expCtx, BSON("a" << 1));
+            acc->startNewGroup(n3);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accInit);
+        assertExpectedResults(expCtx.get(), topSpecifcCases, accInit);
+    } catch (...) {
+        LOGV2(5788009, "top3 a: 1");
+        throw;
+    }
+}
+
+TEST(Accumulators, TopBottomNMultiSortPattern) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    const auto n = Value(3);
+    auto mkdoc = [](int32_t a, int32_t b) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << (a * 10 + b) << (AccumulatorN::kFieldNameSortFields + "0") << a
+                          << (AccumulatorN::kFieldNameSortFields + "1") << b));
+    };
+    auto mkdoc2 = [](Value output, Value a, Value b) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << output << (AccumulatorN::kFieldNameSortFields + "0") << a
+                          << (AccumulatorN::kFieldNameSortFields + "1") << b));
+    };
+
+    OperationsType cases{
+        // Basic tests.
+        {{mkdoc(3, 3), mkdoc(4, 4), mkdoc(4, 5), mkdoc(100, 10)},
+         {Value(std::vector<Value>{Value(45), Value(44), Value(33)})}},
+        {{mkdoc(9, 5), mkdoc(8, 2), mkdoc(9, 1), mkdoc(8, 1), mkdoc(1, 0)},
+         {Value(std::vector<Value>{Value(82), Value(81), Value(10)})}},
+        // 3 or fewer values results in those values being returned.
+        {{mkdoc(9, 9), mkdoc(8, 8), mkdoc(9, 8)},
+         {Value(std::vector<Value>{Value(99), Value(98), Value(88)})}},
+        {{mkdoc(9, 9)}, {Value(std::vector<Value>{Value(99)})}},
+
+        // Ties are broken arbitrarily.
+        {{mkdoc(9, 9), mkdoc(9, 9), mkdoc(1, 0), mkdoc(9, 9), mkdoc(1, 0), mkdoc(9, 9)},
+         {Value(std::vector<Value>{Value(99), Value(10), Value(10)})}},
+
+        // Null/missing cases (missing and null are NOT ignored, but missing is upconverted to
+        // null).
+        {{mkdoc(9, 9),
+          mkdoc2(Value(BSONNULL), Value(BSONNULL), Value(BSONNULL)),
+          mkdoc2(Value(BSONNULL), Value(), Value(BSONNULL)),
+          mkdoc2(Value(), Value(BSONNULL), Value()),
+          mkdoc2(Value(), Value(BSONNULL), Value(BSONNULL))},
+         {Value(std::vector<Value>{Value(BSONNULL), Value(BSONNULL), Value(BSONNULL)})}}};
+
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                expCtx, BSON("a" << -1 << "b" << -1));
+            acc->startNewGroup(n);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accInit);
+    } catch (...) {
+        LOGV2(8236800, "bottom3 a: -1, b: -1");
+        throw;
+    }
+
+    // topN ascending will return same results, but in reverse order.
+    for (auto& [input, expected] : cases) {
+        tassert(8236803, "expected should be an array", expected.isArray());
+        auto arr = expected.getArray();
+        std::reverse(std::begin(arr), std::end(arr));
+        expected = Value(arr);
+    }
+
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(
+                expCtx, BSON("a" << 1 << "b" << 1));
+            acc->startNewGroup(n);
+            return acc;
+        };
+        assertExpectedResults(expCtx.get(), cases, accInit);
+    } catch (...) {
+        LOGV2(8236801, "top3 a: 1, b: 1");
+        throw;
+    }
+}
+
+template <TopBottomSense Sense>
+void runTopBottomAccumulatorTest(ExpressionContext* const expCtx,
+                                 int32_t dir,
+                                 Value n,
+                                 OperationsType cases) {
+    try {
+        auto accInit =
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+            auto acc = AccumulatorTopBottomN<Sense, false>::create(expCtx, BSON("a" << dir));
+            acc->startNewGroup(n);
+            return acc;
+        };
+        assertExpectedResults(expCtx, cases, accInit);
+    } catch (...) {
+        LOGV2(8236802,
+              "failed top/bottom accumulator test",
+              "n"_attr = n,
+              "sort_dir"_attr = dir,
+              "sense"_attr = Sense);
+        throw;
+    }
+}
+
+TEST(Accumulators, TopBottomNSortArray) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    Value n{2};
+    Value arr1{std::vector<Value>{
+        Value(6),
+        Value(1),
+    }};
+    Value arr2{std::vector<Value>{
+        Value(5),
+        Value(2),
+    }};
+    Value arr3{std::vector<Value>{
+        Value(4),
+        Value(3),
+    }};
+
+    auto mkdoc = [](int32_t id, Value arr) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << id << (AccumulatorN::kFieldNameSortFields + "0") << arr));
+    };
+    OperationsType topCases{{{mkdoc(1, arr1), mkdoc(2, arr2), mkdoc(3, arr3)},
+                             {Value(std::vector<Value>{Value(1), Value(2)})}}};
+    OperationsType bottomCases{{{mkdoc(1, arr1), mkdoc(2, arr2), mkdoc(3, arr3)},
+                                {Value(std::vector<Value>{Value(2), Value(3)})}}};
+
+    runTopBottomAccumulatorTest<TopBottomSense::kTop>(expCtx.get(), 1, n, topCases);
+    runTopBottomAccumulatorTest<TopBottomSense::kTop>(expCtx.get(), -1, n, topCases);
+
+    runTopBottomAccumulatorTest<TopBottomSense::kBottom>(expCtx.get(), 1, n, bottomCases);
+    runTopBottomAccumulatorTest<TopBottomSense::kBottom>(expCtx.get(), -1, n, bottomCases);
+}
+
+// Utility to test the single counterparts of the topN/bottomN accumulators.
+template <TopBottomSense s>
+void testSingle(OperationsType cases, ExpressionContext* const expCtx, const BSONObj& sortPattern) {
+    // Unpack for single versions.
+    for (auto& [input, expected] : cases) {
+        expected = Value(expected.getArray()[0]);
+    }
+    try {
+        // n = 1 single = true should return 1 non array value.
+        assertExpectedResults(
+            expCtx,
+            cases,
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+                auto acc = AccumulatorTopBottomN<s, true>::create(expCtx, sortPattern);
+                acc->startNewGroup(Value(1));
+                return acc;
+            });
+    } catch (...) {
+        if constexpr (s == kTop) {
+            LOGV2(5788013, "top single", "sortPattern"_attr = sortPattern);
+        } else {
+            LOGV2(5788016, "bottom single", "sortPattern"_attr = sortPattern);
+        }
+        throw;
+    }
+}
+
+TEST(Accumulators, TopBottomSingle) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    const auto n = Value(1);
+    auto mkdoc = [](Value a) {
+        return Value(BSON(AccumulatorN::kFieldNameOutput
+                          << a << (AccumulatorN::kFieldNameSortFields + "0") << a));
+    };
+
+    const BSONObj ascSort = BSON("a" << 1);
+    const BSONObj descSort = BSON("a" << -1);
+
+    // When n = 1, bottomN over ascending sort is the same as topN over descending sort.
+    OperationsType bottomAscTopDescCases{
+        {{mkdoc(Value(3)), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(4)})}},
+        {{mkdoc(Value(4)), mkdoc(Value(3))}, {Value(std::vector<Value>{Value(4)})}},
+        {{mkdoc(Value(BSONNULL)), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(4)})}},
+
+        {{mkdoc(Value()), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(4)})}},
+        {{mkdoc(Value(BSONUndefined)), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(4)})}}};
+
+    // n = 1 single = false should return a 1 elem array.
+    try {
+        assertExpectedResults(
+            expCtx.get(),
+            bottomAscTopDescCases,
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+                auto acc =
+                    AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(expCtx, ascSort);
+                acc->startNewGroup(n);
+                return acc;
+            });
+    } catch (...) {
+        LOGV2(5788010, "bottom1 a: 1");
+        throw;
+    }
+    testSingle<TopBottomSense::kBottom>(bottomAscTopDescCases, expCtx.get(), ascSort);
+
+    try {
+        assertExpectedResults(
+            expCtx.get(),
+            bottomAscTopDescCases,
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+                auto acc = AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(
+                    expCtx, BSON("a" << -1));
+                acc->startNewGroup(n);
+                return acc;
+            });
+    } catch (...) {
+        LOGV2(5788011, "top1 a: -1");
+        throw;
+    }
+    testSingle<TopBottomSense::kTop>(bottomAscTopDescCases, expCtx.get(), descSort);
+
+    // When n = 1, bottomN over descending sort is the same as topN over ascending sort.
+    OperationsType bottomDescTopAscCases{
+        {{mkdoc(Value(3)), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(3)})}},
+        {{mkdoc(Value(4)), mkdoc(Value(3))}, {Value(std::vector<Value>{Value(3)})}},
+        {{mkdoc(Value(BSONNULL)), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(BSONNULL)})}},
+
+        {{mkdoc(Value()), mkdoc(Value(4))}, {Value(std::vector<Value>{Value(BSONNULL)})}},
+        {{mkdoc(Value(BSONUndefined)), mkdoc(Value(4))},
+         {Value(std::vector<Value>{Value(BSONUndefined)})}}};
+
+    // n = 1 single = false should return a 1 elem array.
+    try {
+        assertExpectedResults(
+            expCtx.get(),
+            bottomDescTopAscCases,
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+                auto acc = AccumulatorTopBottomN<TopBottomSense::kBottom, false>::create(
+                    expCtx, BSON("a" << -1));
+                acc->startNewGroup(n);
+                return acc;
+            });
+    } catch (...) {
+        LOGV2(5788012, "bottom1 a: -1");
+        throw;
+    }
+    testSingle<TopBottomSense::kBottom>(bottomDescTopAscCases, expCtx.get(), descSort);
+
+    // n = 1 single = false should return a 1 elem array.
+    try {
+        assertExpectedResults(
+            expCtx.get(),
+            bottomDescTopAscCases,
+            [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+                auto acc = AccumulatorTopBottomN<TopBottomSense::kTop, false>::create(
+                    expCtx, BSON("a" << 1));
+                acc->startNewGroup(n);
+                return acc;
+            });
+    } catch (...) {
+        LOGV2(6078102, "top a: 1");
+        throw;
+    }
+    testSingle<TopBottomSense::kTop>(bottomDescTopAscCases, expCtx.get(), ascSort);
+}
+
+template <typename T>
+struct TopBottomNRemoveTest : public AggregationContextFixture {
+    void init(boost::optional<int> n, BSONObj sortBy) {
+        auto expCtx = getExpCtxRaw();
+        expCtx->setCollator(std::make_unique<CollatorInterfaceMock>(
+            CollatorInterfaceMock::MockType::kToLowerString));
+        auto accState = T::create(expCtx, sortBy, /* isRemovable */ true);
+        _acc = boost::dynamic_pointer_cast<T>(accState);
+        _acc->startNewGroup(Value(n.value_or(1)));
+    }
+
+    template <typename SortKeyType>
+    void add(SortKeyType sortKey, int output) {
+        auto v = Value(BSON(AccumulatorN::kFieldNameOutput
+                            << output << (AccumulatorN::kFieldNameSortFields + "0") << sortKey));
+        _acc->process(v, false);
+        _q.push(v);
+    }
+
+    void remove() {
+        _acc->remove(_q.front());
+        _q.pop();
+    }
+
+    void assertExpected(std::vector<Value> vec) {
+        ASSERT_VALUE_EQ(Value(vec), _acc->getValue(false));
+    }
+
+    void assertExpectedSingle(int expected) {
+        ASSERT_VALUE_EQ(Value(expected), _acc->getValue(false));
+    }
+
+    void assertNull() {
+        ASSERT_VALUE_EQ(Value(BSONNULL), _acc->getValue(false));
+    }
+
+    // Assumes init() already called.
+    void testNoRemoveUnderflow() {
+        auto usageBefore = _acc->getMemUsage();
+        auto sortKey =
+            BSON("a" << BSONNULL << "b" << BSONNULL << "c" << BSONNULL << "d" << BSONNULL);
+        add(sortKey, 0);
+        add(sortKey, 0);
+        add(sortKey, 0);
+        add(sortKey, 0);
+        remove();
+        remove();
+        remove();
+        remove();
+        auto usageAfter = _acc->getMemUsage();
+        ASSERT_EQ(usageBefore, usageAfter);
+    }
+
+    boost::intrusive_ptr<T> _acc = nullptr;
+    std::queue<Value> _q;
+};
+
+using TopNRemoveTest = TopBottomNRemoveTest<AccumulatorTopBottomN<TopBottomSense::kTop, false>>;
+TEST_F(TopNRemoveTest, TopNRemove) {
+    // Test accumulator {$topN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    // Basic remove test.
+    add(1, 1);
+    add(2, 2);
+    assertExpected({Value(1), Value(2)});
+
+    remove();  // 1, 1
+    assertExpected({Value(2)});
+
+    // Add some elements with equal keys.
+    add(2, 3);
+    add(2, 4);
+    add(3, 5);
+    add(1, 1);
+    assertExpected({Value(1), Value(2), Value(3)});  // 4, 5 not shown.
+
+    remove();                                        // 2, 2
+    assertExpected({Value(1), Value(3), Value(4)});  // 5 not shown.
+
+    // Add value back but its at the end of the queue so it's not included in results.
+    add(2, 2);
+    assertExpected({Value(1), Value(3), Value(4)});  // 2, 5 not shown.
+
+    remove();                                        // 2, 3
+    assertExpected({Value(1), Value(4), Value(2)});  // 5 not shown.
+
+    remove();  // 2, 4
+    assertExpected({Value(1), Value(2), Value(5)});
+
+    // Add value after and then pop front value.
+    add(3, 6);
+    assertExpected({Value(1), Value(2), Value(5)});  // 6 not shown.
+
+    remove();  // 3, 5
+    assertExpected({Value(1), Value(2), Value(6)});
+    remove();  // 1, 1
+    assertExpected({Value(2), Value(6)});
+    remove();  // 2, 2
+    assertExpected({Value(6)});
+    remove();  // Cleared.
+    assertExpected({});
+}
+
+TEST_F(TopNRemoveTest, TopNRemoveRoundRobin) {
+    // Test accumulator {$topN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    // Mostly round robin insert and remove.
+    add(1, 1);
+    add(1, 2);
+    add(2, 4);
+    add(3, 7);
+    add(1, 3);
+    add(2, 5);
+    add(3, 8);
+    add(2, 6);
+    add(3, 9);
+
+    // 1: [1, 2, 3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpected({Value(1), Value(2), Value(3)});
+    remove();
+    // 1: [2, 3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpected({Value(2), Value(3), Value(4)});
+    remove();
+    // 1: [3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpected({Value(3), Value(4), Value(5)});
+    remove();
+    // 1: [3], 2: [5, 6], 3: [7, 8, 9]
+    assertExpected({Value(3), Value(5), Value(6)});
+    remove();
+    // 1: [3], 2: [5, 6], 3: [8, 9]
+    assertExpected({Value(3), Value(5), Value(6)});
+    remove();
+    // 2: [5, 6], 3: [8, 9]
+    assertExpected({Value(5), Value(6), Value(8)});
+    remove();
+    // 2: [6], 3: [8, 9]
+    assertExpected({Value(6), Value(8), Value(9)});
+    remove();
+    // 2: [6], 3: [9]
+    assertExpected({Value(6), Value(9)});
+}
+
+TEST_F(TopNRemoveTest, TopNRemoveCollator) {
+    // Test accumulator {$topN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    add("FOO", 1);
+    add("foo", 2);
+    add("fOo", 3);
+    assertExpected({Value(1), Value(2), Value(3)});
+    remove();
+    assertExpected({Value(2), Value(3)});
+    add("foO", 4);
+    assertExpected({Value(2), Value(3), Value(4)});
+    remove();
+    assertExpected({Value(3), Value(4)});
+    remove();
+    assertExpected({Value(4)});
+}
+
+TEST_F(TopNRemoveTest, TopNRemoveNoUnderflow) {
+    // Test accumulator {$topN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+    testNoRemoveUnderflow();
+}
+
+using BottomNRemoveTest =
+    TopBottomNRemoveTest<AccumulatorTopBottomN<TopBottomSense::kBottom, false>>;
+TEST_F(BottomNRemoveTest, BottomNRemove) {
+    // Test accumulator {$bottomN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    // Mostly round robin insert and remove.
+    add(3, 1);
+    add(3, 2);
+    add(2, 4);
+    add(1, 7);
+    add(3, 3);
+    add(2, 5);
+    add(1, 8);
+    add(2, 6);
+    add(1, 9);
+
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [1, 2, 3]
+    assertExpected({Value(1), Value(2), Value(3)});
+    remove();
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [2, 3]
+    assertExpected({Value(6), Value(2), Value(3)});
+    remove();
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 1: [7, 8, 9], 2: [5, 6], 3: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 1: [8, 9], 2: [5, 6], 3: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 1: [8, 9], 2: [5, 6]
+    assertExpected({Value(9), Value(5), Value(6)});
+    remove();
+    // 1: [8, 9], 2: [6]
+    assertExpected({Value(8), Value(9), Value(6)});
+    remove();
+    // 2: [9], 3: [6]
+    assertExpected({Value(9), Value(6)});
+    remove();
+    // 2: [9]
+    assertExpected({Value(9)});
+    remove();  // Empty.
+    assertExpected({});
+}
+
+TEST_F(BottomNRemoveTest, BottomNRemoveDesc) {
+    // Test accumulator {$bottomN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << -1));
+
+    // Mostly round robin insert and remove.
+    add(1, 1);
+    add(1, 2);
+    add(2, 4);
+    add(3, 7);
+    add(1, 3);
+    add(2, 5);
+    add(3, 8);
+    add(2, 6);
+    add(3, 9);
+
+    // 3: [7, 8, 9], 2: [4, 5, 6], 1: [1, 2, 3]
+    assertExpected({Value(1), Value(2), Value(3)});
+    remove();
+    // 3: [7, 8, 9], 2: [4, 5, 6], 1: [2, 3]
+    assertExpected({Value(6), Value(2), Value(3)});
+    remove();
+    // 3: [7, 8, 9], 2: [4, 5, 6], 1: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 3: [7, 8, 9], 2: [5, 6], 1: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 3: [8, 9], 2: [5, 6], 1: [3]
+    assertExpected({Value(5), Value(6), Value(3)});
+    remove();
+    // 3: [8, 9], 2: [5, 6]
+    assertExpected({Value(9), Value(5), Value(6)});
+    remove();
+    // 3: [8, 9], 2: [6]
+    assertExpected({Value(8), Value(9), Value(6)});
+    remove();
+    // 2: [9], 3: [6]
+    assertExpected({Value(9), Value(6)});
+    remove();
+    // 2: [9]
+    assertExpected({Value(9)});
+    remove();  // Empty.
+    assertExpected({});
+}
+
+TEST_F(BottomNRemoveTest, BottomNAddRemove) {
+    // Test accumulator {$bottomN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    assertExpected({});
+    add(1, 1);
+    assertExpected({Value(1)});
+    add(1, 2);
+    add(1, 3);
+    remove();
+    assertExpected({Value(2), Value(3)});
+}
+
+TEST_F(BottomNRemoveTest, BottomNRemoveCollator) {
+    // Test accumulator {$bottomN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << 1));
+
+    add("FOO", 1);
+    add("foo", 2);
+    add("fOo", 3);
+    assertExpected({Value(1), Value(2), Value(3)});
+    remove();
+    assertExpected({Value(2), Value(3)});
+    add("foO", 4);
+    assertExpected({Value(2), Value(3), Value(4)});
+    remove();
+    assertExpected({Value(3), Value(4)});
+    remove();
+    assertExpected({Value(4)});
+}
+
+TEST_F(BottomNRemoveTest, BottomNRemoveNoUnderflow) {
+    // Test accumulator {$bottomN: {n: 3, output: "$output", sortBy: {sortKey: 1}}}
+    init(3, BSON("sortKey" << -1));
+    testNoRemoveUnderflow();
+}
+
+using TopRemoveTest = TopBottomNRemoveTest<AccumulatorTopBottomN<TopBottomSense::kTop, true>>;
+TEST_F(TopRemoveTest, TopRemove) {
+    // Test accumulator {$top: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+
+    // Mostly round robin insert and remove.
+    add(1, 1);
+    add(1, 2);
+    add(2, 4);
+    add(3, 7);
+    add(1, 3);
+    add(2, 5);
+    add(3, 8);
+    add(2, 6);
+    add(3, 9);
+
+    // 1: [1, 2, 3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpectedSingle(1);
+    remove();
+    // 1: [2, 3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpectedSingle(2);
+    remove();
+    // 1: [3], 2: [4, 5, 6], 3: [7, 8, 9]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [3], 2: [5, 6], 3: [7, 8, 9]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [3], 2: [5, 6], 3: [8, 9]
+    assertExpectedSingle(3);
+    remove();
+    // 2: [5, 6], 3: [8, 9]
+    assertExpectedSingle(5);
+    remove();
+    // 2: [6], 3: [8, 9]
+    assertExpectedSingle(6);
+    remove();
+    // 2: [6], 3: [9]
+    assertExpectedSingle(6);
+    remove();
+    // 2: [9]
+    assertExpectedSingle(9);
+    remove();
+    assertNull();
+}
+
+TEST_F(TopRemoveTest, TopAddRemove) {
+    // Test accumulator {$top: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+
+    assertNull();
+    add(1, 1);
+    assertExpectedSingle(1);
+    add(1, 2);
+    add(1, 3);
+    remove();
+    assertExpectedSingle(2);
+}
+
+TEST_F(TopRemoveTest, TopRemoveNoUnderflow) {
+    // Test accumulator {$top: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+    testNoRemoveUnderflow();
+}
+
+using BottomRemoveTest = TopBottomNRemoveTest<AccumulatorTopBottomN<TopBottomSense::kBottom, true>>;
+TEST_F(BottomRemoveTest, BottomRemove) {
+    // Test accumulator {$bottom: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+
+    // Mostly round robin insert and remove.
+    add(3, 1);
+    add(3, 2);
+    add(2, 4);
+    add(1, 7);
+    add(3, 3);
+    add(2, 5);
+    add(1, 8);
+    add(2, 6);
+    add(1, 9);
+
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [1, 2, 3]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [2, 3]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [7, 8, 9], 2: [4, 5, 6], 3: [3]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [7, 8, 9], 2: [5, 6], 3: [3]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [8, 9], 2: [5, 6], 3: [3]
+    assertExpectedSingle(3);
+    remove();
+    // 1: [8, 9], 2: [5, 6]
+    assertExpectedSingle(6);
+    remove();
+    // 1: [8, 9], 2: [6]
+    assertExpectedSingle(6);
+    remove();
+    // 2: [9], 3: [6]
+    assertExpectedSingle(6);
+    remove();
+    // 2: [9]
+    assertExpectedSingle(9);
+    remove();  // Empty.
+    assertNull();
+}
+
+TEST_F(BottomRemoveTest, BottomAddRemove) {
+    // Test accumulator {$bottom: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+
+    // Concurrent add/delete.
+    add(1, 1);
+    assertExpectedSingle(1);
+    add(1, 2);
+    add(1, 3);
+    remove();
+    assertExpectedSingle(3);
+}
+
+TEST_F(BottomRemoveTest, BottomRemoveNoUnderflow) {
+    // Test accumulator {$bottom: {output: "$output", sortBy: {sortKey: 1}}}
+    init(boost::none, BSON("sortKey" << 1));
+    testNoRemoveUnderflow();
+}
+
 TEST(Accumulators, Rank) {
     auto expCtx = ExpressionContextForTest{};
-    assertExpectedResults<AccumulatorRank>(
+    auto accInit = [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+        return AccumulatorRank::create(expCtx, true /* isAscending */);
+    };
+    assertExpectedResults(
         &expCtx,
         {
             // Document number is correct.
@@ -358,12 +1710,16 @@ TEST(Accumulators, Rank) {
             {{Value{}, Value{}}, Value(1)},
 
         },
+        accInit,
         true /* rank can't be merged */);
 }
 
 TEST(Accumulators, DenseRank) {
     auto expCtx = ExpressionContextForTest{};
-    assertExpectedResults<AccumulatorDenseRank>(
+    auto accInit = [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+        return AccumulatorDenseRank::create(expCtx, true /* isAscending */);
+    };
+    assertExpectedResults(
         &expCtx,
         {
             // Document number is correct.
@@ -378,12 +1734,16 @@ TEST(Accumulators, DenseRank) {
             {{Value(1), Value(1), Value(1), Value(3), Value(3), Value(7)}, Value(3)},
 
         },
+        accInit,
         true /* denseRank can't be merged */);
 }
 
 TEST(Accumulators, DocumentNumberRank) {
     auto expCtx = ExpressionContextForTest{};
-    assertExpectedResults<AccumulatorDocumentNumber>(
+    auto accInit = [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+        return AccumulatorDocumentNumber::create(expCtx, true /* isAscending */);
+    };
+    assertExpectedResults(
         &expCtx,
         {
             // Document number is correct.
@@ -397,6 +1757,7 @@ TEST(Accumulators, DocumentNumberRank) {
             {{Value(1), Value(1), Value(1), Value(3), Value(3), Value(7)}, Value(6)},
 
         },
+        accInit,
         true /* denseRank can't be merged */);
 }
 
@@ -490,11 +1851,21 @@ TEST(Accumulators, CovarianceEdgeCases) {
         Value(std::vector<Value>({Value(0), Value(1)})),
     };
 
-    const std::vector<Value> nanPoints = {
-        Value(std::vector<Value>({Value(numeric_limits<double>::quiet_NaN()),
-                                  Value(numeric_limits<double>::quiet_NaN())})),
-        Value(std::vector<Value>({Value(numeric_limits<double>::quiet_NaN()),
-                                  Value(numeric_limits<double>::quiet_NaN())})),
+    // This is actually an "undefined" case because NaN/Inf is not counted.
+    const std::vector<Value> nonFiniteOnly = {
+        Value(std::vector<Value>({Value(std::numeric_limits<double>::quiet_NaN()),
+                                  Value(std::numeric_limits<double>::quiet_NaN())})),
+        Value(std::vector<Value>({Value(std::numeric_limits<double>::infinity()),
+                                  Value(std::numeric_limits<double>::infinity())})),
+    };
+
+    const std::vector<Value> mixedPoints = {
+        Value(std::vector<Value>({Value(std::numeric_limits<double>::quiet_NaN()),
+                                  Value(std::numeric_limits<double>::quiet_NaN())})),
+        Value(std::vector<Value>({Value(std::numeric_limits<double>::infinity()),
+                                  Value(std::numeric_limits<double>::infinity())})),
+        Value(std::vector<Value>({Value(0), Value(1)})),
+        Value(std::vector<Value>({Value(1), Value(2)})),
     };
 
     assertExpectedResults<AccumulatorCovariancePop>(
@@ -502,7 +1873,8 @@ TEST(Accumulators, CovarianceEdgeCases) {
         {
             {{}, Value(BSONNULL)},
             {singlePoint, Value(0.0)},
-            {nanPoints, Value(numeric_limits<double>::quiet_NaN())},
+            {nonFiniteOnly, Value(BSONNULL)},
+            {mixedPoints, Value(std::numeric_limits<double>::quiet_NaN())},
         },
         true /* Covariance accumulator can't be merged */);
 
@@ -511,7 +1883,8 @@ TEST(Accumulators, CovarianceEdgeCases) {
         {
             {{}, Value(BSONNULL)},
             {singlePoint, Value(BSONNULL)},
-            {nanPoints, Value(numeric_limits<double>::quiet_NaN())},
+            {nonFiniteOnly, Value(BSONNULL)},
+            {mixedPoints, Value(std::numeric_limits<double>::quiet_NaN())},
         },
         true /* Covariance accumulator can't be merged */);
 }
@@ -572,6 +1945,215 @@ TEST(Accumulators, CovarianceWithRandomVariables) {
     assertCovariance<AccumulatorCovarianceSamp>(&expCtx, randomVariables, boost::none);
 }
 
+Value parseAndSerializeAccumExpr(
+    const BSONObj& obj,
+    std::function<boost::intrusive_ptr<Expression>(
+        ExpressionContext* expCtx, BSONElement, const VariablesParseState&)> func) {
+    SerializationOptions options = SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST;
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    auto expr = func(expCtx.get(), obj.firstElement(), expCtx->variablesParseState);
+    return expr->serialize(options);
+}
+
+Document parseAndSerializeAccum(
+    const BSONElement elem,
+    std::function<AccumulationExpression(
+        ExpressionContext* const expCtx, BSONElement, VariablesParseState)> func) {
+    SerializationOptions options = SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST;
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    VariablesParseState vps = expCtx->variablesParseState;
+
+    auto expr = func(expCtx.get(), elem, vps);
+    auto accum = expr.factory();
+    return accum->serialize(expr.initializer, expr.argument, options);
+}
+
+Document parseAndSerializeAccumRepresentative(
+    const BSONElement elem,
+    std::function<AccumulationExpression(
+        ExpressionContext* const expCtx, BSONElement, VariablesParseState)> func) {
+    SerializationOptions options = SerializationOptions::kRepresentativeQueryShapeSerializeOptions;
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    VariablesParseState vps = expCtx->variablesParseState;
+
+    auto expr = func(expCtx.get(), elem, vps);
+    auto accum = expr.factory();
+    return accum->serialize(expr.initializer, expr.argument, options);
+}
+
+TEST(Accumulators, SerializeWithRedaction) {
+    auto jsReduce =
+        BSON("$accumulator" << BSON("init"
+                                    << "function() {}"
+                                    << "accumulateArgs"
+                                    << BSON_ARRAY("$a"
+                                                  << "$b")
+                                    << "accumulate"
+                                    << "function(state, str1, str2) {return str1 + str2;}"
+                                    << "merge"
+                                    << "function(s1, s2) {return s1 || s2;}"
+                                    << "lang"
+                                    << "js"));
+    auto actual = parseAndSerializeAccum(jsReduce.firstElement(), &AccumulatorJs::parse);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({
+            "$accumulator": {
+                "init": "?string",
+                "initArgs": "[]",
+                "accumulate": "?string",
+                "accumulateArgs": [
+                    "$HASH<a>",
+                    "$HASH<b>"
+                ],
+                "merge": "?string",
+                "lang": "js"
+            }
+        })",
+        actual);
+
+    auto topN = BSON("$topN" << BSON("n" << 3 << "output"
+                                         << "$output"
+                                         << "sortBy" << BSON("sortKey" << 1)));
+    actual = parseAndSerializeAccum(
+        topN.firstElement(), &AccumulatorTopBottomN<TopBottomSense::kTop, false>::parseTopBottomN);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({
+            "$topN": {
+                "n": "?number",
+                "output": "$HASH<output>",
+                "sortBy": {
+                    "HASH<sortKey>": 1
+                }
+            }
+        })",
+        actual);
+
+    auto addToSet = BSON("$addToSet" << BSON("a" << 5));
+    actual = parseAndSerializeAccum(addToSet.firstElement(),
+                                    &genericParseSingleExpressionAccumulator<AccumulatorAddToSet>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$addToSet":"?object"})",
+        actual);
+
+    auto sum = BSON("$sum" << BSON_ARRAY(4 << 6));
+    actual = parseAndSerializeAccum(sum.firstElement(),
+                                    &genericParseSingleExpressionAccumulator<AccumulatorSum>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$sum": "?array<?number>"})",
+        actual);
+
+    sum = BSON("$sum" << BSON_ARRAY("$a" << 5 << 3 << BSON("$sum" << BSON_ARRAY(4 << 6))));
+    actual = parseAndSerializeAccum(sum.firstElement(),
+                                    &genericParseSingleExpressionAccumulator<AccumulatorSum>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$sum":["$HASH<a>","?number","?number",{"$sum":"?array<?number>"}]})",
+        actual);
+
+    auto mergeObjs = BSON("$mergeObjects" << BSON_ARRAY("$a" << BSON("b"
+                                                                     << "null")));
+    actual =
+        parseAndSerializeAccum(mergeObjs.firstElement(),
+                               &genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$mergeObjects":["$HASH<a>","?object"]})",
+        actual);
+
+    auto push = BSON("$push" << BSON("$eq" << BSON_ARRAY("$str"
+                                                         << "str2")));
+    actual = parseAndSerializeAccum(push.firstElement(),
+                                    &genericParseSingleExpressionAccumulator<AccumulatorPush>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$push":{"$eq":["$HASH<str>","?string"]}})",
+        actual);
+
+    auto top = BSON("$top" << BSON("output"
+                                   << "$b"
+                                   << "sortBy" << BSON("sales" << 1)));
+    actual = parseAndSerializeAccum(
+        top.firstElement(), &AccumulatorTopBottomN<TopBottomSense::kTop, true>::parseTopBottomN);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({
+            "$top": {
+                "output": "$HASH<b>",
+                "sortBy": {
+                    "HASH<sales>": 1
+                }
+            }
+        })",
+        actual);
+
+    auto max = BSON("$max" << BSON_ARRAY(
+                        "$a" << 2 << 3 << BSON("$max" << BSON_ARRAY(BSON_ARRAY("$b" << 4 << 5)))));
+    actual = parseAndSerializeAccum(max.firstElement(),
+                                    &genericParseSingleExpressionAccumulator<AccumulatorMax>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({
+            "$max": [
+                "$HASH<a>",
+                "?number",
+                "?number",
+                {
+                    "$max": [
+                        [
+                            "$HASH<b>",
+                            "?number",
+                            "?number"
+                        ]
+                    ]
+                }
+            ]
+        })",
+        actual);
+
+    auto internalJsReduce = BSON(
+        "$_internalJsReduce" << BSON("data"
+                                     << "$emits"
+                                     << "eval"
+                                     << "function(key, values) {\n return Array.sum(values);\n"));
+    actual = parseAndSerializeAccum(internalJsReduce.firstElement(),
+                                    &AccumulatorInternalJsReduce::parseInternalJsReduce);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$_internalJsReduce":{"data":"$HASH<emits>","eval":"?string"}})",
+        actual);
+
+    auto concatArrays = BSON("$concatArrays" << BSON_ARRAY(4 << 6));
+    actual = parseAndSerializeAccum(
+        concatArrays.firstElement(),
+        &genericParseSBEUnsupportedSingleExpressionAccumulator<AccumulatorConcatArrays>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$concatArrays": "?array<?number>"})",
+        actual);
+
+    auto setUnion = BSON("$setUnion" << BSON_ARRAY(4 << 6));
+    actual = parseAndSerializeAccum(
+        setUnion.firstElement(),
+        &genericParseSBEUnsupportedSingleExpressionAccumulator<AccumulatorSetUnion>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$setUnion": "?array<?number>"})",
+        actual);
+}
+
+TEST(AccumulatorsToExpression, SerializeWithRedaction) {
+    auto maxN = BSON("$maxN" << BSON("n" << 3 << "input" << BSON_ARRAY(19 << 7 << 28 << 3 << 5)));
+    using Sense = AccumulatorMinMax::Sense;
+    auto actual =
+        parseAndSerializeAccumExpr(maxN, &AccumulatorMinMaxN::parseExpression<Sense::kMax>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$maxN":{"n":"?number","input":"?array<?number>"}})",
+        actual.getDocument());
+
+    auto firstN = BSON("$firstN" << BSON("input"
+                                         << "$sales"
+                                         << "n"
+                                         << "\'string\'"));
+    using FirstLastSense = AccumulatorFirstLastN::Sense;
+    actual = parseAndSerializeAccumExpr(
+        firstN, &AccumulatorFirstLastN::parseExpression<FirstLastSense::kFirst>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$firstN":{"n":"?string","input":"$HASH<sales>"}})",
+        actual.getDocument());
+}
+
 /* ------------------------- AccumulatorMergeObjects -------------------------- */
 
 TEST(AccumulatorMergeObjects, MergingZeroObjectsShouldReturnEmptyDocument) {
@@ -623,4 +2205,270 @@ TEST(AccumulatorMergeObjects, MergingWithEmptyDocumentShouldIgnore) {
     assertExpectedResults<AccumulatorMergeObjects>(&expCtx, {{{first, second}, expected}});
 }
 
+TEST(AccumulatorMergeObjects, RoundTripSerializationLiteral) {
+    auto mergeObjs = BSON("$mergeObjects" << BSON("$literal" << BSON_ARRAY(5 << true)));
+    auto actual = parseAndSerializeAccumRepresentative(
+        mergeObjs.firstElement(),
+        &genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$mergeObjects":{"$const":[2,"or more types"]}})",
+        actual);
+
+    auto roundTrip = parseAndSerializeAccumRepresentative(
+        actual.toBson().firstElement(),
+        &genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
+    ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
+        R"({"$mergeObjects":{"$const":[2,"or more types"]}})",
+        roundTrip);
+}
+
+/* ------------------------- AccumulatorConcatArrays -------------------------- */
+
+TEST(AccumulatorConcatArrays, ConcatArraysRespectsMaxMemoryContraint) {
+    auto expCtx = ExpressionContextForTest{};
+    const int maxMemoryBytes = 20ull;
+    auto concatArrays = AccumulatorConcatArrays(&expCtx, maxMemoryBytes);
+    ASSERT_THROWS_CODE(concatArrays.process(
+                           Value(std::vector<Value>{Value("A somewhat long string"_sd),
+                                                    Value("Another somewhat long string"_sd),
+                                                    Value("Yet another somewhat long string!"_sd)}),
+                           false),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST(AccumulatorConcatArrays, ConcatArraysRefusesNonArrayValue) {
+    auto expCtx = ExpressionContextForTest{};
+    auto concatArrays = AccumulatorConcatArrays(&expCtx);
+
+    // $concatArrays should error if it encounters a non-array
+    const std::vector<Value> nonArrayValues = {Value("A string"_sd), Value(1), Value(BSONNULL)};
+    for (auto& val : nonArrayValues) {
+        ASSERT_THROWS_CODE(
+            concatArrays.process(val, false), AssertionException, ErrorCodes::TypeMismatch);
+    }
+}
+
+TEST(AccumulatorConcatArrays, ConcatArraysBasicCases) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // $concatArrays with a single array should produce the same array
+    const std::vector<Value> singleDocument = {
+        Value(std::vector<Value>({Value(1), Value(2), Value(3)}))};
+    const std::vector<Value> singleDocumentExpect = {Value(1), Value(2), Value(3)};
+
+    // $concatArrays with multiple arrays should produce a single array.
+    const std::vector<Value> multipleDocuments = {
+        Value(std::vector<Value>({Value(1), Value(2)})),
+        Value(std::vector<Value>({Value(3), Value(4)})),
+        Value(std::vector<Value>(
+            {Value(std::vector<Value>({Value(5)})), Value(std::vector<Value>({}))})),
+    };
+    const std::vector<Value> multipleDocumentsExpect = {Value(1),
+                                                        Value(2),
+                                                        Value(3),
+                                                        Value(4),
+                                                        Value(std::vector<Value>({Value(5)})),
+                                                        Value(std::vector<Value>({}))};
+
+    assertExpectedResults<AccumulatorConcatArrays>(
+        &expCtx,
+        {{{}, Value(std::vector<Value>({}))},
+         {singleDocument, Value(singleDocumentExpect)},
+         {multipleDocuments, Value(std::vector<Value>(multipleDocumentsExpect))}});
+}
+
+TEST(AccumulatorConcatArrays, ConcatenatingMultipleArraysShouldPreserveOrder) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // Concatenating two or more arrays should preserve the order of elements in each array and
+    // concatenate the arrays in order documents are encountered (i.e. will preserve sort order).
+    const std::vector<Value> values = {
+        Value(std::vector<Value>({Value(1), Value(2)})),
+        Value(std::vector<Value>({Value(3), Value(4)})),
+    };
+
+    const std::vector<Value> expected = {Value(1), Value(2), Value(3), Value(4)};
+
+    assertExpectedResults<AccumulatorConcatArrays>(&expCtx, {{values, Value{expected}}});
+}
+
+TEST(AccumulatorConcatArrays, DoubleNestedArraysShouldReturnNestedArrays) {
+    auto expCtx = ExpressionContextForTest{};
+
+    std::vector<Value> values = {
+        Value(std::vector<Value>({
+            Value(std::vector<Value>({Value("In a double nested array"_sd)})),
+            Value(std::vector<Value>({Value("Also in a double nested array"_sd)})),
+        })),
+        Value(std::vector<Value>({Value("Only singly nested"_sd)})),
+        Value(std::vector<Value>({Value(std::vector<Value>({Value(1), Value(2)}))}))};
+
+    std::vector<Value> expected = {
+        Value(std::vector<Value>({Value("In a double nested array"_sd)})),
+        Value(std::vector<Value>({Value("Also in a double nested array"_sd)})),
+        Value("Only singly nested"_sd),
+        Value(std::vector<Value>({Value(1), Value(2)}))};
+
+    assertExpectedResults<AccumulatorConcatArrays>(&expCtx, {{values, Value{expected}}});
+}
+
+TEST(AccumulatorConcatArrays, AllowsDuplicates) {
+    auto expCtx = ExpressionContextForTest{};
+
+    std::vector<Value> values = {
+        Value(std::vector<Value>({Value(1), Value(1)})),
+        Value(std::vector<Value>({Value(2), Value(3)})),
+        Value(std::vector<Value>({Value(1), Value(1)})),
+    };
+
+    std::vector<Value> expected = {Value(1), Value(1), Value(2), Value(3), Value(1), Value(1)};
+
+    assertExpectedResults<AccumulatorConcatArrays>(&expCtx, {{values, Value{expected}}});
+}
+
+/* ------------------------- AccumulatorSetUnion -------------------------- */
+
+static void assertSetUnionResults(
+    ExpressionContext* const expCtx,
+    std::initializer_list<std::pair<std::vector<Value>, Value>> operations) {
+    auto initializeAccumulator =
+        [&](ExpressionContext* const expCtx) -> boost::intrusive_ptr<AccumulatorState> {
+        auto accum = AccumulatorSetUnion::create(expCtx);
+        return accum;
+    };
+    assertExpectedResults(expCtx,
+                          OperationsType(operations),
+                          initializeAccumulator,
+                          false /*skipMerging*/,
+                          true /*ignoreArrayOrdering*/);
+}
+
+TEST(AccumulatorSetUnion, SetUnionRespectsMaxMemoryContraint) {
+    auto expCtx = ExpressionContextForTest{};
+    const int maxMemoryBytes = 20ull;
+    auto setUnion = AccumulatorSetUnion(&expCtx, maxMemoryBytes);
+    ASSERT_THROWS_CODE(
+        setUnion.process(Value(std::vector<Value>{Value("A somewhat long string"_sd),
+                                                  Value("Another somwhat long string"_sd),
+                                                  Value("Yet another somewhat long string!"_sd)}),
+                         false),
+        AssertionException,
+        ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST(AccumulatorSetUnion, SetUnionRefusesNonArrayValue) {
+    auto expCtx = ExpressionContextForTest{};
+    auto setUnion = AccumulatorSetUnion(&expCtx);
+
+    // $setUnion should error if it encounters a non-array value.
+    const std::vector<Value> nonArrayValues = {Value("A string"_sd), Value(1), Value(BSONNULL)};
+    for (auto& val : nonArrayValues) {
+        ASSERT_THROWS_CODE(
+            setUnion.process(val, false), AssertionException, ErrorCodes::TypeMismatch);
+    }
+}
+
+TEST(AccumulatorSetUnion, SetUnionRespectsCollation) {
+    auto expCtx = ExpressionContextForTest{};
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    expCtx.setCollator(std::move(collator));
+
+    std::vector<Value> values = {
+        Value(std::vector<Value>({Value("a"_sd), Value("b"_sd), Value("c"_sd)})),
+        Value(std::vector<Value>({Value("d"_sd)}))};
+    std::vector<Value> expected = {Value("a"_sd)};
+
+    assertSetUnionResults(&expCtx, {{values, Value(expected)}});
+}
+
+TEST(AccumulatorSetUnion, SetUnionBasicCases) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // $setUnion with a single array containing no duplicate values should produce the same array.
+    const std::vector<Value> singleDocument = {
+        Value(std::vector<Value>({Value(1), Value(2), Value(3)}))};
+    const std::vector<Value> singleDocumentExpect = {Value(1), Value(2), Value(3)};
+
+    // $setUnion with multiple arrays of all unique values should produce a single array.
+    const std::vector<Value> multipleDocuments = {
+        Value(std::vector<Value>({Value(4), Value(2)})),
+        Value(std::vector<Value>({Value(3), Value(1)})),
+        Value(std::vector<Value>(
+            {Value(std::vector<Value>({Value(5)})), Value(std::vector<Value>({}))})),
+    };
+    const std::vector<Value> multipleDocumentsExpect = {
+        Value(1),
+        Value(2),
+        Value(3),
+        Value(4),
+        Value(std::vector<Value>({})),
+        Value(std::vector<Value>({Value(5)})),
+    };
+
+    assertSetUnionResults(
+        &expCtx,
+        {{{}, Value(std::vector<Value>({}))},
+         {singleDocument, Value(singleDocumentExpect)},
+         {multipleDocuments, Value(std::vector<Value>(multipleDocumentsExpect))}});
+}
+
+TEST(AccumulatorSetUnion, DoesNotAllowDuplicates) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // $setUnion with a single array containin duplicates should produce the same array, but
+    // deduplicated.
+    const std::vector<Value> singleDocumentWithDuplicates = {
+        Value(std::vector<Value>({Value(1), Value(2), Value(2), Value(3)}))};
+    const std::vector<Value> singleDocumentWithDuplicatesExpect = {Value(1), Value(2), Value(3)};
+
+    // $setUnion with multiple arrays, some of which contain duplicate values should produce a
+    // single array containing no duplicates.
+    const std::vector<Value> multipleDocumentsWithDuplicates = {
+        Value(std::vector<Value>({Value(1), Value(2), Value(2)})),
+        Value(std::vector<Value>({Value(2), Value(3), Value(4), Value(std::vector<Value>({}))})),
+        Value(std::vector<Value>(
+            {Value(std::vector<Value>({Value(5)})), Value(std::vector<Value>({}))})),
+    };
+    const std::vector<Value> multipleDocumentsWithDuplicatesExpect = {
+        Value(1),
+        Value(2),
+        Value(3),
+        Value(4),
+        Value(std::vector<Value>({})),
+        Value(std::vector<Value>({Value(5)})),
+    };
+
+    assertSetUnionResults(
+        &expCtx,
+        {
+            {singleDocumentWithDuplicates, Value(singleDocumentWithDuplicatesExpect)},
+            {multipleDocumentsWithDuplicates,
+             Value(std::vector<Value>(multipleDocumentsWithDuplicatesExpect))},
+        });
+}
+
+TEST(AccumulatorSetUnion, DoubleNestedArraysShouldReturnNestedArrays) {
+    auto expCtx = ExpressionContextForTest{};
+
+    std::vector<Value> values = {
+        Value(std::vector<Value>({
+            Value(std::vector<Value>({Value("In a double nested array"_sd)})),
+            Value(std::vector<Value>({Value("Also in a double nested array"_sd)})),
+        })),
+        Value(std::vector<Value>({Value("Only singly nested"_sd)})),
+        Value(std::vector<Value>({Value(std::vector<Value>({Value(1), Value(2)}))}))};
+
+    std::vector<Value> expected = {
+        Value("Only singly nested"_sd),
+        Value(std::vector<Value>({Value(1), Value(2)})),
+        Value(std::vector<Value>({Value("Also in a double nested array"_sd)})),
+        Value(std::vector<Value>({Value("In a double nested array"_sd)})),
+    };
+
+    assertSetUnionResults(&expCtx, {{values, Value{expected}}});
+}
+
 }  // namespace AccumulatorTests
+}  // namespace mongo

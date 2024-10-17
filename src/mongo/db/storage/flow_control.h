@@ -29,15 +29,25 @@
 
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <memory>
+#include <tuple>
+#include <vector>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/member_data.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_fwd.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -51,9 +61,8 @@ namespace mongo {
  * Otherwise this class' only output is to refresh the tickets available in the
  * `FlowControlTicketholder`.
  */
-class FlowControl : public ServerStatusSection {
+class FlowControl {
 public:
-    class Bypass;
     static constexpr int kMaxTickets = 1000 * 1000 * 1000;
 
     FlowControl(ServiceContext* service, repl::ReplicationCoordinator* replCoord);
@@ -93,24 +102,13 @@ public:
      */
     int getNumTickets(Date_t now);
 
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const;
+
     /**
      * This method is called when replication is reserving `opsApplied` timestamps. `timestamp` is
      * the timestamp in the oplog associated with the first oplog time being reserved.
      */
     void sample(Timestamp timestamp, std::uint64_t opsApplied);
-
-    /**
-     * <ServerStatusSection>
-     */
-    bool includeByDefault() const override {
-        return true;
-    }
-
-    /**
-     * <ServerStatusSection>
-     */
-    BSONObj generateSection(OperationContext* opCtx,
-                            const BSONElement& configElement) const override;
 
     /**
      * Disables flow control until `deadline` is reached.
@@ -132,7 +130,7 @@ public:
                                    double locksPerOp,
                                    std::uint64_t lagMillis,
                                    std::uint64_t thresholdLagMillis);
-    void _trimSamples(const Timestamp trimSamplesTo);
+    void _trimSamples(Timestamp trimSamplesTo);
 
     // Sample of (timestamp, ops, lock acquisitions) where ops and lock acquisitions are
     // observations of the corresponding counter at (roughly) <timestamp>.
@@ -155,7 +153,7 @@ private:
     AtomicWord<std::int64_t> _isLaggedTimeMicros{0};
     AtomicWord<Date_t> _disableUntil;
 
-    mutable Mutex _sampledOpsMutex = MONGO_MAKE_LATCH("FlowControl::_sampledOpsMutex");
+    mutable stdx::mutex _sampledOpsMutex;
     std::deque<Sample> _sampledOpsApplied;
 
     // These values are used in the sampling process.
@@ -173,24 +171,6 @@ private:
     std::uint64_t _startWaitTime = 0;
 
     PeriodicJobAnchor _jobAnchor;
-};
-
-class FlowControl::Bypass {
-    Bypass(const Bypass&) = delete;
-    Bypass& operator=(const Bypass&) = delete;
-
-public:
-    Bypass(OperationContext* opCtx)
-        : _opCtx(opCtx), _origValue(opCtx->shouldParticipateInFlowControl()) {
-        _opCtx->setShouldParticipateInFlowControl(false);
-    }
-    ~Bypass() {
-        _opCtx->setShouldParticipateInFlowControl(_origValue);
-    }
-
-private:
-    OperationContext* _opCtx;
-    bool _origValue;
 };
 
 }  // namespace mongo

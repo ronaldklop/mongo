@@ -29,14 +29,21 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/member_config_gen.h"
 #include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/repl/split_horizon.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
@@ -64,7 +71,6 @@ public:
     using MemberConfigBase::kNewlyAddedFieldName;
     using MemberConfigBase::kPriorityFieldName;
     using MemberConfigBase::kSecondaryDelaySecsFieldName;
-    using MemberConfigBase::kSlaveDelaySecsFieldName;
     using MemberConfigBase::kTagsFieldName;
     using MemberConfigBase::kVotesFieldName;
 
@@ -116,10 +122,10 @@ public:
     }
 
     /**
-     * Gets the horizon name for which the parameters (captured during the first `isMaster`)
+     * Gets the horizon name for which the parameters (captured during the first `hello`)
      * correspond.
      */
-    StringData determineHorizon(const SplitHorizon::Parameters& params) const {
+    std::string determineHorizon(const SplitHorizon::Parameters& params) const {
         return _splitHorizon.determineHorizon(params);
     }
 
@@ -132,17 +138,18 @@ public:
     }
 
     /**
+     * Gets this member's base priority, without considering the 'newlyAdded' field.
+     */
+    double getBasePriority() const {
+        return MemberConfigBase::getPriority();
+    }
+
+    /**
      * Gets the amount of time behind the primary that this member will atempt to
      * remain.  Zero seconds means stay as caught up as possible.
      */
     Seconds getSecondaryDelay() const {
-        if (getSecondaryDelaySecs()) {
-            return Seconds(getSecondaryDelaySecs().get());
-        }
-        if (getSlaveDelaySecs()) {
-            return Seconds(getSlaveDelaySecs().get());
-        }
-        return Seconds(0);
+        return getSecondaryDelaySecs() ? Seconds(getSecondaryDelaySecs().get()) : Seconds(0);
     }
 
     /**
@@ -161,17 +168,17 @@ public:
     }
 
     /**
+     * Returns the number of votes the member has, without considering the 'newlyAdded' field.
+     */
+    int getBaseNumVotes() const {
+        return (getVotes() == 0) ? 0 : 1;
+    }
+
+    /**
      * Returns true if this member is an arbiter (is not data-bearing).
      */
     bool isArbiter() const {
         return getArbiterOnly();
-    }
-
-    /**
-     * Returns true if this member has the field 'slaveDelay'.
-     */
-    bool hasSlaveDelay() const {
-        return getSlaveDelaySecs().has_value();
     }
 
     /**
@@ -194,7 +201,7 @@ public:
     }
 
     /**
-     * Returns true if this member is hidden (not reported by isMaster, not electable).
+     * Returns true if this member is hidden (not reported by "hello", not electable).
      */
     bool isHidden() const {
         return getHidden();
@@ -260,7 +267,7 @@ private:
     // Allow MutableReplSetConfig to modify the newlyAdded field.
     friend class MutableReplSetConfig;
 
-    friend void setNewlyAdded_ForTest(MemberConfig*, boost::optional<bool>);
+    friend void setNewlyAdded_forTest(MemberConfig*, boost::optional<bool>);
 
     /**
      * Constructor used by IDL; does not set up tags because we cannot pass TagConfig through IDL.

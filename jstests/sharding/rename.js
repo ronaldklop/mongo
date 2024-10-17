@@ -1,92 +1,105 @@
-// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
-TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
-
-var s = new ShardingTest({shards: 2, mongos: 1, rs: {oplogSize: 10}});
+var s = new ShardingTest({});
 var db = s.getDB("test");
+assert.commandWorked(s.s0.adminCommand({enablesharding: 'test', primaryShard: s.shard0.shardName}));
 
 assert.commandWorked(db.foo.insert({_id: 1}));
-db.foo.renameCollection('bar');
-assert.isnull(db.getLastError(), '1.0');
+assert.commandWorked(db.foo.renameCollection('bar'));
 assert.eq(db.bar.findOne(), {_id: 1}, '1.1');
 assert.eq(db.bar.count(), 1, '1.2');
 assert.eq(db.foo.count(), 0, '1.3');
 
 assert.commandWorked(db.foo.insert({_id: 2}));
-db.foo.renameCollection('bar', true);
-assert.isnull(db.getLastError(), '2.0');
+assert.commandWorked(db.foo.renameCollection('bar', true));
 assert.eq(db.bar.findOne(), {_id: 2}, '2.1');
 assert.eq(db.bar.count(), 1, '2.2');
 assert.eq(db.foo.count(), 0, '2.3');
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: 'test'}));
-s.ensurePrimaryShard('test', s.shard0.shardName);
-
 assert.commandWorked(
-    s.s0.adminCommand({enablesharding: 'otherDB', primaryShard: s.shard1.shardName}));
+    s.s0.adminCommand({enablesharding: 'otherDBSamePrimary', primaryShard: s.shard0.shardName}));
 
-const DDLFeatureFlagParam = assert.commandWorked(
-    s.configRS.getPrimary().adminCommand({getParameter: 1, featureFlagShardingFullDDLSupport: 1}));
-const isDDLFeatureFlagEnabled = DDLFeatureFlagParam.featureFlagShardingFullDDLSupport.value;
-if (!isDDLFeatureFlagEnabled) {
-    // Ensure renaming to or from a sharded collection fails.
-    jsTest.log('Testing renaming sharded collections');
-    assert.commandWorked(
-        s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
+assert.commandWorked(s.s0.adminCommand(
+    {enablesharding: 'otherDBDifferentPrimary', primaryShard: s.shard1.shardName}));
 
-    // Renaming from a sharded collection
-    assert.commandFailed(db.shardedColl.renameCollection('somethingElse'));
+jsTest.log('Testing renaming sharded collections');
+assert.commandWorked(
+    s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
 
-    // Renaming to a sharded collection
-    assert.commandFailed(db.bar.renameCollection('shardedColl'));
-
-    // Renaming to a sharded collection with dropTarget=true
-    const dropTarget = true;
-    assert.commandFailed(db.bar.renameCollection('shardedColl', dropTarget));
-}
+// Renaming to a sharded collection without dropTarget=true
+assert.commandFailed(db.bar.renameCollection('shardedColl'));
 
 // Renaming unsharded collection to a different db with different primary shard.
-db.unSharded.insert({x: 1});
+let unshardedColl = db['unSharded'];
+
+unshardedColl.insert({x: 1});
 assert.commandFailedWithCode(
-    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherDB.foo'}),
-    // TODO SERVER-54879 just check for ErrorCodes.CommandFailed
-    [ErrorCodes.CommandFailed, 13137],
+    db.adminCommand(
+        {renameCollection: unshardedColl.getFullName(), to: 'otherDBDifferentPrimary.foo'}),
+    [ErrorCodes.CommandFailed],
     "Source and destination collections must be on the same database.");
 
-jsTest.log("Testing that rename operations involving views are not allowed");
+// Renaming unsharded collection to a different db with same primary shard.
+assert.commandWorked(
+    db.adminCommand({renameCollection: unshardedColl.getFullName(), to: 'otherDBSamePrimary.foo'}));
+assert.eq(0, unshardedColl.countDocuments({}));
+assert.eq(1, s.getDB('otherDBSamePrimary').foo.countDocuments({}));
+
+// Rename a collection to itself fails, without loosing data
 {
-    assert.commandWorked(db.collForView.insert({_id: 1}));
-    assert.commandWorked(db.createView('view', 'collForView', []));
+    const sameCollName = 'sameColl';
+    const sameColl = db[sameCollName];
+    assert.commandWorked(sameColl.insert({a: 1}));
 
-    let toAView = db.unsharded.renameCollection('view', true /* dropTarget */);
-    assert.commandFailed(toAView);
+    assert.commandFailedWithCode(sameColl.renameCollection(sameCollName, true /* dropTarget */),
+                                 [ErrorCodes.IllegalOperation]);
 
-    let fromAView = db.view.renameCollection('target');
-    assert.commandFailed(fromAView);
+    assert.eq(1, sameColl.countDocuments({}), "Rename a collection to itself must not loose data");
 }
 
-// Ensure write concern works by shutting down 1 node in a replica set shard
-jsTest.log("Testing write concern (2)");
+{
+    // Create collection on non-primary shard (shard1 for test db) to simulate wrong creation via
+    // direct connection: collection rename should fail since `badcollection` uuids are inconsistent
+    // across shards
+    jsTest.log("Testing uuid consistency across shards");
+    assert.commandWorked(
+        s.shard1.getDB('test').badcollection.insert({_id: 1}));               // direct connection
+    assert.commandWorked(s.s0.getDB('test').badcollection.insert({_id: 1}));  // mongos connection
+    assert.commandFailedWithCode(
+        s.s0.getDB('test').badcollection.renameCollection('goodcollection'),
+        [ErrorCodes.InvalidUUID],
+        "collection rename should fail since test.badcollection uuids are inconsistent across shards");
+    s.shard1.getDB('test').badcollection.drop();
 
-var replTest = s.rs0;
+    // Target collection existing on non-primary shard: rename with `dropTarget=false` must fail
+    jsTest.log(
+        "Testing rename behavior when target collection [wrongly] exists on non-primary shards");
+    assert.commandWorked(
+        s.shard1.getDB('test').superbadcollection.insert({_id: 1}));           // direct connection
+    assert.commandWorked(s.s0.getDB('test').goodcollection.insert({_id: 1}));  // mongos connection
+    assert.commandFailedWithCode(
+        s.s0.getDB('test').goodcollection.renameCollection('superbadcollection', false),
+        [ErrorCodes.NamespaceExists],
+        "Collection rename with `dropTarget=false` must have failed because target collection exists on a non-primary shard");
+    // Target collection existing on non-primary shard: rename with `dropTarget=true` must succeed
+    assert.commandWorked(
+        s.s0.getDB('test').goodcollection.renameCollection('superbadcollection', true));
+}
 
-// Kill any node. Don't care if it's a primary or secondary.
-replTest.stop(0);
+// Renaming of system collections must fail
+{
+    function assertRenameFailed(dbName, fromCollName) {
+        const fromColl = s.s0.getDB(dbName).getCollection(fromCollName);
+        const initDocNum = fromColl.find().itcount();
+        assert.commandFailedWithCode(fromColl.renameCollection('new'), ErrorCodes.IllegalOperation);
+        assert.eq(initDocNum, fromColl.find().itcount());
+    }
 
-// Call getPrimary() to populate replTest._secondaries.
-replTest.getPrimary();
-let liveSecondaries = replTest.getSecondaries().filter(function(node) {
-    return node.host !== replTest.nodes[0].host;
-});
-replTest.awaitSecondaryNodes(null, liveSecondaries);
-awaitRSClientHosts(s.s, replTest.getPrimary(), {ok: true, ismaster: true}, replTest.name);
+    assertRenameFailed('config', 'shards');
+    assertRenameFailed('config', 'inexistent');
 
-assert.commandWorked(db.foo.insert({_id: 4}));
-assert.commandWorked(db.foo.renameCollection('bar', true));
+    assertRenameFailed('admin', 'system.version');
+    assertRenameFailed('admin', 'inexistent');
+}
 
 s.stop();
-})();

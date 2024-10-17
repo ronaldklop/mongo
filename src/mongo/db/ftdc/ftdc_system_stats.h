@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
 
 namespace mongo {
@@ -58,7 +59,7 @@ protected:
 
 
 /**
- * Install a system metrics collector if it exists as a periodic collector.
+ * Install system metrics collectors (if any exist).
  */
 void installSystemMetricsCollector(FTDCController* controller);
 

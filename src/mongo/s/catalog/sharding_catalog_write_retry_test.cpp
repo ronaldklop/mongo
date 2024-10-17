@@ -27,56 +27,76 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 #include <memory>
 #include <set>
 #include <string>
+#include <system_error>
+#include <variant>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/write_concern_error_detail.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/future.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
-using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
-using executor::TaskExecutor;
-using std::set;
 using std::string;
 using std::vector;
-using unittest::assertGet;
 
 using InsertRetryTest = ShardingTestFixture;
 using UpdateRetryTest = ShardingTestFixture;
 
-const NamespaceString kTestNamespace("config.TestColl");
+const NamespaceString kTestNamespace =
+    NamespaceString::createNamespaceString_forTest("config.TestColl");
 const HostAndPort kTestHosts[] = {
     HostAndPort("TestHost1:12345"), HostAndPort("TestHost2:12345"), HostAndPort("TestHost3:12345")};
 
 Status getMockDuplicateKeyError() {
-    return {DuplicateKeyErrorInfo(BSON("mock" << 1), BSON("" << 1)), "Mock duplicate key error"};
+    return {DuplicateKeyErrorInfo(
+                BSON("mock" << 1), BSON("" << 1), BSONObj{}, std::monostate{}, boost::none),
+            "Mock duplicate key error"};
 }
 
 TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
@@ -148,7 +168,7 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
 
 void assertFindRequestHasFilter(const RemoteCommandRequest& request, BSONObj filter) {
     // If there is no '$db', append it.
-    auto cmd = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj).body;
+    auto cmd = static_cast<OpMsgRequest>(request).body;
     auto query = query_request_helper::makeFromFindCommandForTests(cmd);
     ASSERT_BSONOBJ_EQ(filter, query->getFilter());
 }
@@ -277,7 +297,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto insertOp = InsertOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, insertOp.getNamespace());
 
@@ -334,7 +354,7 @@ TEST_F(UpdateRetryTest, Success) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -371,7 +391,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
         onCommand([](const RemoteCommandRequest& request) {
             BSONObjBuilder bb;
             CommandHelpers::appendCommandStatusNoThrow(
-                bb, {ErrorCodes::NotWritablePrimary, "not master"});
+                bb, {ErrorCodes::NotWritablePrimary, "not primary"});
             return bb.obj();
         });
     }
@@ -380,7 +400,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
 }
 
 TEST_F(UpdateRetryTest, NotWritablePrimaryReturnedFromTargeter) {
-    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not master"));
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not primary"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
@@ -406,9 +426,12 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
     HostAndPort host2("TestHost2");
     configTargeter()->setFindHostReturnValue(host1);
 
-    CollectionType collection(
-        NamespaceString("db.coll"), OID::gen(), network()->now(), UUID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
+    CollectionType collection(NamespaceString::createNamespaceString_forTest("db.coll"),
+                              OID::gen(),
+                              Timestamp(1, 1),
+                              network()->now(),
+                              UUID::gen(),
+                              BSON("_id" << 1));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
@@ -434,12 +457,12 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
 
         BSONObjBuilder bb;
         CommandHelpers::appendCommandStatusNoThrow(bb,
-                                                   {ErrorCodes::NotWritablePrimary, "not master"});
+                                                   {ErrorCodes::NotWritablePrimary, "not primary"});
         return bb.obj();
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -473,24 +496,20 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
-
-        auto writeErrDetail = std::make_unique<WriteErrorDetail>();
-        writeErrDetail->setIndex(0);
-        writeErrDetail->setStatus(
-            {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"});
-        response.addToErrDetails(writeErrDetail.release());
+        response.addToErrDetails(write_ops::WriteError(
+            0, {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"}));
 
         return response.toBSON();
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -524,7 +543,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -547,7 +566,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 

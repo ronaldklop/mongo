@@ -26,16 +26,27 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <string>
+#include <utility>
 
-#include "mongo/db/json.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -218,8 +229,8 @@ TEST(InternalSchemaObjectMatchExpression, HasSingleChild) {
 }
 
 DEATH_TEST_REGEX(InternalSchemaObjectMatchExpression,
-                 GetChildFailsIndexGreaterThanZero,
-                 "Invariant failure.*i == 0") {
+                 GetChildFailsIndexGreaterThanOne,
+                 "Tripwire assertion.*6400217") {
     auto query = fromjson(
         "    {a: {$_internalSchemaObjectMatch: {"
         "        c: {$eq: 3}"
@@ -228,7 +239,8 @@ DEATH_TEST_REGEX(InternalSchemaObjectMatchExpression,
     auto objMatch = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(objMatch.getStatus());
 
-    objMatch.getValue()->getChild(1);
+    ASSERT_EQ(objMatch.getValue()->numChildren(), 1);
+    ASSERT_THROWS_CODE(objMatch.getValue()->getChild(1), AssertionException, 6400217);
 }
 
 }  // namespace

@@ -27,15 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/executor/mock_network_fixture.h"
-
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/executor/network_interface_mock.h"
-#include "mongo/logv2/log.h"
+#include "mongo/util/intrusive_counter.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace test {
@@ -43,10 +44,14 @@ namespace mock {
 
 MockNetwork::Matcher::Matcher(const BSONObj& matcherQuery) {
     auto expCtx = make_intrusive<ExpressionContext>(
-        nullptr /* opCtx */, nullptr /* collator */, NamespaceString{"db.coll"} /* dummy nss */);
+        nullptr /* opCtx */,
+        nullptr /* collator */,
+        NamespaceString::createNamespaceString_forTest("db.coll") /* dummy nss */);
     // Expression matcher doesn't have copy constructor, so wrap it in a shared_ptr for capture.
     auto m = std::make_shared<mongo::Matcher>(matcherQuery, std::move(expCtx));
-    _matcherFunc = [=](const BSONObj& request) { return m->matches(request); };
+    _matcherFunc = [=](const BSONObj& request) {
+        return m->matches(request);
+    };
 }
 
 bool MockNetwork::_allExpectationsSatisfied() const {
@@ -55,7 +60,13 @@ bool MockNetwork::_allExpectationsSatisfied() const {
     });
 }
 
-void MockNetwork::_runUntilIdle() {
+void MockNetwork::_logUnsatisfiedExpectations() const {
+    for (const auto& expectation : _expectations) {
+        expectation->logIfUnsatisfied();
+    }
+}
+
+void MockNetwork::runUntilIdle() {
     executor::NetworkInterfaceMock::InNetworkGuard guard(_net);
     do {
         // The main responsibility of the mock network is to host incoming requests and scheduled
@@ -87,6 +98,9 @@ void MockNetwork::_runUntilIdle() {
         if (_net->hasReadyRequests()) {
             // Peek the next request.
             auto noi = _net->getFrontOfUnscheduledQueue();
+            // Requests may have already been scheduled due to simultaneous interruptions.
+            if (_net->isNetworkOperationIteratorAtEnd(noi))
+                continue;
             auto request = noi->getRequest().cmdObj;
 
             // We ignore the next request if it's not expected (or already satisfied).
@@ -119,12 +133,17 @@ void MockNetwork::_runUntilIdle() {
     } while (_net->hasReadyNetworkOperations());
 }
 
-void MockNetwork::runUntilExpectationsSatisfied() {
+void MockNetwork::runUntilExpectationsSatisfied(std::chrono::seconds timeoutSeconds) {
+    Timer timer;
     // If there exist extra threads beside the executor and the mock/test thread, when the
     // network is idle, the extra threads may be running and will schedule new requests. As a
     // result, the current best practice is to busy-loop to prepare for that.
     while (!_allExpectationsSatisfied()) {
-        _runUntilIdle();
+        if (timer.seconds() > timeoutSeconds.count()) {
+            _logUnsatisfiedExpectations();
+            LOGV2_FATAL(9467601, "Still waiting on expectations past the timeout period.");
+        }
+        runUntilIdle();
     }
 }
 
@@ -138,7 +157,7 @@ void MockNetwork::runUntil(Date_t target) {
             _net->runUntil(target);
         }
         // Run until idle.
-        _runUntilIdle();
+        runUntilIdle();
     }
     LOGV2_DEBUG(5015403, 1, "mock reached time", "target"_attr = target);
 }

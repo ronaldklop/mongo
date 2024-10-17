@@ -27,11 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <boost/container_hash/extensions.hpp>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/api_parameters.h"
+#include "mongo/idl/idl_parser.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -61,18 +67,7 @@ APIParameters APIParameters::fromClient(const APIParametersFromClient& apiParams
 
 APIParameters APIParameters::fromBSON(const BSONObj& cmdObj) {
     return APIParameters::fromClient(
-        APIParametersFromClient::parse("APIParametersFromClient"_sd, cmdObj));
-}
-
-void APIParameters::uassertNoApiParameters(const BSONObj& bsonObject) {
-    for (const auto& fieldName :
-         std::vector<StringData>{APIParametersFromClient::kApiVersionFieldName,
-                                 APIParametersFromClient::kApiStrictFieldName,
-                                 APIParametersFromClient::kApiDeprecationErrorsFieldName}) {
-        uassert(4937600,
-                str::stream() << "Cannot pass in API parameter field " << fieldName,
-                !bsonObject.hasField(fieldName));
-    }
+        APIParametersFromClient::parse(IDLParserContext{"APIParametersFromClient"}, cmdObj));
 }
 
 void APIParameters::appendInfo(BSONObjBuilder* builder) const {
@@ -85,6 +80,12 @@ void APIParameters::appendInfo(BSONObjBuilder* builder) const {
     if (_apiDeprecationErrors) {
         builder->append(kAPIDeprecationErrorsFieldName, *_apiDeprecationErrors);
     }
+}
+
+BSONObj APIParameters::toBSON() const {
+    BSONObjBuilder bob;
+    appendInfo(&bob);
+    return bob.obj();
 }
 
 std::size_t APIParameters::Hash::operator()(const APIParameters& params) const {

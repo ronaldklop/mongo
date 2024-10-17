@@ -1,12 +1,18 @@
 // Test that prepared transactions don't block DDL operations on the non-conflicting collections.
-// @tags: [uses_transactions, uses_prepare_transaction]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession,
+//   # prepareTransaction.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions,
+//   uses_prepare_transaction
+// ]
 
-load("jstests/core/txns/libs/prepare_helpers.js");
-const dbName = "prepared_transactions_do_not_block_non_conflicting_ddl";
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+
+const dbName = jsTestName();
 const collName = "transactions_collection";
-const otherDBName = "prepared_transactions_do_not_block_non_conflicting_ddl_other";
+const otherDBName = dbName + "_other";
 const otherCollName = "transactions_collection_other";
 const testDB = db.getSiblingDB(dbName);
 const otherDB = db.getSiblingDB(otherDBName);
@@ -80,4 +86,3 @@ const renameCollectionCmd = {
 testSuccess("admin", renameCollectionCmd);
 
 session.endSession();
-}());

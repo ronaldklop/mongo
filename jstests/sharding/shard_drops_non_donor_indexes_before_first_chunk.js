@@ -1,9 +1,12 @@
 /**
  * Verify that a recipient shard drops indexes that do not exist on the donor shard before
  * receiving its first chunk.
+ * @tags: [
+ *   expects_explicit_underscore_id_index,
+ * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const st = new ShardingTest({shards: 2});
 const dbName = 'test';
 const testDB = st.s.getDB('test');
@@ -11,8 +14,8 @@ const collName = jsTest.name();
 const coll = testDB[collName];
 const nDocs = 100;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: coll.getFullName(), key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: coll.getFullName(), middle: {_id: nDocs / 2}}));
 
@@ -99,4 +102,3 @@ shard1Index = shard1Coll.aggregate(commonIndexPipeline).toArray();
 assert.eq(shard0Index, shard1Index);
 
 st.stop();
-})();

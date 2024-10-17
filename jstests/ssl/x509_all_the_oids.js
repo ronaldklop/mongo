@@ -1,8 +1,5 @@
 // Test X509 auth with all known RDN OIDs.
 
-(function() {
-'use strict';
-
 const SERVER_CERT = 'jstests/libs/server.pem';
 const CA_CERT = 'jstests/libs/ca.pem';
 
@@ -10,11 +7,11 @@ function runTest(conn) {
     const script = 'assert(db.getSiblingDB(\'$external\').auth({mechanism: \'MONGODB-X509\'}));';
     clearRawMongoProgramOutput();
     const exitCode = runMongoProgram('mongo',
-                                     '--ssl',
-                                     '--sslAllowInvalidHostnames',
-                                     '--sslPEMKeyFile',
+                                     '--tls',
+                                     '--tlsAllowInvalidHostnames',
+                                     '--tlsCertificateKeyFile',
                                      'jstests/libs/client-all-the-oids.pem',
-                                     '--sslCAFile',
+                                     '--tlsCAFile',
                                      CA_CERT,
                                      '--port',
                                      conn.port,
@@ -36,11 +33,10 @@ function runTest(conn) {
 // Standalone.
 const mongod = MongoRunner.runMongod({
     auth: '',
-    sslMode: 'requireSSL',
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT,
-    sslAllowInvalidCertificates: '',
+    tlsMode: 'requireTLS',
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT,
+    tlsAllowInvalidCertificates: '',
 });
 runTest(mongod);
 MongoRunner.stopMongod(mongod);
-})();

@@ -39,7 +39,6 @@
 namespace mongo {
 namespace optionenvironment {
 
-using std::shared_ptr;
 using std::string;
 using std::type_info;
 
@@ -387,7 +386,7 @@ void buildYAMLNode(YAML::Emitter& out, const BSONObj& in, bool isMap = true) {
                 out << elem.Long();
                 break;
             case BSONType::NumberDouble:
-                out << elem.Double();
+                out << YAML::Precision(10) << elem.Double();
                 break;
             case BSONType::String:
                 out << elem.String();

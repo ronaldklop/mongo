@@ -2,33 +2,9 @@
  * Loading this file overrides functions on Mongo.prototype so that operations which return a
  * "DatabaseDropPending" error response are automatically retried until they succeed.
  */
-(function() {
-"use strict";
-
 const defaultTimeout = 10 * 60 * 1000;
 
 const mongoRunCommandOriginal = Mongo.prototype.runCommand;
-const mongoRunCommandWithMetadataOriginal = Mongo.prototype.runCommandWithMetadata;
-
-function awaitLatestOperationMajorityConfirmed(primary) {
-    // Get the latest optime from the primary.
-    const replSetStatus = assert.commandWorked(primary.adminCommand({replSetGetStatus: 1}),
-                                               "error getting replication status from primary");
-    const primaryInfo = replSetStatus.members.find(memberInfo => memberInfo.self);
-    assert(primaryInfo !== undefined,
-           "failed to find self in replication status: " + tojson(replSetStatus));
-
-    // Wait for all operations until 'primaryInfo.optime' to be applied by a majority of the
-    // replica set.
-    assert.commandWorked(  //
-        primary.adminCommand({
-            getLastError: 1,
-            w: "majority",
-            wtimeout: defaultTimeout,
-            wOpTime: primaryInfo.optime,
-        }),
-        "error awaiting replication");
-}
 
 function runCommandWithRetries(conn, dbName, commandObj, func, makeFuncArgs) {
     if (typeof commandObj !== "object" || commandObj === null) {
@@ -38,8 +14,7 @@ function runCommandWithRetries(conn, dbName, commandObj, func, makeFuncArgs) {
     // We create a copy of 'commandObj' to avoid mutating the parameter the caller specified.
     // Instead, we use the makeFuncArgs() function to build the array of arguments to 'func' by
     // giving it the 'commandObj' that should be used. This is done to work around the
-    // difference in the order of parameters for the Mongo.prototype.runCommand() and
-    // Mongo.prototype.runCommandWithMetadata() functions.
+    // difference in the order of parameters for the Mongo.prototype.runCommand() function.
     commandObj = Object.assign({}, commandObj);
     const commandName = Object.keys(commandObj)[0];
     let resPrevious;
@@ -84,6 +59,7 @@ function runCommandWithRetries(conn, dbName, commandObj, func, makeFuncArgs) {
                         // operation that were sent to the server by finding the object's
                         // reference (i.e. using strict-equality) in 'originalOps'.
                         for (let upsertInfo of res.upserted) {
+                            /* eslint-disable-next-line */
                             upsertInfo.index = originalOps.indexOf(opsToRetry[upsertInfo.index]);
                         }
 
@@ -130,16 +106,8 @@ function runCommandWithRetries(conn, dbName, commandObj, func, makeFuncArgs) {
                 msg += " " + tojsononeline(commandObj);
             }
 
-            msg += " failed due to the " + dbName + " database being marked as drop-pending." +
-                " Waiting for the latest operation to become majority confirmed before trying" +
-                " again.";
+            msg += " failed due to the " + dbName + " database being marked as drop-pending.";
             print(msg);
-
-            // We wait for the primary's latest operation to become majority confirmed.
-            // However, we may still need to retry more than once because the primary may not
-            // yet have generated the oplog entry for the "dropDatabase" operation while it is
-            // dropping each intermediate collection.
-            awaitLatestOperationMajorityConfirmed(conn);
 
             if (TestData.skipDropDatabaseOnDatabaseDropPending && commandName === "dropDatabase") {
                 // We avoid retrying the "dropDatabase" command when another "dropDatabase"
@@ -166,12 +134,3 @@ Mongo.prototype.runCommand = function(dbName, commandObj, options) {
                                  mongoRunCommandOriginal,
                                  (commandObj) => [dbName, commandObj, options]);
 };
-
-Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs) {
-    return runCommandWithRetries(this,
-                                 dbName,
-                                 commandArgs,
-                                 mongoRunCommandWithMetadataOriginal,
-                                 (commandArgs) => [dbName, metadata, commandArgs]);
-};
-})();

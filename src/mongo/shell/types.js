@@ -44,7 +44,7 @@ Date.prototype.tojson = function() {
         this.getTime();
     } catch (e) {
         if (e instanceof TypeError &&
-            e.message.includes("getTime method called on incompatible Object")) {
+            e.message.includes("Date.prototype.getTime called on incompatible")) {
             return new Date(NaN).tojson();
         }
         throw e;
@@ -73,6 +73,7 @@ Date.prototype.tojson = function() {
         ofs + '")';
 };
 
+// eslint-disable-next-line
 ISODate = function(isoDateStr) {
     if (!isoDateStr)
         return new Date();
@@ -170,7 +171,7 @@ Array.shuffle = function(arr) {
     return arr;
 };
 
-Array.tojson = function(a, indent, nolint, depth) {
+Array.tojson = function(a, indent, nolint, depth, sortKeys) {
     if (!Array.isArray(a)) {
         throw new Error("The first argument to Array.tojson must be an array");
     }
@@ -200,7 +201,7 @@ Array.tojson = function(a, indent, nolint, depth) {
         indent += "\t";
 
     for (var i = 0; i < a.length; i++) {
-        s += indent + tojson(a[i], indent, nolint, depth + 1);
+        s += indent + tojson(a[i], indent, nolint, depth + 1, sortKeys);
         if (i < a.length - 1) {
             s += "," + elementSeparator;
         }
@@ -212,6 +213,14 @@ Array.tojson = function(a, indent, nolint, depth) {
 
     s += elementSeparator + indent + "]";
     return s;
+};
+
+Set.tojson = function(s, indent, nolint, depth) {
+    return Array.tojson(Array.from(s), indent, nolint, depth);
+};
+
+Map.tojson = function(m, indent, nolint, depth) {
+    return Array.tojson(Array.from(m.entries()), indent, nolint, depth);
 };
 
 Array.fetchRefs = function(arr, coll) {
@@ -276,6 +285,8 @@ Object.extend = function(dst, src, deep) {
                 eval("v = " + tojson(v));
             } else if ("floatApprox" in v) {  // convert NumberLong properly
                 eval("v = " + tojson(v));
+            } else if (v.constructor === Date) {  // convert Date properly
+                eval("v = " + tojson(v));
             } else {
                 v = Object.extend(typeof (v.length) == "number" ? [] : {}, v, true);
             }
@@ -288,6 +299,36 @@ Object.extend = function(dst, src, deep) {
 Object.merge = function(dst, src, deep) {
     var clone = Object.extend({}, dst, deep);
     return Object.extend(clone, src, deep);
+};
+
+// If there is a conflict in values of a key for two objects being merged, the second value will
+// override the first one in the merged object
+Object.deepMerge = function(...objects) {
+    const isObject = obj => obj && typeof obj === 'object';
+
+    // Create new object prev to hold combination of all object fields.
+    return objects.reduce((prev, obj) => {
+        if (obj === undefined) {
+            obj = {};
+        }
+        Object.keys(obj).forEach(key => {
+            const pVal = prev[key];  // Get the values for key from the two objects being merged.
+            const oVal = obj[key];
+
+            if (Array.isArray(pVal) &&
+                Array.isArray(oVal)) {  // If both are arrays then concatenate them into a new
+                                        // array and add it to prev.
+                prev[key] = pVal.concat(...oVal);
+            } else if (isObject(pVal) &&
+                       isObject(oVal)) {  // If both are objects then recursively merge again.
+                prev[key] = Object.deepMerge(pVal, oVal);
+            } else {  // In all other cases set prev[key] to obj[key].
+                prev[key] = oVal;
+            }
+        });
+
+        return prev;
+    }, {});
 };
 
 Object.keySet = function(o) {
@@ -395,6 +436,10 @@ if (typeof NumberDecimal !== 'undefined') {
     NumberDecimal.prototype.tojson = function() {
         return this.toString();
     };
+
+    NumberDecimal.prototype.equals = function(other) {
+        return numberDecimalsEqual(this, other);
+    };
 }
 
 // ObjectId
@@ -459,7 +504,7 @@ if (typeof (DBPointer) != "undefined") {
     DBPointer.prototype.fetch = function() {
         assert(this.ns, "need a ns");
         assert(this.id, "need an id");
-        return db[this.ns].findOne({_id: this.id});
+        return globalThis.db[this.ns].findOne({_id: this.id});
     };
 
     DBPointer.prototype.tojson = function(indent) {
@@ -486,7 +531,8 @@ if (typeof (DBRef) != "undefined") {
     DBRef.prototype.fetch = function() {
         assert(this.$ref, "need a ns");
         assert(this.$id, "need an id");
-        var coll = this.$db ? db.getSiblingDB(this.$db).getCollection(this.$ref) : db[this.$ref];
+        var coll = this.$db ? globalThis.db.getSiblingDB(this.$db).getCollection(this.$ref)
+                            : globalThis.db[this.$ref];
         return coll.findOne({_id: this.$id});
     };
 
@@ -534,14 +580,12 @@ if (typeof (BinData) != "undefined") {
     print("warning: no BinData class");
 }
 
-// Map
-if (typeof (Map) == "undefined") {
-    Map = function() {
-        this._data = {};
-    };
-}
+// BSONAwareMap
+BSONAwareMap = function() {
+    this._data = {};
+};
 
-Map.hash = function(val) {
+BSONAwareMap.hash = function(val) {
     if (!val)
         return val;
 
@@ -562,19 +606,19 @@ Map.hash = function(val) {
     throw Error("can't hash : " + typeof (val));
 };
 
-Map.prototype.put = function(key, value) {
+BSONAwareMap.prototype.put = function(key, value) {
     var o = this._get(key);
     var old = o.value;
     o.value = value;
     return old;
 };
 
-Map.prototype.get = function(key) {
+BSONAwareMap.prototype.get = function(key) {
     return this._get(key).value;
 };
 
-Map.prototype._get = function(key) {
-    var h = Map.hash(key);
+BSONAwareMap.prototype._get = function(key) {
+    var h = BSONAwareMap.hash(key);
     var a = this._data[h];
     if (!a) {
         a = [];
@@ -590,7 +634,7 @@ Map.prototype._get = function(key) {
     return o;
 };
 
-Map.prototype.values = function() {
+BSONAwareMap.prototype.values = function() {
     var all = [];
     for (var k in this._data) {
         this._data[k].forEach(function(z) {
@@ -611,7 +655,7 @@ tojsononeline = function(x) {
     return tojson(x, " ", true);
 };
 
-tojson = function(x, indent, nolint, depth) {
+tojson = function(x, indent, nolint, depth, sortKeys) {
     if (x === null)
         return "null";
 
@@ -632,7 +676,7 @@ tojson = function(x, indent, nolint, depth) {
         case "boolean":
             return "" + x;
         case "object": {
-            var s = tojsonObject(x, indent, nolint, depth);
+            var s = tojsonObject(x, indent, nolint, depth, sortKeys);
             if ((nolint == null || nolint == true) && s.length < 80 &&
                 (indent == null || indent.length == 0)) {
                 s = s.replace(/[\t\r\n]+/gm, " ");
@@ -649,7 +693,7 @@ tojson = function(x, indent, nolint, depth) {
 };
 tojson.MAX_DEPTH = 100;
 
-tojsonObject = function(x, indent, nolint, depth) {
+tojsonObject = function(x, indent, nolint, depth, sortKeys) {
     if (typeof depth !== 'number') {
         depth = 0;
     }
@@ -661,12 +705,12 @@ tojsonObject = function(x, indent, nolint, depth) {
         indent = "";
 
     if (typeof (x.tojson) == "function" && x.tojson != tojson) {
-        return x.tojson(indent, nolint, depth);
+        return x.tojson(indent, nolint, depth, sortKeys);
     }
 
     if (x.constructor && typeof (x.constructor.tojson) == "function" &&
         x.constructor.tojson != tojson) {
-        return x.constructor.tojson(x, indent, nolint, depth);
+        return x.constructor.tojson(x, indent, nolint, depth, sortKeys);
     }
 
     if (x instanceof Error) {
@@ -692,8 +736,15 @@ tojsonObject = function(x, indent, nolint, depth) {
     var keys = x;
     if (typeof (x._simpleKeys) == "function")
         keys = x._simpleKeys();
-    var fieldStrings = [];
+    let keyNames = [];
     for (var k in keys) {
+        keyNames.push(k);
+    }
+    if (sortKeys)
+        keyNames.sort();
+
+    var fieldStrings = [];
+    for (const k of keyNames) {
         var val = x[k];
 
         // skip internal DB types to avoid issues with interceptors
@@ -702,7 +753,8 @@ tojsonObject = function(x, indent, nolint, depth) {
         if (typeof DBCollection != 'undefined' && val == DBCollection.prototype)
             continue;
 
-        fieldStrings.push(indent + "\"" + k + "\" : " + tojson(val, indent, nolint, depth + 1));
+        fieldStrings.push(indent + "\"" + k +
+                          "\" : " + tojson(val, indent, nolint, depth + 1, sortKeys));
     }
 
     if (fieldStrings.length > 0) {

@@ -27,18 +27,32 @@
  *    it in the license file.
  */
 
+// IWYU pragma: no_include "cxxabi.h"
+#include <chrono>
+#include <exception>
+#include <future>
+#include <mutex>
+#include <system_error>
+
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/persistent_task_queue.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss = NamespaceString("test", "foo");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test", "foo");
 
 struct TestTask {
     std::string key;
@@ -49,7 +63,7 @@ struct TestTask {
     TestTask(BSONObj bson)
         : key(bson.getField("key").String()), val(bson.getField("value").Int()) {}
 
-    static TestTask parse(IDLParserErrorContext, BSONObj bson) {
+    static TestTask parse(IDLParserContext, BSONObj bson) {
         return TestTask{bson};
     }
 
@@ -69,7 +83,7 @@ void killOps(ServiceContext* serviceCtx) {
     ServiceContext::LockedClientsCursor cursor(serviceCtx);
 
     for (Client* client = cursor.next(); client != nullptr; client = cursor.next()) {
-        stdx::lock_guard<Client> lk(*client);
+        ClientLock lk(client);
         if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk))
             continue;
 
@@ -83,9 +97,10 @@ void killOps(ServiceContext* serviceCtx) {
 class PersistentTaskQueueTest : public ShardServerTestFixture {
     void setUp() override {
         ShardServerTestFixture::setUp();
-        AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
+        AutoGetDb autoDb(operationContext(), kNss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
-        CollectionShardingRuntime::get(operationContext(), kNss)
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(operationContext(),
+                                                                             kNss)
             ->setFilteringMetadata(operationContext(), CollectionMetadata());
     }
 };
@@ -241,8 +256,8 @@ TEST_F(PersistentTaskQueueTest, TestWakeupOnEmptyQueue) {
     auto opCtx = operationContext();
     PersistentTaskQueue<TestTask> q(opCtx, kNss);
 
-    auto result = stdx::async(stdx::launch::async, [&q] {
-        ThreadClient tc("RangeDeletionService", getGlobalServiceContext());
+    auto result = stdx::async(stdx::launch::async, [this, &q] {
+        ThreadClient tc("TestWakeupOnEmptyQueue", getServiceContext()->getService());
         auto opCtx = tc->makeOperationContext();
 
         stdx::this_thread::sleep_for(stdx::chrono::milliseconds(500));
@@ -261,8 +276,8 @@ TEST_F(PersistentTaskQueueTest, TestInterruptedWhileWaitingOnCV) {
 
     unittest::Barrier barrier(2);
 
-    auto result = stdx::async(stdx::launch::async, [opCtx, &q, &barrier] {
-        ThreadClient tc("RangeDeletionService", getGlobalServiceContext());
+    auto result = stdx::async(stdx::launch::async, [this, &q, &barrier] {
+        ThreadClient tc("TestInterruptedWhileWaitingOnCV", getServiceContext()->getService());
         auto opCtx = tc->makeOperationContext();
 
         barrier.countDownAndWait();
@@ -285,13 +300,9 @@ TEST_F(PersistentTaskQueueTest, TestKilledOperationContextWhileWaitingOnCV) {
 
     unittest::Barrier barrier(2);
 
-    auto result = stdx::async(stdx::launch::async, [opCtx, &q, &barrier] {
-        ThreadClient tc("RangeDeletionService", getGlobalServiceContext());
-        {
-            stdx::lock_guard<Client> lk(*tc.get());
-            tc->setSystemOperationKillableByStepdown(lk);
-        }
-
+    auto result = stdx::async(stdx::launch::async, [this, &q, &barrier] {
+        ThreadClient tc("TestKilledOperationContextWhileWaitingOnCV",
+                        getServiceContext()->getService());
         auto opCtx = tc->makeOperationContext();
 
         barrier.countDownAndWait();

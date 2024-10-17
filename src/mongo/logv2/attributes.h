@@ -36,7 +36,9 @@ namespace mongo::logv2::attributes {
 // Reusable attribute names, so they only need to be constructed once.
 const boost::log::attribute_name& domain();
 const boost::log::attribute_name& severity();
+const boost::log::attribute_name& tenant();
 const boost::log::attribute_name& component();
+const boost::log::attribute_name& service();
 const boost::log::attribute_name& timeStamp();
 const boost::log::attribute_name& threadName();
 const boost::log::attribute_name& tags();

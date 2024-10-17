@@ -1,4 +1,4 @@
-/*
+/**
  * This test exercises the "linearizable" readConcern option on a simple sharded cluster.
  * Note that a full linearizable read concern test exists in
  * "replsets/linearizable_read_concern.js". This test exists mainly to affirm that a
@@ -19,27 +19,23 @@
  * document. This test is mainly trying to ensure that system behavior is
  * reasonable when executing linearizable reads in a sharded cluster, so as to
  * exercise possible (invalid) user behavior.
+ * @tags: [
+ *    # TODO (SERVER-88129): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");
-
-(function() {
-"use strict";
-
-// Skip db hash check and shard replication since this test leaves a replica set shard
-// partitioned.
-TestData.skipCheckDBHashes = true;
-TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {shardCollectionWithChunks} from "jstests/libs/write_concern_util.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 var testName = "linearizable_read_concern";
 
 var st = new ShardingTest({
     name: testName,
-    shards: 2,
     other: {rs0: {nodes: 3}, rs1: {nodes: 3}, useBridge: true},
     mongos: 1,
-    config: 1,
+    config: TestData.configShard ? undefined : 1,
     enableBalancer: false
 });
 
@@ -85,7 +81,7 @@ var res = assert.commandFailed(testDB.runReadCommand({
     readConcern: {level: "linearizable"},
     maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
 }));
-assert.eq(res.code, ErrorCodes.NotWritablePrimary);
+assert.eq(res.code, ErrorCodes.doMongosRewrite(st.s, ErrorCodes.NotWritablePrimary));
 
 jsTestLog("Testing linearizable read from primaries.");
 
@@ -124,5 +120,9 @@ var result = testDB.runReadCommand({
 });
 assert.commandFailedWithCode(result, ErrorCodes.MaxTimeMSExpired);
 
+// Reconnect so the config server is available for shutdown hooks and to allow potential write
+// operations triggered by consistency checks.
+secondaries[0].reconnect(primary);
+secondaries[1].reconnect(primary);
+
 st.stop();
-})();

@@ -2,12 +2,8 @@
  * Runs the validate command with {background:true} against all nodes (replica set members and
  * standalone nodes, not sharded clusters) concurrently with running tests.
  */
-
-'use strict';
-
-(function() {
-load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
-load('jstests/libs/parallelTester.js');     // For Thread.
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
 if (typeof db === 'undefined') {
     throw new Error(
@@ -27,7 +23,7 @@ const topology = DiscoverTopology.findConnectedNodes(conn);
 const isIgnorableError = function ignorableError(codeName) {
     if (codeName == "NamespaceNotFound" || codeName == "Interrupted" ||
         codeName == "CommandNotSupportedOnView" || codeName == "InterruptedAtShutdown" ||
-        codeName == "InvalidViewDefinition") {
+        codeName == "InvalidViewDefinition" || codeName == "CommandNotSupported") {
         return true;
     }
     return false;
@@ -74,6 +70,15 @@ const validateCollectionsBackgroundThread = function validateCollectionsBackgrou
         return {ok: 1};
     }
 
+    // Skip fast count validation on nodes using FCBIS since FCBIS can result in inaccurate fast
+    // counts.
+    if (conn.adminCommand({getParameter: 1, initialSyncMethod: 1}).initialSyncMethod ===
+        "fileCopyBased") {
+        print("Skipping fast count validation against test node: " + host +
+              " because it uses FCBIS and fast count is expected to be incorrect.");
+        TestData.skipEnforceFastCountOnValidate = true;
+    }
+
     print("Running background validation on all collections on test node: " + host);
 
     // Save a map of namespace to validate cmd results for any cmds that fail so that we can return
@@ -82,38 +87,50 @@ const validateCollectionsBackgroundThread = function validateCollectionsBackgrou
 
     // Validate all collections in every database.
 
-    const dbNames =
-        assert
-            .commandWorked(conn.adminCommand(
-                {"listDatabases": 1, "nameOnly": true, "$readPreference": {"mode": "nearest"}}))
-            .databases.map(function(z) {
+    const multitenancyRes = conn.adminCommand({getParameter: 1, multitenancySupport: 1});
+    const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
+
+    const cmdObj = multitenancy
+        ? {"listDatabasesForAllTenants": 1, "$readPreference": {"mode": "nearest"}}
+        : {"listDatabases": 1, "nameOnly": true, "$readPreference": {"mode": "nearest"}};
+
+    const dbs = assert.commandWorked(conn.adminCommand(cmdObj)).databases.map(function(z) {
+        return {name: z.name, tenant: z.tenantId};
+    });
+
+    conn.adminCommand({configureFailPoint: "crashOnMultikeyValidateFailure", mode: "alwaysOn"});
+    for (let dbInfo of dbs) {
+        const dbName = dbInfo.name;
+        const token = dbInfo.tenant ? _createTenantToken({tenant: dbInfo.tenant}) : undefined;
+
+        try {
+            conn._setSecurityToken(token);
+            let db = conn.getDB(dbName);
+
+            // TODO (SERVER-25493): Change filter to {type: 'collection'}.
+            const listCollRes = assert.commandWorked(db.runCommand({
+                "listCollections": 1,
+                "nameOnly": true,
+                "filter": {$or: [{type: 'collection'}, {type: {$exists: false}}]},
+                "$readPreference": {"mode": "nearest"},
+            }));
+            const collectionNames = new DBCommandCursor(db, listCollRes).map(function(z) {
                 return z.name;
             });
 
-    conn.adminCommand({configureFailPoint: "crashOnMultikeyValidateFailure", mode: "alwaysOn"});
-    for (let dbName of dbNames) {
-        let db = conn.getDB(dbName);
+            for (let collectionName of collectionNames) {
+                let res = conn.getDB(dbName).getCollection(collectionName).runCommand({
+                    "validate": collectionName,
+                    background: true,
+                    "$readPreference": {"mode": "nearest"}
+                });
 
-        const listCollRes = assert.commandWorked(db.runCommand({
-            "listCollections": 1,
-            "nameOnly": true,
-            "filter": {$or: [{type: 'collection'}, {type: {$exists: false}}]},
-            "$readPreference": {"mode": "nearest"},
-        }));
-        const collectionNames = new DBCommandCursor(db, listCollRes).map(function(z) {
-            return z.name;
-        });
-
-        for (let collectionName of collectionNames) {
-            let res = conn.getDB(dbName).getCollection(collectionName).runCommand({
-                "validate": collectionName,
-                background: true,
-                "$readPreference": {"mode": "nearest"}
-            });
-
-            if ((!res.ok && !isIgnorableErrorFunc(res.codeName)) || (res.valid === false)) {
-                failedValidateResults.push({"ns": dbName + "." + collectionName, "res": res});
+                if ((!res.ok && !isIgnorableErrorFunc(res.codeName)) || (res.valid === false)) {
+                    failedValidateResults.push({"ns": dbName + "." + collectionName, "res": res});
+                }
             }
+        } finally {
+            conn._setSecurityToken(undefined);
         }
     }
     conn.adminCommand({configureFailPoint: "crashOnMultikeyValidateFailure", mode: "off"});
@@ -168,6 +185,7 @@ if (topology.type === Topology.kStandalone) {
         });
 
         if (gatheredErrors.length) {
+            // eslint-disable-next-line
             throw new Error(
                 "Background collection validation was not successful against all replica set " +
                 "members: \n" + tojson(gatheredErrors));
@@ -176,4 +194,3 @@ if (topology.type === Topology.kStandalone) {
 } else {
     throw new Error('Unsupported topology configuration: ' + tojson(topology));
 }
-})();

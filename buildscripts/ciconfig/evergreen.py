@@ -3,35 +3,73 @@
 The API also provides methods to access specific fields present in the mongodb/mongo
 configuration file.
 """
+
 from __future__ import annotations
 
 import datetime
-import distutils.spawn  # pylint: disable=no-name-in-module
+import os
 import re
-from typing import Set
+import shutil
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Set
 
+import structlog
 import yaml
 
-import buildscripts.util.runcommand as runcommand
-
 ENTERPRISE_MODULE_NAME = "enterprise"
+ASAN_SIGNATURE = "detect_leaks=1"
+
+LOGGER = structlog.get_logger(__name__)
 
 
 def parse_evergreen_file(path, evergreen_binary="evergreen"):
     """Read an Evergreen file and return EvergreenProjectConfig instance."""
     if evergreen_binary:
-        if not distutils.spawn.find_executable(evergreen_binary):
-            raise EnvironmentError(
-                "Executable '{}' does not exist or is not in the PATH.".format(evergreen_binary))
+        if not shutil.which(evergreen_binary):
+            # On windows in python3.8 there was an update to no longer use HOME in os.path.expanduser
+            # However, cygwin is weird and has HOME but not USERPROFILE
+            # So we just check if HOME is set and USERPROFILE is not
+            # Then we just set USERPROFILE and unset it after
+            # Bug is here: https://bugs.python.org/issue36264
+
+            prev_environ = os.environ.copy()
+            if sys.platform in ("win32", "cygwin"):
+                LOGGER.info(f"Previous os.environ={os.environ} before updating 'USERPROFILE'")
+                if "HOME" in os.environ:
+                    os.environ["USERPROFILE"] = os.environ["HOME"]
+                else:
+                    LOGGER.warn(
+                        "'HOME' enviorment variable unset. This will likely cause us to be unable to find evergreen binary."
+                    )
+
+            default_evergreen_location = os.path.expanduser(os.path.join("~", "evergreen"))
+
+            # Restore enviorment if it was modified above on windows
+            os.environ.clear()
+            os.environ.update(prev_environ)
+
+            if os.path.exists(default_evergreen_location):
+                evergreen_binary = default_evergreen_location
+            elif os.path.exists(f"{default_evergreen_location}.exe"):
+                evergreen_binary = f"{default_evergreen_location}.exe"
+            else:
+                raise EnvironmentError(
+                    f"Executable {evergreen_binary} (default location: {default_evergreen_location}) does not exist or is not in the PATH. PATH={os.environ.get('PATH')}"
+                )
+        else:
+            evergreen_binary = shutil.which(evergreen_binary)
 
         # Call 'evergreen evaluate path' to pre-process the project configuration file.
-        cmd = runcommand.RunCommand(evergreen_binary)
-        cmd.add("evaluate")
-        cmd.add_file(path)
-        error_code, output = cmd.execute()
-        if error_code:
-            raise RuntimeError("Unable to evaluate {}: {}".format(path, output))
-        config = yaml.safe_load(output)
+        cmd = [evergreen_binary, "evaluate", path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(
+                "Unable to evaluate {}.\nSTDOUT:{}\nSTDERR:{}".format(
+                    path, result.stdout, result.stderr
+                )
+            )
+        config = yaml.safe_load(result.stdout)
     else:
         with open(path, "r") as fstream:
             config = yaml.safe_load(fstream)
@@ -39,7 +77,7 @@ def parse_evergreen_file(path, evergreen_binary="evergreen"):
     return EvergreenProjectConfig(config)
 
 
-class EvergreenProjectConfig(object):  # pylint: disable=too-many-instance-attributes
+class EvergreenProjectConfig(object):
     """Represent an Evergreen project configuration file."""
 
     def __init__(self, conf):
@@ -59,13 +97,14 @@ class EvergreenProjectConfig(object):  # pylint: disable=too-many-instance-attri
         self.distro_names = set()
         for variant in self.variants:
             self.distro_names.update(variant.distro_names)
+        self.functions = self._conf["functions"]
 
     @property
-    def task_names(self):
+    def task_names(self) -> List[str]:
         """Get the list of task names."""
         return list(self._tasks_by_name.keys())
 
-    def get_task(self, task_name):
+    def get_task(self, task_name: str) -> Task:
         """Return the task with the given name as a Task instance."""
         return self._tasks_by_name.get(task_name)
 
@@ -103,6 +142,9 @@ class Task(object):
         """Initialize a Task from a dictionary containing its configuration."""
         self.raw = conf_dict
 
+        # Lazy parse task tags.
+        self._tags = None
+
     @property
     def name(self):
         """Get the task name."""
@@ -113,7 +155,7 @@ class Task(object):
         """Get the list of task names this task depends on."""
         return self.raw.get("depends_on", [])
 
-    def _find_func_command(self, func_command):
+    def find_func_command(self, func_command):
         """Return the 'func_command' if found, or None."""
         for command in self.raw.get("commands", []):
             if command.get("func") == func_command:
@@ -121,45 +163,37 @@ class Task(object):
         return None
 
     @property
-    def generate_resmoke_tasks_command(self):
+    def generate_resmoke_tasks_command(self) -> Optional[Dict[str, Any]]:
         """Return the 'generate resmoke tasks' command if found, or None."""
-        func = self._find_func_command("generate resmoke tasks")
-        return func if func is not None else self._find_func_command(
-            "generate randomized multiversion tasks")
+        return self.find_func_command("generate resmoke tasks")
 
     @property
-    def generate_randomized_multiversion_command(self):
-        """Return the 'generate resmoke tasks' command if found, or None."""
-        return self._find_func_command("generate randomized multiversion tasks")
-
-    @property
-    def is_generate_resmoke_task(self):
+    def is_generate_resmoke_task(self) -> bool:
         """Return True if 'generate resmoke tasks' command is found."""
-        return (self.generate_resmoke_tasks_command is not None
-                or self.generate_randomized_multiversion_command is not None)
+        return self.generate_resmoke_tasks_command is not None
 
     @property
-    def run_tests_command(self):
+    def run_tests_command(self) -> Optional[Dict[str, Any]]:
         """Return the 'run tests' command if found, or None."""
-        return self._find_func_command("run tests")
+        return self.find_func_command("run tests")
 
     @property
-    def is_run_tests_task(self):
+    def is_run_tests_task(self) -> bool:
         """Return True if 'run_tests' command is found."""
         return self.run_tests_command is not None
 
     @property
-    def multiversion_setup_command(self):
-        """Return the 'do multiversion setup' command if found, or None."""
-        return self._find_func_command("do multiversion setup")
+    def initialize_multiversion_tasks_command(self) -> Optional[Dict[str, Any]]:
+        """Return the 'initialize multiversion tasks' command if found, or None."""
+        return self.find_func_command("initialize multiversion tasks")
 
     @property
-    def is_multiversion_task(self):
-        """Return True if a multiversion path is found."""
-        return self.multiversion_setup_command is not None or self.multiversion_path is not None
+    def is_initialize_multiversion_tasks_task(self) -> bool:
+        """Return True if 'initialize multiversion tasks' command is found."""
+        return self.initialize_multiversion_tasks_command is not None
 
     @property
-    def generated_task_name(self):
+    def generated_task_name(self) -> str:
         """
         Get basename of the tasks generated by this _gen task.
 
@@ -170,59 +204,53 @@ class Task(object):
 
         return self.name[:-4]
 
-    def get_vars_suite_name(self, command_vars):
-        """Return the command_vars task or suite value, suite value overrides the task value."""
-        if not isinstance(command_vars, dict):
-            raise TypeError("Must specify a dict")
-
-        suite_name = self.generated_task_name
-        if "suite" in command_vars:
-            suite_name = command_vars["suite"]
-
-        return suite_name
-
-    @property
-    def multiversion_path(self):
-        """Get the multiversion path if task uses multiversion setup, or None."""
+    def get_resmoke_command_vars(self) -> Dict[str, Any]:
+        """Get the vars for either 'generate resmoke tasks' or 'run tests', both eventually call resmoke.py."""
         if self.is_run_tests_task:
-            return self.run_tests_command.get("vars", {}).get("task_path_suffix")
-
+            return self.run_tests_command.get("vars", {})
         if self.is_generate_resmoke_task:
-            return self.generate_resmoke_tasks_command.get("vars", {}).get("use_multiversion")
+            return self.generate_resmoke_tasks_command.get("vars", {})
 
-        return None
+        return {}
 
-    @property
-    def resmoke_args(self):
-        """Get the resmoke_args from 'run tests' function if defined, or None."""
+    def get_suite_names(self) -> List[str]:
+        """Get the names of the resmoke.py suites from the task definition."""
+
+        command_vars = self.get_resmoke_command_vars()
+
         if self.is_run_tests_task:
-            return self.run_tests_command.get("vars", {}).get("resmoke_args")
+            return [command_vars.get("suite", self.name)]
+        if self.is_generate_resmoke_task and not self.is_initialize_multiversion_tasks_task:
+            return [command_vars.get("suite", self.generated_task_name)]
+        if self.is_initialize_multiversion_tasks_task:
+            return [
+                suite for suite in self.initialize_multiversion_tasks_command.get("vars", {}).keys()
+            ]
 
-        if self.is_generate_resmoke_task:
-            command_vars = self.generate_resmoke_tasks_command.get("vars", {})
-            suite_name = self.get_vars_suite_name(command_vars)
-            return "--suites={suite_name} {resmoke_args}".format(
-                suite_name=suite_name, resmoke_args=command_vars.get("resmoke_args"))
-        return None
+        raise ValueError(f"{self.name} task does not run a resmoke.py test suite")
 
     @property
-    def resmoke_suite(self):
-        """Get the --suites option in the resmoke_args of 'run tests' if defined, or None.
+    def suite_to_resmoke_args_map(self) -> Dict[str, str]:
+        """Get the resmoke.py arguments from the task definition."""
+        output = {}
 
-        Raise an exception if the --suites options contains more than one suite name.
-        """
-        args = self.resmoke_args
-        if args:
-            suites = ResmokeArgs.get_arg(args, "suites")
-            if suites and "," in suites:
-                raise RuntimeError("More than one resmoke suite discovered in {}".format(suites))
-            return suites
-        return None
+        for suite_name in self.get_suite_names():
+            resmoke_args = f"--suites={suite_name}"
+
+            more_args = self.get_resmoke_command_vars().get("resmoke_args")
+            if more_args is not None:
+                resmoke_args = f"{resmoke_args} {more_args}"
+
+            output[suite_name] = resmoke_args
+
+        return output
 
     @property
     def tags(self):
         """Get a set of tags this task has been marked with."""
-        return set(self.raw.get("tags", []))
+        if self._tags is None:
+            self._tags = set(self.raw.get("tags", []))
+        return self._tags
 
     def __str__(self):
         return self.name
@@ -263,10 +291,12 @@ class Variant(object):
                 # A task in conf_dict may be a task_group, containing a list of tasks.
                 for task_in_group in task_group_map.get(task_name).tasks:
                     self.tasks.append(
-                        VariantTask(task_map.get(task_in_group), task.get("distros", run_on), self))
+                        VariantTask(task_map.get(task_in_group), task.get("distros", run_on), self)
+                    )
             else:
                 self.tasks.append(
-                    VariantTask(task_map.get(task["name"]), task.get("distros", run_on), self))
+                    VariantTask(task_map.get(task["name"]), task.get("distros", run_on), self)
+                )
         self.distro_names = set(run_on)
         for task in self.tasks:
             self.distro_names.update(task.run_on)
@@ -301,8 +331,9 @@ class Variant(object):
         return modules if modules is not None else []
 
     def is_enterprise_build(self) -> bool:
-        """Determine if this build variant include the enterprise module."""
-        return ENTERPRISE_MODULE_NAME in set(self.modules)
+        """Determine if the build variant is configured for enterprise builds."""
+        pattern = r"--enableEnterpriseTests\s*=?\s*off"
+        return not re.search(pattern, str(self.raw))
 
     @property
     def run_on(self):
@@ -317,7 +348,7 @@ class Variant(object):
 
     def is_required_variant(self) -> bool:
         """Return True if the variant is a required variant."""
-        return self.display_name.startswith("! ")
+        return self.display_name.startswith("!")
 
     def get_task(self, task_name):
         """Return the task with the given name as an instance of VariantTask.
@@ -353,6 +384,29 @@ class Variant(object):
         """Get the value of the num_jobs_available expansion or None if not found."""
         return self.expansion("num_jobs_available")
 
+    def is_asan_build(self) -> bool:
+        """Determine if this task is an ASAN build."""
+        san_options = self.expansion("san_options")
+        if san_options:
+            return ASAN_SIGNATURE in san_options
+        return False
+
+    @property
+    def idle_timeout_factor(self) -> Optional[float]:
+        """Get the value of idle_timeout_factor expansion or None if not found."""
+        factor = self.expansion("idle_timeout_factor")
+        if factor:
+            return float(factor)
+        return None
+
+    @property
+    def exec_timeout_factor(self) -> Optional[float]:
+        """Get the value of exec_timeout_factor expansion or None if not found."""
+        factor = self.expansion("exec_timeout_factor")
+        if factor:
+            return float(factor)
+        return None
+
 
 class VariantTask(Task):
     """Represent a task definition in the context of a build variant."""
@@ -368,80 +422,16 @@ class VariantTask(Task):
         return f"{self.variant}: {self.name}"
 
     @property
-    def combined_resmoke_args(self):
+    def combined_suite_to_resmoke_args_map(self) -> Dict[str, str]:
         """Get the combined resmoke arguments.
 
         This results from the concatenation of the task's resmoke_args parameter and the
         variant's test_flags parameter.
         """
-        resmoke_args = self.resmoke_args
-        test_flags = self.variant.test_flags
-        if resmoke_args is None:
-            return None
-        elif test_flags is None:
-            return self.resmoke_args
-        return "{} {}".format(resmoke_args, test_flags)
-
-
-class ResmokeArgs(object):
-    """ResmokeArgs class."""
-
-    @staticmethod
-    def _arg_regex(name):
-        """Return the regex for a resmoke arg."""
-        return re.compile(r"(?P<name_value>--{}[=\s](?P<value>([(\w+,\w+)\w]+)))".format(name))
-
-    @staticmethod
-    def _arg_regex_inclusive_trailing_whitespace(name):
-        """Return the regex for a resmoke arg, including the trailing whitespace if it exists."""
-        return re.compile(r"(?P<name_value>--{}[=\s](?P<value>([(\w+,\w+)\w]+))\s?)".format(name))
-
-    @staticmethod
-    def _get_first_match(resmoke_args, name, group_name=None, include_trailing_space=False):
-        """Return first matching occurrence and matching group_name, or None."""
-        regex = ResmokeArgs._arg_regex_inclusive_trailing_whitespace(
-            name) if include_trailing_space else ResmokeArgs._arg_regex(name)
-        matches = re.findall(regex, resmoke_args)
-        if not matches:
-            return None
-        if len(matches) > 1:
-            raise RuntimeError("More than one match for --{} discovered in {}".format(
-                name, resmoke_args))
-        return re.search(regex, resmoke_args).group(group_name)
-
-    @staticmethod
-    def get_arg(resmoke_args, name):
-        """Return the value from the first --'name' in the 'resmoke_args' string or None.
-
-        Raise an excpetion in the case there is more than one occurrence of '--name'.
-        """
-        return ResmokeArgs._get_first_match(resmoke_args, name, "value")
-
-    @staticmethod
-    def set_updated_arg(resmoke_args, name, value):
-        """Add or update the 'resmoke_args' string and set the 'value' from the first --'name'.
-
-        Raise an exception in the case there is more than one occurrence of '--name'.
-        """
-        name_value = ResmokeArgs._get_first_match(resmoke_args, name, "name_value")
-        if name_value:
-            new_name_value = "--{}={}".format(name, value)
-            return resmoke_args.replace(name_value, new_name_value)
-        return "{} --{}={}".format(resmoke_args, name, value)
-
-    @staticmethod
-    def remove_arg(resmoke_args: str, name: str):
-        """
-        Remove an arg from the 'resmoke_args' string.
-
-        Raise an exception in the case there is more than one occurrence of '--name'.
-
-        :param resmoke_args: The resmoke args being parsed.
-        :param name: The name of the arg to be removed.
-        :return: New resmoke args with the arg removed.
-        """
-        name_value = ResmokeArgs._get_first_match(resmoke_args, name, "name_value",
-                                                  include_trailing_space=True)
-        if name_value:
-            return resmoke_args.replace(name_value, "")
-        return resmoke_args
+        variant_test_flags = self.variant.test_flags
+        if variant_test_flags is not None:
+            output = {}
+            for suite_name, task_resmoke_args in self.suite_to_resmoke_args_map.items():
+                output[suite_name] = f"{task_resmoke_args} {variant_test_flags}"
+            return output
+        return self.suite_to_resmoke_args_map

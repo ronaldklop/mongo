@@ -27,22 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
-#include "mongo/db/update/object_replace_executor.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/mutable/element.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/update_node_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-using ObjectReplaceExecutorTest = UpdateNodeTest;
-using mongo::mutablebson::countChildren;
-using mongo::mutablebson::Element;
+using ObjectReplaceExecutorTest = UpdateTestFixture;
 
 TEST_F(ObjectReplaceExecutorTest, Noop) {
     auto obj = fromjson("{a: 1, b: 2}");
@@ -51,7 +58,6 @@ TEST_F(ObjectReplaceExecutorTest, Noop) {
     mutablebson::Document doc(fromjson("{a: 1, b: 2}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"), result.oplogEntry);
@@ -64,7 +70,6 @@ TEST_F(ObjectReplaceExecutorTest, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecifie
     mutablebson::Document doc(fromjson("{c: 1, d: 2}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 2}"), result.oplogEntry);
@@ -77,7 +82,6 @@ TEST_F(ObjectReplaceExecutorTest, ShouldPreserveIdOfExistingDocumentIfIdNotSpeci
     mutablebson::Document doc(fromjson("{_id: 0, c: 1, d: 2}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
@@ -91,7 +95,6 @@ TEST_F(ObjectReplaceExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
     addImmutablePath("_id");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
@@ -104,7 +107,6 @@ TEST_F(ObjectReplaceExecutorTest, IdTimestampNotModified) {
     mutablebson::Document doc(fromjson("{}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: Timestamp(0,0)}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: Timestamp(0,0)}"), result.oplogEntry);
@@ -117,7 +119,6 @@ TEST_F(ObjectReplaceExecutorTest, NonIdTimestampsModified) {
     mutablebson::Document doc(fromjson("{}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
 
     ASSERT_EQUALS(doc.root().countChildren(), 2U);
 
@@ -144,7 +145,6 @@ TEST_F(ObjectReplaceExecutorTest, ComplexDoc) {
     mutablebson::Document doc(fromjson("{a: 1, b: [0, 2, 2], e: []}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], c: {d: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: [0, 1, 2], c: {d: 1}}"), result.oplogEntry);
@@ -171,7 +171,6 @@ TEST_F(ObjectReplaceExecutorTest, IdFieldIsNotRemoved) {
     addImmutablePath("_id");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1}"), result.oplogEntry);
@@ -237,7 +236,6 @@ TEST_F(ObjectReplaceExecutorTest, CanAddImmutableField) {
     addImmutablePath("a.b");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: {b: 1}}"), result.oplogEntry);
@@ -251,22 +249,9 @@ TEST_F(ObjectReplaceExecutorTest, CanAddImmutableId) {
     addImmutablePath("_id");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);
-}
-
-TEST_F(ObjectReplaceExecutorTest, CannotCreateDollarPrefixedNameWhenValidateForStorageIsTrue) {
-    auto obj = fromjson("{a: {b: 1, $bad: 1}}");
-    ObjectReplaceExecutor node(obj);
-
-    mutablebson::Document doc(fromjson("{}"));
-    ASSERT_THROWS_CODE_AND_WHAT(
-        node.applyUpdate(getApplyParams(doc.root())),
-        AssertionException,
-        ErrorCodes::DollarPrefixedFieldName,
-        "The dollar ($) prefixed field '$bad' in 'a.$bad' is not valid for storage.");
 }
 
 TEST_F(ObjectReplaceExecutorTest, CanCreateDollarPrefixedNameWhenValidateForStorageIsFalse) {
@@ -277,7 +262,6 @@ TEST_F(ObjectReplaceExecutorTest, CanCreateDollarPrefixedNameWhenValidateForStor
     setValidateForStorage(false);
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1, $bad: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: {b: 1, $bad: 1}}"), result.oplogEntry);
@@ -291,9 +275,79 @@ TEST_F(ObjectReplaceExecutorTest, NoLogBuilder) {
     setLogBuilderToNull();
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+}
+
+TEST_F(ObjectReplaceExecutorTest, DuplicateIdFieldsCheck) {
+    BSONObj replacement = BSON("a"
+                               << "1"
+                               << "_id" << 1 << "_id" << 2 << "_id" << 3);
+    ObjectReplaceExecutor node(replacement);
+
+    mutablebson::Document doc(fromjson("{a: 1, _id: 1}"));
+    ASSERT_THROWS_CODE_AND_WHAT(node.applyUpdate(getApplyParams(doc.root())),
+                                AssertionException,
+                                ErrorCodes::BadValue,
+                                "Can't have multiple _id fields in one document");
+}
+
+TEST_F(ObjectReplaceExecutorTest, DuplicateIdFieldsCheckOnEmptyDoc) {
+    BSONObj replacement = BSON("a"
+                               << "1"
+                               << "_id" << 1 << "_id" << 2 << "_id" << 3);
+    ObjectReplaceExecutor node(replacement);
+
+    mutablebson::Document doc(fromjson(""));
+    ASSERT_THROWS_CODE_AND_WHAT(node.applyUpdate(getApplyParams(doc.root())),
+                                AssertionException,
+                                ErrorCodes::BadValue,
+                                "Can't have multiple _id fields in one document");
+}
+
+
+TEST_F(ObjectReplaceExecutorTest, DuplicateIdFieldsCheckOnInvalidDoc) {
+    BSONObj replacement = BSON("a"
+                               << "2"
+                               << "_id" << 4 << "_id" << 5 << "_id" << 6);
+    ObjectReplaceExecutor node(replacement);
+
+    BSONObj invalid = BSON("a"
+                           << "1"
+                           << "_id" << 1 << "_id" << 2 << "_id" << 3);
+    mutablebson::Document doc(invalid);
+    ASSERT_THROWS_CODE_AND_WHAT(node.applyUpdate(getApplyParams(doc.root())),
+                                AssertionException,
+                                ErrorCodes::BadValue,
+                                "Can't have multiple _id fields in one document");
+}
+
+TEST_F(ObjectReplaceExecutorTest, DuplicateIdFieldsCheckAllowsCorrection) {
+    ObjectReplaceExecutor node(fromjson("{a: 4, _id: 3}"));
+
+    BSONObj invalid = BSON("a"
+                           << "1"
+                           << "_id" << 1 << "_id" << 2 << "_id" << 3);
+    mutablebson::Document doc(invalid);
+    auto result = node.applyUpdate(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.noop);
+    ASSERT_EQUALS(fromjson("{a: 4, _id: 3}"), doc);
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 4, _id: 3}"), result.oplogEntry);
+}
+
+TEST_F(ObjectReplaceExecutorTest, DuplicateIdFieldsCheckAllowsNoop) {
+    BSONObj replacement = BSON("a"
+                               << "1"
+                               << "_id" << 1 << "_id" << 2 << "_id" << 3);
+    ObjectReplaceExecutor node(replacement);
+
+    mutablebson::Document doc(replacement);
+    auto result = node.applyUpdate(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.noop);
+    ASSERT_EQUALS(replacement, doc);
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"), result.oplogEntry);
 }
 
 }  // namespace

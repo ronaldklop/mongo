@@ -1,7 +1,4 @@
 // Test db.auth with password prompt
-(function() {
-'use strict';
-
 // Cannot run on windows because of a workaround for runProgram for Windows.
 if (!_isWindows()) {
     const conn = MongoRunner.runMongod();
@@ -17,14 +14,13 @@ if (!_isWindows()) {
     const mongo = 'mongo';
     const host = conn.host;
     const port = conn.port;
-    const ret = runProgram(
+    runProgram(
         binshell, '-c', `echo password | ${mongo} --host ${host} --port ${port} --eval ${auth}`);
 
     assert.soon(() => {
         const output = rawMongoProgramOutput();
-        return output.includes("Enter password:") && output.includes("Authentication succeeded");
+        return output.includes("Enter password:") && output.includes("Successfully authenticated");
     });
 
     MongoRunner.stopMongod(conn);
 }
-}());

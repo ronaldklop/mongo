@@ -27,22 +27,44 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <memory>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/s/drop_database_coordinator.h"
-#include "mongo/db/s/drop_database_legacy.h"
+#include "mongo/db/s/drop_database_coordinator_document_gen.h"
+#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -56,7 +78,8 @@ public:
                "directly. Drops a database.";
     }
 
-    bool acceptsAnyApiVersionParameters() const override {
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
         return true;
     }
 
@@ -69,45 +92,47 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << Request::kCommandName
-                                  << " must be called with majority writeConcern, got "
-                                  << opCtx->getWriteConcern().wMode,
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
 
-            const auto dbName = request().getDbName();
-
-            const auto useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(
-                serverGlobalParams.featureCompatibility);
-
-            if (!useNewPath) {
-                LOGV2_DEBUG(
-                    5281110, 1, "Running legacy drop database procedure", "db"_attr = dbName);
-                dropDatabaseLegacy(opCtx, dbName);
-                return;
-            }
-
-            LOGV2_DEBUG(5281111, 1, "Running new drop database procedure", "db"_attr = dbName);
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Since this operation is not directly writing locally we need to force its db
             // profile level increase in order to be logged in "<db>.system.profile"
             CurOp::get(opCtx)->raiseDbProfileLevel(
-                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(dbName));
+                DatabaseProfileSettings::get(opCtx->getServiceContext())
+                    .getDatabaseProfileLevel(ns().dbName()));
 
-            auto coordinatorDoc = DropDatabaseCoordinatorDocument();
+            DropDatabaseCoordinatorDocument coordinatorDoc;
             coordinatorDoc.setShardingDDLCoordinatorMetadata(
                 {{ns(), DDLCoordinatorTypeEnum::kDropDatabase}});
             auto service = ShardingDDLCoordinatorService::getService(opCtx);
-            auto dropDatabaseCoordinator = checked_pointer_cast<DropDatabaseCoordinator>(
-                service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+            const auto requestVersion =
+                OperationShardingState::get(opCtx).getDbVersion(ns().dbName());
+            auto dropDatabaseCoordinator = [&]() {
+                while (true) {
+                    auto currentCoordinator = checked_pointer_cast<DropDatabaseCoordinator>(
+                        service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+                    const auto currentDbVersion = currentCoordinator->getDatabaseVersion();
+                    if (currentDbVersion == requestVersion) {
+                        return currentCoordinator;
+                    }
+                    LOGV2_DEBUG(6073000,
+                                2,
+                                "DbVersion mismatch, waiting for existing coordinator to finish",
+                                "requestedVersion"_attr = requestVersion,
+                                "coordinatorVersion"_attr = currentDbVersion);
+                    currentCoordinator->getCompletionFuture().wait(opCtx);
+                }
+            }();
             dropDatabaseCoordinator->getCompletionFuture().get(opCtx);
         }
 
     private:
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -118,11 +143,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} shardsvrDropDatabaseCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrDropDatabaseCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

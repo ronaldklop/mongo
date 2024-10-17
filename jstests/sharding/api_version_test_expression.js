@@ -1,13 +1,11 @@
 /**
  * Tests for ensuring api parameters propegate when pipelines are sent to shards.
  * @tags: [
- * requires_fcv_47,
- * requires_sharding,
- * uses_api_parameters,
+ *   requires_sharding,
+ *   uses_api_parameters,
  * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = jsTestName();
 const collName = "test";
@@ -25,8 +23,7 @@ const namespace = dbName + "." + collName;
 const namespaceForeign = dbName + "." + collForeignName;
 
 /* Shard the collection. */
-assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-assert.commandWorked(admin.runCommand({movePrimary: dbName, to: shards[0]._id}));
+assert.commandWorked(admin.runCommand({enableSharding: dbName, primaryShard: shards[0]._id}));
 assert.commandWorked(admin.runCommand({shardCollection: namespace, key: {a: 1}}));
 
 const coll = mongos.getCollection(namespace);
@@ -113,5 +110,12 @@ assert.commandWorked(db.runCommand({
     apiDeprecationErrors: false,
     apiVersion: "1"
 }));
+
+// Create a view with {apiStrict: true}.
+db.view.drop();
+assert.commandWorked(db.runCommand(
+    {create: "view", viewOn: collName, pipeline: [], apiStrict: true, apiVersion: "1"}));
+// find() on views should work normally if 'apiStrict' is true.
+assert.commandWorked(db.runCommand({find: "view", apiStrict: true, apiVersion: "1"}));
+
 st.stop();
-})();

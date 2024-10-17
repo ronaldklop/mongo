@@ -1,10 +1,9 @@
 /**
  * Tests for the $dateFromString expression with the optional 'onError' parameter.
  */
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");  // For assertErrMsgContains.
+import {assertErrCodeAndErrMsgContains} from "jstests/aggregation/extras/utils.js";
 
 const onErrorValue = ISODate("2017-07-04T11:56:02Z");
 const coll = db.date_from_string_on_error;
@@ -147,6 +146,7 @@ for (let onError of [{}, 5, "Not a date", null, undefined]) {
                 {$project: {date: {$dateFromString: {dateString: "invalid", onError: onError}}}})
             .toArray());
 }
+
 // Test that a missing 'onError' value results in no output field when used within a $project
 // stage.
 assert.eq(
@@ -156,14 +156,14 @@ assert.eq(
         .toArray());
 
 // Test that 'onError' is ignored when the 'format' is invalid.
-assertErrCodeAndErrMsgContains(
-    coll,
-    [{
+let res = coll.runCommand("aggregate", {
+    pipeline: [{
         $project:
             {date: {$dateFromString: {dateString: "4/26/1992", format: 5, onError: onErrorValue}}}
     }],
-    40684,
-    "$dateFromString requires that 'format' be a string");
+    cursor: {}
+});
+assert.commandFailedWithCode(res, 40684);
 
 assertErrCodeAndErrMsgContains(
     coll,
@@ -174,4 +174,3 @@ assertErrCodeAndErrMsgContains(
     }],
     18536,
     "Invalid format character '%n' in format string");
-})();

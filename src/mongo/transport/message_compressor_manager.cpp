@@ -27,20 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
 
-#include "mongo/transport/message_compressor_manager.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/message.h"
+#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/shared_buffer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 namespace {
@@ -95,11 +110,7 @@ StatusWith<Message> MessageCompressorManager::compressMessage(
         return {msg};
     }
 
-    LOGV2_DEBUG(22925,
-                3,
-                "Compressing message with {compressor}",
-                "Compressing message",
-                "compressor"_attr = compressor->getName());
+    LOGV2_DEBUG(22925, 3, "Compressing message", "compressor"_attr = compressor->getName());
 
     auto inputHeader = msg.header();
     size_t bufferSize = compressor->getMaxCompressedSize(msg.dataSize()) +
@@ -111,8 +122,6 @@ StatusWith<Message> MessageCompressorManager::compressMessage(
     if (bufferSize > MaxMessageSizeBytes) {
         LOGV2_DEBUG(22926,
                     3,
-                    "Compressed message would be larger than {MaxMessageSizeBytes}, returning "
-                    "original uncompressed message",
                     "Compressed message would be larger than maximum allowed, returning original "
                     "uncompressed message",
                     "MaxMessageSizeBytes"_attr = MaxMessageSizeBytes);
@@ -161,11 +170,7 @@ StatusWith<Message> MessageCompressorManager::decompressMessage(const Message& m
         *compressorId = compressor->getId();
     }
 
-    LOGV2_DEBUG(22927,
-                3,
-                "Decompressing message with {compressor}",
-                "Decompressing message",
-                "compressor"_attr = compressor->getName());
+    LOGV2_DEBUG(22927, 3, "Decompressing message", "compressor"_attr = compressor->getName());
 
     if (compressionHeader.uncompressedSize < 0) {
         return {ErrorCodes::BadValue, "Decompressed message would be negative in size"};
@@ -215,11 +220,7 @@ void MessageCompressorManager::clientBegin(BSONObjBuilder* output) {
 
     BSONArrayBuilder sub(output->subarrayStart("compression"));
     for (const auto& e : _registry->getCompressorNames()) {
-        LOGV2_DEBUG(22929,
-                    3,
-                    "Offering {compressor} compressor to server",
-                    "Offering compressor to server",
-                    "compressor"_attr = e);
+        LOGV2_DEBUG(22929, 3, "Offering compressor to server", "compressor"_attr = e);
         sub.append(e);
     }
     sub.doneFast();
@@ -247,11 +248,7 @@ void MessageCompressorManager::clientFinish(const BSONObj& input) {
     for (const auto& e : elem.Obj()) {
         auto algoName = e.checkAndGetStringData();
         auto ret = _registry->getCompressor(algoName);
-        LOGV2_DEBUG(22933,
-                    3,
-                    "Adding compressor {compressor}",
-                    "Adding compressor",
-                    "compressor"_attr = ret->getName());
+        LOGV2_DEBUG(22933, 3, "Adding compressor", "compressor"_attr = ret->getName());
         _negotiated.push_back(ret);
     }
 }
@@ -292,18 +289,10 @@ void MessageCompressorManager::serverNegotiate(
         // If the MessageCompressorRegistry knows about a compressor with that name, then it is
         // valid and we add it to our list of negotiated compressors.
         if ((cur = _registry->getCompressor(curName))) {
-            LOGV2_DEBUG(22937,
-                        3,
-                        "{compressor} is supported",
-                        "supported compressor",
-                        "compressor"_attr = cur->getName());
+            LOGV2_DEBUG(22937, 3, "supported compressor", "compressor"_attr = cur->getName());
             _negotiated.push_back(cur);
         } else {  // Otherwise the compressor is not supported and we skip over it.
-            LOGV2_DEBUG(22938,
-                        3,
-                        "{compressor} is not supported",
-                        "compressor is not supported",
-                        "compressor"_attr = curName);
+            LOGV2_DEBUG(22938, 3, "compressor is not supported", "compressor"_attr = curName);
         }
     }
 
@@ -319,8 +308,13 @@ void MessageCompressorManager::serverNegotiate(
     }
 }
 
+const std::vector<MessageCompressorBase*>& MessageCompressorManager::getNegotiatedCompressors()
+    const {
+    return _negotiated;
+}
+
 MessageCompressorManager& MessageCompressorManager::forSession(
-    const transport::SessionHandle& session) {
+    const std::shared_ptr<transport::Session>& session) {
     return getForSession(session.get());
 }
 

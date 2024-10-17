@@ -2,13 +2,12 @@
 // specified in runtimeConstants.
 //
 // Do not run in sharded passthroughs since 'runtimeConstants' is disallowed on mongos.
+// Must also set 'fromMongos: true' as otherwise 'runtimeConstants' is disallowed on mongod.
 // @tags: [
-//   assumes_unsharded_collection,
+//   assumes_against_mongod_not_mongos,
+//   requires_scripting,
 // ]
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');
+import {resultsEq} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.js_emit_with_scope;
 coll.drop();
@@ -49,7 +48,8 @@ let pipeline = [
 
 assert.commandWorked(coll.insert({text: 'wood chuck could chuck wood'}));
 
-let results = coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants}).toArray();
+let results =
+    coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants, fromMongos: true}).toArray();
 assert(resultsEq(results,
                  [
                      {k: "wood", v: weights["wood"]},
@@ -70,7 +70,8 @@ pipeline[0].$project.emits.$_internalJsEmit.eval = function() {
     }
 };
 
-results = coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants}).toArray();
+results =
+    coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants, fromMongos: true}).toArray();
 assert(resultsEq(results,
                  [
                      {k: "wood", v: weights["wood"]},
@@ -84,13 +85,17 @@ assert(resultsEq(results,
 //
 // Test that the jsScope is allowed to have any number of fields.
 //
+/* eslint-disable */
 constants.jsScope.multiplier = 5;
 pipeline[0].$project.emits.$_internalJsEmit.eval = function() {
     for (let word of this.text.split(' ')) {
         emit(word, weights[word] * multiplier);
     }
 };
-results = coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants}).toArray();
+/* eslint-enable */
+
+results =
+    coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants, fromMongos: true}).toArray();
 assert(resultsEq(results,
                  [
                      {k: "wood", v: weights["wood"] * 5},
@@ -106,7 +111,8 @@ pipeline[0].$project.emits.$_internalJsEmit.eval = function() {
         emit(word, 1);
     }
 };
-results = coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants}).toArray();
+results =
+    coll.aggregate(pipeline, {cursor: {}, runtimeConstants: constants, fromMongos: true}).toArray();
 assert(resultsEq(results,
                  [
                      {k: "wood", v: 1},
@@ -121,8 +127,11 @@ assert(resultsEq(results,
 // Test that the command fails if the jsScope is not an object.
 //
 constants.jsScope = "you cant do this";
-assert.commandFailedWithCode(
-    db.runCommand(
-        {aggregate: coll.getName(), pipeline: pipeline, cursor: {}, runtimeConstants: constants}),
-    ErrorCodes.TypeMismatch);
-})();
+assert.commandFailedWithCode(db.runCommand({
+    aggregate: coll.getName(),
+    pipeline: pipeline,
+    cursor: {},
+    runtimeConstants: constants,
+    fromMongos: true
+}),
+                             ErrorCodes.TypeMismatch);

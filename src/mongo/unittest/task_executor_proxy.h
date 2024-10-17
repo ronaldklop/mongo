@@ -29,24 +29,42 @@
 
 #pragma once
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace unittest {
 
 /**
  * Proxy for the executor::TaskExecutor interface used for testing.
+ *
+ * Note that the following calls will affect other proxies that share the underlying executor:
+ * - startup()
+ * - shutdown()
+ * - apperndDiagnosticBSON()
+ * - appendConnectionStats()
+ * - dropConnections()
  */
 class TaskExecutorProxy : public executor::TaskExecutor {
-    TaskExecutorProxy(const TaskExecutorProxy&) = delete;
-    TaskExecutorProxy& operator=(const TaskExecutorProxy&) = delete;
-
 public:
     /**
      * Does not own target executor.
      */
-    TaskExecutorProxy(executor::TaskExecutor* executor);
-    ~TaskExecutorProxy();
+    explicit TaskExecutorProxy(executor::TaskExecutor* executor);
+    ~TaskExecutorProxy() override;
+
+    TaskExecutorProxy(const TaskExecutorProxy&) = delete;
+    TaskExecutorProxy& operator=(const TaskExecutorProxy&) = delete;
 
     executor::TaskExecutor* getExecutor() const;
     void setExecutor(executor::TaskExecutor* executor);
@@ -67,19 +85,20 @@ public:
                                              Date_t deadline) override;
     StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
-        const executor::RemoteCommandRequestOnAny& request,
-        const RemoteCommandOnAnyCallbackFn& cb,
-        const BatonHandle& baton = nullptr) override;
-    StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
-        const executor::RemoteCommandRequestOnAny& request,
-        const RemoteCommandOnAnyCallbackFn& cb,
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
+                                                     const RemoteCommandCallbackFn& cb,
+                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommand(
+        const executor::RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
         const BatonHandle& baton = nullptr) override;
     bool hasTasks() override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
+    void dropConnections(const HostAndPort& hostAndPort) override;
+    void appendNetworkInterfaceStats(BSONObjBuilder&) const override;
 
 private:
     // Not owned by us.

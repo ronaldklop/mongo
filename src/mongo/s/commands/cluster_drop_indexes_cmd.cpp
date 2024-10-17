@@ -27,58 +27,55 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#include <set>
+#include <string>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/drop_indexes_gen.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
 
 constexpr auto kRawFieldName = "raw"_sd;
 
-struct StaleConfigRetryState {
-    std::set<ShardId> shardsWithSuccessResponses;
-    std::vector<AsyncRequestsSender::Response> shardSuccessResponses;
-};
-
-const OperationContext::Decoration<std::unique_ptr<StaleConfigRetryState>> staleConfigRetryState =
-    OperationContext::declareDecoration<std::unique_ptr<StaleConfigRetryState>>();
-
-StaleConfigRetryState createAndRetrieveStateFromStaleConfigRetry(OperationContext* opCtx) {
-    if (!staleConfigRetryState(opCtx)) {
-        staleConfigRetryState(opCtx) = std::make_unique<StaleConfigRetryState>();
-    }
-
-    return *staleConfigRetryState(opCtx);
-}
-
-void updateStateForStaleConfigRetry(OperationContext* opCtx,
-                                    const StaleConfigRetryState& retryState,
-                                    const RawResponsesResult& response) {
-    std::set<ShardId> okShardIds;
-    std::set_union(response.shardsWithSuccessResponses.begin(),
-                   response.shardsWithSuccessResponses.end(),
-                   retryState.shardsWithSuccessResponses.begin(),
-                   retryState.shardsWithSuccessResponses.end(),
-                   std::inserter(okShardIds, okShardIds.begin()));
-
-    staleConfigRetryState(opCtx)->shardsWithSuccessResponses = std::move(okShardIds);
-    staleConfigRetryState(opCtx)->shardSuccessResponses = std::move(response.successResponses);
-}
-
 class DropIndexesCmd : public BasicCommandWithRequestParser<DropIndexesCmd> {
 public:
     using Request = DropIndexes;
     using Reply = DropIndexesReply;
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -90,16 +87,20 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::dropIndex);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::dropIndex)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     void validateResult(const BSONObj& resultObj) final {
-        auto ctx = IDLParserErrorContext("DropIndexesReply");
+        auto ctx = IDLParserContext("DropIndexesReply");
         if (!checkIsErrorStatus(resultObj, ctx)) {
             Reply::parse(ctx, resultObj.removeField(kRawFieldName));
             if (resultObj.hasField(kRawFieldName)) {
@@ -121,67 +122,48 @@ public:
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& dbName,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& output) final {
         auto nss = requestParser.request().getNamespace();
-        LOGV2_DEBUG(22751,
-                    1,
-                    "dropIndexes: {namespace} cmd: {command}",
-                    "CMD: dropIndexes",
-                    "namespace"_attr = nss,
-                    "command"_attr = redact(cmdObj));
 
-        // dropIndexes can be retried on a stale config error. If a previous attempt already
-        // successfully dropped the index on shards, those shards will return an IndexNotFound
-        // error when retried. We instead maintain the record of shards that have already
-        // successfully dropped the index, so that we don't try to contact those shards again
-        // across stale config retries.
-        const auto retryState = createAndRetrieveStateFromStaleConfigRetry(opCtx);
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop indexes in 'config' database in sharded cluster",
+                nss.dbName() != DatabaseName::kConfig);
 
-        // If the collection is sharded, we target only the primary shard and the shards that own
-        // chunks for the collection.
-        auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        auto shardResponses =
-            scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
-                opCtx,
-                nss.db(),
-                nss,
-                routingInfo,
-                retryState.shardsWithSuccessResponses,
-                applyReadWriteConcern(
-                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
-                ReadPreferenceSetting::get(opCtx),
-                Shard::RetryPolicy::kNotIdempotent,
-                BSONObj() /* query */,
-                BSONObj() /* collation */);
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop indexes in 'admin' database in sharded cluster",
+                nss.dbName() != DatabaseName::kAdmin);
 
-        // Append responses we've received from previous retries of this operation due to a stale
-        // config error.
-        shardResponses.insert(shardResponses.end(),
-                              retryState.shardSuccessResponses.begin(),
-                              retryState.shardSuccessResponses.end());
+        LOGV2_DEBUG(22751, 1, "CMD: dropIndexes", logAttrs(nss), "command"_attr = redact(cmdObj));
 
-        std::string errmsg;
-        const auto aggregateResponse =
-            appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses));
+        ShardsvrDropIndexes shardsvrDropIndexCmd(nss);
+        shardsvrDropIndexCmd.setDropIndexesRequest(requestParser.request().getDropIndexesRequest());
+        generic_argument_util::setMajorityWriteConcern(shardsvrDropIndexCmd,
+                                                       &opCtx->getWriteConcern());
 
-        // If we have a stale config error, update the success shards for the upcoming retry.
-        if (!aggregateResponse.responseOK && aggregateResponse.firstStaleConfigError) {
-            updateStateForStaleConfigRetry(opCtx, retryState, aggregateResponse);
-            uassertStatusOK(*aggregateResponse.firstStaleConfigError);
-        }
+        const CachedDatabaseInfo dbInfo =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
 
-        CommandHelpers::appendSimpleCommandStatus(output, aggregateResponse.responseOK, errmsg);
-        return aggregateResponse.responseOK;
+        auto cmdResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+            opCtx,
+            dbName,
+            dbInfo,
+            shardsvrDropIndexCmd.toBSON(),
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            Shard::RetryPolicy::kNotIdempotent);
+
+        const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+        CommandHelpers::filterCommandReplyForPassthrough(remoteResponse.data, &output);
+        return true;
     }
 
     const AuthorizationContract* getAuthorizationContract() const final {
         return &::mongo::DropIndexes::kAuthorizationContract;
     }
-} dropIndexesCmd;
+};
+MONGO_REGISTER_COMMAND(DropIndexesCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

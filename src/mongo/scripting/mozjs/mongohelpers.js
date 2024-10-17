@@ -32,7 +32,7 @@
 
 // The contents of exportToMongoHelpers will be copied into the MongoHelpers object and
 // this dictionary will be removed from the global scope.
-exportToMongoHelpers = {
+globalThis.exportToMongoHelpers = {
     // This function accepts an expression or function body and returns a function definition
     'functionExpressionParser': function functionExpressionParser(fnSrc) {
         // Ensure that a provided expression or function body is not terminated with a ';'.
@@ -76,6 +76,7 @@ exportToMongoHelpers = {
             var lines = fnSrc.split('\n');
             var col = loc.column;
             var fnSrc;
+            var tmpTree;
             var origLine = lines[loc.line - 1];
 
             // The parser has a weird behavior where sometimes if you have an expression like

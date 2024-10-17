@@ -2,13 +2,14 @@
 // Tests that stale mongoses can properly move chunks.
 //
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 var st = new ShardingTest({shards: 2, mongos: 2});
 var admin = st.s0.getDB('admin');
 var testDb = 'test';
 var testNs = 'test.foo';
 
-assert.commandWorked(admin.runCommand({enableSharding: testDb}));
-st.ensurePrimaryShard(testDb, st.shard0.name);
+assert.commandWorked(admin.runCommand({enableSharding: testDb, primaryShard: st.shard0.name}));
 assert.commandWorked(admin.runCommand({shardCollection: testNs, key: {_id: 1}}));
 var curShardIndex = 0;
 

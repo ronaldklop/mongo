@@ -29,8 +29,17 @@
 
 #pragma once
 
+#include <iosfwd>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/platform/basic.h"
 
 namespace mongo {
@@ -113,8 +122,8 @@ public:
     // Append the minimum range of the hash to the builder provided (inclusive)
     void appendHashMin(BSONObjBuilder* builder, const char* fieldName) const;
     // Append the minimum range of the hash to the KeyString provided (inclusive)
-    void appendHashMin(KeyString::Builder* ks) const;
-    void appendHashMin(KeyString::PooledBuilder* ks) const;
+    void appendHashMin(key_string::Builder* ks) const;
+    void appendHashMin(key_string::PooledBuilder* ks) const;
     // Append the maximum range of the hash to the builder provided (inclusive)
     void appendHashMax(BSONObjBuilder* builder, const char* fieldName) const;
 
@@ -141,10 +150,6 @@ public:
     // closest (in particular, level == kMaxBits is not allowed).
     void appendVertexNeighbors(unsigned level, std::vector<GeoHash>* output) const;
 
-    // public but only for the purpose of testing
-    void unhash_fast(unsigned* x, unsigned* y) const;
-    void unhash_slow(unsigned* x, unsigned* y) const;
-
 private:
     // Create a hash from the provided string.  Used by the std::string and char* cons.
     void initFromString(const char* s);
@@ -169,6 +174,7 @@ private:
 class GeoHashConverter {
 public:
     static double const kMachinePrecision;  // = 1.1e-16
+    static double const kNumBuckets;        // = 4 * 1024 * 1024 * 1024
 
     struct Parameters {
         // How many bits to use for the hash?

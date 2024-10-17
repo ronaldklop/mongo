@@ -29,6 +29,11 @@
 
 #pragma once
 
+#include <js/Class.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/scripting/mozjs/base.h"
 #include "mongo/scripting/mozjs/wraptype.h"
 
 namespace mongo {
@@ -46,7 +51,9 @@ namespace mozjs {
  * JSThread and add our holder in as our JSThread's private member.
  */
 struct JSThreadInfo : public BaseInfo {
-    static void finalize(js::FreeOp* fop, JSObject* obj);
+    enum Slots { JSThreadConfigSlot, JSThreadInfoSlotCount };
+
+    static void finalize(JS::GCContext* gcCtx, JSObject* obj);
 
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(init);
@@ -67,7 +74,8 @@ struct JSThreadInfo : public BaseInfo {
     static const JSFunctionSpec freeFunctions[3];
 
     static const char* const className;
-    static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
+    static const unsigned classFlags =
+        JSCLASS_HAS_RESERVED_SLOTS(JSThreadInfoSlotCount) | BaseInfo::finalizeFlag;
     static const InstallType installType = InstallType::Private;
 };
 

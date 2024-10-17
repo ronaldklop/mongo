@@ -30,12 +30,13 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <map>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -85,9 +86,11 @@ private:
     std::vector<OplogEntry> _flushForQueryPredicate(const BSONObj& queryPredicate);
 
     /**
-     * Extract transaction information from the oplog if any and records them internally.
+     * Extract transaction information from the oplog if any and records them internally. Returns
+     * a list of 'config.transactions' table updates to be flushed if 'entry' has a 'txnNumber'
+     * greater than the currently stored session information.
      */
-    void _updateSessionInfo(const OplogEntry& entry);
+    boost::optional<std::vector<OplogEntry>> _updateSessionInfo(const OplogEntry& entry);
 
     /**
      * Inspects the oplog entry and determines whether this needs to update the session info or

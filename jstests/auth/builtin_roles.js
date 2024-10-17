@@ -6,8 +6,7 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function assertIsBuiltinRole(def, name, expectPrivs = false, expectAuthRest = false) {
     jsTest.log(tojson(def));
@@ -64,6 +63,7 @@ function runTest(mongo) {
         'killCursors',
         'listCollections',
         'listIndexes',
+        'listSearchIndexes',
         'planCacheRead'
     ];
     const kAdminReadPrivs = [
@@ -123,4 +123,3 @@ MongoRunner.stopMongod(mongod);
 const st = new ShardingTest({shards: 1, mongos: 1, config: 1});
 runTest(st.s0);
 st.stop();
-})();

@@ -1,12 +1,11 @@
-// Tests that $merge cannot be used within a $lookup pipeline.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");                     // For assertErrorCode.
-load("jstests/libs/collection_drop_recreate.js");                // For assertDropCollection.
-load("jstests/noPassthrough/libs/server_parameter_helpers.js");  // For setParameterOnAllHosts.
-load("jstests/libs/discover_topology.js");                       // For findNonConfigNodes.
-load("jstests/libs/fixture_helpers.js");                         // For isSharded.
+/**
+ * Tests that $merge cannot be used within a $lookup pipeline.
+ *
+ * @tags: [requires_fcv_51]
+ */
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const kErrorCodeMergeBannedInLookup = 51047;
 const coll = db.merge_in_lookup_not_allowed;
@@ -15,10 +14,11 @@ coll.drop();
 const from = db.merge_in_lookup_not_allowed_from;
 from.drop();
 
-if (FixtureHelpers.isSharded(from)) {
-    setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
-                           "internalQueryAllowShardedLookup",
-                           true);
+// TODO SERVER-82045 remove creation of database once
+// $lookup/$merge behavior will be equal in both standalone and sharded cluster
+if (FixtureHelpers.isMongos(db)) {
+    // Create database
+    assert.commandWorked(db.adminCommand({'enableSharding': db.getName()}));
 }
 
 let pipeline = [
@@ -85,4 +85,3 @@ pipeline = [
 assert.commandFailedWithCode(
     db.runCommand({aggregate: coll.getName(), pipeline: pipeline, cursor: {}}),
     kErrorCodeMergeBannedInLookup);
-}());

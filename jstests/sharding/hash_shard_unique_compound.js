@@ -4,8 +4,7 @@
  * 1. shard collection on hashed "a", ensure unique index {a:1, b:1}
  * 2. reverse order
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({shards: 1, mongos: 1});
 var dbName = "test";
@@ -42,4 +41,3 @@ jsTest.log("------ indexes 2-------");
 jsTest.log(tojson(coll.getIndexes()));
 
 s.stop();
-})();

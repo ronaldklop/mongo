@@ -27,16 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/exec/plan_cache_util.h"
 #include "mongo/db/query/plan_explainer_factory.h"
-
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_explainer_sbe.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo::plan_explainer_factory {
-std::unique_ptr<PlanExplainer> make(PlanStage* root) {
-    return std::make_unique<PlanExplainerImpl>(root);
+
+std::unique_ptr<PlanExplainer> make(PlanStage* root, boost::optional<size_t> cachedPlanHash) {
+    return make(root,
+                cachedPlanHash,
+                QueryPlanner::CostBasedRankerResult{},
+                stage_builder::PlanStageToQsnMap{},
+                {} /* cbrRejectedPlanStages */);
+}
+
+std::unique_ptr<PlanExplainer> make(PlanStage* root,
+                                    boost::optional<size_t> cachedPlanHash,
+                                    QueryPlanner::CostBasedRankerResult cbrResult,
+                                    stage_builder::PlanStageToQsnMap planStageQsnMap,
+                                    std::vector<std::unique_ptr<PlanStage>> cbrRejectedPlanStages) {
+    return std::make_unique<PlanExplainerImpl>(root,
+                                               cachedPlanHash,
+                                               std::move(cbrResult),
+                                               std::move(planStageQsnMap),
+                                               std::move(cbrRejectedPlanStages));
 }
 
 std::unique_ptr<PlanExplainer> make(PlanStage* root, const PlanEnumeratorExplainInfo& explainInfo) {
@@ -54,7 +74,67 @@ std::unique_ptr<PlanExplainer> make(sbe::PlanStage* root,
                                     const QuerySolution* solution,
                                     std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
                                     bool isMultiPlan) {
-    return std::make_unique<PlanExplainerSBE>(
-        root, data, solution, std::move(rejectedCandidates), isMultiPlan);
+    // Pre-compute Debugging info for explain use.
+    auto debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
+        plan_cache_util::buildDebugInfo(solution));
+    return std::make_unique<PlanExplainerSBE>(root,
+                                              data,
+                                              solution,
+                                              std::move(rejectedCandidates),
+                                              isMultiPlan,
+                                              false,       /* isCachedPlan */
+                                              boost::none, /* cachedPlanHash */
+                                              debugInfoSBE);
+}
+
+std::unique_ptr<PlanExplainer> make(
+    sbe::PlanStage* root,
+    const stage_builder::PlanStageData* data,
+    const QuerySolution* solution,
+    std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
+    bool isMultiPlan,
+    bool isFromPlanCache,
+    boost::optional<size_t> cachedPlanHash,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfoSBE,
+    RemoteExplainVector* remoteExplains) {
+    if (!debugInfoSBE) {
+        debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
+            plan_cache_util::buildDebugInfo(solution));
+    }
+    return std::make_unique<PlanExplainerSBE>(root,
+                                              data,
+                                              solution,
+                                              std::move(rejectedCandidates),
+                                              isMultiPlan,
+                                              isFromPlanCache,
+                                              cachedPlanHash,
+                                              debugInfoSBE,
+                                              remoteExplains);
+}
+
+std::unique_ptr<PlanExplainer> make(
+    sbe::PlanStage* root,
+    const stage_builder::PlanStageData* data,
+    const QuerySolution* solution,
+    bool isMultiPlan,
+    bool isFromPlanCache,
+    boost::optional<size_t> cachedPlanHash,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfoSBE,
+    std::unique_ptr<PlanStage> classicRuntimePlannerStage,
+    RemoteExplainVector* remoteExplains) {
+    if (!debugInfoSBE) {
+        debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
+            plan_cache_util::buildDebugInfo(solution));
+    }
+    return std::make_unique<PlanExplainerClassicRuntimePlannerForSBE>(
+        root,
+        data,
+        solution,
+        isMultiPlan,
+        isFromPlanCache,
+        cachedPlanHash,
+        debugInfoSBE,
+        std::move(classicRuntimePlannerStage),
+        remoteExplains);
 }
 }  // namespace mongo::plan_explainer_factory

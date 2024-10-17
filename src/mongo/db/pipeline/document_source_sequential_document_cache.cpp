@@ -27,11 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <list>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
-
-#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/search/document_source_search.h"
 
 namespace mongo {
 
@@ -41,10 +47,18 @@ DocumentSourceSequentialDocumentCache::DocumentSourceSequentialDocumentCache(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, SequentialDocumentCache* cache)
     : DocumentSource(kStageName, expCtx), _cache(cache) {
     invariant(_cache);
-    invariant(!_cache->isAbandoned());
 
     if (_cache->isServing()) {
         _cache->restartIteration();
+    }
+
+    // If SearchMeta was stored, it is now set in the expCtx for future stages of the subpipeline.
+    if (auto searchMetaVal = _cache->getCachedVariableValue(Variables::kSearchMetaId);
+        !searchMetaVal.missing()) {
+        tassert(6381601,
+                "SEARCH_META variable should not have been set in this expCtx yet.",
+                pExpCtx->variables.getValue(Variables::kSearchMetaId).missing());
+        pExpCtx->variables.setReservedValue(Variables::kSearchMetaId, searchMetaVal, true);
     }
 }
 
@@ -71,6 +85,14 @@ DocumentSource::GetNextResult DocumentSourceSequentialDocumentCache::doGetNext()
         if (nextResult.isEOF()) {
             _cache->freeze();
             _cacheIsEOF = true;
+
+            // SearchMeta may be set in the expCtx, and it should be persisted through the cache. If
+            // not persisted, SearchMeta will be missing when it may be needed for future executions
+            // of the pipeline.
+            if (auto searchMetaVal = pExpCtx->variables.getValue(Variables::kSearchMetaId);
+                !searchMetaVal.missing()) {
+                _cache->setCachedVariableValue(Variables::kSearchMetaId, searchMetaVal);
+            }
         } else {
             _cache->add(nextResult.getDocument());
         }
@@ -81,9 +103,10 @@ DocumentSource::GetNextResult DocumentSourceSequentialDocumentCache::doGetNext()
 
 Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    // The DocumentSourceSequentialDocumentCache should always be the last stage in the pipeline
-    // pre-optimization. By the time optimization reaches this point, all preceding stages are in
-    // the final positions which they would have occupied if no cache stage was present.
+    // The DocumentSourceSequentialDocumentCache relies on all other stages in the pipeline being at
+    // the final positions which they would have occupied if no cache stage was present. This should
+    // be the case when we reach this function. The cache should always be the last stage in the
+    // pipeline pre-optimizing.
     invariant(_hasOptimizedPos || std::next(itr) == container->end());
     invariant((*itr).get() == this);
 
@@ -96,7 +119,7 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     _hasOptimizedPos = true;
 
     // If the cache is the only stage in the pipeline, return immediately.
-    if (itr == container->begin()) {
+    if (itr == container->begin() && std::next(itr) == container->end()) {
         return container->end();
     }
 
@@ -118,14 +141,27 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     DepsTracker deps(DepsTracker::kNoMetadata);
 
     // Iterate through the pipeline stages until we find one which cannot be cached.
-    // A stage cannot be cached if it either: 1. depends on a variable defined in this scope, or
-    // 2. generates random numbers.
+    // A stage cannot be cached if it either:
+    //  1. does not support dependency tracking, and may thus require the full object and metadata.
+    //     $search is an exception to rule 1, as it doesn't depend on other stages.
+    //  2. depends on a variable defined in this scope, or
+    //  3. generates random numbers.
+    DocumentSource* lastPtr = nullptr;
+    std::set<Variables::Id> prefixVarRefs;
     for (; prefixSplit != container->end(); ++prefixSplit) {
-        (*prefixSplit)->getDependencies(&deps);
+        (*prefixSplit)->addVariableRefs(&prefixVarRefs);
 
-        if (deps.hasVariableReferenceTo(varIDs) || deps.needRandomGenerator) {
+        bool isNotSearch = ((*prefixSplit)->getSourceName() != DocumentSourceSearch::kStageName);
+        bool doesNotSupportDependencies =
+            ((*prefixSplit)->getDependencies(&deps) == DepsTracker::State::NOT_SUPPORTED);
+
+        if ((isNotSearch && doesNotSupportDependencies) ||
+            ((Variables::hasVariableReferenceTo(prefixVarRefs, varIDs) ||
+              deps.needRandomGenerator))) {
             break;
         }
+
+        lastPtr = prefixSplit->get();
     }
 
     // The 'prefixSplit' iterator is now pointing to the first stage of the correlated suffix. If
@@ -138,6 +174,9 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
 
     // If the cache has been populated and is serving results, remove the non-correlated prefix.
     if (_cache->isServing()) {
+        // Need to dispose last stage to be removed.
+        Pipeline::stitch(container);
+        lastPtr->dispose();
         container->erase(container->begin(), prefixSplit);
     }
 
@@ -146,16 +185,16 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     return container->end();
 }
 
-Value DocumentSourceSequentialDocumentCache::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
+Value DocumentSourceSequentialDocumentCache::serialize(const SerializationOptions& opts) const {
+    if (opts.verbosity) {
         return Value(Document{
             {kStageName,
-             Document{{"maxSizeBytes"_sd, Value(static_cast<long long>(_cache->maxSizeBytes()))},
+             Document{{"maxSizeBytes"_sd,
+                       opts.serializeLiteral(static_cast<long long>(_cache->maxSizeBytes()))},
                       {"status"_sd,
-                       _cache->isBuilding()
-                           ? "kBuilding"_sd
-                           : _cache->isServing() ? "kServing"_sd : "kAbandoned"_sd}}}});
+                       _cache->isBuilding()      ? "kBuilding"_sd
+                           : _cache->isServing() ? "kServing"_sd
+                                                 : "kAbandoned"_sd}}}});
     }
 
     return Value();

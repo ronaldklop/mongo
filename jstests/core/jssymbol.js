@@ -1,6 +1,11 @@
 // Test Symbol.toPrimitive works for DB and BSON objects
 //
-(function() {
+// @tags: [
+//   no_selinux,
+//   # TODO SERVER-77024: Shell collection creation are broken when name is a js property identifier
+//   assumes_no_implicit_collection_creation_on_get_collection
+// ]
+
 // Exercise Symbol.toPrimitive on DB objects
 assert(`${db}` === 'test');
 assert(isNaN(+db));
@@ -12,9 +17,9 @@ assert(db[Symbol.species] != 1);
 assert(db[Symbol.toPrimitive] != 1);
 
 // Exercise Symbol.toPrimitive on BSON objects
-col1 = db.jssymbol_col;
+let col1 = db.jssymbol_col;
 col1.insert({});
-a = db.getCollection("jssymbol_col").getIndexes()[0];
+let a = db.getCollection("jssymbol_col").getIndexes()[0];
 
 assert(isNaN(+a));
 assert(+a.v >= 1);
@@ -28,4 +33,3 @@ assert(db[Symbol.species] != 1);
 assert(db[Symbol.toPrimitive] != 1);
 
 col1.drop();
-})();

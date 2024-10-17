@@ -7,7 +7,7 @@ var storageEngine = "wiredTiger";
 var dbFileMatcher = /(collection|index)-.+\.wt$/;
 
 // Set up helper functions.
-assertDocumentCount = function(db, count) {
+let assertDocumentCount = function(db, count) {
     assert.eq(count,
               db[baseName].count(),
               'Expected ' + count + ' documents in ' + db._name + '.' + baseName + '. ' +
@@ -19,6 +19,11 @@ assertDocumentCount = function(db, count) {
  * deleted. MongoDB does not always delete data immediately with a catalog change.
  */
 const waitForDatabaseDirectoryRemoval = function(dbName, dbDirPath) {
+    // The periodic task to drop data tables for two-phase commit runs once per second and
+    // in standalone mode, without timestamps, can execute table drops immediately. It should
+    // only take a couple seconds for the periodic task to start removing any data tables.
+    // However, slow disk access may delay the actual removal of the directory.
+    // Therefore, we should be conservative and use the default timeout in assert.soon().
     assert.soon(
         function() {
             const files = listFiles(dbDirPath).filter(function(path) {
@@ -31,14 +36,13 @@ const waitForDatabaseDirectoryRemoval = function(dbName, dbDirPath) {
             }
         },
         "dbpath contained '" + dbName +
-            "' directory when it should have been removed: " + tojson(listFiles(dbDirPath)),
-        10 * 1000);  // The periodic task to run data table cleanup runs once a second.
+            "' directory when it should have been removed: " + tojson(listFiles(dbDirPath)));
 };
 
 /**
  * Returns the current connection which gets restarted with wiredtiger.
  */
-checkDBFilesInDBDirectory = function(conn, dbToCheck) {
+let checkDBFilesInDBDirectory = function(conn, dbToCheck) {
     MongoRunner.stopMongod(conn);
     conn = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: '', restart: true});
 
@@ -54,9 +58,9 @@ checkDBFilesInDBDirectory = function(conn, dbToCheck) {
         dir = dbpath + Array(22).join('.229.135.166');
     }
 
-    files = listFiles(dir);
+    let files = listFiles(dir);
     var fileCount = 0;
-    for (f in files) {
+    for (let f in files) {
         if (files[f].isDirectory)
             continue;
         fileCount += 1;
@@ -70,13 +74,13 @@ checkDBFilesInDBDirectory = function(conn, dbToCheck) {
 /**
  * Returns the restarted connection with wiredtiger.
  */
-checkDBDirectoryNonexistent = function(conn, dbToCheck) {
+let checkDBDirectoryNonexistent = function(conn, dbToCheck) {
     MongoRunner.stopMongod(conn);
     conn = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: '', restart: true});
 
     var files = listFiles(dbpath);
     // Check that there are no files in the toplevel dbpath.
-    for (f in files) {
+    for (let f in files) {
         if (!files[f].isDirectory) {
             assert(!dbFileMatcher.test(files[f].name),
                    'Database file' + files[f].name +

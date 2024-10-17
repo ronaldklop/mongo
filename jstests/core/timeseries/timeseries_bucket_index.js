@@ -2,66 +2,53 @@
  * Tests basic index creation and operations on a time-series bucket collection.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns and tenant
+ *   # migrations may result in writes splitting between two primaries, and thus different buckets.
+ *   does_not_support_stepdowns,
+ *   tenant_migration_incompatible,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
-(function() {
-"use strict";
+import {TimeseriesTest} from "jstests/core/timeseries/libs/timeseries.js";
+import {getWinningPlan, isIdhackOrExpress, planHasStage} from "jstests/libs/query/analyze_plan.js";
 
-load("jstests/core/timeseries/libs/timeseries.js");
-load("jstests/libs/analyze_plan.js");  // For 'planHasStage' helper.
+TimeseriesTest.run((insert) => {
+    const coll = db.timeseries_bucket_index;
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
 
-if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series collection feature flag is disabled");
-    return;
-}
+    const timeFieldName = 'time';
 
-const coll = db.timeseries_bucket_index;
-const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
+    coll.drop();
+    assert.commandWorked(
+        db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
-const timeFieldName = 'time';
+    assert.commandWorked(bucketsColl.createIndex({"control.min.time": 1}));
 
-coll.drop();
-assert.commandWorked(db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-assert.contains(bucketsColl.getName(), db.getCollectionNames());
+    const t = new Date();
+    const doc = {_id: 0, [timeFieldName]: t, x: 0};
+    assert.commandWorked(insert(coll, doc), 'failed to insert doc: ' + tojson(doc));
 
-assert.commandWorked(bucketsColl.createIndex({"control.min.time": 1}));
+    assert.commandWorked(bucketsColl.createIndex({"control.max.time": 1}));
 
-const t = new Date();
-const doc = {
-    _id: 0,
-    [timeFieldName]: t,
-    x: 0
-};
-assert.commandWorked(coll.insert(doc), 'failed to insert doc: ' + tojson(doc));
+    let buckets = bucketsColl.find().toArray();
+    assert.eq(buckets.length, 1, 'Expected one bucket but found ' + tojson(buckets));
+    const bucketId = buckets[0]._id;
+    const minTime = buckets[0].control.min.time;
+    const maxTime = buckets[0].control.max.time;
 
-assert.commandWorked(bucketsColl.createIndex({"control.max.time": 1}));
+    assert.docEq(buckets, bucketsColl.find({_id: bucketId}).toArray());
+    let explain = bucketsColl.find({_id: bucketId}).explain();
+    assert(isIdhackOrExpress(db, getWinningPlan(explain.queryPlanner)), explain);
 
-let buckets = bucketsColl.find().toArray();
-assert.eq(buckets.length, 1, 'Expected one bucket but found ' + tojson(buckets));
-const bucketId = buckets[0]._id;
-const minTime = buckets[0].control.min.time;
-const maxTime = buckets[0].control.min.time;
+    assert.docEq(buckets, bucketsColl.find({"control.max.time": maxTime}).toArray());
+    explain = bucketsColl.find({"control.max.time": minTime}).explain();
+    assert(planHasStage(db, getWinningPlan(explain.queryPlanner), "IXSCAN"), explain);
 
-assert.docEq(buckets, bucketsColl.find({_id: bucketId}).toArray());
-let explain = bucketsColl.find({_id: bucketId}).explain();
-assert(planHasStage(db, explain, "COLLSCAN"), explain);
+    let res = assert.commandWorked(bucketsColl.validate());
+    assert(res.valid, res);
 
-assert.docEq(buckets, bucketsColl.find({"control.min.time": minTime}).toArray());
-explain = bucketsColl.find({"control.min.time": minTime}).explain();
-assert(planHasStage(db, explain, "IXSCAN"), explain);
-
-assert.docEq(buckets, bucketsColl.find({"control.max.time": maxTime}).toArray());
-explain = bucketsColl.find({"control.max.time": minTime}).explain();
-assert(planHasStage(db, explain, "IXSCAN"), explain);
-
-let res = assert.commandWorked(bucketsColl.validate());
-assert(res.valid, res);
-
-assert.commandWorked(bucketsColl.remove({_id: bucketId}));
-assert.docEq([], bucketsColl.find().toArray());
-})();
+    assert.commandWorked(bucketsColl.remove({_id: bucketId}));
+    assert.docEq([], bucketsColl.find().toArray());
+});

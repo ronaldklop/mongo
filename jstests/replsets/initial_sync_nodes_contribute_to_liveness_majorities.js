@@ -8,17 +8,15 @@
  * to run for primary again. Since the other secondary is disconnected, the primary must receive a
  * vote from the initial sync node to get elected again.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig, waitForState} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
     name,
     nodes: [{}, {rsConfig: {priority: 0}}],
-    settings: {electionTimeoutMillis: 1000, heartbeatIntervalMillis: 250},
+    settings: {electionTimeoutMillis: 3000, heartbeatIntervalMillis: 250},
     useBridge: true
 });
 rst.startSet();
@@ -49,9 +47,9 @@ assert.commandWorked(initialSyncSecondary.adminCommand({
 secondary.disconnect(primary);
 
 // Verify that the primary should not step down due to not seeing a quorum. This is because the
-// primary should be receiving heartbeats from the initial sync node.
-assert.throws(() => checkLog.contains(
-                  primary, "can't see a majority of the set, relinquishing primary", 3000));
+// primary should be receiving heartbeats from the initial sync node. We specifically look for the
+// 'Can't see a majority of the set, relinquishing primary' log message.
+assert.throws(() => checkLog.containsJson(primary, 21809, {} /* attrs */, 3000));
 
 assert.eq(primary, rst.getPrimary());
 
@@ -96,4 +94,3 @@ assert.commandWorked(initialSyncSecondary.adminCommand(
 waitForState(initialSyncSecondary, ReplSetTest.State.SECONDARY);
 
 rst.stopSet();
-})();

@@ -31,6 +31,11 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/optional.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <set>
 #include <string>
@@ -91,12 +96,6 @@ public:
     explicit FieldRef(StringData path);
 
     /**
-     * Field parts accessed through getPart() calls no longer would be valid, after the destructor
-     * ran.
-     */
-    ~FieldRef() {}
-
-    /**
      * Builds a field path out of each field part in 'dottedField'.
      */
     void parse(StringData dottedField);
@@ -141,6 +140,11 @@ public:
     bool isPrefixOfOrEqualTo(const FieldRef& other) const;
 
     /**
+     * Returns true if 'this' is a prefix of, or equal to, 'other', or vice versa.
+     */
+    bool fullyOverlapsWith(const FieldRef& other) const;
+
+    /**
      * Returns the number of field parts in the prefix that 'this' and 'other' share.
      */
     FieldIndex commonPrefixSize(const FieldRef& other) const;
@@ -151,6 +155,12 @@ public:
      * ^(0|[1-9]+[0-9]*)$.
      */
     bool isNumericPathComponentStrict(FieldIndex i) const;
+
+    /**
+     * Similar to isNumericPathComponentStrict, but returns true for 0-prefixed indices, such as
+     * "00" and "01".
+     */
+    bool isNumericPathComponentLenient(FieldIndex i) const;
 
     /**
      * Returns true if this FieldRef has any numeric path components.

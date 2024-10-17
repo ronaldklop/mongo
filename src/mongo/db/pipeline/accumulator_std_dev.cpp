@@ -27,31 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cmath>
+#include <vector>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
 #include "mongo/db/pipeline/window_function/window_function_stddev.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
 
 REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<AccumulatorStdDevPop>);
 REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
-REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
-REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
-REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevPop, AccumulatorStdDevPop, WindowFunctionStdDevPop);
-REGISTER_REMOVABLE_WINDOW_FUNCTION(stdDevSamp, AccumulatorStdDevSamp, WindowFunctionStdDevSamp);
-
-const char* AccumulatorStdDev::getOpName() const {
-    return (_isSamp ? "$stdDevSamp" : "$stdDevPop");
-}
+REGISTER_STABLE_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
+REGISTER_STABLE_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(stdDevPop, AccumulatorStdDevPop, WindowFunctionStdDevPop);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(stdDevSamp,
+                                          AccumulatorStdDevSamp,
+                                          WindowFunctionStdDevSamp);
 
 void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
     if (!merging) {
@@ -71,7 +75,7 @@ void AccumulatorStdDev::processInternal(const Value& input, bool merging) {
         }
     } else {
         // This is what getValue(true) produced below.
-        verify(input.getType() == Object);
+        MONGO_verify(input.getType() == Object);
         const double m2 = input["m2"].getDouble();
         const double mean = input["mean"].getDouble();
         const long long count = input["count"].getLong();
@@ -118,7 +122,7 @@ intrusive_ptr<AccumulatorState> AccumulatorStdDevPop::create(ExpressionContext* 
 AccumulatorStdDev::AccumulatorStdDev(ExpressionContext* const expCtx, bool isSamp)
     : AccumulatorState(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
     // This is a fixed size AccumulatorState so we never need to update this
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorStdDev::reset() {

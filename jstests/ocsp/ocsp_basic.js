@@ -1,13 +1,17 @@
 // Check that OCSP verification works
 // @tags: [
 //   requires_http_client,
-//   live_record_incompatible,
 // ]
 
-load("jstests/ocsp/lib/mock_ocsp.js");
-
-(function() {
-"use strict";
+import {FAULT_REVOKED, MockOCSPServer} from "jstests/ocsp/lib/mock_ocsp.js";
+import {
+    clearOCSPCache,
+    OCSP_CA_PEM,
+    OCSP_SERVER_CERT,
+    OCSP_SERVER_CERT_REVOKED,
+    waitForServer
+} from "jstests/ocsp/lib/ocsp_helpers.js";
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 var ocsp_options = {
     sslMode: "requireSSL",
@@ -37,6 +41,7 @@ mock_ocsp.stop();
 Object.extend(ocsp_options, {waitForConnect: false});
 ocsp_options.sslPEMKeyFile = OCSP_SERVER_CERT_REVOKED;
 
+print("Restarting MockOCSPServer with FAULT_REVOKED option");
 mock_ocsp = new MockOCSPServer(FAULT_REVOKED, 1);
 mock_ocsp.start();
 
@@ -45,6 +50,7 @@ conn = MongoRunner.runMongod(ocsp_options);
 waitForServer(conn);
 
 assert.throws(() => {
+    print("Following connection should fail");
     new Mongo(conn.host);
 });
 
@@ -57,7 +63,7 @@ if (determineSSLProvider() === "apple") {
     const APPLE_OCSP_ERROR_CODE = "CSSMERR_TP_CERT_REVOKED";
     let output = rawMongoProgramOutput();
     assert(output.search(APPLE_OCSP_ERROR_CODE));
-    return;
+    quit();
 }
 
 clearOCSPCache();
@@ -99,4 +105,3 @@ MongoRunner.stopMongod(conn);
 // sleep to make sure that the threads don't interfere with each other.
 sleep(1000);
 mock_ocsp.stop();
-}());

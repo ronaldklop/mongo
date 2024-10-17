@@ -2,15 +2,15 @@
  * Tests the find command on views.
  *
  * @tags: [
- *   requires_find_command,
+ *   assumes_unsharded_collection,
  *   requires_getmore,
+ *   # Explain of a resolved view must be executed by mongos.
+ *   directly_against_shardsvrs_incompatible,
+ *   requires_fcv_73,
  * ]
  */
-(function() {
-"use strict";
-
-// For arrayEq and orderedArrayEq.
-load("jstests/aggregation/extras/utils.js");
+import {arrayEq, orderedArrayEq} from "jstests/aggregation/extras/utils.js";
+import {getSingleNodeExplain} from "jstests/libs/query/analyze_plan.js";
 
 let viewsDB = db.getSiblingDB("views_find");
 assert.commandWorked(viewsDB.dropDatabase());
@@ -86,16 +86,19 @@ assert.commandWorked(viewsDB.identityView.find().explain());
 
 // Find with explicit explain modes works on a view.
 let explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("queryPlanner"));
+explainPlan = getSingleNodeExplain(explainPlan);
 assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
 assert(!explainPlan.hasOwnProperty("executionStats"));
 
 explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("executionStats"));
+explainPlan = getSingleNodeExplain(explainPlan);
 assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
 assert(explainPlan.hasOwnProperty("executionStats"));
 assert.eq(explainPlan.executionStats.nReturned, 5);
 assert(!explainPlan.executionStats.hasOwnProperty("allPlansExecution"));
 
 explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("allPlansExecution"));
+explainPlan = getSingleNodeExplain(explainPlan);
 assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
 assert(explainPlan.hasOwnProperty("executionStats"));
 assert.eq(explainPlan.executionStats.nReturned, 5);
@@ -108,8 +111,15 @@ assert.commandFailedWithCode(
     ErrorCodes.InvalidPipelineOperator);
 
 // Views can support a "findOne" if singleBatch: true and limit: 1.
-assertFindResultEq({find: "identityView", filter: {state: "NY"}, singleBatch: true, limit: 1},
-                   [{_id: "New York", state: "NY", pop: 7}]);
+let res = assert.commandWorked(
+    viewsDB.runCommand({find: "identityView", filter: {state: "NY"}, singleBatch: true, limit: 1}));
+assert.eq(res.cursor.firstBatch, [{_id: "New York", state: "NY", pop: 7}]);
+// singleBatch: true should ensure no cursor is returned.
+assert.eq(res.cursor.id, 0);
+// The behavior should be the same with batchSize: 1.
+res = assert.commandWorked(viewsDB.runCommand(
+    {find: "identityView", filter: {}, singleBatch: true, limit: 1, batchSize: 1}));
+assert.eq(res.cursor.id, 0);
 assert.eq(viewsDB.identityView.findOne({_id: "San Francisco"}),
           {_id: "San Francisco", state: "CA", pop: 4});
 
@@ -118,4 +128,3 @@ assert.eq(viewsDB.identityView.findOne({_id: "San Francisco"}),
 assert.commandFailedWithCode(
     viewsDB.runCommand({find: "identityView", readOnce: true}),
     [ErrorCodes.OperationNotSupportedInTransaction, ErrorCodes.InvalidPipelineOperator]);
-}());

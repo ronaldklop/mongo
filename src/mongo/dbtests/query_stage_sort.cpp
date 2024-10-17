@@ -27,34 +27,72 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstdint>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/collection_yield_restore.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/sort.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/sort_key_generator.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_executor_impl.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 /**
  * This file tests db/exec/sort.cpp
  */
 
+namespace mongo {
 namespace QueryStageSortTests {
-
-using std::set;
-using std::unique_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
@@ -69,14 +107,14 @@ public:
     }
 
     virtual ~QueryStageSortTestBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
-    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
+    void getRecordIds(std::set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -87,10 +125,10 @@ public:
      * We feed a mix of (key, unowned, owned) data to the sort stage.
      */
     void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, const CollectionPtr& coll) {
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
 
         for (int i = 0; i < numObj(); ++i, ++it) {
             ASSERT_FALSE(it == recordIds.end());
@@ -110,7 +148,7 @@ public:
      * Wraps a sort stage with a QueuedDataStage in a plan executor. Returns the plan executor,
      * which is owned by the caller.
      */
-    unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
         const CollectionPtr& coll) {
         // Build the mock scan stage which feeds the data.
         auto ws = std::make_unique<WorkingSet>();
@@ -139,7 +177,7 @@ public:
                                         &coll,
                                         PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                         QueryPlannerParams::DEFAULT);
-        invariant(statusWithPlanExecutor.isOK());
+        invariant(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
 
@@ -177,7 +215,7 @@ public:
                                                             std::move(keyGenStage));
 
         auto fetchStage = std::make_unique<FetchStage>(
-            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, &coll);
 
         // Must fetch so we can look at the doc as a BSONObj.
         auto statusWithPlanExecutor =
@@ -185,7 +223,7 @@ public:
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -242,7 +280,7 @@ public:
         return "unittests.QueryStageSort";
     }
     static NamespaceString nss() {
-        return NamespaceString(ns());
+        return NamespaceString::createNamespaceString_forTest(ns());
     }
 
 protected:
@@ -258,18 +296,18 @@ protected:
 // Sort some small # of results in increasing order.
 class QueryStageSortInc : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -281,18 +319,18 @@ public:
 // Sort some small # of results in decreasing order.
 class QueryStageSortDec : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -305,7 +343,7 @@ public:
 template <int LIMIT>
 class QueryStageSortDecWithLimit : public QueryStageSortDec {
 public:
-    virtual int limit() const {
+    int limit() const override {
         return LIMIT;
     }
 };
@@ -313,18 +351,18 @@ public:
 // Sort a big bunch of objects.
 class QueryStageSortExt : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 10000;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -336,28 +374,29 @@ public:
 // Mutation invalidation of docs fed to sort.
 class QueryStageSortMutationInvalidation : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 2000;
     }
-    virtual int limit() const {
+    int limit() const override {
         return 10;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         fillData();
 
         // The data we're going to later invalidate.
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
@@ -384,7 +423,7 @@ public:
         // We should have read in the first 'firstRead' recordIds.  Invalidate the first one.
         // Since it's in the WorkingSet, the updates should not be reflected in the output.
         exec->saveState();
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
         Snapshotted<BSONObj> oldDoc = coll->docFor(&_opCtx, *it);
 
         const OID updatedId = oldDoc.value().getField("_id").OID();
@@ -395,10 +434,18 @@ public:
         auto newDoc = [&](const Snapshotted<BSONObj>& oldDoc) {
             return BSON("_id" << oldDoc.value()["_id"] << "foo" << limit() + 10);
         };
-        CollectionUpdateArgs args;
+        CollectionUpdateArgs args{oldDoc.value()};
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc(oldDoc), false, nullptr, &args);
+            collection_internal::updateDocument(&_opCtx,
+                                                coll,
+                                                *it,
+                                                oldDoc,
+                                                newDoc(oldDoc),
+                                                collection_internal::kUpdateNoIndexes,
+                                                nullptr /* indexesAffected */,
+                                                nullptr /* opDebug */,
+                                                &args);
             wuow.commit();
         }
         exec->restoreState(&coll);
@@ -416,7 +463,15 @@ public:
             oldDoc = coll->docFor(&_opCtx, *it);
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->updateDocument(&_opCtx, *it++, oldDoc, newDoc(oldDoc), false, nullptr, &args);
+                collection_internal::updateDocument(&_opCtx,
+                                                    coll,
+                                                    *it++,
+                                                    oldDoc,
+                                                    newDoc(oldDoc),
+                                                    collection_internal::kUpdateNoIndexes,
+                                                    nullptr /* indexesAffected */,
+                                                    nullptr /* opDebug */,
+                                                    &args);
                 wuow.commit();
             }
         }
@@ -454,25 +509,26 @@ public:
 // Deletion invalidation of everything fed to sort.
 class QueryStageSortDeletionInvalidation : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 2000;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         fillData();
 
         // The data we're going to later invalidate.
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
@@ -498,11 +554,13 @@ public:
 
         // We should have read in the first 'firstRead' recordIds.  Invalidate the first.
         exec->saveState();
+
         OpDebug* const nullOpDebug = nullptr;
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
+            collection_internal::deleteDocument(
+                &_opCtx, coll, kUninitializedStmtId, *it++, nullOpDebug);
             wuow.commit();
         }
         exec->restoreState(&coll);
@@ -518,7 +576,8 @@ public:
         while (it != recordIds.end()) {
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
+                collection_internal::deleteDocument(
+                    &_opCtx, coll, kUninitializedStmtId, *it++, nullOpDebug);
                 wuow.commit();
             }
         }
@@ -550,7 +609,7 @@ public:
 template <int LIMIT>
 class QueryStageSortDeletionInvalidationWithLimit : public QueryStageSortDeletionInvalidation {
 public:
-    virtual int limit() const {
+    int limit() const override {
         return LIMIT;
     }
 };
@@ -558,20 +617,21 @@ public:
 // Should error out if we sort with parallel arrays.
 class QueryStageSortParallelArrays : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         auto ws = std::make_unique<WorkingSet>();
         auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
@@ -609,7 +669,7 @@ public:
                                                             std::move(keyGenStage));
 
         auto fetchStage = std::make_unique<FetchStage>(
-            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, &coll);
 
         // We don't get results back since we're sorting some parallel arrays.
         auto statusWithPlanExecutor =
@@ -617,7 +677,7 @@ public:
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -627,11 +687,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_sort") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageSortInc>();
         add<QueryStageSortDec>();
         // Sort with limit has a general limiting strategy for limit > 1
@@ -647,6 +707,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageSortTest;
+unittest::OldStyleSuiteInitializer<All> queryStageSortTest;
 
 }  // namespace QueryStageSortTests
+}  // namespace mongo

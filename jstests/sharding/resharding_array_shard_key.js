@@ -2,13 +2,12 @@
  * Tests that during resharding, inserts and updates that specify an array for the new shard key
  * fail.
  *
- * @tags: [requires_fcv_49, uses_atclustertime]
+ * @tags: [
+ *   uses_atclustertime,
+ * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest();
 reshardingTest.setup();
@@ -27,13 +26,13 @@ assert.commandWorked(whileReshardingCollection.insert({_id: 0, oldKey: -20, newK
 
 const recipientShardNames = reshardingTest.recipientShardNames;
 
-function awaitEstablishmentOfFetchTimestamp(inputCollection) {
+function awaitEstablishmentOfCloneTimestamp(inputCollection) {
     const mongos = inputCollection.getMongo();
     assert.soon(() => {
         const coordinatorDoc = mongos.getCollection("config.reshardingOperations").findOne({
             ns: inputCollection.getFullName()
         });
-        return coordinatorDoc !== null && coordinatorDoc.fetchTimestamp !== undefined;
+        return coordinatorDoc !== null && coordinatorDoc.cloneTimestamp !== undefined;
     });
 }
 
@@ -42,8 +41,8 @@ reshardingTest.withReshardingInBackground(
         newShardKeyPattern: {newKey: 1},
         newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
     },
-    (tempNs) => {
-        awaitEstablishmentOfFetchTimestamp(whileReshardingCollection);
+    () => {
+        awaitEstablishmentOfCloneTimestamp(whileReshardingCollection);
 
         const testDB = whileReshardingCollection.getDB();
         let session = testDB.getMongo().startSession({retryWrites: true});
@@ -74,8 +73,7 @@ reshardingTest.withReshardingInBackground({
     newShardKeyPattern: {newKey: 1},
     newChunks: [{min: {newKey: MinKey}, max: {newKey: MaxKey}, shard: recipientShardNames[0]}],
 },
-                                          (tempNs) => {},
+                                          () => {},
                                           {expectedErrorCode: ErrorCodes.ShardKeyNotFound});
 
 reshardingTest.teardown();
-})();

@@ -1,7 +1,6 @@
-(function() {
-"use strict";
-
 // This test makes assertions about the number of logical session records.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 TestData.disableImplicitSessions = true;
 
 var refresh = {refreshLogicalSessionCacheNow: 1};
@@ -76,4 +75,3 @@ assert.eq(db1.system.sessions.count(), 3, "should have three local session recor
 
 // Stop the test.
 replTest.stopSet();
-})();

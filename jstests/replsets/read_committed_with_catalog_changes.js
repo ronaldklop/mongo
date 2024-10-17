@@ -22,16 +22,13 @@
  *  - compact collection
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  * ]
  */
 
-load("jstests/libs/parallelTester.js");  // For Thread.
-load("jstests/libs/write_concern_util.js");
-
-(function() {
-"use strict";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 // Each test case includes a 'prepare' method that sets up the initial state starting with a
 // database that has been dropped, a 'performOp' method that does some operation, and two
@@ -205,10 +202,10 @@ const testCases = {
 
 // Assertion helpers. These must get all state as arguments rather than through closure since
 // they may be passed in to a Thread.
-function assertReadsBlock(coll) {
-    var res = coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 5000});
-    assert.commandFailedWithCode(
-        res, ErrorCodes.MaxTimeMSExpired, "Expected read of " + coll.getFullName() + " to block");
+function assertReadsBlock(db, coll) {
+    // With point-in-time catalog lookups, reads no longer block waiting for the majority commit
+    // point to advance.
+    assert.commandWorked(coll.runCommand('find', {"readConcern": {"level": "majority"}}));
 }
 
 function assertReadsSucceed(coll, timeoutMs = 20000) {
@@ -221,11 +218,7 @@ function assertReadsSucceed(coll, timeoutMs = 20000) {
 
 // Set up a set and grab things for later.
 var name = "read_committed_with_catalog_changes";
-var replTest = new ReplSetTest({
-    name: name,
-    nodes: 3,
-    nodeOptions: {enableMajorityReadConcern: ''},
-});
+var replTest = new ReplSetTest({name: name, nodes: 3});
 
 replTest.startSet();
 var nodes = replTest.nodeList();
@@ -244,6 +237,10 @@ replTest.initiate(config);
 var primary = replTest.getPrimary();
 var secondary = replTest.getSecondary();
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 // This is the DB that all of the tests will use.
 var mainDB = primary.getDB('mainDB');
 
@@ -291,7 +288,7 @@ for (var testName in testCases) {
     // Perform the op and ensure that blocked collections block and unblocked ones don't.
     test.performOp(mainDB);
     assertReadsSucceed(otherDBCollection);
-    test.blockedCollections.forEach((name) => assertReadsBlock(mainDB[name]));
+    test.blockedCollections.forEach((name) => assertReadsBlock(mainDB, mainDB[name]));
     test.unblockedCollections.forEach((name) => assertReadsSucceed(mainDB[name]));
 
     // Use background threads to test that reads that start blocked can complete if the
@@ -316,7 +313,7 @@ for (var testName in testCases) {
     try {
         // Try the committed read again after sleeping to ensure that it still blocks even if it
         // isn't immediately after the operation.
-        test.blockedCollections.forEach((name) => assertReadsBlock(mainDB[name]));
+        test.blockedCollections.forEach((name) => assertReadsBlock(mainDB, mainDB[name]));
 
         // Restart oplog application on the secondary and ensure the blocked collections become
         // unblocked.
@@ -337,4 +334,3 @@ for (var testName in testCases) {
 }
 
 replTest.stopSet();
-}());

@@ -1,5 +1,4 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({shards: 2});
 
@@ -22,4 +21,3 @@ assert.commandFailed(
     "Allowed shard in IP when config is localhost");
 
 s.stop();
-})();

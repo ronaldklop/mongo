@@ -33,7 +33,10 @@ def generate(env):
     for builder in ("Program", "SharedLibrary", "LoadableModule"):
         emitter = builders[builder].emitter
         builders[builder].emitter = SCons.Builder.ListEmitter(
-            [emitter, _tag_as_precious,]
+            [
+                emitter,
+                _tag_as_precious,
+            ]
         )
 
 
@@ -41,7 +44,7 @@ def exists(env):
     # By default, the windows linker is incremental, so unless
     # overridden in the environment with /INCREMENTAL:NO, the tool is
     # in play.
-    if env.TargetOSIs("windows") and not "/INCREMENTAL:NO" in env["LINKFLAGS"]:
+    if env.TargetOSIs("windows") and "/INCREMENTAL:NO" not in env["LINKFLAGS"]:
         return True
 
     # On posix platforms, excluding darwin, we may have enabled

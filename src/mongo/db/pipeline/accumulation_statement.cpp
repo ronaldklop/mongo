@@ -27,16 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
 #include <string>
 
-#include "mongo/db/pipeline/accumulation_statement.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
@@ -46,41 +49,29 @@ namespace mongo {
 using std::string;
 
 namespace {
-// Used to keep track of which Accumulators are registered under which name.
-using ParserRegistration =
-    std::pair<AccumulationStatement::Parser,
-              boost::optional<ServerGlobalParams::FeatureCompatibility::Version>>;
-static StringMap<ParserRegistration> parserMap;
+// Used to keep track of which Accumulators are registered under which name and in which contexts
+// they can be used in.
+static StringMap<AccumulationStatement::ParserRegistration> parserMap;
 }  // namespace
 
-void AccumulationStatement::registerAccumulator(
-    std::string name,
-    AccumulationStatement::Parser parser,
-    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion) {
+void AccumulationStatement::registerAccumulator(std::string name,
+                                                AccumulationStatement::Parser parser,
+                                                AllowedWithApiStrict allowedWithApiStrict,
+                                                AllowedWithClientType allowedWithClientType,
+                                                boost::optional<FeatureFlag> featureFlag) {
     auto it = parserMap.find(name);
     massert(28722,
             str::stream() << "Duplicate accumulator (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = {parser, requiredMinVersion};
+    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, featureFlag};
+    operatorCountersGroupAccumulatorExpressions.addCounter(name);
 }
 
-AccumulationStatement::Parser& AccumulationStatement::getParser(
-    StringData name,
-    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> allowedMaxVersion) {
+AccumulationStatement::ParserRegistration& AccumulationStatement::getParser(StringData name) {
     auto it = parserMap.find(name);
     uassert(
         15952, str::stream() << "unknown group operator '" << name << "'", it != parserMap.end());
-    auto& [parser, requiredMinVersion] = it->second;
-    uassert(ErrorCodes::QueryFeatureNotAllowed,
-            // We would like to include the current version and the required minimum version in this
-            // error message, but using FeatureCompatibilityVersion::toString() would introduce a
-            // dependency cycle (see SERVER-31968).
-            str::stream() << name
-                          << " is not allowed in the current feature compatibility version. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << " for more information.",
-            !requiredMinVersion || !allowedMaxVersion || *requiredMinVersion <= *allowedMaxVersion);
-    return parser;
+    return it->second;
 }
 
 boost::intrusive_ptr<AccumulatorState> AccumulationStatement::makeAccumulator() const {
@@ -104,7 +95,8 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             fieldName[0] != '$');
 
     uassert(40238,
-            str::stream() << "The field '" << fieldName << "' must specify one accumulator",
+            str::stream() << "The field '" << fieldName
+                          << "' must specify one accumulator: " << elem,
             elem.Obj().nFields() == 1);
 
     auto specElem = elem.Obj().firstElement();
@@ -113,17 +105,21 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             str::stream() << "The " << accName << " accumulator is a unary operator",
             specElem.type() != BSONType::Array);
 
-    auto&& parser =
-        AccumulationStatement::getParser(accName, expCtx->maxFeatureCompatibilityVersion);
-    auto [initializer, argument, factory] = parser(expCtx, specElem, vps);
+    auto&& [parser, allowedWithApiStrict, allowedWithClientType, featureFlag] =
+        AccumulationStatement::getParser(accName);
 
-    return AccumulationStatement(fieldName.toString(),
-                                 AccumulationExpression(initializer, argument, factory));
+    expCtx->throwIfFeatureFlagIsNotEnabledOnFCV(accName, featureFlag);
+
+    tassert(5837900, "Accumulators should only appear in a user operation", expCtx->opCtx);
+    assertLanguageFeatureIsAllowed(
+        expCtx->opCtx, accName.toString(), allowedWithApiStrict, allowedWithClientType);
+
+    expCtx->incrementGroupAccumulatorExprCounter(accName);
+    auto accExpr = parser(expCtx, specElem, vps);
+
+    return AccumulationStatement(fieldName.toString(), std::move(accExpr));
 }
 
-MONGO_INITIALIZER(accumulatorParserMap)(InitializerContext*) {
-    // Nothing to do. This initializer exists to tie together all the individual initializers
-    // defined by REGISTER_ACCUMULATOR / REGISTER_ACCUMULATOR_WITH_MIN_VERSION.
-}
-
+MONGO_INITIALIZER_GROUP(BeginAccumulatorRegistration, ("default"), ("EndAccumulatorRegistration"))
+MONGO_INITIALIZER_GROUP(EndAccumulatorRegistration, ("BeginAccumulatorRegistration"), ())
 }  // namespace mongo

@@ -29,12 +29,37 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <set>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/granularity_rounder.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/sorter/sorter.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -45,11 +70,18 @@ namespace mongo {
 class DocumentSourceBucketAuto final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$bucketAuto"_sd;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     const char* getSourceName() const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kBucketAuto;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kBlocking,
@@ -92,8 +124,18 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    const boost::intrusive_ptr<Expression> getGroupByExpression() const;
-    const std::vector<AccumulationStatement>& getAccumulatedFields() const;
+    /**
+     * Returns the groupBy expression. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
+    boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    boost::intrusive_ptr<Expression>& getMutableGroupByExpression();
+    /**
+     * Returns the AccumulationStatements. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
+    const std::vector<AccumulationStatement>& getAccumulationStatements() const;
+    std::vector<AccumulationStatement>& getMutableAccumulationStatements();
 
 protected:
     GetNextResult doGetNext() final;
@@ -133,7 +175,7 @@ private:
      */
     GetNextResult populateSorter();
 
-    void initalizeBucketIteration();
+    void initializeBucketIteration();
 
     /**
      * Computes the 'groupBy' expression value for 'doc'.

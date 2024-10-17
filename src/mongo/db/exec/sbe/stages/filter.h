@@ -29,33 +29,57 @@
 
 #pragma once
 
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 namespace mongo::sbe {
 /**
- * This is a filter plan stage. If the IsConst template parameter is true then the filter expression
- * is 'constant' i.e. it does not depend on values coming from its input. It means that we can
- * evaluate it in the open() call and skip getNext() calls completely if the result is false.
- * The IsEof template parameter controls 'early out' behavior of the filter expression. Once the
- * filter evaluates to false then the getNext() call returns EOF.
+ * A plan stage which discards or retains values based on a predicate expression.
+ *
+ * If the 'IsConst' template parameter is true then the filter expression is 'constant' i.e. it does
+ * not depend on values coming from its input. In this case, the stage is notated as "cfilter"
+ * rather than plain "filter". The predicate is evaluated in the open() call. If the result is
+ * false, then 'getNext()' returns EOF immediately.
+ *
+ * The 'IsEof' template parameter controls 'early out' behavior of the filter expression. If this
+ * template parameter is true, then the stage is notated as "efilter" rather than plain "filter".
+ * Once the filter evaluates to false then the getNext() call returns EOF.
+ *
+ * Only one of 'IsConst' and 'IsEof' may be true.
+ *
+ * Records pass through the filter when the 'filter' expression evaluates to true.
+ *
+ * Debug string representations:
+ *
+ *  filter { predicate } childStage
+ *  cfilter { predicate } childStage
+ *  efilter { predicate } childStage
  */
 template <bool IsConst, bool IsEof = false>
 class FilterStage final : public PlanStage {
 public:
     FilterStage(std::unique_ptr<PlanStage> input,
                 std::unique_ptr<EExpression> filter,
-                PlanNodeId planNodeId)
-        : PlanStage(IsConst ? "cfilter"_sd : (IsEof ? "efilter" : "filter"_sd), planNodeId),
+                PlanNodeId planNodeId,
+                bool participateInTrialRunTracking = true)
+        : PlanStage(IsConst ? "cfilter"_sd : (IsEof ? "efilter" : "filter"_sd),
+                    nullptr /* yieldPolicy */,
+                    planNodeId,
+                    participateInTrialRunTracking),
           _filter(std::move(filter)) {
         static_assert(!IsEof || !IsConst);
         _children.emplace_back(std::move(input));
+        tassert(8400101, "Filter must be passed a filter", _filter);
     }
 
     std::unique_ptr<PlanStage> clone() const final {
-        return std::make_unique<FilterStage<IsConst, IsEof>>(
-            _children[0]->clone(), _filter->clone(), _commonStats.nodeId);
+        return std::make_unique<FilterStage<IsConst, IsEof>>(_children[0]->clone(),
+                                                             _filter->clone(),
+                                                             _commonStats.nodeId,
+                                                             participateInTrialRunTracking());
     }
 
     void prepare(CompileCtx& ctx) final {
@@ -124,7 +148,7 @@ public:
     void close() final {
         auto optTimer(getOptTimer(_opCtx));
 
-        _commonStats.closes++;
+        trackClose();
 
         if (_childOpened) {
             _children[0]->close();
@@ -132,7 +156,7 @@ public:
         }
     }
 
-    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const {
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const override {
         auto ret = std::make_unique<PlanStageStats>(_commonStats);
         ret->specific = std::make_unique<FilterStats>(_specificStats);
 
@@ -163,6 +187,19 @@ public:
         DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
 
         return ret;
+    }
+
+    size_t estimateCompileTimeSize() const final {
+        size_t size = sizeof(*this);
+        size += size_estimator::estimate(_children);
+        size += _filter->estimateSize();
+        size += size_estimator::estimate(_specificStats);
+        return size;
+    }
+
+protected:
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
     }
 
 private:

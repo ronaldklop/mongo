@@ -27,57 +27,99 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <iosfwd>
+#include <list>
+#include <map>
 #include <memory>
 #include <ostream>
+#include <ratio>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
-#include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
 #include "mongo/db/repl/initial_syncer.h"
-#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/oplog_fetcher_mock.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
-#include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/db/repl/sync_source_selector_mock.h"
 #include "mongo/db/repl/task_executor_mock.h"
-#include "mongo/db/repl/update_position_args.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_mock.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/mock/mock_dbclient_connection.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
 #include "mongo/executor/mock_network_fixture.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor_test_fixture.h"
+#include "mongo/executor/thread_pool_mock.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+#include "mongo/util/version/releases.h"
 
-#include "mongo/logv2/log.h"
-#include "mongo/unittest/barrier.h"
-#include "mongo/unittest/unittest.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 
 namespace mongo {
@@ -114,9 +156,9 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-using LockGuard = stdx::lock_guard<Latch>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
 using NetworkGuard = executor::NetworkInterfaceMock::InNetworkGuard;
-using UniqueLock = stdx::unique_lock<Latch>;
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 const BSONObj kListDatabasesFailPointData = BSON("cloner"
                                                  << "AllDatabaseCloner"
@@ -144,7 +186,7 @@ class InitialSyncerTest : public executor::ThreadPoolExecutorTest,
                           public SyncSourceSelector,
                           public ScopedGlobalServiceContextForTest {
 public:
-    InitialSyncerTest() : _threadClient(getGlobalServiceContext()) {}
+    InitialSyncerTest() : _threadClient(getGlobalServiceContext()->getService()) {}
 
     executor::ThreadPoolMock::Options makeThreadPoolMockOptions() const override;
     executor::ThreadPoolMock::Options makeClonerThreadPoolMockOptions() const;
@@ -163,22 +205,27 @@ public:
     }
 
     // SyncSourceSelector
-    void clearSyncSourceBlacklist() override {
-        _syncSourceSelector->clearSyncSourceBlacklist();
+    void clearSyncSourceDenylist() override {
+        _syncSourceSelector->clearSyncSourceDenylist();
     }
     HostAndPort chooseNewSyncSource(const OpTime& ot) override {
         return _syncSourceSelector->chooseNewSyncSource(ot);
     }
-    void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
-        _syncSourceSelector->blacklistSyncSource(host, until);
+    void denylistSyncSource(const HostAndPort& host, Date_t until) override {
+        _syncSourceSelector->denylistSyncSource(host, until);
     }
     ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
                                                   const rpc::ReplSetMetadata& replMetadata,
                                                   const rpc::OplogQueryMetadata& oqMetadata,
                                                   const OpTime& previousOpTimeFetched,
-                                                  const OpTime& lastOpTimeFetched) override {
+                                                  const OpTime& lastOpTimeFetched) const override {
         return _syncSourceSelector->shouldChangeSyncSource(
             currentSource, replMetadata, oqMetadata, previousOpTimeFetched, lastOpTimeFetched);
+    }
+
+    ChangeSyncSourceAction shouldChangeSyncSourceOnError(
+        const HostAndPort& currentSource, const OpTime& lastOpTimeFetched) const override {
+        return _syncSourceSelector->shouldChangeSyncSourceOnError(currentSource, lastOpTimeFetched);
     }
 
     void scheduleNetworkResponse(std::string cmdName, const BSONObj& obj) {
@@ -196,7 +243,7 @@ public:
                                  const BSONObj& obj) {
         NetworkInterfaceMock* net = getNet();
         Milliseconds millis(0);
-        RemoteCommandResponse response(obj, millis);
+        RemoteCommandResponse response = RemoteCommandResponse::make_forTest(obj, millis);
         LOGV2(24159,
               "Sending response for network request",
               "dbname"_attr = noi->getRequest().dbname,
@@ -214,7 +261,9 @@ public:
                   "errorStatus"_attr = errorStatus);
         }
         verifyNextRequestCommandName(cmdName);
-        net->scheduleResponse(net->getNextReadyRequest(), net->now(), errorStatus);
+        net->scheduleResponse(net->getNextReadyRequest(),
+                              net->now(),
+                              RemoteCommandResponse::make_forTest(errorStatus));
     }
 
     void processNetworkResponse(std::string cmdName, const BSONObj& obj) {
@@ -284,8 +333,7 @@ protected:
     };
 
     // protects _storageInterfaceWorkDone.
-    Mutex _storageInterfaceWorkDoneMutex =
-        MONGO_MAKE_LATCH("InitialSyncerTest::_storageInterfaceWorkDoneMutex");
+    stdx::mutex _storageInterfaceWorkDoneMutex;
     StorageInterfaceResults _storageInterfaceWorkDone;
 
     void setUp() override {
@@ -322,7 +370,7 @@ protected:
         _storageInterface->dropCollFn = [this](OperationContext* opCtx,
                                                const NamespaceString& nss) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
-            _storageInterfaceWorkDone.droppedCollections.push_back(nss.ns());
+            _storageInterfaceWorkDone.droppedCollections.push_back(nss.toString_forTest());
             return Status::OK();
         };
         _storageInterface->dropUserDBsFn = [this](OperationContext* opCtx) {
@@ -341,7 +389,7 @@ protected:
             if (collInfo->stats->initCalled) {
                 LOGV2(24165,
                       "reusing collection during test which may cause problems",
-                      "nss"_attr = nss);
+                      logAttrs(nss));
             }
             auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collInfo->stats);
             auto status = localLoader->init(secondaryIndexSpecs);
@@ -353,6 +401,11 @@ protected:
         };
 
         auto* service = getGlobalServiceContext();
+
+        auto replSettings = createServerlessReplSettings();
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings);
+        repl::ReplicationCoordinator::set(service, std::move(replCoord));
+
         service->setFastClockSource(std::make_unique<ClockSourceMock>());
         service->setPreciseClockSource(std::make_unique<ClockSourceMock>());
         ThreadPool::Options dbThreadPoolOptions;
@@ -360,7 +413,7 @@ protected:
         dbThreadPoolOptions.minThreads = 1U;
         dbThreadPoolOptions.maxThreads = 1U;
         dbThreadPoolOptions.onCreateThread = [](const std::string& threadName) {
-            Client::initThread(threadName.c_str());
+            Client::initThread(threadName.c_str(), getGlobalServiceContext()->getService());
         };
         _dbWorkThreadPool = std::make_unique<ThreadPool>(dbThreadPoolOptions);
         _dbWorkThreadPool->startup();
@@ -384,6 +437,9 @@ protected:
         _mockServer->setCommandReply("listDatabases", makeListDatabasesResponse({}));
         _options1.uuid = UUID::gen();
 
+        _mockServer->insert(NamespaceString::kDefaultInitialSyncIdNamespace,
+                            BSON("_id" << UUID::gen()));
+
         reset();
 
         launchExecutorThread();
@@ -393,17 +449,21 @@ protected:
             std::make_unique<ReplicationConsistencyMarkersMock>(),
             std::make_unique<ReplicationRecoveryMock>());
 
-        _executorProxy = std::make_unique<TaskExecutorMock>(&getExecutor());
+        _executorProxy = std::make_shared<TaskExecutorMock>(&getExecutor());
 
         _myLastOpTime = OpTime({3, 0}, 1);
 
-        InitialSyncerOptions options;
+        InitialSyncerInterface::Options options;
         options.initialSyncRetryWait = Milliseconds(1);
-        options.getMyLastOptime = [this]() { return _myLastOpTime; };
+        options.getMyLastOptime = [this]() {
+            return _myLastOpTime;
+        };
         options.setMyLastOptime = [this](const OpTimeAndWallTime& opTimeAndWallTime) {
             _setMyLastOptime(opTimeAndWallTime);
         };
-        options.resetOptimes = [this]() { _myLastOpTime = OpTime(); };
+        options.resetOptimes = [this]() {
+            _myLastOpTime = OpTime();
+        };
         options.syncSourceSelector = this;
 
         _options = options;
@@ -413,13 +473,13 @@ protected:
         threadPoolOptions.minThreads = 1U;
         threadPoolOptions.maxThreads = 1U;
         threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-            Client::initThread(threadName.c_str());
+            Client::initThread(threadName.c_str(), getGlobalServiceContext()->getService());
         };
 
         auto dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateMock>();
         dataReplicatorExternalState->taskExecutor = _executorProxy;
-        dataReplicatorExternalState->currentTerm = 1LL;
-        dataReplicatorExternalState->lastCommittedOpTime = _myLastOpTime;
+        dataReplicatorExternalState->setCurrentTerm(1LL);
+        dataReplicatorExternalState->setLastCommittedOpTime(_myLastOpTime);
         {
             ReplSetConfig config(
                 ReplSetConfig::parse(BSON("_id"
@@ -429,7 +489,7 @@ protected:
                                                                    << "localhost:12345"))
                                           << "settings"
                                           << BSON("electionTimeoutMillis" << 10000))));
-            dataReplicatorExternalState->replSetConfigResult = config;
+            dataReplicatorExternalState->setReplSetConfigResult(config);
         }
         _externalState = dataReplicatorExternalState.get();
 
@@ -470,8 +530,8 @@ protected:
         if (_executorThreadShutdownComplete) {
             return;
         }
-        getExecutor().shutdown();
-        getExecutor().join();
+        shutdownExecutorThread();
+        joinExecutorThread();
         _clonerExecutor->shutdown();
         _clonerExecutor->join();
         _executorThreadShutdownComplete = true;
@@ -511,8 +571,8 @@ protected:
     std::shared_ptr<TaskExecutorMock> _executorProxy;
     std::shared_ptr<executor::ThreadPoolTaskExecutor> _clonerExecutor;
 
-    InitialSyncerOptions _options;
-    InitialSyncerOptions::SetMyLastOptimeFn _setMyLastOptime;
+    InitialSyncerInterface::Options _options;
+    InitialSyncerInterface::Options::SetMyLastOptimeFn _setMyLastOptime;
     OpTime _myLastOpTime;
     Date_t _myLastWallTime;
     std::unique_ptr<SyncSourceSelectorMock> _syncSourceSelector;
@@ -538,13 +598,17 @@ private:
 
 executor::ThreadPoolMock::Options InitialSyncerTest::makeThreadPoolMockOptions() const {
     executor::ThreadPoolMock::Options options;
-    options.onCreateThread = []() { Client::initThread("InitialSyncerTest"); };
+    options.onCreateThread = []() {
+        Client::initThread("InitialSyncerTest", getGlobalServiceContext()->getService());
+    };
     return options;
 }
 
 executor::ThreadPoolMock::Options InitialSyncerTest::makeClonerThreadPoolMockOptions() const {
     executor::ThreadPoolMock::Options options;
-    options.onCreateThread = []() { Client::initThread("ClonerThreadTest"); };
+    options.onCreateThread = []() {
+        Client::initThread("ClonerThreadTest", getGlobalServiceContext()->getService());
+    };
     return options;
 }
 
@@ -575,13 +639,14 @@ RemoteCommandResponse makeCursorResponse(CursorId cursorId,
                                          int rbid) {
     OpTime futureOpTime(Timestamp(1000, 1000), 1000);
     Date_t futureWallTime = Date_t() + Seconds(futureOpTime.getSecs());
-    rpc::OplogQueryMetadata oqMetadata({futureOpTime, futureWallTime}, futureOpTime, rbid, 0, 0);
+    rpc::OplogQueryMetadata oqMetadata(
+        {futureOpTime, futureWallTime}, futureOpTime, futureOpTime, rbid, 0, 0, "");
 
     BSONObjBuilder bob;
     {
         BSONObjBuilder cursorBob(bob.subobjStart("cursor"));
         cursorBob.append("id", cursorId);
-        cursorBob.append("ns", nss.toString());
+        cursorBob.append("ns", nss.toString_forTest());
         {
             BSONArrayBuilder batchBob(
                 cursorBob.subarrayStart(isFirstBatch ? "firstBatch" : "nextBatch"));
@@ -592,7 +657,7 @@ RemoteCommandResponse makeCursorResponse(CursorId cursorId,
     }
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     bob.append("ok", 1);
-    return {bob.obj(), Milliseconds()};
+    return RemoteCommandResponse::make_forTest(bob.obj(), Milliseconds());
 }
 
 /**
@@ -623,35 +688,44 @@ OplogEntry makeOplogEntry(int t,
         oField = BSON("dropIndexes"
                       << "a_1");
     }
-    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
-                              opType,                      // op type
-                              NamespaceString("a.a"),      // namespace
-                              boost::none,                 // uuid
-                              boost::none,                 // fromMigrate
-                              version,                     // version
-                              oField,                      // o
-                              boost::none,                 // o2
-                              {},                          // sessionInfo
-                              boost::none,                 // upsert
-                              Date_t() + Seconds(t),       // wall clock time
-                              {},                          // statement ids
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),                             // optime
+                              opType,                                                 // op type
+                              NamespaceString::createNamespaceString_forTest("a.a"),  // namespace
+                              boost::none,                                            // uuid
+                              boost::none,                                            // fromMigrate
+                              boost::none,            // checkExistenceForDiffInsert
+                              version,                // version
+                              oField,                 // o
+                              boost::none,            // o2
+                              {},                     // sessionInfo
+                              boost::none,            // upsert
+                              Date_t() + Seconds(t),  // wall clock time
+                              {},                     // statement ids
                               boost::none,    // optime of previous write within same transaction
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
                               boost::none,    // ShardId of resharding recipient
-                              boost::none)};  // _id
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
 }
 
 BSONObj makeOplogEntryObj(int t, OpTypeEnum opType, int version) {
     return makeOplogEntry(t, opType, version).getEntry().toBSON();
 }
 
+BSONObj getLastLTSBson() {
+    FeatureCompatibilityVersionDocument fcvDoc;
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
+    return fcvDoc.toBSON();
+}
+
 void InitialSyncerTest::processSuccessfulLastOplogEntryFetcherResponse(std::vector<BSONObj> docs) {
     auto net = getNet();
-    auto request = assertRemoteCommandNameEquals(
-        "find",
-        net->scheduleSuccessfulResponse(makeCursorResponse(0LL, _options.localOplogNS, docs)));
+    auto request =
+        assertRemoteCommandNameEquals("find",
+                                      net->scheduleSuccessfulResponse(makeCursorResponse(
+                                          0LL, NamespaceString::kRsOplogNamespace, docs)));
     ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
     ASSERT_TRUE(request.cmdObj.hasField("sort"));
     ASSERT_EQUALS(mongo::BSONType::Object, request.cmdObj["sort"].type());
@@ -660,18 +734,18 @@ void InitialSyncerTest::processSuccessfulLastOplogEntryFetcherResponse(std::vect
 }
 
 void assertFCVRequest(RemoteCommandRequest request) {
-    ASSERT_EQUALS(NamespaceString::kServerConfigurationNamespace.db(), request.dbname)
+    ASSERT_EQUALS(NamespaceString::kServerConfigurationNamespace.dbName(), request.dbname)
         << request.toString();
     ASSERT_EQUALS(NamespaceString::kServerConfigurationNamespace.coll(),
                   request.cmdObj.getStringField("find"));
-    ASSERT_BSONOBJ_EQ(BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
+    ASSERT_BSONOBJ_EQ(BSON("_id" << multiversion::kParameterName),
                       request.cmdObj.getObjectField("filter"));
 }
 
 void InitialSyncerTest::processSuccessfulFCVFetcherResponseLastLTS() {
     FeatureCompatibilityVersionDocument fcvDoc;
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
     processSuccessfulFCVFetcherResponse({fcvDoc.toBSON()});
 }
 
@@ -686,12 +760,17 @@ void InitialSyncerTest::processSuccessfulFCVFetcherResponse(std::vector<BSONObj>
 }
 
 TEST_F(InitialSyncerTest, InvalidConstruction) {
-    InitialSyncerOptions options;
-    options.getMyLastOptime = []() { return OpTime(); };
-    options.setMyLastOptime = [](const OpTimeAndWallTime&) {};
-    options.resetOptimes = []() {};
+    InitialSyncerInterface::Options options;
+    options.getMyLastOptime = []() {
+        return OpTime();
+    };
+    options.setMyLastOptime = [](const OpTimeAndWallTime&) {
+    };
+    options.resetOptimes = []() {
+    };
     options.syncSourceSelector = this;
-    auto callback = [](const StatusWith<OpTimeAndWallTime>&) {};
+    auto callback = [](const StatusWith<OpTimeAndWallTime>&) {
+    };
 
     // Null task executor in external state.
     {
@@ -746,6 +825,7 @@ TEST_F(InitialSyncerTest, StartupReturnsShutdownInProgressIfInitialSyncerIsShutt
     // SyncSourceSelector returns an invalid sync source so InitialSyncer is stuck waiting for
     // another sync source in 'Options::syncSourceRetryWait' ms.
     ASSERT_OK(initialSyncer->shutdown());
+    executor::NetworkInterfaceMock::InNetworkGuard(getNet())->runReadyNetworkOperations();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, initialSyncer->startup(opCtx.get(), maxAttempts));
 }
 
@@ -796,7 +876,7 @@ TEST_F(InitialSyncerTest, StartupSetsInitialDataTimestampAndStableTimestampOnSuc
     ASSERT_TRUE(initialSyncer->isActive());
 
     ASSERT_EQUALS(Timestamp::kAllowUnstableCheckpointsSentinel,
-                  _storageInterface->getInitialDataTimestamp());
+                  _storageInterface->getInitialDataTimestamp(getGlobalServiceContext()));
     ASSERT_EQUALS(Timestamp::min(), _storageInterface->getStableTimestamp());
 }
 
@@ -907,7 +987,6 @@ TEST_F(InitialSyncerTest,
     // Check number of failed attempts in stats.
     auto progress = initialSyncer->getInitialSyncProgress();
     LOGV2(24166,
-          "Progress after {initialSyncMaxAttempts} failed attempts: {progress}",
           "Progress after initialSyncMaxAttempts failed attempts",
           "initialSyncMaxAttempts"_attr = initialSyncMaxAttempts,
           "progress"_attr = progress);
@@ -964,6 +1043,7 @@ TEST_F(InitialSyncerTest,
     // This will cancel the _chooseSyncSourceCallback() task scheduled at getNet()->now() +
     // '_options.syncSourceRetryWait'.
     ASSERT_OK(initialSyncer->shutdown());
+    executor::NetworkInterfaceMock::InNetworkGuard(getNet())->runReadyNetworkOperations();
 
     initialSyncer->join();
 
@@ -976,7 +1056,9 @@ TEST_F(InitialSyncerTest,
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort());
-    _executorProxy->shouldFailScheduleWorkAtRequest = []() { return true; };
+    _executorProxy->shouldFailScheduleWorkAtRequest = []() {
+        return true;
+    };
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
 
     initialSyncer->join();
@@ -1002,7 +1084,9 @@ TEST_F(InitialSyncerTest,
 
     // Last choose sync source attempt should now be scheduled. Advance clock so we fail last
     // choose sync source attempt which cause the next initial sync attempt to be scheduled.
-    _executorProxy->shouldFailScheduleWorkAtRequest = []() { return true; };
+    _executorProxy->shouldFailScheduleWorkAtRequest = []() {
+        return true;
+    };
     advanceClock(net, _options.syncSourceRetryWait);
 
     initialSyncer->join();
@@ -1144,8 +1228,8 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetRollbackIdScheduleError) 
     // creating the oplog collection.
     executor::RemoteCommandRequest request;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&request](const executor::RemoteCommandRequestOnAny& requestToSend) {
-            request = {requestToSend, 0};
+        [&request](const executor::RemoteCommandRequest& requestToSend) {
+            request = requestToSend;
             return true;
         };
 
@@ -1156,7 +1240,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetRollbackIdScheduleError) 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
-    ASSERT_EQUALS("admin", request.dbname);
+    ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
     assertRemoteCommandNameEquals("replSetGetRBID", request);
     ASSERT_EQUALS(syncSource, request.target);
 }
@@ -1206,7 +1290,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsRollbackCheckerOnShutdown) {
         ASSERT_TRUE(net->hasReadyRequests());
         auto noi = net->getNextReadyRequest();
         const auto& request = assertRemoteCommandNameEquals("replSetGetRBID", noi->getRequest());
-        ASSERT_EQUALS("admin", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kAdmin, request.dbname);
         ASSERT_EQUALS(syncSource, request.target);
         net->blackHole(noi);
     }
@@ -1253,8 +1337,8 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughDefaultBeginFetchingOpTimeSc
     // this test case.
     executor::RemoteCommandRequest request;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&request](const executor::RemoteCommandRequestOnAny& requestToSend) {
-            request = {requestToSend, 0};
+        [&request](const executor::RemoteCommandRequest& requestToSend) {
+            request = requestToSend;
             auto elem = requestToSend.cmdObj.firstElement();
             return (("find" == elem.fieldNameStringData()) &&
                     ("oplog.rs" == elem.valueStringData()));
@@ -1277,7 +1361,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughDefaultBeginFetchingOpTimeSc
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
     ASSERT_EQUALS(syncSource, request.target);
-    ASSERT_EQUALS(NamespaceString::kLocalDb, request.dbname);
+    ASSERT_EQUALS(DatabaseName::kLocal, request.dbname);
     assertRemoteCommandNameEquals("find", request);
 }
 
@@ -1338,8 +1422,8 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetBeginFetchingOpTimeSchedu
     // inspection at the end of this test case.
     executor::RemoteCommandRequest request;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&request](const executor::RemoteCommandRequestOnAny& requestToSend) {
-            request = {requestToSend, 0};
+        [&request](const executor::RemoteCommandRequest& requestToSend) {
+            request = requestToSend;
             auto elem = requestToSend.cmdObj.firstElement();
             return (("find" == elem.fieldNameStringData()) &&
                     (NamespaceString::kSessionTransactionsTableNamespace.coll() ==
@@ -1366,7 +1450,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetBeginFetchingOpTimeSchedu
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
     ASSERT_EQUALS(syncSource, request.target);
-    ASSERT_EQUALS(NamespaceString::kConfigDb, request.dbname);
+    ASSERT_EQUALS(DatabaseName::kConfig, request.dbname);
     assertRemoteCommandNameEquals("find", request);
 }
 
@@ -1452,8 +1536,8 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughLastOplogEntryFetcherSchedul
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
         _executorProxy->shouldFailScheduleRemoteCommandRequest =
-            [&request](const executor::RemoteCommandRequestOnAny& requestToSend) {
-                request = {requestToSend, 0};
+            [&request](const executor::RemoteCommandRequest& requestToSend) {
+                request = requestToSend;
                 auto elem = requestToSend.cmdObj.firstElement();
                 return (("find" == elem.fieldNameStringData()) &&
                         ("oplog.rs" == elem.valueStringData()));
@@ -1471,7 +1555,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughLastOplogEntryFetcherSchedul
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
     ASSERT_EQUALS(syncSource, request.target);
-    ASSERT_EQUALS(_options.localOplogNS.db(), request.dbname);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.dbName(), request.dbname);
     assertRemoteCommandNameEquals("find", request);
     ASSERT_BSONOBJ_EQ(BSON("$natural" << -1), request.cmdObj.getObjectField("sort"));
     ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
@@ -1647,8 +1731,8 @@ TEST_F(InitialSyncerTest,
     initialSyncer->join();
 
     // OpTimeAndWallTime now uses the IDL parser, so the status code returned is from
-    // IDLParserErrorContext
-    ASSERT_EQUALS(_lastApplied.getStatus().code(), 40414);
+    // IDLParserContext
+    ASSERT_EQUALS(_lastApplied.getStatus().code(), ErrorCodes::IDLFailedToParse);
 }
 
 TEST_F(InitialSyncerTest,
@@ -1656,7 +1740,7 @@ TEST_F(InitialSyncerTest,
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
-    getExternalState()->replSetConfigResult = Status(ErrorCodes::OperationFailed, "");
+    getExternalState()->setReplSetConfigResult(Status(ErrorCodes::OperationFailed, ""));
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
@@ -1695,8 +1779,8 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherScheduleError) {
     // We reject the first find command that is on the fCV collection.
     executor::RemoteCommandRequest request;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&request](const executor::RemoteCommandRequestOnAny& requestToSend) {
-            request = {requestToSend, 0};
+        [&request](const executor::RemoteCommandRequest& requestToSend) {
+            request = requestToSend;
             return "find" == requestToSend.cmdObj.firstElement().fieldNameStringData() &&
                 NamespaceString::kServerConfigurationNamespace.coll() ==
                 requestToSend.cmdObj.firstElement().str();
@@ -1743,17 +1827,18 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherCallbackError_Mock
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
 
     _mock
-        ->expect(BSON("find"
-                      << "oplog.rs"),
-                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
         .times(2);
 
     // This is what we want to test.
     _mock
         ->expect(BSON("find"
                       << "system.version"),
-                 RemoteCommandResponse(ErrorCodes::OperationFailed,
-                                       "find command failed at sync source"))
+                 RemoteCommandResponse::make_forTest(
+                     Status(ErrorCodes::OperationFailed, "find command failed at sync source")))
         .times(1);
 
     // Start the real work.
@@ -1809,32 +1894,22 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsFCVFetcherOnShutdown) {
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
 
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+    // Run mock.
+    _mock->runUntilExpectationsSatisfied();
 
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        ASSERT_TRUE(net->hasReadyRequests());
-    }
-
+    // Shut down initial syncer and verify that cancels on FCV fetcher.
     ASSERT_OK(initialSyncer->shutdown());
-    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+    _mock->runUntilIdle();
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
@@ -1845,37 +1920,34 @@ TEST_F(InitialSyncerTest, InitialSyncerResendsFindCommandIfFCVFetcherReturnsRetr
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // Respond to the first FCV attempt with a retriable error.
+    _mock
+        ->expect(BSON("find"
+                      << "system.version"),
+                 RemoteCommandResponse::make_forTest(
+                     Status(ErrorCodes::HostUnreachable, "host unreachable network error")))
+        .times(1);
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
 
-    auto net = getNet();
-    executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-    // Base rollback ID.
-    net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-    // Oplog entry associated with the defaultBeginFetchingTimestamp.
-    processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-    // Send an empty optime as the response to the beginFetchingOptime find request, which will
-    // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-    auto request = net->scheduleSuccessfulResponse(
-        makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-    assertRemoteCommandNameEquals("find", request);
-    net->runReadyNetworkOperations();
-
-    // Oplog entry associated with the beginApplyingTimestamp.
-    processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-    // FCV first attempt - retriable error.
-    assertRemoteCommandNameEquals(
-        "find", net->scheduleErrorResponse(Status(ErrorCodes::HostUnreachable, "")));
-    net->runReadyNetworkOperations();
-
     // InitialSyncer stays active because it resends the find request for the fCV.
+    _mock->runUntilExpectationsSatisfied();
     ASSERT_TRUE(initialSyncer->isActive());
 
     // FCV second attempt.
-    processSuccessfulFCVFetcherResponseLastLTS();
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+    _mock->runUntilExpectationsSatisfied();
 }
 
 void InitialSyncerTest::runInitialSyncWithBadFCVResponse(std::vector<BSONObj> docs,
@@ -1884,30 +1956,22 @@ void InitialSyncerTest::runInitialSyncWithBadFCVResponse(std::vector<BSONObj> do
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(0LL, NamespaceString::kServerConfigurationNamespace, docs))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        processSuccessfulFCVFetcherResponse(docs);
-    }
+    _mock->runUntilExpectationsSatisfied();
 
     initialSyncer->join();
     ASSERT_EQUALS(expectedError, _lastApplied);
@@ -1922,7 +1986,7 @@ TEST_F(InitialSyncerTest,
        InitialSyncerReturnsTooManyMatchingDocumentsWhenFCVFetcherReturnsMultipleDocuments) {
     FeatureCompatibilityVersionDocument fcvDoc;
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
     auto docs = {fcvDoc.toBSON(),
                  BSON("_id"
                       << "other")};
@@ -1933,8 +1997,8 @@ TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsUpgradeTargetVersion) {
     FeatureCompatibilityVersionDocument fcvDoc;
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
-    fcvDoc.setTargetVersion(ServerGlobalParams::FeatureCompatibility::kLatest);
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
+    fcvDoc.setTargetVersion(multiversion::GenericFCV::kLatest);
     runInitialSyncWithBadFCVResponse({fcvDoc.toBSON()}, ErrorCodes::IncompatibleServerVersion);
 }
 
@@ -1942,16 +2006,17 @@ TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsDowngradeTargetVersion) {
     FeatureCompatibilityVersionDocument fcvDoc;
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
-    fcvDoc.setTargetVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
-    fcvDoc.setPreviousVersion(ServerGlobalParams::FeatureCompatibility::kLatest);
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
+    fcvDoc.setTargetVersion(multiversion::GenericFCV::kLastLTS);
+    fcvDoc.setPreviousVersion(multiversion::GenericFCV::kLatest);
     runInitialSyncWithBadFCVResponse({fcvDoc.toBSON()}, ErrorCodes::IncompatibleServerVersion);
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerReturnsParseErrorWhenFCVFetcherReturnsNoVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "targetVersion"
-                            << FeatureCompatibilityVersionParser::kVersion44)};
-    runInitialSyncWithBadFCVResponse(docs, ((ErrorCodes::Error)40414));
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    auto docs = {BSON("_id" << multiversion::kParameterName << "targetVersion"
+                            << multiversion::toString(multiversion::GenericFCV::kLatest))};
+    runInitialSyncWithBadFCVResponse(docs, ErrorCodes::IDLFailedToParse);
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) {
@@ -1959,38 +2024,28 @@ TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) 
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        FeatureCompatibilityVersionDocument fcvDoc;
-        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-        fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
-        processSuccessfulFCVFetcherResponse({fcvDoc.toBSON()});
-    }
+    _mock->runUntilExpectationsSatisfied();
 
     // We shut it down so we do not have to finish initial sync. If the fCV fetcher got an error,
     // we would return that.
     ASSERT_OK(initialSyncer->shutdown());
-    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+    _mock->runUntilIdle();
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
@@ -2012,15 +2067,16 @@ TEST_F(
 
     // Only respond to oplog queries twice to block the initial syncer on getting stopTimestamp.
     _mock
-        ->expect(BSON("find"
-                      << "oplog.rs"),
-                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
         .times(2);
 
     // This is what we want to test.
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
     FeatureCompatibilityVersionDocument fcvDoc;
-    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
     _mock
         ->expect([](auto& request) { return request["find"].str() == "system.version"; },
                  makeCursorResponse(
@@ -2030,6 +2086,9 @@ TEST_F(
     FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     // Start the real work.
     ASSERT_OK(initialSyncer->startup(opCtx.get(), initialSyncMaxAttempts));
@@ -2043,7 +2102,8 @@ TEST_F(
 
     _mock
         ->expect([](auto& request) { return request["find"].str() == "oplog.rs"; },
-                 makeCursorResponse(0LL, _options.localOplogNS, {lastOp.getEntry().toBSON()}))
+                 makeCursorResponse(
+                     0LL, NamespaceString::kRsOplogNamespace, {lastOp.getEntry().toBSON()}))
         .times(1);
 
     _mock->runUntilExpectationsSatisfied();
@@ -2069,6 +2129,10 @@ TEST_F(InitialSyncerTest,
     FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
+
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(net);
 
@@ -2128,39 +2192,29 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughOplogFetcherCallbackError) {
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
+    // Ensure second lastOplogFetch doesn't happen until we're ready for it.
+    FailPointEnableBlock clonerFailpoint("hangAfterClonerStage", kListDatabasesFailPointData);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    _mock->runUntilExpectationsSatisfied();
 
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-        // Keep the cloner from finishing so end-of-clone-stage network events don't interfere.
-        FailPointEnableBlock clonerFailpoint("hangBeforeClonerStage", kListDatabasesFailPointData);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}));
-        net->runReadyNetworkOperations();
-
-        // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastLTS();
-
-        // Simulate an error response to the OplogFetcher.
-        getOplogFetcher()->simulateResponseError(
-            Status(ErrorCodes::OperationFailed, "dead cursor"));
-    }
+    // Simulate an error response to the OplogFetcher.
+    getOplogFetcher()->simulateResponseError(Status(ErrorCodes::OperationFailed, "dead cursor"));
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
@@ -2175,57 +2229,40 @@ TEST_F(InitialSyncerTest,
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
-
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    _mock->runUntilExpectationsSatisfied();
 
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+    _mock
+        ->expect(
+            [](auto& request) { return request["find"].str() == "oplog.rs"; },
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(1);
 
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        request =
-            assertRemoteCommandNameEquals("find",
-                                          net->scheduleSuccessfulResponse(makeCursorResponse(
-                                              0LL, _options.localOplogNS, {makeOplogEntryObj(1)})));
-        ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
-        net->runReadyNetworkOperations();
-
-        {
-            // Ensure second lastOplogFetch doesn't happen until we're ready for it.
-            FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
-                                                 kListDatabasesFailPointData);
-            // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastLTS();
-
-            // Simulate cursor closing on sync source.
-            getOplogFetcher()->receiveBatch(0LL, {makeOplogEntryObj(1)});
-        }
-
-        // Oplog entry associated with the stopTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Last rollback checker replSetGetRBID command.
-        assertRemoteCommandNameEquals(
-            "replSetGetRBID", net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1)));
-        net->runReadyNetworkOperations();
-    }
+    // Simulate cursor closing on sync source.
+    getOplogFetcher()->receiveBatch(0LL, {makeOplogEntryObj(1)});
+    _mock->runUntilExpectationsSatisfied();
 
     initialSyncer->join();
     ASSERT_OK(_lastApplied.getStatus());
@@ -2244,56 +2281,45 @@ TEST_F(
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    _mock->runUntilExpectationsSatisfied();
 
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+    // Simulate cursor closing on sync source.
+    getOplogFetcher()->receiveBatch(0LL,
+                                    {makeOplogEntryObj(1),
+                                     makeOplogEntryObj(2, OpTypeEnum::kCommand),
+                                     makeOplogEntryObj(3, OpTypeEnum::kCommand)});
 
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
+    _mock
+        ->expect(
+            [](auto& request) { return request["find"].str() == "oplog.rs"; },
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(3)}))
+        .times(1);
 
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        {
-            // Ensure second lastOplogFetch doesn't happen until we're ready for it.
-            FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
-                                                 kListDatabasesFailPointData);
-            // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastLTS();
-
-            // Simulate cursor closing on sync source.
-            getOplogFetcher()->receiveBatch(0LL,
-                                            {makeOplogEntryObj(1),
-                                             makeOplogEntryObj(2, OpTypeEnum::kCommand),
-                                             makeOplogEntryObj(3, OpTypeEnum::kCommand)});
-        }
-
-        // Oplog entry associated with the stopTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(3)});
-
-        // Last rollback checker replSetGetRBID command.
-        assertRemoteCommandNameEquals(
-            "replSetGetRBID", net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1)));
-        net->runReadyNetworkOperations();
-    }
-
+    _mock->runUntilExpectationsSatisfied();
     initialSyncer->join();
     ASSERT_OK(_lastApplied.getStatus());
     auto dummyEntry = makeOplogEntry(3);
@@ -2308,49 +2334,41 @@ TEST_F(
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    _mock->runUntilExpectationsSatisfied();
 
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+    // Simulate cursor closing on sync source.
+    getOplogFetcher()->receiveBatch(0LL,
+                                    {makeOplogEntryObj(1),
+                                     makeOplogEntryObj(2, OpTypeEnum::kCommand),
+                                     makeOplogEntryObj(3, OpTypeEnum::kCommand)});
 
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
+    // Oplog entry associated with the stopTimestamp.
+    // Return an oplog entry with an optime that is more recent than what the completed
+    // OplogFetcher has read from the sync source.
+    _mock
+        ->expect(
+            [](auto& request) { return request["find"].str() == "oplog.rs"; },
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(4)}))
+        .times(1);
 
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        {
-            // Ensure second lastOplogFetch doesn't happen until we're ready for it.
-            FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
-                                                 kListDatabasesFailPointData);
-            // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastLTS();
-
-            // Simulate cursor closing on sync source.
-            getOplogFetcher()->receiveBatch(0LL,
-                                            {makeOplogEntryObj(1),
-                                             makeOplogEntryObj(2, OpTypeEnum::kCommand),
-                                             makeOplogEntryObj(3, OpTypeEnum::kCommand)});
-        }
-
-        // Oplog entry associated with the stopTimestamp.
-        // Return an oplog entry with an optime that is more recent than what the completed
-        // OplogFetcher has read from the sync source.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(4)});
-    }
-
+    _mock->runUntilExpectationsSatisfied();
     initialSyncer->join();
+
     ASSERT_EQUALS(ErrorCodes::RemoteResultsUnavailable, _lastApplied);
 }
 
@@ -2364,31 +2382,22 @@ TEST_F(InitialSyncerTest,
                                  Status(ErrorCodes::FailedToParse, "listDatabases failed"));
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastLTS();
-    }
+    _mock->runUntilExpectationsSatisfied();
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, _lastApplied);
@@ -2399,34 +2408,25 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsBothOplogFetcherAndAllDatabaseClon
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+    _mock
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // FCV response.
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {getLastLTSBson()}))
+        .times(1);
+
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastLTS();
-    }
+    _mock->runUntilExpectationsSatisfied();
 
     ASSERT_OK(initialSyncer->shutdown());
-    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+    _mock->runUntilIdle();
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
@@ -2442,7 +2442,7 @@ TEST_F(InitialSyncerTest,
     executor::RemoteCommandRequest request;
     int count = 0;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&count, &request](const executor::RemoteCommandRequestOnAny& requestToSend) {
+        [&count, &request](const executor::RemoteCommandRequest& requestToSend) {
             auto elem = requestToSend.cmdObj.firstElement();
             if (("find" == elem.fieldNameStringData()) && (requestToSend.cmdObj.hasField("sort")) &&
                 (1 == requestToSend.cmdObj.getIntField("limit")) &&
@@ -2451,7 +2451,7 @@ TEST_F(InitialSyncerTest,
                     count++;
                     return false;
                 }
-                request = {requestToSend, 0};
+                request = requestToSend;
                 return true;
             }
             return false;
@@ -2494,52 +2494,26 @@ TEST_F(InitialSyncerTest,
     auto opCtx = makeOpCtx();
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
-    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
     {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+        MockNetwork::InSequence seq(*_mock);
+        _mock
+            ->expect(
+                BSON("find"
+                     << "oplog.rs"),
+                makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
+            .times(1);
 
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-
-        // Oplog entry associated with the defaultBeginFetchingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        // Send an empty optime as the response to the beginFetchingOptime find request, which will
-        // cause the beginFetchingTimestamp to be set to the defaultBeginFetchingTimestamp.
-        auto request = net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
-        assertRemoteCommandNameEquals("find", request);
-        net->runReadyNetworkOperations();
-
-        // Oplog entry associated with the beginApplyingTimestamp.
-        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
-
-        {
-            // Ensure second lastOplogFetch doesn't happen until we're ready for it.
-            FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
-                                                 kListDatabasesFailPointData);
-            // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastLTS();
-        }
-
-        // Oplog entry associated with the stopTimestamp.
-        request = assertRemoteCommandNameEquals(
-            "find",
-            net->scheduleErrorResponse(
-                Status(ErrorCodes::OperationFailed,
-                       "Oplog entry fetcher associated with the stopTimestamp failed")));
-        ASSERT_TRUE(request.cmdObj.hasField("sort"));
-        ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
-        net->runReadyNetworkOperations();
-
-        // _lastOplogEntryFetcherCallbackAfterCloningData() will shut down the OplogFetcher after
-        // setting the completion status.
-        // We call runReadyNetworkOperations() again to deliver the cancellation status to
-        // _oplogFetcherCallback().
-        net->runReadyNetworkOperations();
+        _mock
+            ->expect(BSON("find"
+                          << "oplog.rs"),
+                     RemoteCommandResponse::make_forTest(
+                         Status(ErrorCodes::OperationFailed,
+                                "Oplog entry fetcher associated with the stopTimestamp failed")))
+            .times(1);
     }
+
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    _mock->runUntilExpectationsSatisfied();
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
@@ -2553,6 +2527,9 @@ TEST_F(InitialSyncerTest, InitialSyncerRetriesLastOplogEntryFetcherNetworkError)
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -2936,7 +2913,7 @@ TEST_F(
             const NamespaceStringOrUUID& nsOrUUID,
             const TimestampedBSONObj& doc,
             long long term) {
-            insertDocumentNss = *nsOrUUID.nss();
+            insertDocumentNss = nsOrUUID.nss();
             insertDocumentDoc = doc;
             insertDocumentTerm = term;
             return Status(ErrorCodes::OperationFailed, "failed to insert oplog entry");
@@ -2986,7 +2963,7 @@ TEST_F(
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
-    ASSERT_EQUALS(_options.localOplogNS, insertDocumentNss);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace, insertDocumentNss);
     ASSERT_BSONOBJ_EQ(oplogEntry, insertDocumentDoc.obj);
 }
 
@@ -3005,7 +2982,7 @@ TEST_F(
             const NamespaceStringOrUUID& nsOrUUID,
             const TimestampedBSONObj& doc,
             long long term) {
-            insertDocumentNss = *nsOrUUID.nss();
+            insertDocumentNss = nsOrUUID.nss();
             insertDocumentDoc = doc;
             insertDocumentTerm = term;
             initialSyncer->shutdown().transitional_ignore();
@@ -3056,7 +3033,7 @@ TEST_F(
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
-    ASSERT_EQUALS(_options.localOplogNS, insertDocumentNss);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace, insertDocumentNss);
     ASSERT_BSONOBJ_EQ(oplogEntry, insertDocumentDoc.obj);
 }
 
@@ -3070,13 +3047,13 @@ TEST_F(
     executor::RemoteCommandRequest request;
     bool first = true;
     _executorProxy->shouldFailScheduleRemoteCommandRequest =
-        [&first, &request](const executor::RemoteCommandRequestOnAny& requestToSend) {
+        [&first, &request](const executor::RemoteCommandRequest& requestToSend) {
             if ("replSetGetRBID" == requestToSend.cmdObj.firstElement().fieldNameStringData()) {
                 if (first) {
                     first = false;
                     return false;
                 }
-                request = {requestToSend, 0};
+                request = requestToSend;
                 return true;
             }
             return false;
@@ -3195,6 +3172,10 @@ TEST_F(InitialSyncerTest, InitialSyncerHandlesNetworkErrorsFromRollbackCheckerAf
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3507,6 +3488,9 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -3541,13 +3525,13 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
         // Instead of fast forwarding to AllDatabaseCloner completion by returning an empty list of
         // database names, we'll simulate copying a single database with a single collection on the
         // sync source.  We must do this setup before responding to the FCV, to avoid a race.
-        NamespaceString nss("a.a");
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.a");
         _mockServer->setCommandReply("listDatabases",
-                                     makeListDatabasesResponse({nss.db().toString()}));
+                                     makeListDatabasesResponse({nss.db_forTest().toString()}));
 
         // Set up data for "a"
-        _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
-        _mockServer->insert(nss.ns(), BSON("_id" << 1 << "a" << 1));
+        _mockServer->assignCollectionUuid(nss.ns_forTest(), *_options1.uuid);
+        _mockServer->insert(nss, BSON("_id" << 1 << "a" << 1));
 
         // listCollections for "a"
         _mockServer->setCommandReply(
@@ -3575,8 +3559,7 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
                 0LL,
                 NamespaceString(nss.getCommandNS()),
                 {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
-                          << "_id_"
-                          << "ns" << nss.ns())})
+                          << IndexConstants::kIdIndexName << "ns" << nss.ns_forTest())})
                 .data);
 
         {
@@ -3652,7 +3635,9 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchScheduleE
         // Before processing scheduled last oplog entry fetcher response, set flag in
         // TaskExecutorMock so that InitialSyncer will fail to schedule
         // _getNextApplierBatchCallback().
-        _executorProxy->shouldFailScheduleWorkRequest = []() { return true; };
+        _executorProxy->shouldFailScheduleWorkRequest = []() {
+            return true;
+        };
 
         // Oplog entry associated with the stopTimestamp.
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(2)});
@@ -3709,7 +3694,9 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughSecondGetNextApplierBatchSch
         // Before processing scheduled last oplog entry fetcher response, set flag in
         // TaskExecutorMock so that InitialSyncer will fail to schedule second
         // _getNextApplierBatchCallback() at (now + options.getApplierBatchCallbackRetryWait).
-        _executorProxy->shouldFailScheduleWorkAtRequest = []() { return true; };
+        _executorProxy->shouldFailScheduleWorkAtRequest = []() {
+            return true;
+        };
 
         // Oplog entry associated with the stopTimestamp.
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(2)});
@@ -3766,7 +3753,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchOnShutdown) {
         // Oplog entry associated with the stopTimestamp.
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(2)});
 
-        // Since we black holed OplogFetcher's find request, _getNextApplierBatch_inlock() will
+        // Since we black holed OplogFetcher's find request, _getNextApplierBatch() will
         // not return any operations for us to apply, leading to _getNextApplierBatchCallback()
         // rescheduling itself at new->now() + _options.getApplierBatchCallbackRetryWait.
     }
@@ -3779,6 +3766,11 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchOnShutdown) {
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchInLockError) {
+    // oplog version validation is moved from oplog batcher to oplog fetcher. This test can be
+    // removed after removing the feture flag.
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagReduceMajorityWriteLatency", false);
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3787,7 +3779,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchInLockErr
 
     ASSERT_TRUE(_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx.get()));
 
-    // _getNextApplierBatch_inlock() returns BadValue when it gets an oplog entry with an unexpected
+    // _getNextApplierBatch() returns BadValue when it gets an oplog entry with an unexpected
     // version (not OplogEntry::kOplogVersion).
     auto oplogEntry = makeOplogEntryObj(1);
     auto oplogEntryWithInconsistentVersion =
@@ -3822,7 +3814,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchInLockErr
             processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch with bad oplog entries that will be added to the oplog
-            // buffer and processed by _getNextApplierBatch_inlock().
+            // buffer and processed by _getNextApplierBatch().
             getOplogFetcher()->receiveBatch(1LL, {oplogEntry, oplogEntryWithInconsistentVersion});
         }
 
@@ -3843,6 +3835,11 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchInLockErr
 TEST_F(
     InitialSyncerTest,
     InitialSyncerReturnsEmptyBatchFromGetNextApplierBatchInLockIfRsSyncApplyStopFailPointIsEnabled) {
+    // oplog version validation is moved from oplog batcher to oplog fetcher. This test can be
+    // removed after removing the feture flag.
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagReduceMajorityWriteLatency", false);
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3851,13 +3848,13 @@ TEST_F(
 
     ASSERT_TRUE(_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx.get()));
 
-    // _getNextApplierBatch_inlock() returns BadValue when it gets an oplog entry with an unexpected
+    // _getNextApplierBatch() returns BadValue when it gets an oplog entry with an unexpected
     // version (not OplogEntry::kOplogVersion).
     auto oplogEntry = makeOplogEntryObj(1);
     auto oplogEntryWithInconsistentVersion =
         makeOplogEntryObj(2, OpTypeEnum::kInsert, OplogEntry::kOplogVersion + 100);
 
-    // Enable 'rsSyncApplyStop' so that _getNextApplierBatch_inlock() returns an empty batch of
+    // Enable 'rsSyncApplyStop' so that _getNextApplierBatch() returns an empty batch of
     // operations instead of a batch containing an oplog entry with a bad version.
     auto failPoint = globalFailPointRegistry().find("rsSyncApplyStop");
     failPoint->setMode(FailPoint::alwaysOn);
@@ -3891,7 +3888,7 @@ TEST_F(
             processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch with bad oplog entries that will be added to the oplog
-            // buffer and processed by _getNextApplierBatch_inlock().
+            // buffer and processed by _getNextApplierBatch().
             getOplogFetcher()->receiveBatch(1LL, {oplogEntry, oplogEntryWithInconsistentVersion});
         }
 
@@ -3899,7 +3896,7 @@ TEST_F(
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(2)});
 
         // Since the 'rsSyncApplyStop' fail point is enabled, InitialSyncer will get an empty
-        // batch of operations from _getNextApplierBatch_inlock() even though the oplog buffer
+        // batch of operations from _getNextApplierBatch() even though the oplog buffer
         // is not empty.
     }
 
@@ -3962,7 +3959,9 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughMultiApplierScheduleError) {
         getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1), makeOplogEntryObj(2)});
 
         // Make MultiApplier::startup() fail.
-        _executorProxy->shouldFailScheduleWorkRequest = []() { return true; };
+        _executorProxy->shouldFailScheduleWorkRequest = []() {
+            return true;
+        };
 
         // Advance clock until _getNextApplierBatchCallback() runs.
         auto when = net->now() + _options.getApplierBatchCallbackRetryWait;
@@ -4153,12 +4152,13 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
 
 void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
     auto lastOp = doInitialSyncWithOneBatch();
-    serverGlobalParams.mutableFeatureCompatibility.reset();
+    serverGlobalParams.mutableFCV.reset();
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(lastOp.getOpTime(), _lastApplied.getValue().opTime);
     ASSERT_EQUALS(lastOp.getWallClockTime(), _lastApplied.getValue().wallTime);
 
-    ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(), _storageInterface->getInitialDataTimestamp());
+    ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(),
+                  _storageInterface->getInitialDataTimestamp(getGlobalServiceContext()));
 }
 
 TEST_F(InitialSyncerTest,
@@ -4170,6 +4170,9 @@ TEST_F(InitialSyncerTest,
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     doSuccessfulInitialSyncWithOneBatch();
 }
@@ -4183,6 +4186,9 @@ TEST_F(InitialSyncerTest,
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -4219,14 +4225,14 @@ TEST_F(InitialSyncerTest,
         // Instead of fast forwarding to AllDatabaseCloner completion by returning an empty list of
         // database names, we'll simulate copying a single database with a single collection on the
         // sync source.  We must do this setup before responding to the FCV, to avoid a race.
-        NamespaceString nss("a.a");
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.a");
         _mockServer->setCommandReply("listDatabases",
-                                     makeListDatabasesResponse({nss.db().toString()}));
+                                     makeListDatabasesResponse({nss.db_forTest().toString()}));
 
 
         // Set up data for "a"
-        _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
-        _mockServer->insert(nss.ns(), BSON("_id" << 1 << "a" << 1));
+        _mockServer->assignCollectionUuid(nss.ns_forTest(), *_options1.uuid);
+        _mockServer->insert(nss, BSON("_id" << 1 << "a" << 1));
 
         // listCollections for "a"
         _mockServer->setCommandReply(
@@ -4254,8 +4260,7 @@ TEST_F(InitialSyncerTest,
                 0LL,
                 NamespaceString(nss.getCommandNS()),
                 {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
-                          << "_id_"
-                          << "ns" << nss.ns())})
+                          << IndexConstants::kIdIndexName << "ns" << nss.ns_forTest())})
                 .data);
 
         {
@@ -4289,23 +4294,6 @@ TEST_F(InitialSyncerTest,
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(lastOp.getOpTime(), _lastApplied.getValue().opTime);
     ASSERT_EQUALS(lastOp.getWallClockTime(), _lastApplied.getValue().wallTime);
-}
-
-TEST_F(InitialSyncerTest,
-       InitialSyncerReturnsInvalidSyncSourceWhenFailInitialSyncWithBadHostFailpointIsEnabled) {
-    auto initialSyncer = &getInitialSyncer();
-    auto opCtx = makeOpCtx();
-
-    // This fail point makes chooseSyncSourceCallback fail with an InvalidSyncSource error.
-    auto failPoint = globalFailPointRegistry().find("failInitialSyncWithBadHost");
-    failPoint->setMode(FailPoint::alwaysOn);
-    ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
-
-    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
-    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    initialSyncer->join();
-    ASSERT_EQUALS(ErrorCodes::InvalidSyncSource, _lastApplied);
 }
 
 TEST_F(InitialSyncerTest, OplogOutOfOrderOnOplogFetchFinish) {
@@ -4363,10 +4351,9 @@ TEST_F(InitialSyncerTest, OplogOutOfOrderOnOplogFetchFinish) {
 TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
-    ASSERT_OK(ServerParameterSet::getGlobal()
-                  ->getMap()
-                  .find("collectionClonerBatchSize")
-                  ->second->setFromString("1"));
+    ASSERT_OK(ServerParameterSet::getNodeParameterSet()
+                  ->get("collectionClonerBatchSize")
+                  ->setFromString("1", boost::none));
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 27017));
 
@@ -4385,13 +4372,15 @@ TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
     const auto dbSize = 10000;
     const auto numDocs = 5;
     const auto avgObjSize = dbSize / numDocs;
-    NamespaceString nss("a.a");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.a");
 
     auto hangDuringCloningFailPoint =
         globalFailPointRegistry().find("initialSyncHangDuringCollectionClone");
     // Hang after all docs have been cloned in collection 'a.a'.
     auto timesEntered = hangDuringCloningFailPoint->setMode(
-        FailPoint::alwaysOn, 0, BSON("namespace" << nss.ns() << "numDocsToClone" << numDocs));
+        FailPoint::alwaysOn,
+        0,
+        BSON("namespace" << nss.ns_forTest() << "numDocsToClone" << numDocs));
 
     {
         // Keep the cloner from finishing so end-of-clone-stage network events don't interfere.
@@ -4427,15 +4416,15 @@ TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
         // We do not populate database 'b' with data as we don't actually complete initial sync in
         // this test.
         _mockServer->setCommandReply("listDatabases",
-                                     makeListDatabasesResponse({nss.db().toString(), "b"}));
+                                     makeListDatabasesResponse({nss.db_forTest().toString(), "b"}));
         // The AllDatabaseCloner post stage calls dbStats to record initial sync progress
         // metrics. This will be used to calculate both the data size of "a" and "b".
         _mockServer->setCommandReply("dbStats", BSON("dataSize" << dbSize));
 
         // Set up data for "a"
-        _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
+        _mockServer->assignCollectionUuid(nss.ns_forTest(), *_options1.uuid);
         for (int i = 1; i <= 5; ++i) {
-            _mockServer->insert(nss.ns(), BSON("_id" << i << "a" << i));
+            _mockServer->insert(nss, BSON("_id" << i << "a" << i));
         }
 
         // listCollections for "a"
@@ -4465,8 +4454,7 @@ TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
                 0LL,
                 NamespaceString(nss.getCommandNS()),
                 {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
-                          << "_id_"
-                          << "ns" << nss.ns())})
+                          << IndexConstants::kIdIndexName << "ns" << nss.ns_forTest())})
                 .data);
         // Release the 'hangBeforeCloningFailPoint' to continue the cloning phase.
     }
@@ -4474,6 +4462,10 @@ TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
     // Wait for the server to have reached the end of cloning collection 'a.a'. The size of this
     // collection is expected to equal 'dbSize'.
     hangDuringCloningFailPoint->waitForTimesEntered(timesEntered + 1);
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+        net->runUntil(Date_t::now() + Seconds(1));
+    }
     auto progress = initialSyncer->getInitialSyncProgress();
     LOGV2(5301701, "Progress in middle of cloning", "progress"_attr = progress);
     {
@@ -4511,6 +4503,9 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     // Skip clearing initial sync progress so that we can check initialSyncStatus fields after
     // initial sync is complete.
@@ -4518,10 +4513,9 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
-    ASSERT_OK(ServerParameterSet::getGlobal()
-                  ->getMap()
-                  .find("collectionClonerBatchSize")
-                  ->second->setFromString("1"));
+    ASSERT_OK(ServerParameterSet::getNodeParameterSet()
+                  ->get("collectionClonerBatchSize")
+                  ->setFromString("1", boost::none));
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 27017));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), 2U));
@@ -4562,12 +4556,13 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
         auto progress = initialSyncer->getInitialSyncProgress();
         LOGV2(24168, "Progress after first failed response", "progress"_attr = progress);
-        ASSERT_EQUALS(progress.nFields(), 11) << progress;
+        ASSERT_EQUALS(progress.nFields(), 12) << progress;
+        ASSERT_EQUALS(progress.getField("method").String(), "logical") << progress;
         ASSERT_FALSE(progress.hasField("remainingInitialSyncEstimatedMillis"));
         ASSERT_FALSE(progress.hasField("InitialSyncEnd"));
         ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 0) << progress;
         ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
-        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberInt) << progress;
         ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 0) << progress;
         ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 0) << progress;
         ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
@@ -4630,12 +4625,12 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
         auto progress = initialSyncer->getInitialSyncProgress();
         LOGV2(24171, "Progress after failure", "progress"_attr = progress);
-        ASSERT_EQUALS(progress.nFields(), 11) << progress;
+        ASSERT_EQUALS(progress.nFields(), 12) << progress;
         ASSERT_FALSE(progress.hasField("remainingInitialSyncEstimatedMillis"));
         ASSERT_FALSE(progress.hasField("InitialSyncEnd"));
         ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
         ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
-        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberInt) << progress;
         ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 0) << progress;
         ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 0) << progress;
         ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
@@ -4665,16 +4660,16 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
         // Set up the successful cloner run.
         // listDatabases: a
-        NamespaceString nss("a.a");
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.a");
         _mockServer->setCommandReply("listDatabases",
-                                     makeListDatabasesResponse({nss.db().toString()}));
+                                     makeListDatabasesResponse({nss.db_forTest().toString()}));
         // The AllDatabaseCloner post stage calls dbStats to record initial sync progress metrics.
         _mockServer->setCommandReply("dbStats", BSON("dataSize" << 10));
 
         // Set up data for "a"
-        _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
+        _mockServer->assignCollectionUuid(nss.ns_forTest(), *_options1.uuid);
         for (int i = 1; i <= 5; ++i) {
-            _mockServer->insert(nss.ns(), BSON("_id" << i << "a" << i));
+            _mockServer->insert(nss, BSON("_id" << i << "a" << i));
         }
 
         // listCollections for "a"
@@ -4704,8 +4699,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
                 0LL,
                 NamespaceString(nss.getCommandNS()),
                 {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
-                          << "_id_"
-                          << "ns" << nss.ns())})
+                          << IndexConstants::kIdIndexName << "ns" << nss.ns_forTest())})
                 .data);
 
         // Play all but last of the successful round of responses.
@@ -4734,10 +4728,10 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     auto progress = initialSyncer->getInitialSyncProgress();
     LOGV2(24173, "Progress after all but last successful response", "progress"_attr = progress);
-    ASSERT_EQUALS(progress.nFields(), 13) << progress;
+    ASSERT_EQUALS(progress.nFields(), 14) << progress;
     ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
     ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
-    ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+    ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberInt) << progress;
     ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 10) << progress;
     ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 10) << progress;
     ASSERT_EQUALS(progress["initialSyncOplogStart"].timestamp(), Timestamp(1, 1)) << progress;
@@ -4811,7 +4805,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     progress = initialSyncer->getInitialSyncProgress();
     LOGV2(24175, "Progress at end", "progress"_attr = progress);
-    ASSERT_EQUALS(progress.nFields(), 14) << progress;
+    ASSERT_EQUALS(progress.nFields(), 15) << progress;
     ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
     ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
     ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
@@ -4878,6 +4872,9 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgressForNetwork
     // Skip recovering tenant migration access blockers for the same reason as the above.
     FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
         "skipRecoverTenantMigrationAccessBlockers");
+    FailPointEnableBlock skipRecoverUserWriteCriticalSections(
+        "skipRecoverUserWriteCriticalSections");
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
 
     // Skip clearing initial sync progress so that we can check initialSyncStatus fields after
     // initial sync is complete.
@@ -5039,9 +5036,9 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExc
 
             // Set up the cloner data.  This must be done before providing the FCV to avoid races.
             // listDatabases
-            NamespaceString nss("a.a");
+            NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.a");
             _mockServer->setCommandReply("listDatabases",
-                                         makeListDatabasesResponse({nss.db().toString()}));
+                                         makeListDatabasesResponse({nss.db_forTest().toString()}));
 
             // listCollections for "a"
             // listCollections data has to be broken up or it will trigger BSONObjTooLarge
@@ -5082,8 +5079,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExc
                     0LL,
                     NamespaceString(nss.getCommandNS()),
                     {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
-                              << "_id_"
-                              << "ns" << nss.ns())})
+                              << IndexConstants::kIdIndexName << "ns" << nss.ns_forTest())})
                     .data);
 
             // Feature Compatibility Version.

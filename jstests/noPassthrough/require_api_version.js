@@ -5,16 +5,15 @@
  * requireApiVersion is true.
  *
  * @tags: [
- *   requires_journaling,
  *   requires_replication,
  *   requires_transactions,
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-function runTest(db, supportsTransctions, isMongos, writeConcern = {}, secondaries = []) {
+function runTest(db, supportsTransactions, writeConcern = {}, secondaries = []) {
     assert.commandWorked(db.runCommand({setParameter: 1, requireApiVersion: true}));
     for (const secondary of secondaries) {
         assert.commandWorked(secondary.adminCommand({setParameter: 1, requireApiVersion: true}));
@@ -37,76 +36,83 @@ function runTest(db, supportsTransctions, isMongos, writeConcern = {}, secondari
     assert.commandWorked(db.adminCommand({dropRole: 'testRole', apiVersion: "1", writeConcern}));
 
     /*
-     * "getMore" never accepts or requires apiVersion.
+     * "getMore" accepts apiVersion.
      */
     assert.commandWorked(db.runCommand(
         {insert: "collection", documents: [{}, {}, {}], apiVersion: "1", writeConcern}));
     let reply = db.runCommand({find: "collection", batchSize: 1, apiVersion: "1"});
     assert.commandWorked(reply);
-    assert.commandWorked(db.runCommand({getMore: reply.cursor.id, collection: "collection"}));
+    assert.commandFailedWithCode(
+        db.runCommand({getMore: reply.cursor.id, collection: "collection"}), 498870);
+    assert.commandWorked(
+        db.runCommand({getMore: reply.cursor.id, collection: "collection", apiVersion: "1"}));
 
-    if (supportsTransctions) {
+    if (supportsTransactions) {
         /*
-         * Transaction-starting commands must have apiVersion, transaction-continuing commands must
-         * not.
+         * Commands in transactions require API version.
          */
         const session = db.getMongo().startSession({causalConsistency: false});
         const sessionDb = session.getDatabase(db.getName());
+        assert.commandFailedWithCode(sessionDb.runCommand({
+            find: "collection",
+            batchSize: 1,
+            txnNumber: NumberLong(0),
+            stmtId: NumberInt(2),
+            startTransaction: true,
+            autocommit: false
+        }),
+                                     498870);
         reply = sessionDb.runCommand({
             find: "collection",
             batchSize: 1,
             apiVersion: "1",
-            txnNumber: NumberLong(0),
+            txnNumber: NumberLong(1),
             stmtId: NumberInt(0),
             startTransaction: true,
             autocommit: false
         });
         assert.commandWorked(reply);
+        assert.commandFailedWithCode(sessionDb.runCommand({
+            getMore: reply.cursor.id,
+            collection: "collection",
+            txnNumber: NumberLong(1),
+            stmtId: NumberInt(1),
+            autocommit: false
+        }),
+                                     498870);
         assert.commandWorked(sessionDb.runCommand({
             getMore: reply.cursor.id,
             collection: "collection",
-            txnNumber: NumberLong(0),
+            txnNumber: NumberLong(1),
             stmtId: NumberInt(1),
-            autocommit: false
+            autocommit: false,
+            apiVersion: "1"
         }));
-        assert.commandWorked(sessionDb.runCommand({
-            find: "collection",
-            batchSize: 1,
-            txnNumber: NumberLong(0),
-            stmtId: NumberInt(2),
-            autocommit: false
-        }));
-        const commitTxnWithApiVersionErrorCode = isMongos ? 4937702 : 4937700;
-        assert.commandFailedWithCode(sessionDb.runCommand({
-            commitTransaction: 1,
-            apiVersion: "1",
-            txnNumber: NumberLong(0),
-            autocommit: false
-        }),
-                                     commitTxnWithApiVersionErrorCode);
+
+        assert.commandFailedWithCode(
+            sessionDb.runCommand(
+                {commitTransaction: 1, txnNumber: NumberLong(1), autocommit: false}),
+            498870);
+
         assert.commandWorked(sessionDb.runCommand(
-            {commitTransaction: 1, txnNumber: NumberLong(0), autocommit: false}));
+            {commitTransaction: 1, apiVersion: "1", txnNumber: NumberLong(1), autocommit: false}));
 
         // Start a new txn so we can test abortTransaction.
         reply = sessionDb.runCommand({
             find: "collection",
             apiVersion: "1",
-            txnNumber: NumberLong(1),
+            txnNumber: NumberLong(2),
             stmtId: NumberInt(0),
             startTransaction: true,
             autocommit: false
         });
         assert.commandWorked(reply);
-        const abortTxnWithApiVersionErrorCode = isMongos ? 4937701 : 4937700;
-        assert.commandFailedWithCode(sessionDb.runCommand({
-            abortTransaction: 1,
-            apiVersion: "1",
-            txnNumber: NumberLong(1),
-            autocommit: false
-        }),
-                                     abortTxnWithApiVersionErrorCode);
+        assert.commandFailedWithCode(
+            sessionDb.runCommand(
+                {abortTransaction: 1, txnNumber: NumberLong(2), autocommit: false}),
+            498870);
         assert.commandWorked(sessionDb.runCommand(
-            {abortTransaction: 1, txnNumber: NumberLong(1), autocommit: false}));
+            {abortTransaction: 1, apiVersion: "1", txnNumber: NumberLong(2), autocommit: false}));
     }
 
     assert.commandWorked(
@@ -119,37 +125,43 @@ function runTest(db, supportsTransctions, isMongos, writeConcern = {}, secondari
 }
 
 function requireApiVersionOnShardOrConfigServerTest() {
-    let shardsvrMongod =
-        MongoRunner.runMongod({shardsvr: "", setParameter: {"requireApiVersion": true}});
-    assert.eq(null,
-              shardsvrMongod,
-              "mongod should not be able to start up with --shardsvr and requireApiVersion=true");
+    assert.throws(
+        () => MongoRunner.runMongod(
+            {shardsvr: "", replSet: "dummy", setParameter: {"requireApiVersion": true}}),
+        [],
+        "mongod should not be able to start up with --shardsvr and requireApiVersion=true");
 
-    let configsvrMongod =
-        MongoRunner.runMongod({configsvr: "", setParameter: {"requireApiVersion": 1}});
-    assert.eq(null,
-              configsvrMongod,
-              "mongod should not be able to start up with --configsvr and requireApiVersion=true");
+    assert.throws(
+        () => MongoRunner.runMongod(
+            {configsvr: "", replSet: "dummy", setParameter: {"requireApiVersion": 1}}),
+        [],
+        "mongod should not be able to start up with --configsvr and requireApiVersion=true");
 
-    shardsvrMongod = MongoRunner.runMongod({shardsvr: ""});
-    assert.neq(null, shardsvrMongod, "mongod was not able to start up");
+    const rs = new ReplSetTest({nodes: 1});
+    rs.startSet({shardsvr: ""});
+    rs.initiate();
+    const singleNodeShard = rs.getPrimary();
+    assert.neq(null, singleNodeShard, "mongod was not able to start up");
     assert.commandFailed(
-        shardsvrMongod.adminCommand({setParameter: 1, requireApiVersion: true}),
+        singleNodeShard.adminCommand({setParameter: 1, requireApiVersion: true}),
         "should not be able to set requireApiVersion=true on mongod that was started with --shardsvr");
-    MongoRunner.stopMongod(shardsvrMongod);
+    rs.stopSet();
 
-    configsvrMongod = MongoRunner.runMongod({configsvr: ""});
-    assert.neq(null, configsvrMongod, "mongod was not able to start up");
+    const configsvrRS = new ReplSetTest({nodes: 1});
+    configsvrRS.startSet({configsvr: ""});
+    configsvrRS.initiate();
+    const configsvrConn = configsvrRS.getPrimary();
+    assert.neq(null, configsvrConn, "mongod was not able to start up");
     assert.commandFailed(
-        configsvrMongod.adminCommand({setParameter: 1, requireApiVersion: 1}),
+        configsvrConn.adminCommand({setParameter: 1, requireApiVersion: 1}),
         "should not be able to set requireApiVersion=true on mongod that was started with --configsvr");
-    MongoRunner.stopMongod(configsvrMongod);
+    configsvrRS.stopSet();
 }
 
 requireApiVersionOnShardOrConfigServerTest();
 
 const mongod = MongoRunner.runMongod();
-runTest(mongod.getDB("admin"), false /* supportsTransactions */, false /* isMongos */);
+runTest(mongod.getDB("admin"), false /* supportsTransactions */);
 MongoRunner.stopMongod(mongod);
 
 const rst = new ReplSetTest({nodes: 3});
@@ -158,12 +170,10 @@ rst.initiateWithHighElectionTimeout();
 
 runTest(rst.getPrimary().getDB("admin"),
         true /* supportsTransactions */,
-        false /* isMongos */,
         {w: "majority"} /* writeConcern */,
         rst.getSecondaries());
 rst.stopSet();
 
 const st = new ShardingTest({});
-runTest(st.s0.getDB("admin"), true /* supportsTransactions */, true /* isMongos */);
+runTest(st.s0.getDB("admin"), true /* supportsTransactions */);
 st.stop();
-}());

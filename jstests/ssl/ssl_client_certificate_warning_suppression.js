@@ -7,18 +7,15 @@
  * and is not output when the setParameter is set to false.
  */
 
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-'use strict';
+import {CA_CERT} from "jstests/ssl/libs/ssl_helpers.js";
 
 function test(suppress) {
     const opts = {
-        sslMode: 'requireSSL',
-        sslPEMKeyFile: "jstests/libs/server.pem",
-        sslCAFile: "jstests/libs/ca.pem",
+        tlsMode: 'requireTLS',
+        tlsCertificateKeyFile: "jstests/libs/server.pem",
+        tlsCAFile: "jstests/libs/ca.pem",
         waitForConnect: false,
-        sslAllowConnectionsWithoutCertificates: "",
+        tlsAllowConnectionsWithoutCertificates: "",
         setParameter: {suppressNoTLSPeerCertificateWarning: suppress}
     };
     clearRawMongoProgramOutput();
@@ -26,9 +23,9 @@ function test(suppress) {
 
     assert.soon(function() {
         return runMongoProgram('mongo',
-                               '--ssl',
-                               '--sslAllowInvalidHostnames',
-                               '--sslCAFile',
+                               '--tls',
+                               '--tlsAllowInvalidHostnames',
+                               '--tlsCAFile',
                                CA_CERT,
                                '--port',
                                mongod.port,
@@ -62,4 +59,3 @@ function test(suppress) {
 
 test(true);
 test(false);
-})();

@@ -1,10 +1,8 @@
-// Tests basic functionality of read-only, non-materialized views.
+/**
+ * Tests basic functionality of read-only, non-materialized views.
+ */
 
-(function() {
-"use strict";
-
-// For arrayEq.
-load("jstests/aggregation/extras/utils.js");
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 let viewsDB = db.getSiblingDB("views_basic");
 assert.commandWorked(viewsDB.dropDatabase());
@@ -13,7 +11,7 @@ let assertCmdResultEq = function(cmd, expected) {
     let res = viewsDB.runCommand(cmd);
     assert.commandWorked(res);
 
-    let cursor = new DBCommandCursor(db, res, 5);
+    let cursor = new DBCommandCursor(viewsDB, res, 5);
     let actual = cursor.toArray();
     assert(arrayEq(actual, expected),
            "actual: " + tojson(cursor.toArray()) + ", expected:" + tojson(expected));
@@ -50,4 +48,3 @@ assertCmdResultEq({
     cursor: {}
 },
                   [{_id: "CA", totalPop: 17}]);
-}());

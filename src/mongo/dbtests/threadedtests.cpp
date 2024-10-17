@@ -27,31 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
 
 #include <boost/version.hpp>
-#include <functional>
+#include <fmt/format.h>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <typeinfo>
 
-#include "mongo/config.h"
 #include "mongo/db/client.h"
-#include "mongo/dbtests/dbtests.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/bits.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/concurrency/priority_ticketholder.h"
+#include "mongo/util/concurrency/semaphore_ticketholder.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
-namespace ThreadedTests {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-using std::cout;
-using std::endl;
-using std::string;
-using std::unique_ptr;
+namespace mongo {
+namespace ThreadedTests {
 
 template <int nthreads_param = 10>
 class ThreadedTest {
@@ -75,7 +80,7 @@ private:
         if (!remaining)
             return;
 
-        stdx::thread athread([=] { subthread(remaining); });
+        stdx::thread athread([=, this] { subthread(remaining); });
         launch_subthreads(remaining - 1);
         athread.join();
     }
@@ -87,12 +92,12 @@ class IsAtomicWordAtomic : public ThreadedTest<> {
     typedef typename _AtomicUInt::WordType WordType;
     _AtomicUInt target;
 
-    void subthread(int) {
+    void subthread(int) override {
         for (int i = 0; i < iterations; i++) {
             target.fetchAndAdd(WordType(1));
         }
     }
-    void validate() {
+    void validate() override {
         ASSERT_EQUALS(target.load(), unsigned(nthreads * iterations));
 
         _AtomicUInt u;
@@ -130,7 +135,7 @@ public:
         tp.startup();
 
         for (unsigned i = 0; i < iterations; i++) {
-            tp.schedule([=](auto status) {
+            tp.schedule([=, this](auto status) {
                 ASSERT_OK(status);
                 increment(2);
             });
@@ -178,13 +183,13 @@ private:
     char pad3[128];
     AtomicWord<int> k;
 
-    virtual void validate() {
+    void validate() override {
         if (once++ == 0) {
             // <= 1.35 we use a different rwmutex impl so worth noting
-            cout << "Boost version : " << BOOST_VERSION << endl;
+            std::cout << "Boost version : " << BOOST_VERSION << std::endl;
         }
-        cout << typeid(whichmutex).name() << " Slack useful work fraction: " << ((double)a) / b
-             << " locks:" << locks << endl;
+        std::cout << typeid(whichmutex).name() << " Slack useful work fraction: " << ((double)a) / b
+                  << " locks:" << locks << std::endl;
     }
     void watch() {
         while (1) {
@@ -199,7 +204,7 @@ private:
         }
     }
     AtomicWord<bool> done;
-    virtual void subthread(int x) {
+    void subthread(int x) override {
         if (x == 1) {
             watch();
             return;
@@ -226,12 +231,35 @@ private:
 
 // Tests waiting on the TicketHolder by running many more threads than can fit into the "hotel", but
 // only max _nRooms threads should ever get in at once
+template <class TicketHolderImpl>
 class TicketHolderWaits : public ThreadedTest<10> {
     static const int checkIns = 1000;
     static const int rooms = 3;
 
 public:
-    TicketHolderWaits() : _hotel(rooms), _tickets(_hotel._nRooms) {}
+    TicketHolderWaits() : _hotel(rooms) {
+        auto client = Client::getCurrent();
+        constexpr bool trackPeakUsed = false;
+        // TODO SERVER-72616: We can only test PriorityTicketHolder on Linux. Remove ifdefs when
+        // it's available on other platforms.
+#ifdef __linux__
+        if constexpr (std::is_same_v<PriorityTicketHolder, TicketHolderImpl>) {
+            // When run with the PriorityTicketHolder, scale down the default
+            // 'lowPriorityAdmissionBypassThreshold' for test purposes.
+            int lowPriorityAdmissionBypassThreshold = 100;
+            _tickets = std::make_unique<TicketHolderImpl>(client->getServiceContext(),
+                                                          _hotel._nRooms,
+                                                          lowPriorityAdmissionBypassThreshold,
+                                                          trackPeakUsed);
+        } else {
+            _tickets = std::make_unique<TicketHolderImpl>(
+                client->getServiceContext(), _hotel._nRooms, trackPeakUsed);
+        }
+#else
+        _tickets = std::make_unique<TicketHolderImpl>(
+            client->getServiceContext(), _hotel._nRooms, trackPeakUsed);
+#endif
+    }
 
 private:
     class Hotel {
@@ -239,35 +267,41 @@ private:
         Hotel(int nRooms) : _nRooms(nRooms), _checkedIn(0), _maxRooms(0) {}
 
         void checkIn() {
-            stdx::lock_guard<Latch> lk(_frontDesk);
+            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
             _checkedIn++;
-            verify(_checkedIn <= _nRooms);
+            MONGO_verify(_checkedIn <= _nRooms);
             if (_checkedIn > _maxRooms)
                 _maxRooms = _checkedIn;
         }
 
         void checkOut() {
-            stdx::lock_guard<Latch> lk(_frontDesk);
+            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
             _checkedIn--;
-            verify(_checkedIn >= 0);
+            MONGO_verify(_checkedIn >= 0);
         }
 
-        Mutex _frontDesk = MONGO_MAKE_LATCH("Hotel::_frontDesk");
+        stdx::mutex _frontDesk;
         int _nRooms;
         int _checkedIn;
         int _maxRooms;
     };
 
     Hotel _hotel;
-    TicketHolder _tickets;
 
-    virtual void subthread(int x) {
-        string threadName = (str::stream() << "ticketHolder" << x);
-        Client::initThread(threadName.c_str());
+    void subthread(int x) override {
+        std::string threadName = (str::stream() << "ticketHolder" << x);
+        Client::initThread(threadName.c_str(), getGlobalServiceContext()->getService());
+        auto opCtx = Client::getCurrent()->makeOperationContext();
+        MockAdmissionContext admCtx;
 
         for (int i = 0; i < checkIns; i++) {
-            _tickets.waitForTicket();
-            TicketHolderReleaser whenDone(&_tickets);
+            boost::optional<ScopedAdmissionPriorityBase> admissionPriority;
+            if ((i % 3) == 0) {
+                // One of every three admissions is low priority.
+                admissionPriority.emplace(opCtx.get(), admCtx, AdmissionContext::Priority::kLow);
+            }
+
+            auto ticket = _tickets->waitForTicket(opCtx.get(), &admCtx);
 
             _hotel.checkIn();
 
@@ -282,30 +316,40 @@ private:
         }
     }
 
-    virtual void validate() {
+    void validate() override {
         // This should always be true, assuming that it takes < 1 sec for the hardware to process a
         // check-out/check-in Time for test is then ~ #threads / _nRooms * 2 seconds
-        verify(_hotel._maxRooms == _hotel._nRooms);
+        MONGO_verify(_hotel._maxRooms == _hotel._nRooms);
     }
+
+protected:
+    std::unique_ptr<TicketHolder> _tickets;
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("threading") {}
 
-    void setupTests() {
+    void setupTests() override {
         // Slack is a test to see how long it takes for another thread to pick up
         // and begin work after another relinquishes the lock.  e.g. a spin lock
         // would have very little slack.
-        add<Slack<SimpleMutex, stdx::lock_guard<SimpleMutex>>>();
+        add<Slack<stdx::mutex, stdx::lock_guard<stdx::mutex>>>();
 
         add<IsAtomicWordAtomic<AtomicWord<unsigned>>>();
         add<IsAtomicWordAtomic<AtomicWord<unsigned long long>>>();
         add<ThreadPoolTest>();
 
-        add<TicketHolderWaits>();
+        add<TicketHolderWaits<SemaphoreTicketHolder>>();
+        // TODO SERVER-72616: We can only test PriorityTicketHolder on Linux. Remove this when it's
+        // available on other platforms.
+#ifdef __linux__
+        add<TicketHolderWaits<PriorityTicketHolder>>();
+#endif
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
+
 }  // namespace ThreadedTests
+}  // namespace mongo

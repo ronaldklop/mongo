@@ -29,17 +29,40 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
+/**
+ * Combines values from multiple streams into one stream. The union has n 'inputStages', each of
+ * which provides m slots, specified as a vector of slot vectors 'inputVals'. (This vector has n * m
+ * total slots.) The union stage itself also returns m slots, specified as 'outputVals'. Each of the
+ * n branches is executed in turn until reaching EOF, and the values from its m slots are remapped
+ * to the m output slots.
+ *
+ * This is a binding reflector, meaning that only the 'outputVals' slots are visible to stages
+ * higher in the tree.
+ *
+ * Debug string repsentation:
+ *
+ *   union [<output slots>] [[<input slots 1>] childStage_1, ..., [<input slots n>] childStage_n]
+ */
 class UnionStage final : public PlanStage {
 public:
-    UnionStage(std::vector<std::unique_ptr<PlanStage>> inputStages,
+    UnionStage(PlanStage::Vector inputStages,
                std::vector<value::SlotVector> inputVals,
                value::SlotVector outputVals,
-               PlanNodeId planNodeId);
+               PlanNodeId planNodeId,
+               bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -52,16 +75,21 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    bool shouldOptimizeSaveState(size_t idx) const final {
+        return _currentStageIndex == idx;
+    }
 
 private:
     struct UnionBranch {
-        PlanStage* stage{nullptr};
-        const bool reOpen{false};
+        PlanStage* const stage{nullptr};
         bool isOpen{false};
 
         void open() {
             if (!isOpen) {
-                stage->open(reOpen);
+                stage->open(false /*reOpen*/);
                 isOpen = true;
             }
         }
@@ -74,11 +102,13 @@ private:
         }
     };
 
+    void clearBranches();
+
     const std::vector<value::SlotVector> _inputVals;
     const value::SlotVector _outputVals;
-    stdx::unordered_map<PlanStage*, std::vector<value::SlotAccessor*>> _inValueAccessors;
-    std::vector<value::ViewOfValueAccessor> _outValueAccessors;
+    std::vector<value::SwitchAccessor> _outValueAccessors;
     std::queue<UnionBranch> _remainingBranchesToDrain;
     PlanStage* _currentStage{nullptr};
+    size_t _currentStageIndex{0};
 };
 }  // namespace mongo::sbe

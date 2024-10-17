@@ -30,12 +30,15 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
-#include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/mongo_version_range.h"
 
 namespace mongo {
 
@@ -49,13 +52,7 @@ public:
     // Name of the version collection in the config server.
     static const NamespaceString ConfigNS;
 
-    // Field names and types in the version collection type.
-    static const BSONField<int> minCompatibleVersion;
-    static const BSONField<int> currentVersion;
-    static const BSONField<BSONArray> excludingMongoVersions;
     static const BSONField<OID> clusterId;
-    static const BSONField<OID> upgradeId;
-    static const BSONField<BSONObj> upgradeState;
 
     /**
      * Returns the BSON representation of the entry.
@@ -89,66 +86,16 @@ public:
      */
     std::string toString() const;
 
-    int getMinCompatibleVersion() const {
-        return _minCompatibleVersion.get();
-    }
-    void setMinCompatibleVersion(const int minCompatibleVersion);
-
-    int getCurrentVersion() const {
-        return _currentVersion.get();
-    }
-    void setCurrentVersion(const int currentVersion);
-
     const OID& getClusterId() const {
-        return _clusterId.get();
-    }
-    bool isClusterIdSet() const {
-        return _clusterId.is_initialized();
+        return _clusterId;
     }
     void setClusterId(const OID& clusterId);
-
-    const std::vector<MongoVersionRange> getExcludingMongoVersions() const {
-        if (!isExcludingMongoVersionsSet()) {
-            return std::vector<MongoVersionRange>();
-        }
-        return _excludingMongoVersions.get();
-    }
-    bool isExcludingMongoVersionsSet() const {
-        return _excludingMongoVersions.is_initialized();
-    }
-    void setExcludingMongoVersions(const std::vector<MongoVersionRange>& excludingMongoVersions);
-
-    const OID& getUpgradeId() const {
-        return _upgradeId.get();
-    }
-    bool isUpgradeIdSet() const {
-        return _upgradeId.is_initialized();
-    }
-    void setUpgradeId(const OID& upgradeId);
-
-    const BSONObj& getUpgradeState() const {
-        return _upgradeState.get();
-    }
-    bool isUpgradeStateSet() const {
-        return _upgradeState.is_initialized();
-    }
-    void setUpgradeState(const BSONObj& upgradeState);
 
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial rule.
 
-    // (M) minimum compatible version
-    boost::optional<int> _minCompatibleVersion;
-    // (M) current version
-    boost::optional<int> _currentVersion;
-    // (S) clusterId -- required if current version > UpgradeHistory::UpgradeHistory_NoEpochVersion
-    boost::optional<OID> _clusterId;
-    // (O) range of disallowed versions to upgrade to
-    boost::optional<std::vector<MongoVersionRange>> _excludingMongoVersions;
-    // (O) upgrade id of current or last upgrade
-    boost::optional<OID> _upgradeId;
-    // (O)  upgrade state of current or last upgrade
-    boost::optional<BSONObj> _upgradeState;
+    // (M) clusterId
+    OID _clusterId;
 };
 
 }  // namespace mongo

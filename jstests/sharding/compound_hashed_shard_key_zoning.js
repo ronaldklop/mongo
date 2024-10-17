@@ -9,10 +9,8 @@
  *   multiversion_incompatible,
  * ]
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 const st = new ShardingTest({shards: 3});
 const kDbName = 'test';
@@ -316,4 +314,3 @@ function testNonemptyZonedCollection() {
 testNonemptyZonedCollection();
 
 st.stop();
-})();

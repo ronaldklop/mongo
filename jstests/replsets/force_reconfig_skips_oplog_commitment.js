@@ -4,10 +4,8 @@
  * the current config.
  */
 
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");  // For reconnect.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -19,6 +17,9 @@ rst.initiate();
 const primary = rst.getPrimary();
 const secondary = rst.getSecondary();
 const coll = primary.getDB(dbName)[collName];
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // This makes the test run faster.
 assert.commandWorked(secondary.adminCommand(
@@ -66,4 +67,3 @@ restartServerReplication(secondary);
 rst.awaitNodesAgreeOnConfigVersion();
 
 rst.stopSet();
-}());

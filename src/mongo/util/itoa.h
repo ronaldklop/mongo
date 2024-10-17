@@ -29,8 +29,10 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 #include "mongo/base/string_data.h"
 
@@ -48,6 +50,14 @@ public:
     explicit ItoA(std::uint64_t i);
     ItoA(const ItoA&) = delete;
     ItoA& operator=(const ItoA&) = delete;
+
+    std::string toString() const {
+        return std::string{_str};
+    }
+
+    StringData toStringData() const {
+        return _str;
+    }
 
     operator StringData() const {
         return _str;

@@ -8,7 +8,7 @@
           "a:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "msg": "isdbgrid",
             "minWireVersion": 0,
             "maxWireVersion": 6
@@ -18,11 +18,15 @@
           "b:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "hosts": [
               "b:27017"
             ],
             "setName": "rs",
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            },
             "minWireVersion": 0,
             "maxWireVersion": 6
           }

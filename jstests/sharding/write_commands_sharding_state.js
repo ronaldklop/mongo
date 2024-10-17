@@ -1,17 +1,20 @@
 // This test requires persistence because it assumes standalone shards will still have their data
 // after restarting.
-// @tags: [requires_persistence]
+// @tags: [
+//   requires_persistence,
+//   # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+//   embedded_router_incompatible,
+// ]
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({name: "write_commands", mongos: 2, shards: 2});
 
 var dbTestName = 'WriteCommandsTestDB';
 var collName = dbTestName + '.TestColl';
 
-assert.commandWorked(st.s0.adminCommand({enablesharding: dbTestName}));
-st.ensurePrimaryShard(dbTestName, st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enablesharding: dbTestName, primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(st.s0.adminCommand({shardCollection: collName, key: {Key: 1}, unique: true}));
 
@@ -81,4 +84,3 @@ assert.eq(1, st.shard0.getDB(dbTestName).TestColl.find({Key: 11}).count());
 assert.eq(1, st.shard1.getDB(dbTestName).TestColl.find({Key: 21}).count());
 
 st.stop();
-})();

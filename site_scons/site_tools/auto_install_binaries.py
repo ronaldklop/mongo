@@ -23,6 +23,7 @@
 # TODO: Handle chmod state
 
 from collections import defaultdict, namedtuple
+from typing import List
 
 import SCons
 from SCons.Tool import install
@@ -41,8 +42,10 @@ ROLE_DECLARATIONS = "AIB_ROLE_DECLARATIONS"
 SUFFIX_MAP = "AIB_SUFFIX_MAP"
 TASKS = "AIB_TASKS"
 
-
-SuffixMap = namedtuple("SuffixMap", ["directory", "default_role"],)
+SuffixMap = namedtuple(
+    "SuffixMap",
+    ["directory", "default_role"],
+)
 
 
 class RoleInfo:
@@ -97,9 +100,7 @@ def declare_roles(env, roles, base_role=None, meta_role=None):
     for role in roles:
         for d in role.dependencies:
             if d not in role_names:
-                raise Exception(
-                    "Role dependency '{}' does not name a declared role".format(d)
-                )
+                raise Exception("Role dependency '{}' does not name a declared role".format(d))
 
     if isinstance(base_role, str):
         if base_role not in role_names:
@@ -108,13 +109,9 @@ def declare_roles(env, roles, base_role=None, meta_role=None):
             )
     elif isinstance(base_role, DeclaredRole):
         if base_role not in roles:
-            raise Exception(
-                "A base_role argument was provided but it is not a declared role"
-            )
+            raise Exception("A base_role argument was provided but it is not a declared role")
     elif base_role is not None:
-        raise Exception(
-            "The base_role argument must be a string name of a role or a role object"
-        )
+        raise Exception("The base_role argument must be a string name of a role or a role object")
     else:
         # Set it to something falsey
         base_role = str()
@@ -126,13 +123,9 @@ def declare_roles(env, roles, base_role=None, meta_role=None):
             )
     elif isinstance(meta_role, DeclaredRole):
         if meta_role not in roles:
-            raise Exception(
-                "A meta_role argument was provided but it is not a declared role"
-            )
+            raise Exception("A meta_role argument was provided but it is not a declared role")
     elif meta_role is not None:
-        raise Exception(
-            "The meta_role argument must be a string name of a role or a role object"
-        )
+        raise Exception("The meta_role argument must be a string name of a role or a role object")
     else:
         # Set it to something falsy
         meta_role = str()
@@ -198,12 +191,7 @@ def get_alias_map_entry(env, component, role):
             r_entry.dependencies.add(base_c_entry)
 
         meta_role = env.get(META_ROLE)
-        if (
-            meta_role
-            and role != meta_role
-            and meta_component
-            and component != meta_component
-        ):
+        if meta_role and role != meta_role and meta_component and component != meta_component:
             meta_r_entry = get_alias_map_entry(env, component, meta_role)
             meta_c_r_entry = get_alias_map_entry(env, meta_component, meta_role)
             meta_c_r_entry.dependencies.add(meta_r_entry)
@@ -226,8 +214,8 @@ def scan_for_transitive_install(node, env, _path):
     if component is None:
         return []
 
-    scanned = getattr(node.attributes, "AIB_SCANNED", [])
-    if scanned:
+    scanned = getattr(node.attributes, "AIB_SCANNED", None)
+    if scanned is not None:
         return scanned
 
     # Access directly by keys because we don't want to accidentally
@@ -258,12 +246,7 @@ def scan_for_transitive_install(node, env, _path):
         if component_base_entry.files:
             results.update(component_base_entry.files)
 
-    if (
-        base_role
-        and base_component
-        and component != base_component
-        and role != base_role
-    ):
+    if base_role and base_component and component != base_component and role != base_role:
         base_base_entry = alias_map[base_component][base_role]
         if base_base_entry.files:
             results.update(base_base_entry.files)
@@ -277,6 +260,8 @@ def scan_for_transitive_install(node, env, _path):
     )
 
     for child in installed_children:
+        if child.has_builder() and child.get_builder().get_name(env) == "ThinTarget":
+            child = env.File(f"#/{env['SCONS2BAZEL_TARGETS'].bazel_output(child)}")
         auto_installed_files = get_auto_installed_files(env, child)
         if not auto_installed_files:
             continue
@@ -324,9 +309,7 @@ def tag_components(env, target, **kwargs):
 
     if component is None:
         raise Exception(
-            "AIB_COMPONENT must be provided; untagged targets: {}".format(
-                [t.path for t in target]
-            )
+            "AIB_COMPONENT must be provided; untagged targets: {}".format([t.path for t in target])
         )
 
     if role is None:
@@ -361,6 +344,9 @@ def auto_install_task(env, component, role):
     return list(entry.files)
 
 
+bazel_installs = set()
+
+
 def auto_install_pseudobuilder(env, target, source, **kwargs):
     """Auto install pseudo-builder."""
     source = env.Flatten([source])
@@ -369,11 +355,9 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
 
     installed_files = []
     for s in source:
-
         target_for_source = target
 
         if not target_for_source:
-
             # AIB currently uses file suffixes to do mapping. However, sometimes we need
             # to do the mapping based on a different suffix. This is used for things like
             # dSYM files, where we really just want to describe where .dSYM bundles should
@@ -385,9 +369,7 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
             auto_install_mapping = env[SUFFIX_MAP].get(suffix)
 
             if not auto_install_mapping:
-                raise Exception(
-                    "No target provided and no auto install mapping found for:", str(s)
-                )
+                raise Exception("No target provided and no auto install mapping found for:", str(s))
 
             target_for_source = auto_install_mapping.directory
 
@@ -398,8 +380,13 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
         # adding debug files to the runtime component file if we do not skip
         # this.
         existing_installed_files = get_auto_installed_files(env, s)
-        if existing_installed_files:
-            continue
+        if "BAZEL_INSTALL" in kwargs:
+            if s in bazel_installs:
+                continue
+            bazel_installs.add(s)
+        else:
+            if existing_installed_files:
+                continue
 
         # We must do an early subst here so that the _aib_debugdir
         # generator has a chance to run while seeing 'source'. We need
@@ -409,15 +396,17 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
         # second subst to expand DESTDIR, interpolating
         # `target_for_source` in as $TARGET. Yes, this is confusing.
         target_for_source = env.subst(target_for_source, source=s)
-        target_for_source = env.Dir(env.subst('$DESTDIR/$TARGET', target=target_for_source))
+        target_for_source = env.Dir(env.subst("$DESTDIR/$TARGET", target=target_for_source))
 
         aib_additional_directory = getattr(s.attributes, "aib_additional_directory", None)
         if aib_additional_directory is not None:
             target_for_source = env.Dir(aib_additional_directory, directory=target_for_source)
 
         new_installed_files = env.Install(target=target_for_source, source=s)
+        if s.has_builder() and s.get_builder().get_name(env) == "ThinTarget":
+            new_installed_files += getattr(s.attributes, INSTALLED_FILES, [])
         setattr(s.attributes, INSTALLED_FILES, new_installed_files)
-
+        setattr(new_installed_files[0].attributes, "AIB_INSTALL_FROM", s)
         installed_files.extend(new_installed_files)
 
     entry.files.update(installed_files)
@@ -450,9 +439,7 @@ def finalize_install_dependencies(env):
                 if generate_dependent_aliases:
                     dependent_aliases = env.Flatten(
                         [
-                            env.Alias(
-                                generate_alias_name(env, d.component, d.role, task)
-                            )
+                            env.Alias(generate_alias_name(env, d.component, d.role, task))
                             for d in info.dependencies
                         ]
                     )
@@ -536,16 +523,16 @@ def list_components(env, **kwargs):
         print("\t", key)
 
 
-def list_recursive(mapping, counter=0):
+def list_hierarchical_aib_recursive(mapping, counter=0):
     if counter == 0:
         print("  " * counter, mapping.id)
     counter += 1
     for dep in mapping.dependencies:
         print("  " * counter, dep.id)
-        list_recursive(dep, counter=counter)
+        list_hierarchical_aib_targets(dep, counter=counter)
 
 
-def list_targets(dag_mode=False):
+def list_hierarchical_aib_targets(dag_mode=False):
     def target_lister(env, **kwargs):
         if dag_mode:
             installed_files = set(env.FindInstalledFiles())
@@ -553,7 +540,44 @@ def list_targets(dag_mode=False):
                 scan_for_transitive_install(f, env, None)
 
         mapping = env[ALIAS_MAP][env[META_COMPONENT]][env[META_ROLE]]
-        list_recursive(mapping)
+        list_hierarchical_aib_recursive(mapping)
+
+    return target_lister
+
+
+def list_recursive(mapping) -> List[str]:
+    items = set()
+    items.add(mapping.id)
+    for dep in mapping.dependencies:
+        items |= list_recursive(dep)
+    return items
+
+
+def list_targets():
+    def target_lister(env, **kwargs):
+        mapping = env[ALIAS_MAP][env[META_COMPONENT]][env[META_ROLE]]
+        tasks = sorted(list(env[TASKS].keys()))
+        roles = sorted(list(env[ROLE_DECLARATIONS].keys()))
+        targets_with_role = list(list_recursive(mapping)) + [mapping.id]
+        targets: List[str] = []
+        for target_role in targets_with_role:
+            # Does this target_role end with one of our speicifed roles
+            matching_roles = list(filter(target_role.endswith, [f"-{role}" for role in roles]))
+            assert len(matching_roles) == 1
+
+            targets.append(target_role[: -len(matching_roles[0])])
+
+        # dedup and sort targets
+        targets = sorted(list(set(targets)))
+        print(
+            "The following are AIB targets. Note that runtime role is implied if not specified. For example, install-mongod"
+        )
+        tasks_str = ",".join(tasks)
+        print(f"TASK={{{tasks_str}}}")
+        roles_str = ",".join(roles)
+        print(f"ROLE={{{roles_str}}}")
+        for target in targets:
+            print(f"  TASK-{target}-ROLE")
 
     return target_lister
 
@@ -567,7 +591,7 @@ def exists(_env):
     return True
 
 
-def generate(env):  # pylint: disable=too-many-statements
+def generate(env):
     """Generate the auto install builders."""
     env["AUTO_INSTALL_ENABLED"] = True
 
@@ -590,7 +614,8 @@ def generate(env):  # pylint: disable=too-many-statements
     )
 
     env.AddMethod(
-        scan_for_transitive_install_pseudobuilder, "GetTransitivelyInstalledFiles"
+        scan_for_transitive_install_pseudobuilder,
+        "GetTransitivelyInstalledFiles",
     )
     env.AddMethod(get_role_declaration, "GetRoleDeclaration")
     env.AddMethod(get_auto_installed_files, "GetAutoInstalledFiles")
@@ -608,11 +633,14 @@ def generate(env):  # pylint: disable=too-many-statements
     env.Alias("list-aib-components", [], [list_components])
     env.AlwaysBuild("list-aib-components")
 
-    env.Alias("list-aib-targets", [], [list_targets(dag_mode=False)])
-    env.AlwaysBuild("list-aib-targets")
+    env.Alias("list-hierarchical-aib-targets", [], [list_hierarchical_aib_targets(dag_mode=False)])
+    env.AlwaysBuild("list-hierarchical-aib-targets")
 
-    env.Alias("list-aib-dag", [], [list_targets(dag_mode=True)])
-    env.AlwaysBuild("list-aib-dag")
+    env.Alias("list-hierarchical-aib-dag", [], [list_hierarchical_aib_targets(dag_mode=True)])
+    env.AlwaysBuild("list-hierarchical-aib-dag")
+
+    env.Alias("list-targets", [], [list_targets()])
+    env.AlwaysBuild("list-targets")
 
     for builder in ["Program", "SharedLibrary", "LoadableModule", "StaticLibrary"]:
         builder = env["BUILDERS"][builder]
@@ -626,5 +654,6 @@ def generate(env):  # pylint: disable=too-many-statements
     assert base_install_builder.target_scanner is None
 
     base_install_builder.target_scanner = SCons.Scanner.Scanner(
-        function=scan_for_transitive_install, path_function=None
+        function=scan_for_transitive_install,
+        path_function=None,
     )

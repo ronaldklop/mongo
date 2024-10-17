@@ -1,12 +1,14 @@
 /**
  * Tests primary aborts in-progress transactions on stepup.
  *
- * @tags: [uses_transactions, exclude_from_large_txns]
+ * @tags: [
+ *   exclude_from_large_txns,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");  // For reconnect()
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getLastOpTime, reconnect, setLogVerbosity} from "jstests/replsets/rslib.js";
 
 function getTxnTableEntry(db) {
     let txnTableEntries = db.getSiblingDB("config")["transactions"].find().toArray();
@@ -79,8 +81,13 @@ const startOpTime = testDB.getSiblingDB("local").oplog.rs.findOne({ts: commitOpT
 jsTestLog("Wait for the new primary to block on fail point.");
 stopReplProducerOnDocumentFailPoint.wait();
 
-jsTestLog("Wait for the new primary to apply the first op of transaction.");
-assert.soon(() => getLastOpTime(newPrimary) >= startOpTime);
+jsTestLog("Wait for the new primary to apply the first op of transaction at timestamp: " +
+          tojson(startOpTime));
+assert.soon(() => {
+    const lastOpTime = getLastOpTime(newPrimary);
+    jsTestLog("Current lastOpTime on the new primary: " + tojson(lastOpTime));
+    return rs.compareOpTimes(lastOpTime, startOpTime) >= 0;
+});
 
 // Now the transaction should be in-progress on newPrimary.
 txnTableEntry = getTxnTableEntry(newTestDB);
@@ -136,8 +143,7 @@ const secondDoc = {
 };
 assert.commandWorked(newSession.getDatabase(dbName).getCollection(collName).insert(secondDoc));
 assert.commandWorked(newSession.commitTransaction_forTesting());
-assert.docEq(testDB.getCollection(collName).find().toArray(), [secondDoc]);
-assert.docEq(newTestDB.getCollection(collName).find().toArray(), [secondDoc]);
+assert.docEq([secondDoc], testDB.getCollection(collName).find().toArray());
+assert.docEq([secondDoc], newTestDB.getCollection(collName).find().toArray());
 
 replTest.stopSet();
-})();

@@ -1,8 +1,11 @@
-// Verifies targeting errors encountered in a transaction lead to write errors.
+// Verifies targeting errors encountered in a transaction lead to write errors when write without
+// shard key feature is not enabled.
 //
 // @tags: [uses_transactions]
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    WriteWithoutShardKeyTestUtil
+} from "jstests/sharding/updateOne_without_shard_key/libs/write_without_shard_key_test_util.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -14,6 +17,21 @@ assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {skey: "hashed
 
 const session = st.s.startSession();
 const sessionDB = session.getDatabase("test");
+
+if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDB)) {
+    session.startTransaction();
+    assert.commandWorked(sessionDB.runCommand(
+        {update: collName, updates: [{q: {skey: {$lte: 5}}, u: {$set: {x: 1}}, multi: false}]}));
+    assert.commandWorked(session.abortTransaction_forTesting());
+
+    session.startTransaction();
+    assert.commandWorked(
+        sessionDB.runCommand({delete: collName, deletes: [{q: {skey: {$lte: 5}}, limit: 1}]}));
+    assert.commandWorked(session.abortTransaction_forTesting());
+
+    st.stop();
+    quit();
+}
 
 // Failed update.
 
@@ -37,4 +55,3 @@ assert(res.hasOwnProperty("writeErrors"), "expected write errors, res: " + tojso
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 st.stop();
-}());

@@ -1,17 +1,21 @@
-// @tags: [
-//   assumes_superuser_permissions,
-//   does_not_support_stepdowns,
-// ]
-
 /**
  * SERVER-7140 test. Checks that process info is re-logged on log rotation
+ * @tags: [
+ *   # The test runs commands that are not allowed with security token: getLog, logRotate.
+ *   not_allowed_with_signed_security_token,
+ *   assumes_superuser_permissions,
+ *   does_not_support_stepdowns,
+ *   no_selinux,
+ *   # This test searches for a MongoRPC-specific log string (*conn).
+ *   grpc_incompatible,
+ * ]
  */
 
 /**
  * Checks an array for match against regex.
  * Returns true if regex matches a string in the array
  */
-doesLogMatchRegex = function(logArray, regex) {
+let doesLogMatchRegex = function(logArray, regex) {
     for (var i = (logArray.length - 1); i >= 0; i--) {
         var regexInLine = regex.exec(logArray[i]);
         if (regexInLine != null) {
@@ -21,7 +25,7 @@ doesLogMatchRegex = function(logArray, regex) {
     return false;
 };
 
-doTest = function() {
+let doTest = function() {
     var log = db.adminCommand({getLog: 'global'});
     // this regex will need to change if output changes
     var re = new RegExp(".*conn.*options.*");

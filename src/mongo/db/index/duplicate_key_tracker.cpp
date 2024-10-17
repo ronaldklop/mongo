@@ -27,19 +27,38 @@
  *    it in the license file.
  */
 
+
+#include <mutex>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/index/duplicate_key_tracker.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/progress_meter.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/index/duplicate_key_tracker.h"
-
-#include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/storage/execution_context.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -48,45 +67,51 @@ static constexpr StringData kKeyField = "key"_sd;
 }
 
 DuplicateKeyTracker::DuplicateKeyTracker(OperationContext* opCtx, const IndexCatalogEntry* entry)
-    : _indexCatalogEntry(entry),
-      _keyConstraintsTable(
-          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)) {
+    : _keyConstraintsTable(opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(
+          opCtx, KeyFormat::Long)) {
 
-    invariant(_indexCatalogEntry->descriptor()->unique());
+    invariant(entry->descriptor()->unique());
 }
 
 DuplicateKeyTracker::DuplicateKeyTracker(OperationContext* opCtx,
                                          const IndexCatalogEntry* entry,
-                                         StringData ident)
-    : _indexCatalogEntry(entry) {
+                                         StringData ident) {
     _keyConstraintsTable =
         opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
-            opCtx, ident);
+            opCtx, ident, KeyFormat::Long);
 
-    invariant(_indexCatalogEntry->descriptor()->unique(),
+    invariant(entry->descriptor()->unique(),
               str::stream() << "Duplicate key tracker table exists on disk with ident: " << ident
-                            << " but the index is not unique: "
-                            << _indexCatalogEntry->descriptor());
+                            << " but the index is not unique: " << entry->descriptor());
 }
 
-void DuplicateKeyTracker::finalizeTemporaryTable(OperationContext* opCtx,
-                                                 TemporaryRecordStore::FinalizationAction action) {
-    _keyConstraintsTable->finalizeTemporaryTable(opCtx, action);
+void DuplicateKeyTracker::keepTemporaryTable() {
+    _keyConstraintsTable->keep();
 }
 
-Status DuplicateKeyTracker::recordKey(OperationContext* opCtx, const KeyString::Value& key) {
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+Status DuplicateKeyTracker::recordKey(OperationContext* opCtx,
+                                      const IndexCatalogEntry* indexCatalogEntry,
+                                      const key_string::Value& key) {
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     LOGV2_DEBUG(20676,
                 1,
                 "Index build: recording duplicate key conflict on unique index",
-                "index"_attr = _indexCatalogEntry->descriptor()->indexName());
+                "index"_attr = indexCatalogEntry->descriptor()->indexName());
 
-    // The KeyString::Value will be serialized in the format [KeyString][TypeBits]. We need to
+    // The key_string::Value will be serialized in the format [KeyString][TypeBits]. We need to
     // store the TypeBits for error reporting later on. The RecordId does not need to be stored, so
     // we exclude it from the serialization.
     BufBuilder builder;
-    key.serializeWithoutRecordId(builder);
+    if (KeyFormat::Long ==
+        indexCatalogEntry->accessMethod()
+            ->asSortedData()
+            ->getSortedDataInterface()
+            ->rsKeyFormat()) {
+        key.serializeWithoutRecordIdLong(builder);
+    } else {
+        key.serializeWithoutRecordIdStr(builder);
+    }
 
     auto status =
         _keyConstraintsTable->rs()->insertRecord(opCtx, builder.buf(), builder.len(), Timestamp());
@@ -94,32 +119,35 @@ Status DuplicateKeyTracker::recordKey(OperationContext* opCtx, const KeyString::
         return status.getStatus();
 
     auto numDuplicates = _duplicateCounter.addAndFetch(1);
-    opCtx->recoveryUnit()->onRollback([this]() { _duplicateCounter.fetchAndAdd(-1); });
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+        [this](OperationContext*) { _duplicateCounter.fetchAndAdd(-1); });
 
     if (numDuplicates % 1000 == 0) {
         LOGV2_INFO(4806700,
                    "Index build: high number of duplicate keys on unique index",
-                   "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
+                   "index"_attr = indexCatalogEntry->descriptor()->indexName(),
                    "numDuplicateKeys"_attr = numDuplicates);
     }
 
     return Status::OK();
 }
 
-Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx,
+                                             const IndexCatalogEntry* indexCatalogEntry) const {
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     auto constraintsCursor = _keyConstraintsTable->rs()->getCursor(opCtx);
     auto record = constraintsCursor->next();
 
-    auto index = _indexCatalogEntry->accessMethod()->getSortedDataInterface();
+    auto index = indexCatalogEntry->accessMethod()->asSortedData()->getSortedDataInterface();
 
     static const char* curopMessage = "Index Build: checking for duplicate keys";
     ProgressMeterHolder progress;
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
-        progress.set(
-            CurOp::get(opCtx)->setProgress_inlock(curopMessage, _duplicateCounter.load(), 1));
+        progress.set(lk,
+                     CurOp::get(opCtx)->setProgress(lk, curopMessage, _duplicateCounter.load(), 1),
+                     opCtx);
     }
 
     int resolved = 0;
@@ -127,7 +155,8 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
         resolved++;
 
         BufReader reader(record->data.data(), record->data.size());
-        auto key = KeyString::Value::deserialize(reader, index->getKeyStringVersion());
+        auto key = key_string::Value::deserialize(
+            reader, index->getKeyStringVersion(), boost::none /* RecordId format */);
 
         auto status = index->dupKeyCheck(opCtx, key);
         if (!status.isOK())
@@ -140,10 +169,17 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
         wuow.commit();
         constraintsCursor->restore();
 
-        progress->hit();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            progress.get(lk)->hit();
+        }
         record = constraintsCursor->next();
     }
-    progress->finished();
+
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progress.get(lk)->finished();
+    }
 
     invariant(resolved == _duplicateCounter.load());
 
@@ -152,7 +188,7 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
                 logLevel,
                 "index build: resolved duplicate key conflicts for unique index",
                 "numResolved"_attr = resolved,
-                "indexName"_attr = _indexCatalogEntry->descriptor()->indexName());
+                "indexName"_attr = indexCatalogEntry->descriptor()->indexName());
     return Status::OK();
 }
 

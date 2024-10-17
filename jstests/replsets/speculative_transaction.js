@@ -5,9 +5,8 @@
  *
  * @tags: [uses_transactions, requires_majority_read_concern]
  */
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");  // For stopServerReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "speculative_transaction";
@@ -20,6 +19,9 @@ const primary = rst.getPrimary();
 const secondary = rst.getSecondary();
 var testDB = primary.getDB(dbName);
 const coll = testDB[collName];
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 function runTest(sessionOptions) {
     testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
@@ -122,4 +124,3 @@ function runTest(sessionOptions) {
 runTest({causalConsistency: false});
 runTest({causalConsistency: true});
 rst.stopSet();
-}());

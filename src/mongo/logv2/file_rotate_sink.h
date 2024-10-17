@@ -30,10 +30,14 @@
 #pragma once
 
 #include <boost/log/sinks/text_ostream_backend.hpp>
+#include <functional>
 #include <memory>
 #include <string>
 
+#include <boost/log/core/record_view.hpp>
+
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/logv2/log_format.h"
 
 namespace mongo::logv2 {
@@ -48,7 +52,7 @@ public:
     Status addFile(const std::string& filename, bool append);
     void removeFile(const std::string& filename);
 
-    Status rotate(bool rename, StringData renameSuffix);
+    Status rotate(bool rename, StringData renameSuffix, std::function<void(Status)> onMinorError);
 
     void consume(const boost::log::record_view& rec, const string_type& formatted_string);
 

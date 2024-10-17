@@ -1,16 +1,25 @@
-// Ensures that if the primary config server is blackholed from the point of view of mongos, CRUD
-// and read-only config operations continue to work.
-(function() {
-'use strict';
+/*
+ * Ensures that if the primary config server is blackholed from the point of view of mongos, CRUD
+ * and read-only config operations continue to work.
+ *
+ * @tags: [
+ *    config_shard_incompatible,
+ *    # TODO (SERVER-88129): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
+ */
 
-load('jstests/replsets/rslib.js');
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 // Checking index consistency involves talking to the primary config server which is blackholed from
 // the mongos in this test.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-var st = new ShardingTest({shards: 2, mongos: 1, useBridge: true});
+var st = new ShardingTest({shards: 2, mongos: 1, useBridge: true, config: 3});
 
 var testDB = st.s.getDB('BlackHoleDB');
 var configDB = st.s.getDB('config');
@@ -79,9 +88,13 @@ assert.throws(function() {
 
 // With secondary read pref config server reads should work
 st.s.setReadPref('secondary');
+FixtureHelpers.awaitReplication(configDB);
 assert.lt(0, configDB.chunks.find().itcount());
 assert.lt(0, configDB.chunks.find().count());
 assert.lt(0, configDB.chunks.aggregate().itcount());
 
+jsTest.log('Remove network partition before tearing down');
+configPrimary.discardMessagesFrom(st.s, 0.0);
+st.s.discardMessagesFrom(configPrimary, 0.0);
+
 st.stop();
-}());

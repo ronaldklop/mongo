@@ -1,8 +1,15 @@
 // Test --host with a replica set.
 // @tags: [requires_replication]
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-(function() {
-'use strict';
+if (_isWindows()) {
+    // Windows is prone to slow DNS resolution issues, which causes this test to fail
+    // even if the shell should eventually connect to the server. Since we are testing
+    // valid/invalid legacy shell options, it should be sufficient to test on other
+    // variants and reduce noise on Windows.
+    jsTest.log("Skipping test on Windows");
+    quit();
+}
 
 const replSetName = 'hostTestReplSetName';
 
@@ -32,7 +39,7 @@ if ("undefined" == typeof inner_mode) {
     if (exitCode != 0) {
         doassert("inner test failed with exit code " + exitCode);
     }
-    return;
+    quit();
 }
 
 function testHost(host, uri, ok) {
@@ -82,4 +89,3 @@ expFailure('mongodb://localhost:');
 expFailure(`mongodb://:${port}`);
 
 jsTest.log("SUCCESSFUL test completion");
-})();

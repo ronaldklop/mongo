@@ -31,8 +31,10 @@
 
 #include <functional>
 #include <iosfwd>
+#include <typeinfo>
 #include <vector>
 
+#include "mongo/platform/compiler.h"
 #include "mongo/util/dynamic_catch.h"
 
 namespace mongo {
@@ -55,7 +57,7 @@ void setupSynchronousSignalHandlers();
  *     mongoMalloc
  *     mongoRealloc
  */
-void reportOutOfMemoryErrorAndExit();
+MONGO_COMPILER_NORETURN void reportOutOfMemoryErrorAndExit();
 
 /**
  * Clears the signal mask for the process. This is called from forkServer and to setup
@@ -130,5 +132,7 @@ private:
 
 /** The singleton ActiveExceptionWitness. */
 ActiveExceptionWitness& globalActiveExceptionWitness();
+
+std::string describeActiveException();
 
 }  // namespace mongo

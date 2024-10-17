@@ -6,12 +6,13 @@
  * transaction, then roll back that commit entry, the success of which depends on the prevOpTime
  * being set properly.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-load("jstests/replsets/libs/rollback_test.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 const collName = "prepare_failover_rollback_commit";
@@ -64,4 +65,3 @@ const newSession2 = new _DelegatingDriverSession(primary, session);
 assert.commandWorked(PrepareHelpers.commitTransaction(newSession2, prepareTimestamp));
 
 rollbackTest.stop();
-})();

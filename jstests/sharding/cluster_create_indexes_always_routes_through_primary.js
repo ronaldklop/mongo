@@ -1,7 +1,6 @@
 // Ensure that a call to createIndexes in a sharded cluster will route to the primary, even when
 // setSecondaryOk() is set to true.
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 let st = new ShardingTest({shards: {rs0: {nodes: 2}}});
 const testDBName = jsTestName();
@@ -17,4 +16,3 @@ assert.commandWorked(
     testDB.runCommand({createIndexes: collName, indexes: [{key: {a: 1}, name: "index"}]}));
 
 st.stop();
-})();

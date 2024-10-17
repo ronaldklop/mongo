@@ -1,9 +1,8 @@
 // In SERVER-20169, the $range expression was added to the aggregation framework. In this file, we
 // test the behavior and error cases of this expression.
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-(function() {
-"use strict";
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 var coll = db.range;
 coll.drop();
@@ -66,4 +65,3 @@ assertErrorCode(coll,
                 34449,
                 "range requires a" +
                     " non-zero step value");
-}());

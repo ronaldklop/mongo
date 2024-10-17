@@ -29,44 +29,65 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/repl/tenant_migration_access_blocker.h"
 #include "mongo/db/repl/tenant_migration_donor_access_blocker.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class TenantMigrationConflictInfo final : public ErrorExtraInfo {
+const Status kNonRetryableTenantMigrationStatus(
+    ErrorCodes::Interrupted,
+    "Operation interrupted by an internal data migration and could not be automatically retried");
+
+class TenantMigrationConflictInfoBase : public ErrorExtraInfo {
 public:
-    static constexpr auto code = ErrorCodes::TenantMigrationConflict;
+    TenantMigrationConflictInfoBase(UUID migrationId,
+                                    std::shared_ptr<TenantMigrationAccessBlocker> mtab = nullptr)
+        : _migrationId(std::move(migrationId)), _mtab(std::move(mtab)){};
 
-    TenantMigrationConflictInfo(const std::string tenantId,
-                                std::shared_ptr<TenantMigrationAccessBlocker> mtab = nullptr,
-                                TenantMigrationAccessBlocker::OperationType operationType =
-                                    TenantMigrationAccessBlocker::kWrite)
-        : _tenantId(std::move(tenantId)), _mtab(std::move(mtab)), _operationType(operationType){};
-
-    const auto& getTenantId() const {
-        return _tenantId;
+    const auto& getMigrationId() const {
+        return _migrationId;
     }
 
     const auto& getTenantMigrationAccessBlocker() const {
         return _mtab;
     }
 
-    TenantMigrationAccessBlocker::OperationType getOperationType() const {
-        return _operationType;
-    }
-
     void serialize(BSONObjBuilder* bob) const override;
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
 
 private:
-    std::string _tenantId;
-    std::shared_ptr<TenantMigrationAccessBlocker> _mtab;
-    TenantMigrationAccessBlocker::OperationType _operationType;
+    const UUID _migrationId;
+    const std::shared_ptr<TenantMigrationAccessBlocker> _mtab;
 };
-using TenantMigrationConflictException = ExceptionFor<ErrorCodes::TenantMigrationConflict>;
+
+class TenantMigrationConflictInfo final : public TenantMigrationConflictInfoBase {
+public:
+    static constexpr auto code = ErrorCodes::TenantMigrationConflict;
+
+    TenantMigrationConflictInfo(UUID migrationId,
+                                std::shared_ptr<TenantMigrationAccessBlocker> mtab = nullptr)
+        : TenantMigrationConflictInfoBase(std::move(migrationId), std::move(mtab)) {}
+};
+
+class NonRetryableTenantMigrationConflictInfo final : public TenantMigrationConflictInfoBase {
+public:
+    static constexpr auto code = ErrorCodes::NonRetryableTenantMigrationConflict;
+
+    NonRetryableTenantMigrationConflictInfo(
+        UUID migrationId, std::shared_ptr<TenantMigrationAccessBlocker> mtab = nullptr)
+        : TenantMigrationConflictInfoBase(std::move(migrationId), std::move(mtab)) {}
+};
+
 using TenantMigrationCommittedException = ExceptionFor<ErrorCodes::TenantMigrationCommitted>;
 
 }  // namespace mongo

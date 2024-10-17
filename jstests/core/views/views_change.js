@@ -2,15 +2,10 @@
  * Tests the behavior of views when the backing view or collection is changed.
  * @tags: [
  *   assumes_superuser_permissions,
- *   requires_find_command,
  *   requires_non_retryable_commands,
  * ]
  */
-(function() {
-"use strict";
-
-// For arrayEq.
-load("jstests/aggregation/extras/utils.js");
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 let viewDB = db.getSiblingDB("views_change");
 let collection = viewDB.collection;
@@ -31,7 +26,7 @@ let resetCollectionAndViews = function() {
 let assertFindResultEq = function(collName, expected) {
     let res = viewDB.runCommand({find: collName, filter: {}, projection: {_id: 0, a: 1, b: 1}});
     assert.commandWorked(res);
-    let arr = new DBCommandCursor(db, res).toArray();
+    let arr = new DBCommandCursor(viewDB, res).toArray();
     let errmsg = tojson({expected: expected, got: arr});
     assert(arrayEq(arr, expected), errmsg);
 };
@@ -99,4 +94,3 @@ assert.commandWorked(collection.insert(doc));
 assertFindResultEq("viewOnView", [doc]);
 assert.commandWorked(viewDB.runCommand({drop: "view"}));
 assertFindResultEq("viewOnView", []);
-}());

@@ -29,10 +29,18 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -52,12 +60,6 @@ namespace mongo {
  */
 class KeyPattern {
 public:
-    /**
-     * Is the provided key pattern the index over the ID field?
-     * The always required ID index is always {_id: 1} or {_id: -1}.
-     */
-    static bool isIdKeyPattern(const BSONObj& pattern);
-
     /**
      * Is the provided key pattern ordered increasing or decreasing or not?
      */
@@ -90,11 +92,27 @@ public:
         return _pattern;
     }
 
+    BSONObj serializeForIDL(const SerializationOptions& options = {}) const {
+        BSONObjBuilder bob;
+        for (const auto& e : _pattern) {
+            bob.appendAs(e, options.serializeIdentifier(e.fieldNameStringData()));
+        }
+        return bob.obj();
+    }
+
     /**
      * Returns a string representation of this KeyPattern.
      */
     std::string toString() const {
         return str::stream() << *this;
+    }
+
+    /**
+     * Returns a string representation of this BSONObj keypattern.
+     */
+    static std::string toString(const BSONObj& keyPattern) {
+        StringBuilder sb;
+        return addToStringBuilder(sb, keyPattern).str();
     }
 
     /**
@@ -131,7 +149,10 @@ public:
 
     BSONObj globalMax() const;
 
+    size_t getApproximateSize() const;
+
 private:
+    static StringBuilder& addToStringBuilder(StringBuilder& sb, const BSONObj& pattern);
     BSONObj _pattern;
 };
 

@@ -2,13 +2,14 @@
  * Test that we can successfully reconstruct a prepared transaction that was prepared before the
  * stable timestamp at the end of rollback recovery.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/rollback_test.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 const collName = "rollback_reconstructs_transactions_prepared_before_stable";
@@ -131,4 +132,3 @@ assert.sameMembers(testColl.find().toArray(), [{_id: 0, a: 1}, {_id: 1}, {_id: 2
 assert.eq(testColl.count(), 3);
 
 rollbackTest.stop();
-}());

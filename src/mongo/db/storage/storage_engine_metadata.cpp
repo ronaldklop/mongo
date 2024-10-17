@@ -27,35 +27,49 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/storage_engine_metadata.h"
-
-#include <boost/filesystem.hpp>
-#include <boost/optional.hpp>
-#include <cstdio>
-#include <fstream>
-#include <limits>
-#include <ostream>
+#include <boost/filesystem/operations.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cerrno>
+#include <cstdint>
+#include <exception>
+#include <fstream>  // IWYU pragma: keep
+#include <system_error>
 #include <vector>
 
 #ifdef __linux__  // Only needed by flushDirectory for Linux
 #include <boost/filesystem/path.hpp>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #endif
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_type_validated.h"
-#include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_tag.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
 #include "mongo/util/assert_util.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/file.h"
 #include "mongo/util/str.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -85,10 +99,8 @@ std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std:
         metadata.reset(new StorageEngineMetadata(dbpath));
         Status status = metadata->read();
         if (!status.isOK()) {
-            LOGV2_FATAL_NOTRACE(28661,
-                                "Unable to read the storage engine metadata file: {error}",
-                                "Unable to read the storage engine metadata file",
-                                "error"_attr = status);
+            LOGV2_FATAL_NOTRACE(
+                28661, "Unable to read the storage engine metadata file", "error"_attr = status);
         }
     }
     return metadata;
@@ -205,7 +217,7 @@ Status StorageEngineMetadata::read() {
         if (!storageEngineOptionsElement.isABSONObj()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream()
-                              << "The 'storage.options' field in metadata must be a string: "
+                              << "The 'storage.options' field in metadata must be an object: "
                               << storageEngineOptionsElement.toString());
         }
         setStorageEngineOptions(storageEngineOptionsElement.Obj());
@@ -222,7 +234,6 @@ void flushMyDirectory(const boost::filesystem::path& file) {
     // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(),);
     if (!file.has_branch_path()) {
         LOGV2(22283,
-              "warning flushMyDirectory couldn't find parent dir for file: {file}",
               "flushMyDirectory couldn't find parent dir for file",
               "file"_attr = file.generic_string());
         return;
@@ -234,13 +245,15 @@ void flushMyDirectory(const boost::filesystem::path& file) {
     LOGV2_DEBUG(22284, 1, "flushing directory {dir_string}", "dir_string"_attr = dir.string());
 
     int fd = ::open(dir.string().c_str(), O_RDONLY);  // DO NOT THROW OR ASSERT BEFORE CLOSING
-    massert(13650,
-            str::stream() << "Couldn't open directory '" << dir.string()
-                          << "' for flushing: " << errnoWithDescription(),
-            fd >= 0);
+    if (fd < 0) {
+        auto ec = lastPosixError();
+        msgasserted(13650,
+                    str::stream() << "Couldn't open directory '" << dir.string()
+                                  << "' for flushing: " << errorMessage(ec));
+    }
     if (fsync(fd) != 0) {
-        int e = errno;
-        if (e == EINVAL) {  // indicates filesystem does not support synchronization
+        auto ec = lastPosixError();
+        if (ec == posixError(EINVAL)) {  // indicates filesystem does not support synchronization
             if (!_warnedAboutFilesystem) {
                 LOGV2_OPTIONS(
                     22285,
@@ -252,10 +265,9 @@ void flushMyDirectory(const boost::filesystem::path& file) {
             }
         } else {
             close(fd);
-            massert(13651,
-                    str::stream() << "Couldn't fsync directory '" << dir.string()
-                                  << "': " << errnoWithDescription(e),
-                    false);
+            msgasserted(13651,
+                        str::stream() << "Couldn't fsync directory '" << dir.string()
+                                      << "': " << errorMessage(ec));
         }
     }
     close(fd);
@@ -273,20 +285,20 @@ Status StorageEngineMetadata::write() const {
     {
         std::ofstream ofs(metadataTempPath.c_str(), std::ios_base::out | std::ios_base::binary);
         if (!ofs) {
+            auto ec = lastSystemError();
             return Status(ErrorCodes::FileNotOpen,
-                          str::stream()
-                              << "Failed to write metadata to " << metadataTempPath.string() << ": "
-                              << errnoWithDescription());
+                          str::stream() << "Failed to write metadata to "
+                                        << metadataTempPath.string() << ": " << errorMessage(ec));
         }
 
         BSONObj obj = BSON(
             "storage" << BSON("engine" << _storageEngine << "options" << _storageEngineOptions));
         ofs.write(obj.objdata(), obj.objsize());
         if (!ofs) {
+            auto ec = lastSystemError();
             return Status(ErrorCodes::OperationFailed,
-                          str::stream()
-                              << "Failed to write BSON data to " << metadataTempPath.string()
-                              << ": " << errnoWithDescription());
+                          str::stream() << "Failed to write BSON data to "
+                                        << metadataTempPath.string() << ": " << errorMessage(ec));
         }
     }
 

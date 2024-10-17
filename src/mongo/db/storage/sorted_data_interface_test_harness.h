@@ -29,16 +29,25 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/util/unowned_ptr.h"
 
 namespace mongo {
 
@@ -112,32 +121,27 @@ void registerSortedDataInterfaceHarnessHelperFactory(
 
 std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper();
 
-KeyString::Value makeKeyString(SortedDataInterface* sorted,
-                               BSONObj bsonKey,
-                               boost::optional<RecordId> rid = boost::none);
+key_string::Value makeKeyString(SortedDataInterface* sorted,
+                                BSONObj bsonKey,
+                                const boost::optional<RecordId>& rid = boost::none);
 
-KeyString::Value makeKeyStringForSeek(SortedDataInterface* sorted,
-                                      BSONObj bsonKey,
-                                      bool isForward,
-                                      bool inclusive);
+key_string::Builder makeKeyStringForSeek(SortedDataInterface* sorted, BSONObj bsonKey);
+
+key_string::Builder makeKeyStringForSeek(SortedDataInterface* sorted,
+                                         BSONObj bsonKey,
+                                         bool isForward,
+                                         bool inclusive);
 
 /**
  * Inserts all entries in toInsert into index.
  * ASSERT_OKs the inserts.
- * Always uses dupsAllowed=true.
  *
  * Should be used for declaring and changing conditions, not for testing inserts.
  */
-void insertToIndex(unowned_ptr<OperationContext> opCtx,
-                   unowned_ptr<SortedDataInterface> index,
-                   std::initializer_list<IndexKeyEntry> toInsert);
-
-inline void insertToIndex(unowned_ptr<HarnessHelper> harness,
-                          unowned_ptr<SortedDataInterface> index,
-                          std::initializer_list<IndexKeyEntry> toInsert) {
-    auto client = harness->serviceContext()->makeClient("insertToIndex");
-    insertToIndex(harness->newOperationContext(client.get()), index, toInsert);
-}
+void insertToIndex(OperationContext* opCtx,
+                   SortedDataInterface* index,
+                   std::initializer_list<IndexKeyEntry> toInsert,
+                   bool dupsAllowed = true);
 
 /**
  * Removes all entries in toRemove from index.
@@ -145,15 +149,15 @@ inline void insertToIndex(unowned_ptr<HarnessHelper> harness,
  *
  * Should be used for declaring and changing conditions, not for testing removes.
  */
-void removeFromIndex(unowned_ptr<OperationContext> opCtx,
-                     unowned_ptr<SortedDataInterface> index,
+void removeFromIndex(OperationContext* opCtx,
+                     SortedDataInterface* index,
                      std::initializer_list<IndexKeyEntry> toRemove);
 
-inline void removeFromIndex(unowned_ptr<HarnessHelper> harness,
-                            unowned_ptr<SortedDataInterface> index,
+inline void removeFromIndex(HarnessHelper* harness,
+                            SortedDataInterface* index,
                             std::initializer_list<IndexKeyEntry> toRemove) {
-    auto client = harness->serviceContext()->makeClient("removeFromIndex");
-    removeFromIndex(harness->newOperationContext(client.get()), index, toRemove);
+    auto client = harness->serviceContext()->getService()->makeClient("removeFromIndex");
+    removeFromIndex(harness->newOperationContext(client.get()).get(), index, toRemove);
 }
 
 }  // namespace mongo

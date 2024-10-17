@@ -27,37 +27,60 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+#include <boost/filesystem/operations.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
-#include "mongo/platform/basic.h"
+#include <boost/filesystem/path.hpp>
 
-#include <boost/filesystem.hpp>
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-static const NamespaceString kConfigNss("local.system.replset");
+static const NamespaceString kConfigNss =
+    NamespaceString::createNamespaceString_forTest("local.system.replset");
 static const std::string kRepairIncompleteFileName = "_repair_incomplete";
 
 using boost::filesystem::path;
 
 class StorageRepairObserverTest : public ServiceContextMongoDTest {
 public:
-    StorageRepairObserverTest() : ServiceContextMongoDTest("ephemeralForTest") {
-
+    StorageRepairObserverTest() {
         repl::ReplicationCoordinator::set(
             getServiceContext(),
             std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext()));
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
     }
 
     void assertRepairIncompleteOnTearDown() {
@@ -66,13 +89,23 @@ public:
 
     void createMockReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_X);
-        Helpers::putSingleton(opCtx, "local.system.replset", replConfig);
+        Lock::DBLock dbLock(opCtx, DatabaseName::kLocal, MODE_X);
+        auto coll = acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest(NamespaceString::kSystemReplSetNamespace,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kWrite),
+            MODE_X);
+        Helpers::putSingleton(opCtx, coll, replConfig);
     }
 
     void assertReplConfigValid(OperationContext* opCtx, bool valid) {
         BSONObj replConfig;
-        ASSERT(Helpers::getSingleton(opCtx, "local.system.replset", replConfig));
+        ASSERT(Helpers::getSingleton(
+            opCtx,
+            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
+            replConfig));
         if (valid) {
             ASSERT(!replConfig.hasField("repaired"));
         } else {
@@ -82,8 +115,11 @@ public:
 
     bool hasReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_IS);
-        return Helpers::getSingleton(opCtx, "local.system.replset", replConfig);
+        Lock::DBLock dbLock(opCtx, DatabaseName::kLocal, MODE_IS);
+        return Helpers::getSingleton(
+            opCtx,
+            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
+            replConfig);
     }
 
     path repairFilePath() {
@@ -101,12 +137,12 @@ public:
         return StorageRepairObserver::get(getServiceContext());
     }
 
-    void setUp() {
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
         storageGlobalParams.repair = true;
     }
 
-    void tearDown() {
+    void tearDown() override {
         auto repairObserver = getRepairObserver();
         if (_assertRepairIncompleteOnTearDown) {
             ASSERT(repairObserver->isIncomplete());

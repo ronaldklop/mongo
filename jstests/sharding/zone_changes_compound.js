@@ -1,11 +1,15 @@
 /**
  * Test that chunks and documents are moved correctly after zone changes.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/zone_changes_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    assertChunksOnShards,
+    assertDocsOnShards,
+    assertShardTags,
+    moveZoneToShard,
+    runBalancer,
+} from "jstests/sharding/libs/zone_changes_util.js";
 
 let st = new ShardingTest({shards: 3});
 let primaryShard = st.shard0;
@@ -16,8 +20,8 @@ let coll = testDB.compound;
 let ns = coll.getFullName();
 let shardKey = {x: 1, y: 1};
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, primaryShard.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: primaryShard.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: shardKey}));
 
 jsTest.log("Insert docs and check that they end up on the primary shard.");
@@ -101,4 +105,3 @@ assertChunksOnShards(configDB, ns, shardChunkBounds);
 assertDocsOnShards(st, ns, shardChunkBounds, docs, shardKey);
 
 st.stop();
-})();

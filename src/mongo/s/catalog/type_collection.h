@@ -29,7 +29,25 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -45,7 +63,6 @@ using ReshardingFields = TypeCollectionReshardingFields;
  *      "_id" : "foo.bar",
  *      "lastmodEpoch" : ObjectId("58b6fd76132358839e409e47"),
  *      "lastmod" : ISODate("1970-02-19T17:02:47.296Z"),
- *      "dropped" : false,
  *      "key" : {
  *          "_id" : 1
  *      },
@@ -79,40 +96,61 @@ using ReshardingFields = TypeCollectionReshardingFields;
 class CollectionType : private CollectionTypeBase {
 public:
     // Make field names accessible.
-    static constexpr auto kDefaultCollationFieldName = kPre50CompatibleDefaultCollationFieldName;
     static constexpr auto kEpochFieldName = kPre22CompatibleEpochFieldName;
-    static constexpr auto kKeyPatternFieldName = kPre50CompatibleKeyPatternFieldName;
-    static constexpr auto kUuidFieldName = kPre50CompatibleUuidFieldName;
-    static constexpr auto kAllowMigrationsFieldName = kPre50CompatibleAllowMigrationsFieldName;
+
+    using CollectionTypeBase::kAllowMigrationsFieldName;
+    using CollectionTypeBase::kDefaultCollationFieldName;
+    using CollectionTypeBase::kDefragmentationPhaseFieldName;
+    using CollectionTypeBase::kDefragmentCollectionFieldName;
+    using CollectionTypeBase::kEnableAutoMergeFieldName;
+    using CollectionTypeBase::kIndexVersionFieldName;
+    using CollectionTypeBase::kKeyPatternFieldName;
+    using CollectionTypeBase::kMaxChunkSizeBytesFieldName;
+    using CollectionTypeBase::kNoBalanceFieldName;
     using CollectionTypeBase::kNssFieldName;
+    using CollectionTypeBase::kPermitMigrationsFieldName;
     using CollectionTypeBase::kReshardingFieldsFieldName;
+    using CollectionTypeBase::kTimeseriesFieldsFieldName;
     using CollectionTypeBase::kTimestampFieldName;
     using CollectionTypeBase::kUniqueFieldName;
+    using CollectionTypeBase::kUnsplittableFieldName;
     using CollectionTypeBase::kUpdatedAtFieldName;
+    using CollectionTypeBase::kUuidFieldName;
 
     // Make getters and setters accessible.
+    using CollectionTypeBase::getDefragmentationPhase;
+    using CollectionTypeBase::getKeyPattern;
+    using CollectionTypeBase::getMaxChunkSizeBytes;
     using CollectionTypeBase::getNss;
     using CollectionTypeBase::getReshardingFields;
+    using CollectionTypeBase::getTimeseriesFields;
     using CollectionTypeBase::getTimestamp;
     using CollectionTypeBase::getUnique;
+    using CollectionTypeBase::getUnsplittable;
     using CollectionTypeBase::getUpdatedAt;
+    using CollectionTypeBase::getUuid;
+    using CollectionTypeBase::setDefragmentationPhase;
+    using CollectionTypeBase::setDefragmentCollection;
+    using CollectionTypeBase::setKeyPattern;
     using CollectionTypeBase::setNss;
     using CollectionTypeBase::setReshardingFields;
+    using CollectionTypeBase::setTimeseriesFields;
     using CollectionTypeBase::setTimestamp;
     using CollectionTypeBase::setUnique;
+    using CollectionTypeBase::setUnsplittable;
     using CollectionTypeBase::setUpdatedAt;
+    using CollectionTypeBase::setUuid;
     using CollectionTypeBase::toBSON;
 
     // Name of the collections collection in the config server.
     static const NamespaceString ConfigNS;
 
-    CollectionType(NamespaceString nss, OID epoch, Date_t updatedAt, UUID uuid);
-
     CollectionType(NamespaceString nss,
                    OID epoch,
-                   boost::optional<Timestamp> creationTime,
+                   Timestamp creationTime,
                    Date_t updatedAt,
-                   UUID uuid);
+                   UUID uuid,
+                   KeyPattern keyPattern);
 
     explicit CollectionType(const BSONObj& obj);
 
@@ -125,38 +163,50 @@ public:
     }
     void setEpoch(OID epoch);
 
-    const UUID& getUuid() const {
-        return *getPre50CompatibleUuid();
-    }
-    void setUuid(UUID uuid);
-
-    bool getDropped() const {
-        return getPre50CompatibleDropped().get_value_or(false);
-    }
-
-    const KeyPattern& getKeyPattern() const {
-        return *getPre50CompatibleKeyPattern();
-    }
-    void setKeyPattern(KeyPattern keyPattern);
-
     BSONObj getDefaultCollation() const {
-        return getPre50CompatibleDefaultCollation().get_value_or(BSONObj());
+        return CollectionTypeBase::getDefaultCollation().get_value_or(BSONObj());
     }
+
+    void setMaxChunkSizeBytes(int64_t value);
+
     void setDefaultCollation(const BSONObj& defaultCollation);
 
+    bool getDefragmentCollection() const {
+        return CollectionTypeBase::getDefragmentCollection().get_value_or(false);
+    }
+
     bool getAllowBalance() const {
-        return !getNoBalance();
+        return !getNoBalance() && !getDefragmentCollection();
     }
 
     bool getAllowMigrations() const {
-        return getPre50CompatibleAllowMigrations().get_value_or(true);
+        return CollectionTypeBase::getAllowMigrations().get_value_or(true);
     }
 
     void setAllowMigrations(bool allowMigrations) {
         if (allowMigrations)
-            setPre50CompatibleAllowMigrations(boost::none);
+            CollectionTypeBase::setAllowMigrations(boost::none);
         else
-            setPre50CompatibleAllowMigrations(false);
+            CollectionTypeBase::setAllowMigrations(false);
+    }
+
+    boost::optional<CollectionIndexes> getIndexVersion() const {
+        return CollectionTypeBase::getIndexVersion()
+            ? CollectionIndexes(getUuid(), *CollectionTypeBase::getIndexVersion())
+            : boost::optional<CollectionIndexes>(boost::none);
+    }
+
+    void setIndexVersion(CollectionIndexes indexVersion) {
+        tassert(7000500,
+                str::stream() << "Cannot set collection indexes to " << indexVersion
+                              << " since collection uuid is " << getUuid(),
+                indexVersion.uuid() == getUuid());
+        CollectionTypeBase::setIndexVersion(indexVersion.indexVersion());
+    }
+
+    // TODO SERVER-61033: remove after permitMigrations have been merge with allowMigrations.
+    bool getPermitMigrations() const {
+        return CollectionTypeBase::getPermitMigrations().get_value_or(true);
     }
 };
 

@@ -1,11 +1,8 @@
 // Tests that no-op createIndex commands do not block behind transactions.
 // @tags: [uses_transactions]
-(function() {
-"use strict";
-
 // TODO(SERVER-39704): Remove the following load after SERVER-39704 is completed
-// For withTxnAndAutoRetryOnMongos.
-load('jstests/libs/auto_retry_transaction_in_sharding.js');
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const dbName = 'noop_createIndexes_not_blocked';
 const collName = 'test';
@@ -16,8 +13,7 @@ testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
 const session = db.getMongo().startSession({causalConsistency: false});
 const sessionDB = session.getDatabase(dbName);
 
-const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
-if (isMongos) {
+if (FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Access the collection before creating indexes so it can be implicitly sharded.
     assert.eq(sessionDB[collName].find().itcount(), 0);
 }
@@ -29,11 +25,9 @@ const createIndexesCommand = {
 };
 assert.commandWorked(sessionDB.runCommand(createIndexesCommand));
 
-// Default read concern level to use for transactions. Snapshot read concern is not supported in
-// sharded transactions when majority reads are disabled.
+// Default read concern level to use for transactions.
 if (!TestData.hasOwnProperty('defaultTransactionReadConcernLevel')) {
-    TestData.defaultTransactionReadConcernLevel =
-        TestData.enableMajorityReadConcern !== false ? 'snapshot' : 'local';
+    TestData.defaultTransactionReadConcernLevel = 'snapshot';
 }
 
 // TODO(SERVER-39704): We use the withTxnAndAutoRetryOnMongos
@@ -58,7 +52,7 @@ withTxnAndAutoRetryOnMongos(session, () => {
     // This should block and time out because the index does not already exist.
     res = testDB.runCommand(
         {createIndexes: collName, indexes: [{key: {b: 1}, name: "b_1"}], maxTimeMS: 500});
-    assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
+    assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
     // This should block and time out because one of the indexes does not already exist.
     res = testDB.runCommand({
@@ -66,6 +60,5 @@ withTxnAndAutoRetryOnMongos(session, () => {
         indexes: [{key: {a: 1}, name: "a_1"}, {key: {b: 1}, name: "b_1"}],
         maxTimeMS: 500
     });
-    assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
+    assert(ErrorCodes.isExceededTimeLimitError(res.code));
 });
-}());

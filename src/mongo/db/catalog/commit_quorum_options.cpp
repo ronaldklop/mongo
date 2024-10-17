@@ -27,15 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/commit_quorum_options.h"
 
+#include <cstddef>
+
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -77,7 +80,7 @@ Status CommitQuorumOptions::parse(const BSONElement& commitQuorumElement) {
         }
         numNodes = static_cast<decltype(numNodes)>(cNumNodes);
     } else if (commitQuorumElement.type() == String) {
-        mode = commitQuorumElement.valuestrsafe();
+        mode = commitQuorumElement.str();
         if (mode.empty()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "commitQuorum can't be an empty string");

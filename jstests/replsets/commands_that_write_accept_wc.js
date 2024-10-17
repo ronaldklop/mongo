@@ -4,10 +4,14 @@
  * defines various database commands and what they expect to be true before and after the fact.
  * It then runs the commands with an invalid writeConcern and a valid writeConcern and
  * ensures that they succeed and fail appropriately.
+ *
+ * @tags: [
+ *   requires_scripting,
+ * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({
     name: 'WCSet',
     // Set priority of secondaries to zero to prevent spurious elections.
@@ -44,7 +48,7 @@ commands.push({
 commands.push({
     req: {createIndexes: collName, indexes: [{key: {'type': 1}, name: 'type_index'}]},
     setupFunc: function() {
-        coll.insert({type: 'oak'});
+        assert.commandWorked(coll.insert({type: 'oak'}));
         assert.eq(coll.getIndexes().length, 1);
     },
     confirmFunc: function() {
@@ -62,7 +66,7 @@ commands.push({
         writeConcern: {w: 'majority'}
     },
     setupFunc: function() {
-        coll.insert({type: 'oak'});
+        assert.commandWorked(coll.insert({type: 'oak'}));
         assert.eq(coll.count({type: 'ginkgo'}), 0);
         assert.eq(coll.count({type: 'oak'}), 1);
     },
@@ -80,7 +84,7 @@ commands.push({
         writeConcern: {w: 'majority'}
     },
     setupFunc: function() {
-        coll.insert({type: 'oak'});
+        assert.commandWorked(coll.insert({type: 'oak'}));
         assert.eq(coll.count({type: 'ginkgo'}), 0);
         assert.eq(coll.count({type: 'oak'}), 1);
     },
@@ -98,7 +102,7 @@ commands.push({
         writeConcern: {w: 'majority'}
     },
     setupFunc: function() {
-        coll.insert({type: 'oak'});
+        assert.commandWorked(coll.insert({type: 'oak'}));
         assert.eq(coll.count({type: 'ginkgo'}), 0);
         assert.eq(coll.count({type: 'oak'}), 1);
     },
@@ -111,7 +115,7 @@ commands.push({
 commands.push({
     req: {applyOps: [{op: "u", ns: coll.getFullName(), o: {_id: 1, type: "willow"}, o2: {_id: 1}}]},
     setupFunc: function() {
-        coll.insert({_id: 1, type: 'oak'});
+        assert.commandWorked(coll.insert({_id: 1, type: 'oak'}));
         assert.eq(coll.count({type: 'willow'}), 0);
     },
     confirmFunc: function() {
@@ -141,15 +145,24 @@ commands.push({
             });
         },
         reduce: function(key, values) {
-            return {count: values.length};
+            // We may be re-reducing values that have already been partially reduced. In that case,
+            // we expect to see an object like {count: <count>} in the array of input values.
+            const numValues = values.reduce(function(acc, currentValue) {
+                if (typeof currentValue === "object") {
+                    return acc + currentValue.count;
+                } else {
+                    return acc + 1;
+                }
+            }, 0);
+            return {count: numValues};
         },
         out: "foo"
     },
     setupFunc: function() {
-        coll.insert({x: 1, tags: ["a", "b"]});
-        coll.insert({x: 2, tags: ["b", "c"]});
-        coll.insert({x: 3, tags: ["c", "a"]});
-        coll.insert({x: 4, tags: ["b", "c"]});
+        assert.commandWorked(coll.insert({x: 1, tags: ["a", "b"]}));
+        assert.commandWorked(coll.insert({x: 2, tags: ["b", "c"]}));
+        assert.commandWorked(coll.insert({x: 3, tags: ["c", "a"]}));
+        assert.commandWorked(coll.insert({x: 4, tags: ["b", "c"]}));
     },
     confirmFunc: function() {
         assert.eq(db.foo.findOne({_id: 'a'}).value.count, 2);
@@ -189,4 +202,3 @@ commands.forEach(function(cmd) {
 });
 
 replTest.stopSet();
-})();

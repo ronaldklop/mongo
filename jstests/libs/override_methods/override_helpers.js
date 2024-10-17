@@ -1,10 +1,13 @@
+import {getCommandName} from "jstests/libs/cmd_object_utils.js";
+
+// Store the original 'runCommand' function before applying any overrides.
+const preOverrideRunCommand = Mongo.prototype.runCommand;
+
 /**
  * The OverrideHelpers object defines convenience methods for overriding commands and functions in
  * the mongo shell.
  */
-var OverrideHelpers = (function() {
-    "use strict";
-
+export const OverrideHelpers = (function() {
     function makeIsAggregationWithFirstStage(stageName) {
         return function(commandName, commandObj) {
             if (commandName !== "aggregate" || typeof commandObj !== "object" ||
@@ -63,9 +66,13 @@ var OverrideHelpers = (function() {
             let newCode;
             if (typeof jsCode === "function") {
                 // Load the override file and immediately invoke the supplied function.
-                newCode = `load("${overrideFile}"); (${jsCode})();`;
+                if (jsCode.constructor.name === 'AsyncFunction') {
+                    newCode = `await import("${overrideFile}"); await (${jsCode.toString()})();`;
+                } else {
+                    newCode = `await import("${overrideFile}"); (${jsCode.toString()})();`;
+                }
             } else {
-                newCode = `load("${overrideFile}"); ${jsCode};`;
+                newCode = `await import("${overrideFile}"); ${jsCode};`;
             }
 
             return startParallelShellOriginal(newCode, port, noConnect);
@@ -74,36 +81,41 @@ var OverrideHelpers = (function() {
 
     function overrideRunCommand(overrideFunc) {
         const mongoRunCommandOriginal = Mongo.prototype.runCommand;
-        const mongoRunCommandWithMetadataOriginal = Mongo.prototype.runCommandWithMetadata;
 
         Mongo.prototype.runCommand = function(dbName, commandObj, options) {
-            const commandName = Object.keys(commandObj)[0];
             return overrideFunc(this,
                                 dbName,
-                                commandName,
+                                getCommandName(commandObj),
                                 commandObj,
                                 mongoRunCommandOriginal,
-                                (commandObj) => [dbName, commandObj, options]);
+                                (commandObj, db = dbName) => [db, commandObj, options]);
         };
+    }
 
-        Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs) {
-            const commandName = Object.keys(commandArgs)[0];
-            return overrideFunc(this,
-                                dbName,
-                                commandName,
-                                commandArgs,
-                                mongoRunCommandWithMetadataOriginal,
-                                (commandArgs) => [dbName, metadata, commandArgs]);
-        };
+    /**
+     * Higher order function for executing `db.runCommand()` commands without overrides.
+     * Example usage:
+     *  const res = OverrideHelpers.withPreOverrideRunCommand(() => db.adminCommand(cmd));
+     */
+    function withPreOverrideRunCommand(fn) {
+        const overriddenRunCommand = Mongo.prototype.runCommand;
+        try {
+            Mongo.prototype.runCommand = preOverrideRunCommand;
+            return fn();
+        } finally {
+            Mongo.prototype.runCommand = overriddenRunCommand;
+        }
     }
 
     return {
         isAggregationWithListLocalSessionsStage:
             makeIsAggregationWithFirstStage("$listLocalSessions"),
         isAggregationWithOutOrMergeStage: isAggregationWithOutOrMergeStage,
+        isAggregationWithCurrentOpStage: makeIsAggregationWithFirstStage("$currentOp"),
         isAggregationWithChangeStreamStage: makeIsAggregationWithFirstStage("$changeStream"),
         isMapReduceWithInlineOutput: isMapReduceWithInlineOutput,
         prependOverrideInParallelShell: prependOverrideInParallelShell,
         overrideRunCommand: overrideRunCommand,
+        withPreOverrideRunCommand: withPreOverrideRunCommand,
     };
 })();

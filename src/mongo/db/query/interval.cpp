@@ -29,6 +29,13 @@
 
 #include "mongo/db/query/interval.h"
 
+#include <utility>
+
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+
 namespace mongo {
 
 using std::string;
@@ -45,7 +52,7 @@ Interval::Interval(BSONObj base, bool si, bool ei) {
 }
 
 void Interval::init(BSONObj base, bool si, bool ei) {
-    verify(base.nFields() >= 2);
+    MONGO_verify(base.nFields() >= 2);
 
     _intervalData = base.getOwned();
     BSONObjIterator it(_intervalData);
@@ -55,8 +62,16 @@ void Interval::init(BSONObj base, bool si, bool ei) {
     endInclusive = ei;
 }
 
+Interval::Interval(
+    BSONObj base, BSONElement start, bool startInclusive, BSONElement end, bool endInclusive)
+    : _intervalData(base),
+      start(start),
+      startInclusive(startInclusive),
+      end(end),
+      endInclusive(endInclusive) {}
+
 bool Interval::isEmpty() const {
-    return _intervalData.nFields() == 0;
+    return start.eoo() && end.eoo();
 }
 
 bool Interval::isPoint() const {
@@ -172,6 +187,10 @@ bool Interval::isMaxToMin() const {
     return (start.type() == BSONType::MaxKey && end.type() == BSONType::MinKey);
 }
 
+bool Interval::isFullyOpen() const {
+    return isMinToMax() || isMaxToMin();
+}
+
 Interval::IntervalComparison Interval::compare(const Interval& other) const {
     //
     // Intersect cases
@@ -248,7 +267,7 @@ void Interval::intersect(const Interval& other, IntervalComparison cmp) {
             break;
 
         default:
-            verify(false);
+            MONGO_verify(false);
     }
 }
 
@@ -284,7 +303,7 @@ void Interval::combine(const Interval& other, IntervalComparison cmp) {
             break;
 
         default:
-            verify(false);
+            MONGO_verify(false);
     }
 }
 

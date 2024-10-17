@@ -35,11 +35,11 @@ global:
         - "mongo/db/s/migration_session_id.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
     - "mongo/s/chunk_range.idl"
     - "mongo/s/chunk_version.idl"
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/session/logical_session_id.idl"
 
 enums:
     Decision:
@@ -58,6 +58,7 @@ types:
         cpp_type: "mongo::MigrationSessionId"
         deserializer: "mongo::MigrationSessionId::fromString"
         serializer: "mongo::MigrationSessionId::toString"
+        is_view: false
 
 structs:
     migrationCoordinatorDocument:
@@ -95,7 +96,8 @@ structs:
                 description: "The range being migrated."
             preMigrationChunkVersion:
                 type: ChunkVersion
-                description: "The version, at the start of the migration, of the chunk being moved."
+                description: "The data placement, at the start of the migration, of the chunk being 
+                             moved."
             decision:
                 type: Decision
                 description: "Enumeration that defines whether the migration committed or aborted."

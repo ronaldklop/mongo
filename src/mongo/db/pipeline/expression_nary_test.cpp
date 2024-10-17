@@ -27,67 +27,89 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cmath>
+#include <iterator>
+#include <limits>
+#include <set>
+#include <string>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/config.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+
+using namespace mongo;
 
 namespace ExpressionTests {
-using boost::intrusive_ptr;
-using std::numeric_limits;
-using std::set;
-using std::string;
-using std::vector;
 
 /** A dummy child of ExpressionNary used for testing. */
 class Testable : public ExpressionNary {
 public:
-    virtual Value evaluate(const Document& root, Variables* variables) const {
+    Value evaluate(const Document& root, Variables* variables) const override {
         // Just put all the values in a list.
         // By default, this is not associative/commutative so the results will change if
         // instantiated as commutative or associative and operations are reordered.
-        vector<Value> values;
+        std::vector<Value> values;
         for (auto&& child : _children)
             values.push_back(child->evaluate(root, variables));
         return Value(values);
     }
 
-    virtual const char* getOpName() const {
+    const char* getOpName() const override {
         return "$testable";
     }
 
-    virtual bool isAssociative() const {
-        return _isAssociative;
+    Associativity getAssociativity() const override {
+        return _associativity;
     }
 
-    virtual bool isCommutative() const {
+    bool isCommutative() const override {
         return _isCommutative;
     }
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
     }
 
-    static intrusive_ptr<Testable> create(ExpressionContext* const expCtx,
-                                          bool associative,
-                                          bool commutative) {
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    static boost::intrusive_ptr<Testable> create(ExpressionContext* const expCtx,
+                                                 Associativity associative,
+                                                 bool commutative) {
         return new Testable(expCtx, associative, commutative);
     }
 
 private:
-    Testable(ExpressionContext* const expCtx, bool isAssociative, bool isCommutative)
-        : ExpressionNary(expCtx), _isAssociative(isAssociative), _isCommutative(isCommutative) {}
-    bool _isAssociative;
+    Testable(ExpressionContext* const expCtx, Associativity associativity, bool isCommutative)
+        : ExpressionNary(expCtx), _associativity(associativity), _isCommutative(isCommutative) {}
+    Associativity _associativity;
     bool _isCommutative;
 };
 
@@ -115,13 +137,13 @@ static BSONObj constify(const BSONObj& obj, bool parentIsArray = false) {
 }
 
 /** Convert Expression to BSON. */
-static BSONObj expressionToBson(const intrusive_ptr<Expression>& expression) {
-    return BSON("" << expression->serialize(false)).firstElement().embeddedObject().getOwned();
+static BSONObj expressionToBson(const boost::intrusive_ptr<Expression>& expression) {
+    return BSON("" << expression->serialize()).firstElement().embeddedObject().getOwned();
 }
 
 class ExpressionBaseTest : public unittest::Test {
 public:
-    void addOperand(intrusive_ptr<ExpressionNary> expr, Value arg) {
+    void addOperand(boost::intrusive_ptr<ExpressionNary> expr, Value arg) {
         expr->addOperand(ExpressionConstant::create(&expCtx, arg));
     }
 
@@ -141,7 +163,7 @@ public:
         ASSERT_EQUALS(output.getType(), v.getType());
     }
 
-    intrusive_ptr<ExpressionNary> _expr;
+    boost::intrusive_ptr<ExpressionNary> _expr;
 };
 
 class ExpressionNaryTestTwoArg : public ExpressionBaseTest {
@@ -154,26 +176,30 @@ public:
                       _expr->evaluate({}, &_expr->getExpressionContext()->variables).getType());
     }
 
-    intrusive_ptr<ExpressionNary> _expr;
+    boost::intrusive_ptr<ExpressionNary> _expr;
 };
 
 /* ------------------------- NaryExpression -------------------------- */
 
 class ExpressionNaryTest : public unittest::Test {
 public:
-    virtual void setUp() override {
-        _notAssociativeNorCommutative = Testable::create(&expCtx, false, false);
-        _associativeOnly = Testable::create(&expCtx, true, false);
-        _associativeAndCommutative = Testable::create(&expCtx, true, true);
+    void setUp() override {
+        _notAssociativeNorCommutative =
+            Testable::create(&expCtx, ExpressionNary::Associativity::kNone, false);
+        _associativeOnly = Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
+        _associativeAndCommutative =
+            Testable::create(&expCtx, ExpressionNary::Associativity::kFull, true);
+        _leftAssociativeOnly =
+            Testable::create(&expCtx, ExpressionNary::Associativity::kLeft, false);
     }
 
 protected:
-    void assertDependencies(const intrusive_ptr<Testable>& expr,
+    void assertDependencies(const boost::intrusive_ptr<Testable>& expr,
                             const BSONArray& expectedDependencies) {
         DepsTracker dependencies;
-        expr->addDependencies(&dependencies);
+        expression::addDependencies(expr.get(), &dependencies);
         BSONArrayBuilder dependenciesBson;
-        for (set<string>::const_iterator i = dependencies.fields.begin();
+        for (OrderedPathSet::const_iterator i = dependencies.fields.begin();
              i != dependencies.fields.end();
              ++i) {
             dependenciesBson << *i;
@@ -183,11 +209,13 @@ protected:
         ASSERT_EQUALS(false, dependencies.getNeedsAnyMetadata());
     }
 
-    void assertContents(const intrusive_ptr<Testable>& expr, const BSONArray& expectedContents) {
+    void assertContents(const boost::intrusive_ptr<Testable>& expr,
+                        const BSONArray& expectedContents) {
         ASSERT_BSONOBJ_EQ(constify(BSON("$testable" << expectedContents)), expressionToBson(expr));
     }
 
-    void addOperandArrayToExpr(const intrusive_ptr<Testable>& expr, const BSONArray& operands) {
+    void addOperandArrayToExpr(const boost::intrusive_ptr<Testable>& expr,
+                               const BSONArray& operands) {
         VariablesParseState vps = expCtx.variablesParseState;
         BSONObjIterator i(operands);
         while (i.more()) {
@@ -197,9 +225,10 @@ protected:
     }
 
     ExpressionContextForTest expCtx;
-    intrusive_ptr<Testable> _notAssociativeNorCommutative;
-    intrusive_ptr<Testable> _associativeOnly;
-    intrusive_ptr<Testable> _associativeAndCommutative;
+    boost::intrusive_ptr<Testable> _notAssociativeNorCommutative;
+    boost::intrusive_ptr<Testable> _associativeOnly;
+    boost::intrusive_ptr<Testable> _associativeAndCommutative;
+    boost::intrusive_ptr<Testable> _leftAssociativeOnly;
 };
 
 TEST_F(ExpressionNaryTest, AddedConstantOperandIsSerialized) {
@@ -245,14 +274,58 @@ TEST_F(ExpressionNaryTest, ValidateObjectExpressionDependency) {
 TEST_F(ExpressionNaryTest, SerializationToBsonObj) {
     _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(5)));
     ASSERT_BSONOBJ_EQ(BSON("foo" << BSON("$testable" << BSON_ARRAY(BSON("$const" << 5)))),
-                      BSON("foo" << _notAssociativeNorCommutative->serialize(false)));
+                      BSON("foo" << _notAssociativeNorCommutative->serialize()));
 }
 
 TEST_F(ExpressionNaryTest, SerializationToBsonArr) {
     _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(5)));
     ASSERT_BSONOBJ_EQ(constify(BSON_ARRAY(BSON("$testable" << BSON_ARRAY(5)))),
-                      BSON_ARRAY(_notAssociativeNorCommutative->serialize(false)));
+                      BSON_ARRAY(_notAssociativeNorCommutative->serialize()));
 }
+
+TEST_F(ExpressionNaryTest, RedactsCorrectlyWithConstantArguments) {
+    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(5)));
+    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(10)));
+    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(15)));
+
+    SerializationOptions opts;
+
+    // The default shape should wrap the constants in $const.
+    ASSERT_BSONOBJ_EQ(
+        BSON("foo" << BSON("$testable" << BSON_ARRAY(BSON("$const" << 5) << BSON("$const" << 10)
+                                                                         << BSON("$const" << 15)))),
+        BSON("foo" << _notAssociativeNorCommutative->serialize(opts)));
+
+    // The representative shape should be an array of raw constants (i.e. not wrapped in $const).
+    opts.literalPolicy = LiteralSerializationPolicy::kToRepresentativeParseableValue;
+    ASSERT_BSONOBJ_EQ(BSON("foo" << BSON("$testable" << BSON_ARRAY(1 << 1 << 1))),
+                      BSON("foo" << _notAssociativeNorCommutative->serialize(opts)));
+}
+
+TEST_F(ExpressionNaryTest, RedactsCorrectlyWithMixedArguments) {
+    VariablesParseState vps = expCtx.variablesParseState;
+    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(&expCtx, Value(5)));
+    _notAssociativeNorCommutative->addOperand(
+        Expression::parseExpression(&expCtx, BSON("$sum" << BSON_ARRAY(1 << 2)), vps));
+    _notAssociativeNorCommutative->addOperand(ExpressionFieldPath::parse(&expCtx, "$b", vps));
+
+    SerializationOptions opts;
+
+    // The default shape should wrap the constants in $const.
+    ASSERT_BSONOBJ_EQ(BSON("foo" << BSON("$testable" << BSON_ARRAY(
+                                             BSON("$const" << 5)
+                                             << BSON("$sum" << BSON_ARRAY(BSON("$const" << 1)
+                                                                          << BSON("$const" << 2)))
+                                             << "$b"))),
+                      BSON("foo" << _notAssociativeNorCommutative->serialize(opts)));
+
+    // The representative shape should not wrap the constant in $const.
+    opts.literalPolicy = LiteralSerializationPolicy::kToRepresentativeParseableValue;
+    ASSERT_BSONOBJ_EQ(BSON("foo" << BSON("$testable" << BSON_ARRAY(
+                                             1 << BSON("$sum" << BSON_ARRAY(1 << 1)) << "$b"))),
+                      BSON("foo" << _notAssociativeNorCommutative->serialize(opts)));
+}
+
 
 // Verify that the internal operands are optimized
 TEST_F(ExpressionNaryTest, InternalOperandOptimizationIsDone) {
@@ -269,7 +342,7 @@ TEST_F(ExpressionNaryTest, AllConstantOperandOptimization) {
     BSONArray spec = BSON_ARRAY(1 << 2);
     addOperandArrayToExpr(_notAssociativeNorCommutative, spec);
     assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
+    boost::intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
     ASSERT(_notAssociativeNorCommutative != optimized);
     ASSERT_BSONOBJ_EQ(BSON("$const" << BSON_ARRAY(1 << 2)), expressionToBson(optimized));
 }
@@ -282,7 +355,7 @@ TEST_F(ExpressionNaryTest, GroupingOptimizationOnNotCommutativeNorAssociative) {
     BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
     addOperandArrayToExpr(_notAssociativeNorCommutative, spec);
     assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
+    boost::intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
     ASSERT(_notAssociativeNorCommutative == optimized);
     assertContents(_notAssociativeNorCommutative, spec);
 }
@@ -291,34 +364,74 @@ TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyFrontOperands) {
     BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY(BSON_ARRAY(55 << 66) << "$path"));
+}
+
+TEST_F(ExpressionNaryTest, GroupingOptimizationOnLeftAssociativeOnlyFrontOperands) {
+    BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
+    addOperandArrayToExpr(_leftAssociativeOnly, spec);
+    assertContents(_leftAssociativeOnly, spec);
+    boost::intrusive_ptr<Expression> optimized = _leftAssociativeOnly->optimize();
+    ASSERT(_leftAssociativeOnly == optimized);
+    assertContents(_leftAssociativeOnly, BSON_ARRAY(BSON_ARRAY(55 << 66) << "$path"));
+}
+
+
+TEST_F(ExpressionNaryTest, GroupingOptimizationOnlyExecuteOnLeftAssociativeOnlyFrontConstants) {
+    BSONArray spec = BSON_ARRAY(55 << 66 << "$path" << 77 << 88 << "$path1" << 99 << 1010);
+    addOperandArrayToExpr(_leftAssociativeOnly, spec);
+    assertContents(_leftAssociativeOnly, spec);
+    boost::intrusive_ptr<Expression> optimized = _leftAssociativeOnly->optimize();
+    ASSERT(_leftAssociativeOnly == optimized);
+    assertContents(
+        _leftAssociativeOnly,
+        BSON_ARRAY(BSON_ARRAY(55 << 66) << "$path" << 77 << 88 << "$path1" << 99 << 1010));
 }
 
 TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyMiddleOperands) {
     BSONArray spec = BSON_ARRAY("$path1" << 55 << 66 << "$path");
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY("$path1" << BSON_ARRAY(55 << 66) << "$path"));
+}
+
+TEST_F(ExpressionNaryTest, GroupingOptimizationNotExecuteOnLeftAssociativeOnlyMiddleOperands) {
+    BSONArray spec = BSON_ARRAY("$path1" << 55 << 66 << "$path");
+    addOperandArrayToExpr(_leftAssociativeOnly, spec);
+    assertContents(_leftAssociativeOnly, spec);
+    boost::intrusive_ptr<Expression> optimized = _leftAssociativeOnly->optimize();
+    ASSERT(_leftAssociativeOnly == optimized);
+    assertContents(_leftAssociativeOnly, BSON_ARRAY("$path1" << 55 << 66 << "$path"));
 }
 
 TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyBackOperands) {
     BSONArray spec = BSON_ARRAY("$path" << 55 << 66);
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY("$path" << BSON_ARRAY(55 << 66)));
 }
+
+TEST_F(ExpressionNaryTest, GroupingOptimizationNotExecuteOnLeftAssociativeOnlyBackOperands) {
+    BSONArray spec = BSON_ARRAY("$path" << 55 << 66);
+    addOperandArrayToExpr(_leftAssociativeOnly, spec);
+    assertContents(_leftAssociativeOnly, spec);
+    boost::intrusive_ptr<Expression> optimized = _leftAssociativeOnly->optimize();
+    ASSERT(_leftAssociativeOnly == optimized);
+    assertContents(_leftAssociativeOnly, BSON_ARRAY("$path" << 55 << 66));
+}
+
 
 TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSingleConstantsFront) {
     BSONArray spec = BSON_ARRAY(55 << "$path");
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY(55 << "$path"));
 }
@@ -327,7 +440,7 @@ TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSing
     BSONArray spec = BSON_ARRAY("$path1" << 55 << "$path2");
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY("$path1" << 55 << "$path2"));
 }
@@ -336,7 +449,7 @@ TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSing
     BSONArray spec = BSON_ARRAY("$path" << 55);
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, BSON_ARRAY("$path" << 55));
 }
@@ -345,7 +458,7 @@ TEST_F(ExpressionNaryTest, GroupingOptimizationOnCommutativeAndAssociative) {
     BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
     addOperandArrayToExpr(_associativeAndCommutative, spec);
     assertContents(_associativeAndCommutative, spec);
-    intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
     ASSERT(_associativeAndCommutative == optimized);
     assertContents(_associativeAndCommutative, BSON_ARRAY("$path" << BSON_ARRAY(55 << 66)));
 }
@@ -354,15 +467,17 @@ TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnOtherExpressionsForAssoci
     BSONArray spec = BSON_ARRAY(66 << "$path" << BSON("$sum" << BSON_ARRAY("$path" << 2)));
     addOperandArrayToExpr(_associativeOnly, spec);
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
     assertContents(_associativeOnly, spec);
 }
 
+
 TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnSameButNotAssociativeExpression) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, false, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kNone, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
@@ -372,7 +487,7 @@ TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnSameButNotAssociativeExpr
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     assertContents(_associativeOnly, spec);
@@ -385,7 +500,8 @@ TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnSameButNotAssociativeExpr
 TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnNotCommutativeNorAssociative) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, false, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kNone, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
     specBuilder.append(expressionToBson(innerOperand));
     _notAssociativeNorCommutative->addOperand(innerOperand);
@@ -395,7 +511,7 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnNotCommutativeNorAs
 
     BSONArray spec = specBuilder.arr();
     assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
+    boost::intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
     ASSERT(_notAssociativeNorCommutative == optimized);
 
     assertContents(_notAssociativeNorCommutative, spec);
@@ -409,7 +525,8 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnNotCommutativeNorAs
 TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFrontOperandNoGroup) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
@@ -419,7 +536,7 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFron
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << 99 << "$path2");
@@ -434,7 +551,8 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFron
 TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFrontOperandAndGroup) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
@@ -444,11 +562,35 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFron
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << BSON_ARRAY(101 << 99) << "$path2");
     assertContents(_associativeOnly, expectedContent);
+}
+
+
+// Test that if there is an expression of the same type as the first operand
+// in a non-commutative but left-associative expression, the inner expression is not expanded.
+TEST_F(ExpressionNaryTest,
+       FlattenInnerOperandsOptimizationOnLeftAssociativeFrontOperandAndGroupIsNoOp) {
+    BSONArrayBuilder specBuilder;
+
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kLeft, false);
+    addOperandArrayToExpr(innerOperand, BSON_ARRAY("$path" << 100 << 200 << "$path1" << 101));
+    specBuilder.append(expressionToBson(innerOperand));
+    _leftAssociativeOnly->addOperand(innerOperand);
+
+    addOperandArrayToExpr(_leftAssociativeOnly, BSON_ARRAY(99 << "$path2"));
+    specBuilder << 99 << "$path2";
+
+    BSONArray spec = specBuilder.arr();
+    assertContents(_leftAssociativeOnly, spec);
+    boost::intrusive_ptr<Expression> optimized = _leftAssociativeOnly->optimize();
+    ASSERT(_leftAssociativeOnly == optimized);
+
+    assertContents(_leftAssociativeOnly, spec);
 }
 
 // Test that if there is an expression of the same type in the middle of the operands
@@ -462,7 +604,8 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMidd
     addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3"));
     specBuilder << 200 << "$path3";
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
@@ -472,7 +615,7 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMidd
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(200 << "$path3" << 100 << "$path1" << 99 << "$path2");
@@ -490,7 +633,8 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMidd
     addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3" << 201));
     specBuilder << 200 << "$path3" << 201;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
@@ -500,7 +644,7 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMidd
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(200 << "$path3" << BSON_ARRAY(201 << 100) << "$path1"
@@ -519,14 +663,15 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyBack
     addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3"));
     specBuilder << 200 << "$path3";
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(200 << "$path3" << 100 << "$path1");
@@ -544,14 +689,15 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyBack
     addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3" << 201));
     specBuilder << 200 << "$path3" << 201;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent =
@@ -567,19 +713,21 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyBack
 TEST_F(ExpressionNaryTest, FlattenConsecutiveInnerOperandsOptimizationOnAssociativeOnlyNoGroup) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
 
-    intrusive_ptr<Testable> innerOperand2 = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand2 =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand2, BSON_ARRAY(200 << "$path2"));
     specBuilder.append(expressionToBson(innerOperand2));
     _associativeOnly->addOperand(innerOperand2);
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << 200 << "$path2");
@@ -594,19 +742,21 @@ TEST_F(ExpressionNaryTest, FlattenConsecutiveInnerOperandsOptimizationOnAssociat
 TEST_F(ExpressionNaryTest, FlattenConsecutiveInnerOperandsOptimizationOnAssociativeAndGroup) {
     BSONArrayBuilder specBuilder;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeOnly->addOperand(innerOperand);
 
-    intrusive_ptr<Testable> innerOperand2 = Testable::create(&expCtx, true, false);
+    boost::intrusive_ptr<Testable> innerOperand2 =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, false);
     addOperandArrayToExpr(innerOperand2, BSON_ARRAY(200 << "$path2"));
     specBuilder.append(expressionToBson(innerOperand2));
     _associativeOnly->addOperand(innerOperand2);
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
     ASSERT(_associativeOnly == optimized);
 
     BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << BSON_ARRAY(101 << 200) << "$path2");
@@ -623,7 +773,8 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnCommutativeAndAssoc
     addOperandArrayToExpr(_associativeAndCommutative, BSON_ARRAY(200 << "$path3" << 201));
     specBuilder << 200 << "$path3" << 201;
 
-    intrusive_ptr<Testable> innerOperand = Testable::create(&expCtx, true, true);
+    boost::intrusive_ptr<Testable> innerOperand =
+        Testable::create(&expCtx, ExpressionNary::Associativity::kFull, true);
     addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
     specBuilder.append(expressionToBson(innerOperand));
     _associativeAndCommutative->addOperand(innerOperand);
@@ -633,7 +784,7 @@ TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnCommutativeAndAssoc
 
     BSONArray spec = specBuilder.arr();
     assertContents(_associativeAndCommutative, spec);
-    intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
+    boost::intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
     ASSERT(_associativeAndCommutative == optimized);
 
     BSONArray expectedContent = BSON_ARRAY("$path3"
@@ -665,30 +816,30 @@ public:
 TEST_F(ExpressionTruncOneArgTest, IntArg1) {
     assertEval(0, 0);
     assertEval(0, 0);
-    assertEval(numeric_limits<int>::min(), numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), numeric_limits<int>::max());
+    assertEval(std::numeric_limits<int>::min(), std::numeric_limits<int>::min());
+    assertEval(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
 }
 
 TEST_F(ExpressionTruncTwoArgTest, IntArg2) {
     assertEval(0, 0, 0);
     assertEval(2, -1, 0);
     assertEval(29, -1, 20);
-    assertEval(numeric_limits<int>::min(), 10, numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), 42, numeric_limits<int>::max());
+    assertEval(std::numeric_limits<int>::min(), 10, std::numeric_limits<int>::min());
+    assertEval(std::numeric_limits<int>::max(), 42, std::numeric_limits<int>::max());
 }
 
 TEST_F(ExpressionTruncOneArgTest, LongArg1) {
     assertEval(0LL, 0LL);
-    assertEval(numeric_limits<long long>::min(), numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), numeric_limits<long long>::max());
+    assertEval(std::numeric_limits<long long>::min(), std::numeric_limits<long long>::min());
+    assertEval(std::numeric_limits<long long>::max(), std::numeric_limits<long long>::max());
 }
 
 TEST_F(ExpressionTruncTwoArgTest, LongArg2) {
     assertEval(0LL, 0LL, 0LL);
     assertEval(2LL, -1LL, 0LL);
     assertEval(29LL, -1LL, 20LL);
-    assertEval(numeric_limits<long long>::min(), 10LL, numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), 42LL, numeric_limits<long long>::max());
+    assertEval(std::numeric_limits<long long>::min(), 10LL, std::numeric_limits<long long>::min());
+    assertEval(std::numeric_limits<long long>::max(), 42LL, std::numeric_limits<long long>::max());
 }
 
 TEST_F(ExpressionTruncOneArgTest, DoubleArg1) {
@@ -707,9 +858,9 @@ TEST_F(ExpressionTruncOneArgTest, DoubleArg1) {
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
+    double largerThanLong = static_cast<double>(std::numeric_limits<long long>::max()) * 2.0;
     assertEval(largerThanLong, largerThanLong);
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
+    double smallerThanLong = std::numeric_limits<long long>::min() * 2.0;
     assertEval(smallerThanLong, smallerThanLong);
 }
 
@@ -813,7 +964,7 @@ TEST_F(ExpressionTruncTwoArgTest, NullArg2) {
 
 class ExpressionSqrtTest : public ExpressionNaryTestOneArg {
 public:
-    virtual void assertEvaluates(Value input, Value output) override {
+    void assertEvaluates(Value input, Value output) override {
         _expr = new ExpressionSqrt(&expCtx);
         ExpressionNaryTestOneArg::assertEvaluates(input, output);
     }
@@ -858,7 +1009,7 @@ TEST_F(ExpressionSqrtTest, SqrtNaNArg) {
 
 class ExpressionExpTest : public ExpressionNaryTestOneArg {
 public:
-    virtual void assertEvaluates(Value input, Value output) override {
+    void assertEvaluates(Value input, Value output) override {
         _expr = new ExpressionExp(&expCtx);
         ExpressionNaryTestOneArg::assertEvaluates(input, output);
     }
@@ -899,7 +1050,7 @@ TEST_F(ExpressionExpTest, ExpNaNArg) {
 
 class ExpressionCeilTest : public ExpressionNaryTestOneArg {
 public:
-    virtual void assertEvaluates(Value input, Value output) override {
+    void assertEvaluates(Value input, Value output) override {
         _expr = new ExpressionCeil(&expCtx);
         ExpressionNaryTestOneArg::assertEvaluates(input, output);
     }
@@ -907,16 +1058,16 @@ public:
 
 TEST_F(ExpressionCeilTest, IntArg) {
     assertEvaluates(Value(0), Value(0));
-    assertEvaluates(Value(numeric_limits<int>::min()), Value(numeric_limits<int>::min()));
-    assertEvaluates(Value(numeric_limits<int>::max()), Value(numeric_limits<int>::max()));
+    assertEvaluates(Value(std::numeric_limits<int>::min()), Value(std::numeric_limits<int>::min()));
+    assertEvaluates(Value(std::numeric_limits<int>::max()), Value(std::numeric_limits<int>::max()));
 }
 
 TEST_F(ExpressionCeilTest, LongArg) {
     assertEvaluates(Value(0LL), Value(0LL));
-    assertEvaluates(Value(numeric_limits<long long>::min()),
-                    Value(numeric_limits<long long>::min()));
-    assertEvaluates(Value(numeric_limits<long long>::max()),
-                    Value(numeric_limits<long long>::max()));
+    assertEvaluates(Value(std::numeric_limits<long long>::min()),
+                    Value(std::numeric_limits<long long>::min()));
+    assertEvaluates(Value(std::numeric_limits<long long>::max()),
+                    Value(std::numeric_limits<long long>::max()));
 }
 
 TEST_F(ExpressionCeilTest, DoubleArg) {
@@ -929,9 +1080,9 @@ TEST_F(ExpressionCeilTest, DoubleArg) {
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // ceil should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
+    double largerThanLong = static_cast<double>(std::numeric_limits<long long>::max()) * 2.0;
     assertEvaluates(Value(largerThanLong), Value(largerThanLong));
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
+    double smallerThanLong = std::numeric_limits<long long>::min() * 2.0;
     assertEvaluates(Value(smallerThanLong), Value(smallerThanLong));
 }
 
@@ -957,7 +1108,7 @@ TEST_F(ExpressionCeilTest, NullArg) {
 
 class ExpressionFloorTest : public ExpressionNaryTestOneArg {
 public:
-    virtual void assertEvaluates(Value input, Value output) override {
+    void assertEvaluates(Value input, Value output) override {
         _expr = new ExpressionFloor(&expCtx);
         ExpressionNaryTestOneArg::assertEvaluates(input, output);
     }
@@ -965,16 +1116,16 @@ public:
 
 TEST_F(ExpressionFloorTest, IntArg) {
     assertEvaluates(Value(0), Value(0));
-    assertEvaluates(Value(numeric_limits<int>::min()), Value(numeric_limits<int>::min()));
-    assertEvaluates(Value(numeric_limits<int>::max()), Value(numeric_limits<int>::max()));
+    assertEvaluates(Value(std::numeric_limits<int>::min()), Value(std::numeric_limits<int>::min()));
+    assertEvaluates(Value(std::numeric_limits<int>::max()), Value(std::numeric_limits<int>::max()));
 }
 
 TEST_F(ExpressionFloorTest, LongArg) {
     assertEvaluates(Value(0LL), Value(0LL));
-    assertEvaluates(Value(numeric_limits<long long>::min()),
-                    Value(numeric_limits<long long>::min()));
-    assertEvaluates(Value(numeric_limits<long long>::max()),
-                    Value(numeric_limits<long long>::max()));
+    assertEvaluates(Value(std::numeric_limits<long long>::min()),
+                    Value(std::numeric_limits<long long>::min()));
+    assertEvaluates(Value(std::numeric_limits<long long>::max()),
+                    Value(std::numeric_limits<long long>::max()));
 }
 
 TEST_F(ExpressionFloorTest, DoubleArg) {
@@ -987,9 +1138,9 @@ TEST_F(ExpressionFloorTest, DoubleArg) {
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // floor should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
+    double largerThanLong = static_cast<double>(std::numeric_limits<long long>::max()) * 2.0;
     assertEvaluates(Value(largerThanLong), Value(largerThanLong));
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
+    double smallerThanLong = std::numeric_limits<long long>::min() * 2.0;
     assertEvaluates(Value(smallerThanLong), Value(smallerThanLong));
 }
 
@@ -1031,30 +1182,30 @@ public:
 
 TEST_F(ExpressionRoundOneArgTest, IntArg1) {
     assertEval(0, 0);
-    assertEval(numeric_limits<int>::min(), numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), numeric_limits<int>::max());
+    assertEval(std::numeric_limits<int>::min(), std::numeric_limits<int>::min());
+    assertEval(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
 }
 
 TEST_F(ExpressionRoundTwoArgTest, IntArg2) {
     assertEval(0, 0, 0);
     assertEval(2, -1, 0);
     assertEval(29, -1, 30);
-    assertEval(numeric_limits<int>::min(), 10, numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), 42, numeric_limits<int>::max());
+    assertEval(std::numeric_limits<int>::min(), 10, std::numeric_limits<int>::min());
+    assertEval(std::numeric_limits<int>::max(), 42, std::numeric_limits<int>::max());
 }
 
 TEST_F(ExpressionRoundOneArgTest, LongArg1) {
     assertEval(0LL, 0LL);
-    assertEval(numeric_limits<long long>::min(), numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), numeric_limits<long long>::max());
+    assertEval(std::numeric_limits<long long>::min(), std::numeric_limits<long long>::min());
+    assertEval(std::numeric_limits<long long>::max(), std::numeric_limits<long long>::max());
 }
 
 TEST_F(ExpressionRoundTwoArgTest, LongArg2) {
     assertEval(0LL, 0LL, 0LL);
     assertEval(2LL, -1LL, 0LL);
     assertEval(29LL, -1LL, 30LL);
-    assertEval(numeric_limits<long long>::min(), 10LL, numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), 42LL, numeric_limits<long long>::max());
+    assertEval(std::numeric_limits<long long>::min(), 10LL, std::numeric_limits<long long>::min());
+    assertEval(std::numeric_limits<long long>::max(), 42LL, std::numeric_limits<long long>::max());
 }
 
 TEST_F(ExpressionRoundOneArgTest, DoubleArg1) {
@@ -1072,9 +1223,9 @@ TEST_F(ExpressionRoundOneArgTest, DoubleArg1) {
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
+    double largerThanLong = static_cast<double>(std::numeric_limits<long long>::max()) * 2.0;
     assertEval(largerThanLong, largerThanLong);
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
+    double smallerThanLong = std::numeric_limits<long long>::min() * 2.0;
     assertEval(smallerThanLong, smallerThanLong);
 }
 
@@ -1224,13 +1375,13 @@ public:
 };
 
 TEST_F(ExpressionFirstTest, HandlesArrays) {
-    assertEval(vector<Value>{Value("A"_sd)}, "A"_sd);
-    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd)}, "A"_sd);
-    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "A"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd)}, "A"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd), Value("B"_sd)}, "A"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "A"_sd);
 }
 
 TEST_F(ExpressionFirstTest, HandlesEmptyArray) {
-    assertEval(vector<Value>{}, Value());
+    assertEval(std::vector<Value>{}, Value());
 }
 
 TEST_F(ExpressionFirstTest, HandlesNullish) {
@@ -1259,13 +1410,13 @@ public:
 };
 
 TEST_F(ExpressionLastTest, HandlesArrays) {
-    assertEval(vector<Value>{Value("A"_sd)}, "A"_sd);
-    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd)}, "B"_sd);
-    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "C"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd)}, "A"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd), Value("B"_sd)}, "B"_sd);
+    assertEval(std::vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "C"_sd);
 }
 
 TEST_F(ExpressionLastTest, HandlesEmptyArray) {
-    assertEval(vector<Value>{}, Value());
+    assertEval(std::vector<Value>{}, Value());
 }
 
 TEST_F(ExpressionLastTest, HandlesNullish) {
@@ -1277,6 +1428,62 @@ TEST_F(ExpressionLastTest, HandlesNullish) {
 TEST_F(ExpressionLastTest, RejectsNonArrays) {
     assertEvalFails("asdf"_sd);
     assertEvalFails(BSONBinData("asdf", 4, BinDataGeneral));
+}
+
+/* ------------------------- ExpressionTsSecond -------------------------- */
+
+class ExpressionTsSecondTest : public ExpressionNaryTestOneArg {
+public:
+    void assertEval(ImplicitValue input, ImplicitValue output) {
+        _expr = new ExpressionTsSecond(&expCtx);
+        ExpressionNaryTestOneArg::assertEvaluates(input, output);
+    }
+    void assertEvalFails(ImplicitValue input) {
+        _expr = new ExpressionTsSecond(&expCtx);
+        ASSERT_THROWS_CODE(eval(input), DBException, 5687301);
+    }
+};
+
+TEST_F(ExpressionTsSecondTest, HandlesTimestamp) {
+    assertEval(Timestamp(1622731060, 10), static_cast<long long>(1622731060));
+}
+
+TEST_F(ExpressionTsSecondTest, HandlesNullish) {
+    assertEval(BSONNULL, BSONNULL);
+    assertEval(BSONUndefined, BSONNULL);
+    assertEval(Value(), BSONNULL);
+}
+
+TEST_F(ExpressionTsSecondTest, HandlesInvalidTimestamp) {
+    assertEvalFails(1622731060);
+}
+
+/* ------------------------- ExpressionTsIncrement -------------------------- */
+
+class ExpressionTsIncrementTest : public ExpressionNaryTestOneArg {
+public:
+    void assertEval(ImplicitValue input, ImplicitValue output) {
+        _expr = new ExpressionTsIncrement(&expCtx);
+        ExpressionNaryTestOneArg::assertEvaluates(input, output);
+    }
+    void assertEvalFails(ImplicitValue input) {
+        _expr = new ExpressionTsIncrement(&expCtx);
+        ASSERT_THROWS_CODE(eval(input), DBException, 5687302);
+    }
+};
+
+TEST_F(ExpressionTsIncrementTest, HandlesTimestamp) {
+    assertEval(Timestamp(1622731060, 10), static_cast<long long>(10));
+}
+
+TEST_F(ExpressionTsIncrementTest, HandlesNullish) {
+    assertEval(BSONNULL, BSONNULL);
+    assertEval(BSONUndefined, BSONNULL);
+    assertEval(Value(), BSONNULL);
+}
+
+TEST_F(ExpressionTsIncrementTest, HandlesInvalidTimestamp) {
+    assertEvalFails(10);
 }
 
 }  // anonymous namespace

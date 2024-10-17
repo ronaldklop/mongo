@@ -8,7 +8,7 @@
           "a:27017",
           {
             "ok": 1,
-            "ismaster": false,
+            "isWritablePrimary": false,
             "secondary": true,
             "setName": "rs",
             "hosts": [
@@ -42,12 +42,16 @@
           "b:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "setName": "rs",
             "hosts": [
               "a:27017",
               "b:27017"
             ],
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            },
             "minWireVersion": 0,
             "maxWireVersion": 6
           }
@@ -75,13 +79,17 @@
           "b:27017",
           {
             "ok": 1,
-            "ismaster": true,
+            "isWritablePrimary": true,
             "setName": "rs",
             "hosts": [
               "a:27017",
               "b:27017",
               "c:27017"
             ],
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            },
             "minWireVersion": 0,
             "maxWireVersion": 6
           }
@@ -113,7 +121,7 @@
           "c:27017",
           {
             "ok": 1,
-            "ismaster": false,
+            "isWritablePrimary": false,
             "secondary": true,
             "setName": "rs",
             "primary": "b:27017",

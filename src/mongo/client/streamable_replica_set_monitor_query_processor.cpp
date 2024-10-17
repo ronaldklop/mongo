@@ -26,13 +26,21 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/streamable_replica_set_monitor_query_processor.h"
 
 #include <memory>
 
-#include "mongo/client/global_conn_pool.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/client/replica_set_monitor_manager.h"
+#include "mongo/client/sdam/topology_description.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::shutdown() {
@@ -51,12 +59,11 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::
 
     const auto& setName = newDescription->getSetName();
     if (setName) {
-        auto replicaSetMonitor = std::static_pointer_cast<StreamableReplicaSetMonitor>(
+        auto replicaSetMonitor = checked_pointer_cast<StreamableReplicaSetMonitor>(
             ReplicaSetMonitorManager::get()->getMonitor(*setName));
         if (!replicaSetMonitor) {
             LOGV2_DEBUG(4333215,
                         kLogLevel,
-                        "Could not find rsm instance {replicaSet} for query processing",
                         "Could not find rsm instance for query processing",
                         "replicaSet"_attr = *setName);
             return;
@@ -64,7 +71,7 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::
         replicaSetMonitor->_processOutstanding(newDescription);
     }
 
-    // No set name occurs when there is an error monitoring isMaster replies (e.g. HostUnreachable).
+    // No set name occurs when there is an error monitoring "hello" replies (e.g. HostUnreachable).
     // There is nothing to do in that case.
 }
 };  // namespace mongo

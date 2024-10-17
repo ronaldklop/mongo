@@ -2,12 +2,9 @@
 //
 // Cannot implicitly shard accessed collections because a collection can be implictly created and
 // exists when none is expected.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
-load("jstests/aggregation/extras/utils.js");          // For assertArrayEq.
-load("jstests/libs/fixture_helpers.js");              // For FixtureHelpers.isMongos.
+import {dropWithoutImplicitRecreate} from "jstests/aggregation/extras/merge_helpers.js";
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // A helper function to create a pipeline with a $merge stage using a custom 'updatePipeline'
 // for the whenMatched mode. If 'initialStages' array is specified, the $merge stage will be
@@ -278,8 +275,8 @@ target.drop();
 
     dropWithoutImplicitRecreate(source.getName());
     dropWithoutImplicitRecreate(target.getName());
-    assert.commandWorked(source.createIndex({"z": 1}, {unique: true}));
-    assert.commandWorked(target.createIndex({"z": 1}, {unique: true}));
+    assert.commandWorked(source.createIndex({"z": 1}, {unique: true, sparse: true}));
+    assert.commandWorked(target.createIndex({"z": 1}, {unique: true, sparse: true}));
 
     const pipeline = makeMergePipeline({
         initialStages: [{$project: {_id: 0}}],
@@ -288,12 +285,12 @@ target.drop();
         updatePipeline: [{$addFields: {z: 1}}]
     });
 
-    // The 'on' field is missing.
+    // The 'on' field is missing and the index is sparse.
     assert.commandWorked(source.insert({_id: 1}));
     let error = assert.throws(() => source.aggregate(pipeline));
     assert.commandFailedWithCode(error, 51132);
 
-    // The 'on' field is null.
+    // The 'on' field is null and the index is sparse.
     assert.commandWorked(source.update({_id: 1}, {z: null}));
     error = assert.throws(() => source.aggregate(pipeline));
     assert.commandFailedWithCode(error, 51132);
@@ -658,4 +655,3 @@ target.drop();
     assertArrayEq(
         {actual: target.find().toArray(), expected: [{_id: 1, c: 1, z: 49}, {_id: 2, a: 3}]});
 })();
-}());

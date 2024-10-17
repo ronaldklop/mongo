@@ -31,11 +31,13 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <tuple>
 
-#include "mongo/unittest/unittest.h"
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
-#include <boost/lexical_cast.hpp>
 
 namespace {
 
@@ -118,7 +120,9 @@ public:
         std::function<std::unique_ptr<FunctorClonable>(const FunctorClonable&)>;
 
     static CloningFunctionType getCloningFunction() {
-        return [](const FunctorClonable& c) { return std::make_unique<FunctorClonable>(c); };
+        return [](const FunctorClonable& c) {
+            return std::make_unique<FunctorClonable>(c);
+        };
     }
 };
 
@@ -144,8 +148,8 @@ public:
 
     static CloningFunctionType getCloningFunction() {
         return [calls = 0](const FunctorWithDynamicStateClonable& c) mutable {
-            return std::make_unique<FunctorWithDynamicStateClonable>(
-                c.data + boost::lexical_cast<std::string>(++calls));
+            return std::make_unique<FunctorWithDynamicStateClonable>(c.data +
+                                                                     std::to_string(++calls));
         };
     }
 };
@@ -282,18 +286,18 @@ void construction() {
 
     // Test unique pointer construction (conversion)
     {
-        auto acceptor = [](const mongo::clonable_ptr<Clonable>&) {};
+        auto acceptor = [](const mongo::clonable_ptr<Clonable>&) {
+        };
         acceptor(std::make_unique<Clonable>());
     }
 
     // Test non-conversion pointer construction
-    { static_assert(!std::is_convertible<Clonable*, mongo::clonable_ptr<Clonable>>::value, ""); }
+    { static_assert(!std::is_convertible<Clonable*, mongo::clonable_ptr<Clonable>>::value); }
 
     // Test conversion unique pointer construction
     {
         static_assert(
-            std::is_convertible<std::unique_ptr<Clonable>, mongo::clonable_ptr<Clonable>>::value,
-            "");
+            std::is_convertible<std::unique_ptr<Clonable>, mongo::clonable_ptr<Clonable>>::value);
     }
 }
 
@@ -303,7 +307,7 @@ void augmentedConstruction() {
     // Test default construction
     {
         static_assert(
-            !std::is_default_constructible<mongo::clonable_ptr<Clonable, CloneFactory>>::value, "");
+            !std::is_default_constructible<mongo::clonable_ptr<Clonable, CloneFactory>>::value);
     }
 
     // Test Clone Factory construction
@@ -314,8 +318,7 @@ void augmentedConstruction() {
     // Test non-construction from a nullptr
     {
         static_assert(!std::is_constructible<mongo::clonable_ptr<Clonable, CloneFactory>,
-                                             std::nullptr_t>::value,
-                      "");
+                                             std::nullptr_t>::value);
     }
 #endif
 
@@ -327,8 +330,7 @@ void augmentedConstruction() {
     // Test construction from a raw Clonable pointer.
     {
         static_assert(
-            !std::is_constructible<mongo::clonable_ptr<Clonable, CloneFactory>, Clonable*>::value,
-            "");
+            !std::is_constructible<mongo::clonable_ptr<Clonable, CloneFactory>, Clonable*>::value);
     }
 #endif
 
@@ -387,22 +389,19 @@ void augmentedConstruction() {
     // Test non-conversion pointer construction
     {
         static_assert(
-            !std::is_convertible<mongo::clonable_ptr<Clonable, CloneFactory>, Clonable*>::value,
-            "");
+            !std::is_convertible<mongo::clonable_ptr<Clonable, CloneFactory>, Clonable*>::value);
     }
 
     // Test non-conversion from factory
     {
         static_assert(
-            !std::is_convertible<mongo::clonable_ptr<Clonable, CloneFactory>, CloneFactory>::value,
-            "");
+            !std::is_convertible<mongo::clonable_ptr<Clonable, CloneFactory>, CloneFactory>::value);
     }
 
     // Test conversion unique pointer construction
     {
         static_assert(!std::is_convertible<std::unique_ptr<Clonable>,
-                                           mongo::clonable_ptr<Clonable, CloneFactory>>::value,
-                      "");
+                                           mongo::clonable_ptr<Clonable, CloneFactory>>::value);
     }
 }
 
@@ -923,7 +922,7 @@ private:
     const std::string root;
     int generation = 0;
 
-    GeneratorImplementation* clone_impl() const {
+    GeneratorImplementation* clone_impl() const override {
         return new GeneratorImplementation{*this};
     }
 
@@ -933,7 +932,7 @@ public:
     void consumeText(const std::string&) override {}
 
     std::string produceText() override {
-        return root + boost::lexical_cast<std::string>(++generation);
+        return root + std::to_string(++generation);
     }
 };
 
@@ -941,7 +940,7 @@ class StorageImplementation : public Interface {
 private:
     std::string store;
 
-    StorageImplementation* clone_impl() const {
+    StorageImplementation* clone_impl() const override {
         return new StorageImplementation{*this};
     }
 

@@ -2,13 +2,9 @@
  * Test that the read operations are not killed and their connections are also not
  * closed during step down.
  */
-load('jstests/libs/parallelTester.js');
-load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
-load("jstests/replsets/rslib.js");
-
-(function() {
-
-"use strict";
+import {waitForCurOpByFailPoint} from "jstests/libs/curop_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "readOpsDuringStepDown";
 const dbName = "test";
@@ -28,8 +24,7 @@ TestData.dbName = dbName;
 TestData.collName = collName;
 
 jsTestLog("1. Do a document write");
-assert.commandWorked(
-        primaryColl.insert({_id: 0}, {"writeConcern": {"w": "majority"}}));
+assert.commandWorked(primaryColl.insert({_id: 0}, {"writeConcern": {"w": "majority"}}));
 rst.awaitReplication();
 
 // Open a cursor on primary.
@@ -39,7 +34,7 @@ const cursorIdToBeReadAfterStepDown =
 jsTestLog("2. Start blocking getMore cmd before step down");
 const joinGetMoreThread = startParallelShell(() => {
     // Open another cursor on primary before step down.
-    primaryDB = db.getSiblingDB(TestData.dbName);
+    const primaryDB = db.getSiblingDB(TestData.dbName);
     const cursorIdToBeReadDuringStepDown =
         assert.commandWorked(primaryDB.runCommand({"find": TestData.collName, batchSize: 0}))
             .cursor.id;
@@ -58,9 +53,11 @@ waitForCurOpByFailPoint(primaryAdmin, collNss, "waitAfterPinningCursorBeforeGetM
 
 jsTestLog("2. Start blocking find cmd before step down");
 const joinFindThread = startParallelShell(() => {
-    // Enable the fail point for find cmd.
-    assert.commandWorked(
-        db.adminCommand({configureFailPoint: "waitInFindBeforeMakingBatch", mode: "alwaysOn"}));
+    // Enable the fail point for find cmd. We know this is a replica set, so enable
+    // "shardWaitInFindBeforeMakingBatch" (helper function configureFailPoint() cannot be used
+    // inside a parallel shell).
+    assert.commandWorked(db.adminCommand(
+        {configureFailPoint: "shardWaitInFindBeforeMakingBatch", mode: "alwaysOn"}));
 
     var findRes = assert.commandWorked(
         db.getSiblingDB(TestData.dbName).runCommand({"find": TestData.collName}));
@@ -80,13 +77,13 @@ checkLog.contains(primary, "Starting to kill user operations");
 
 // Enable "waitAfterCommandFinishesExecution" fail point to make sure the find and get more
 // commands on database 'test' does not complete before step down.
-setFailPoint(primaryAdmin,
-             "waitAfterCommandFinishesExecution",
-             {ns: collNss, commands: ["find", "getMore"]});
+const failPointAfterCommand = configureFailPoint(primaryAdmin,
+                                                 "waitAfterCommandFinishesExecution",
+                                                 {ns: collNss, commands: ["find", "getMore"]});
 
 jsTestLog("4. Disable fail points");
-clearFailPoint(primaryAdmin, "waitInFindBeforeMakingBatch");
-clearFailPoint(primaryAdmin, "waitAfterPinningCursorBeforeGetMoreBatch");
+configureFailPoint(primaryAdmin, "waitInFindBeforeMakingBatch", {} /* data */, "off");
+configureFailPoint(primaryAdmin, "waitAfterPinningCursorBeforeGetMoreBatch", {} /* data */, "off");
 
 // Wait until the primary transitioned to SECONDARY state.
 joinStepDownThread();
@@ -95,8 +92,7 @@ rst.waitForState(primary, ReplSetTest.State.SECONDARY);
 // We don't want to check if we have reached "waitAfterCommandFinishesExecution" fail point
 // because we already know that the primary has stepped down successfully. This implies that
 // the find and get more commands are still running even after the node stepped down.
-clearFailPoint(primaryAdmin, "waitAfterCommandFinishesExecution");
-
+failPointAfterCommand.off();
 // Wait for find & getmore thread to join.
 joinGetMoreThread();
 joinFindThread();
@@ -106,14 +102,14 @@ var getMoreRes = assert.commandWorked(
     primaryDB.runCommand({"getMore": cursorIdToBeReadAfterStepDown, collection: collName}));
 assert.docEq([{_id: 0}], getMoreRes.cursor.nextBatch);
 
-// Validate that no operations got killed on step down and no network disconnection happened due
-// to failed unacknowledged operations.
+// Validate that no network disconnection happened due to failed unacknowledged operations.
 const replMetrics = assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
-assert.eq(replMetrics.stateTransition.userOperationsKilled, 0);
 // Should account for find and getmore commands issued before step down.
-assert.gte(replMetrics.stateTransition.userOperationsRunning, 2);
+// TODO (SERVER-85259): Remove references to replMetrics.stateTransition.userOperations*
+assert.gte(replMetrics.stateTransition.totalOperationsRunning ||
+               replMetrics.stateTransition.userOperationsRunning,
+           2);
 assert.eq(replMetrics.network.notPrimaryUnacknowledgedWrites, 0);
 
 rst.stopSet();
-})();

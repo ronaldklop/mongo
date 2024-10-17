@@ -27,24 +27,61 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#include <memory>
+#include <set>
+#include <string>
+#include <variant>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection_common.h"
 #include "mongo/db/commands/rename_collection_gen.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
+MONGO_FAIL_POINT_DEFINE(renameWaitAfterDatabaseCreation);
 namespace {
 
 class RenameCollectionCmd final : public TypedCommand<RenameCollectionCmd> {
 public:
     using Request = RenameCollectionCommand;
+
+    const std::set<std::string>& apiVersions() const override {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -63,46 +100,92 @@ public:
             auto toNss = request().getTo();
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid source namespace: " << fromNss.ns(),
+                    str::stream() << "Invalid source namespace: " << fromNss.toStringForErrorMsg(),
                     fromNss.isValid());
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid target namespace: " << toNss.ns(),
+                    str::stream() << "Invalid target namespace: " << toNss.toStringForErrorMsg(),
                     toNss.isValid());
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't rename a collection to itself",
+                    fromNss != toNss);
+
+            if (fromNss.isTimeseriesBucketsCollection()) {
+                uassert(ErrorCodes::IllegalOperation,
+                        "Renaming system.buckets collections is not allowed",
+                        AuthorizationSession::get(opCtx->getClient())
+                            ->isAuthorizedForActionsOnResource(
+                                ResourcePattern::forClusterResource(fromNss.tenantId()),
+                                ActionType::setUserWriteBlockMode));
+            }
+
             RenameCollectionRequest renameCollReq(request().getTo());
-            renameCollReq.setDropTarget(request().getDropTarget());
             renameCollReq.setStayTemp(request().getStayTemp());
+            renameCollReq.setExpectedSourceUUID(request().getCollectionUUID());
+            visit(
+                OverloadedVisitor{
+                    [&renameCollReq](bool dropTarget) { renameCollReq.setDropTarget(dropTarget); },
+                    [&renameCollReq](const UUID& uuid) {
+                        renameCollReq.setDropTarget(true);
+                        renameCollReq.setExpectedTargetUUID(uuid);
+                    },
+                },
+                request().getDropTarget());
 
             ShardsvrRenameCollection renameCollRequest(fromNss);
-            renameCollRequest.setDbName(fromNss.db());
+            renameCollRequest.setDbName(fromNss.dbName());
             renameCollRequest.setRenameCollectionRequest(renameCollReq);
+            renameCollRequest.setAllowEncryptedCollectionRename(
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(fromNss.tenantId()),
+                        ActionType::setUserWriteBlockMode));
 
             auto catalogCache = Grid::get(opCtx)->catalogCache();
-            const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, fromNss.db()));
-            auto cri = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, fromNss));
+            auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, fromNss.dbName());
+            if (swDbInfo == ErrorCodes::NamespaceNotFound) {
+                uassert(CollectionUUIDMismatchInfo(fromNss.dbName(),
+                                                   *request().getCollectionUUID(),
+                                                   fromNss.coll().toString(),
+                                                   boost::none),
+                        "Database does not exist",
+                        !request().getCollectionUUID());
+            }
+            const auto dbInfo = uassertStatusOK(swDbInfo);
 
             auto shard = uassertStatusOK(
-                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbInfo.primaryId()));
+                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbInfo->getPrimary()));
+
+            // Creates the destination database if it doesn't exist already.
+            cluster::createDatabase(opCtx, toNss.dbName(), shard->getId());
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &renameWaitAfterDatabaseCreation, opCtx, "renameWaitAfterDatabaseCreation", []() {
+                    LOGV2(8433001,
+                          "Hanging rename due to 'renameWaitAfterDatabaseCreation' "
+                          "failpoint");
+                });
+
+            generic_argument_util::setMajorityWriteConcern(renameCollRequest);
+            generic_argument_util::setDbVersionIfPresent(renameCollRequest, dbInfo->getVersion());
 
             auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                fromNss.db().toString(),
-                CommandHelpers::appendMajorityWriteConcern(appendDbVersionIfPresent(
-                    renameCollRequest.toBSON({}), dbInfo.databaseVersion())),
+                fromNss.dbName(),
+                renameCollRequest.toBSON(),
                 Shard::RetryPolicy::kNoRetry));
 
             uassertStatusOK(cmdResponse.commandStatus);
 
             auto renameCollResp = RenameCollectionResponse::parse(
-                IDLParserErrorContext("renameCollection"), cmdResponse.response);
+                IDLParserContext("renameCollection"), cmdResponse.response);
 
-            // TODO: SERVER-53098 advance the cache by collection version.
-            catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                toNss, renameCollResp.getCollectionVersion(), dbInfo.primaryId());
+            catalogCache->onStaleCollectionVersion(toNss, renameCollResp.getCollectionVersion());
 
             catalogCache->invalidateCollectionEntry_LINEARIZABLE(fromNss);
+            catalogCache->invalidateIndexEntry_LINEARIZABLE(fromNss);
         }
 
         NamespaceString ns() const override {
@@ -111,15 +194,15 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassertStatusOK(rename_collection::checkAuthForRenameCollectionCommand(
-                opCtx->getClient(), ns().db().toString(), request().toBSON(BSONObj())));
+                opCtx->getClient(), request()));
         }
 
         bool supportsWriteConcern() const override {
             return true;
         }
     };
-
-} renameCollectionCmd;
+};
+MONGO_REGISTER_COMMAND(RenameCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

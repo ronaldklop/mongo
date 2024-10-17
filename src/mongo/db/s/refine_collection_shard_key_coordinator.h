@@ -29,25 +29,64 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/s/refine_collection_shard_key_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class RefineCollectionShardKeyCoordinator final
-    : public ShardingDDLCoordinator_NORESILIENT,
-      public std::enable_shared_from_this<RefineCollectionShardKeyCoordinator> {
+class RefineCollectionShardKeyCoordinator
+    : public RecoverableShardingDDLCoordinator<RefineCollectionShardKeyCoordinatorDocument,
+                                               RefineCollectionShardKeyCoordinatorPhaseEnum> {
 public:
-    RefineCollectionShardKeyCoordinator(OperationContext* opCtx,
-                                        const NamespaceString& nss,
-                                        const KeyPattern newShardKey);
+    using StateDoc = RefineCollectionShardKeyCoordinatorDocument;
+    using Phase = RefineCollectionShardKeyCoordinatorPhaseEnum;
+
+    RefineCollectionShardKeyCoordinator(ShardingDDLCoordinatorService* service,
+                                        const BSONObj& initialState);
+
+    void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
+
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
 private:
-    SemiFuture<void> runImpl(std::shared_ptr<executor::TaskExecutor> executor) override;
+    StringData serializePhase(const Phase& phase) const override {
+        return RefineCollectionShardKeyCoordinatorPhase_serializer(phase);
+    }
 
-    ServiceContext* _serviceContext;
+    bool _mustAlwaysMakeProgress() override {
+        return _doc.getPhase() > Phase::kRemoteIndexValidation;
+    }
 
-    const KeyPattern _newShardKey;
+    void _performNoopWriteOnDataShardsAndConfigServer(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const OperationSessionInfo& osi,
+        const std::shared_ptr<executor::TaskExecutor>& executor);
+
+    ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                  const CancellationToken& token) noexcept override;
+
+    const mongo::RefineCollectionShardKeyRequest _request;
+
+    // Critical section reason.
+    const BSONObj _critSecReason;
 };
 
 }  // namespace mongo

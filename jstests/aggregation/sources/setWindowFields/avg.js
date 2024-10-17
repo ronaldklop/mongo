@@ -1,18 +1,11 @@
 /**
  * Test that $avg works as a window function.
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/window_function_helpers.js");
-
-const featureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1}))
-        .featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
+import {
+    computeAsGroup,
+    seedWithTickerData,
+    testAccumAgainstGroup
+} from "jstests/aggregation/extras/window_function_helpers.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -44,7 +37,7 @@ for (let index = 0; index < results.length; index++) {
     let groupRes = computeAsGroup({
         coll: coll,
         partitionKey: {ticker: results[index].ticker},
-        accum: "$avg",
+        accumSpec: {"$avg": "$price"},
         bounds: ["unbounded", 0],
         indexInPartition: results[index].partIndex,
         defaultValue: null
@@ -55,11 +48,10 @@ for (let index = 0; index < results.length; index++) {
     groupRes = computeAsGroup({
         coll: coll,
         partitionKey: {ticker: results[index].ticker},
-        accum: "$avg",
+        accumSpec: {"$avg": "$price"},
         bounds: ["unbounded", 3],
         indexInPartition: results[index].partIndex,
         defaultValue: null
     });
     assert.eq(groupRes, results[index].runningAvgLead);
 }
-})();

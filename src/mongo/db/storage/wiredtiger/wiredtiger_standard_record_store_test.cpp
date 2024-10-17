@@ -27,200 +27,59 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstring>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <time.h>
+#include <wiredtiger.h>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/json.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/kv_engine_test_harness.h"
-#include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/db/storage/damage_vector.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store_oplog_stones.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_record_store_test_harness.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
-
-class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
-public:
-    WiredTigerHarnessHelper() : WiredTigerHarnessHelper(""_sd) {}
-
-    WiredTigerHarnessHelper(StringData extraStrings)
-        : _dbpath("wt_test"),
-          _engine(kWiredTigerEngineName,
-                  _dbpath.path(),
-                  &_cs,
-                  extraStrings.toString(),
-                  1,
-                  0,
-                  false,
-                  false,
-                  false,
-                  false) {
-        repl::ReplicationCoordinator::set(serviceContext(),
-                                          std::make_unique<repl::ReplicationCoordinatorMock>(
-                                              serviceContext(), repl::ReplSettings()));
-        _engine.notifyStartupComplete();
-    }
-
-    ~WiredTigerHarnessHelper() {}
-
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore() override {
-        return newNonCappedRecordStore("a.b");
-    }
-
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(const std::string& ns) {
-        return newNonCappedRecordStore(ns, CollectionOptions());
-    }
-
-    virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(
-        const std::string& ns, const CollectionOptions& collOptions) override {
-        WiredTigerRecoveryUnit* ru =
-            checked_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
-        OperationContextNoop opCtx(ru);
-        string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
-
-        StatusWith<std::string> result =
-            WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName, ns, collOptions, "");
-        ASSERT_TRUE(result.isOK());
-        std::string config = result.getValue();
-
-        {
-            WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession()->getSession();
-            invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
-            uow.commit();
-        }
-
-        WiredTigerRecordStore::Params params;
-        params.ns = ns;
-        params.ident = ns;
-        params.engineName = kWiredTigerEngineName;
-        params.isCapped = false;
-        params.keyFormat = collOptions.clusteredIndex ? KeyFormat::String : KeyFormat::Long;
-        params.isEphemeral = false;
-        params.cappedCallback = nullptr;
-        params.sizeStorer = nullptr;
-        params.isReadOnly = false;
-        params.tracksSizeAdjustments = true;
-
-        auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
-        ret->postConstructorInit(&opCtx);
-        return std::move(ret);
-    }
-
-    virtual std::unique_ptr<RecordStore> newOplogRecordStore() {
-        WiredTigerRecoveryUnit* ru =
-            dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
-        OperationContextNoop opCtx(ru);
-        string ident = "a.b";
-        string uri = WiredTigerKVEngine::kTableUriPrefix + "a.b";
-
-        CollectionOptions options;
-        options.capped = true;
-
-        const std::string ns = NamespaceString::kRsOplogNamespace.toString();
-        StatusWith<std::string> result =
-            WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName, ns, options, "");
-        ASSERT_TRUE(result.isOK());
-        std::string config = result.getValue();
-
-        {
-            WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession()->getSession();
-            invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
-            uow.commit();
-        }
-
-        WiredTigerRecordStore::Params params;
-        params.ns = ns;
-        params.ident = ident;
-        params.engineName = kWiredTigerEngineName;
-        params.isCapped = true;
-        params.keyFormat = KeyFormat::Long;
-        params.isEphemeral = false;
-        // Large enough not to exceed capped limits.
-        params.oplogMaxSize = 1024 * 1024 * 1024;
-        params.cappedCallback = nullptr;
-        params.sizeStorer = nullptr;
-        params.isReadOnly = false;
-        params.tracksSizeAdjustments = true;
-
-        auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
-        ret->postConstructorInit(&opCtx);
-        return std::move(ret);
-    }
-
-    virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
-        return std::unique_ptr<RecoveryUnit>(_engine.newRecoveryUnit());
-    }
-
-    virtual WT_CONNECTION* conn() {
-        return _engine.getConnection();
-    }
-
-    KVEngine* getEngine() override final {
-        return &_engine;
-    }
-
-private:
-    unittest::TempDir _dbpath;
-    ClockSourceMock _cs;
-
-    WiredTigerKVEngine _engine;
-};
-
-std::unique_ptr<RecordStoreHarnessHelper> makeWTRSHarnessHelper() {
-    return std::make_unique<WiredTigerHarnessHelper>();
-}
-
-MONGO_INITIALIZER(RegisterRecordStoreHarnessFactory)(InitializerContext* const) {
-    mongo::registerRecordStoreHarnessHelperFactory(makeWTRSHarnessHelper);
-}
-
 TEST(WiredTigerRecordStoreTest, StorageSizeStatisticsDisabled) {
     WiredTigerHarnessHelper harnessHelper("statistics=(none)");
-    unique_ptr<RecordStore> rs(harnessHelper.newNonCappedRecordStore("a.b"));
+    std::unique_ptr<RecordStore> rs(harnessHelper.newRecordStore("a.b"));
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper.newOperationContext());
     ASSERT_THROWS(rs->storageSize(opCtx.get()), AssertionException);
 }
 
 TEST(WiredTigerRecordStoreTest, SizeStorer1) {
-    unique_ptr<WiredTigerHarnessHelper> harnessHelper(new WiredTigerHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+    std::unique_ptr<WiredTigerHarnessHelper> harnessHelper(new WiredTigerHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    string ident = rs->getIdent();
-    string uri = checked_cast<WiredTigerRecordStore*>(rs.get())->getURI();
+    std::string ident = rs->getIdent();
+    std::string uri = checked_cast<WiredTigerRecordStore*>(rs.get())->getURI();
 
-    string indexUri = WiredTigerKVEngine::kTableUriPrefix + "myindex";
-    const bool enableWtLogging = false;
-    WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri, enableWtLogging);
+    std::string indexUri = WiredTigerKVEngine::kTableUriPrefix + "myindex";
+    WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri);
     checked_cast<WiredTigerRecordStore*>(rs.get())->setSizeStorer(&ss);
 
     int N = 12;
@@ -251,20 +110,22 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
         WiredTigerRecordStore::Params params;
-        params.ns = "a.b"_sd;
+        params.nss = NamespaceString::createNamespaceString_forTest("a.b");
         params.ident = ident;
-        params.engineName = kWiredTigerEngineName;
+        params.engineName = std::string{kWiredTigerEngineName};
         params.isCapped = false;
         params.keyFormat = KeyFormat::Long;
+        params.overwrite = true;
         params.isEphemeral = false;
-        params.cappedCallback = nullptr;
+        params.isLogged = false;
         params.sizeStorer = &ss;
-        params.isReadOnly = false;
         params.tracksSizeAdjustments = true;
+        params.forceUpdateWithFullDocument = false;
 
-        auto ret = new StandardWiredTigerRecordStore(nullptr, opCtx.get(), params);
-        ret->postConstructorInit(opCtx.get());
+        auto ret = new WiredTigerRecordStore(nullptr, opCtx.get(), params);
+        ret->postConstructorInit(opCtx.get(), params.nss);
         rs.reset(ret);
     }
 
@@ -275,12 +136,14 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        WiredTigerRecoveryUnit* ru = checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
+
+        WiredTigerRecoveryUnit* ru =
+            checked_cast<WiredTigerRecoveryUnit*>(shard_role_details::getRecoveryUnit(opCtx.get()));
 
         {
             WriteUnitOfWork uow(opCtx.get());
             WT_SESSION* s = ru->getSession()->getSession();
-            invariantWTOK(s->create(s, indexUri.c_str(), ""));
+            invariantWTOK(s->create(s, indexUri.c_str(), ""), s);
             uow.commit();
         }
 
@@ -288,9 +151,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
     }
 
     {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        const bool enableWtLogging = false;
-        WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri, enableWtLogging);
+        WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri);
         auto info = ss2.load(uri);
         ASSERT_EQUALS(N, info->numRecords.load());
     }
@@ -300,20 +161,17 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
 class SizeStorerUpdateTest : public mongo::unittest::Test {
 private:
-    virtual void setUp() {
+    void setUp() override {
         harnessHelper.reset(new WiredTigerHarnessHelper());
-        const bool enableWtLogging = false;
-        sizeStorer.reset(
-            new WiredTigerSizeStorer(harnessHelper->conn(),
-                                     WiredTigerKVEngine::kTableUriPrefix + "sizeStorer",
-                                     enableWtLogging));
-        rs = harnessHelper->newNonCappedRecordStore();
+        sizeStorer.reset(new WiredTigerSizeStorer(
+            harnessHelper->conn(), WiredTigerKVEngine::kTableUriPrefix + "sizeStorer"));
+        rs = harnessHelper->newRecordStore();
         WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
         wtrs->setSizeStorer(sizeStorer.get());
         ident = wtrs->getIdent();
         uri = wtrs->getURI();
     }
-    virtual void tearDown() {
+    void tearDown() override {
         rs.reset(nullptr);
         sizeStorer->flush(false);
         sizeStorer.reset(nullptr);
@@ -343,7 +201,101 @@ TEST_F(SizeStorerUpdateTest, Basic) {
     rs->updateStatsAfterRepair(opCtx.get(), val, val);
     ASSERT_EQUALS(getNumRecords(), val);
     ASSERT_EQUALS(getDataSize(), val);
+};
+
+TEST_F(SizeStorerUpdateTest, DataSizeModification) {
+    ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
+    RecordId recordId;
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        auto rId = rs->insertRecord(opCtx.get(), "12345", 5, Timestamp{1});
+        ASSERT_TRUE(rId.isOK());
+        recordId = rId.getValue();
+        uow.commit();
+    }
+
+    ASSERT_EQ(getDataSize(), 5);
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        ASSERT_OK(rs->updateRecord(opCtx.get(), recordId, "54321", 5));
+        uow.commit();
+    }
+    ASSERT_EQ(getDataSize(), 5);
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        ASSERT_OK(rs->updateRecord(opCtx.get(), recordId, "1234", 4));
+        uow.commit();
+    }
+    ASSERT_EQ(getDataSize(), 4);
+
+    RecordData oldRecordData("1234", 4);
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        const auto damageSource = "";
+        DamageVector damageVector;
+        damageVector.push_back(DamageEvent(0, 0, 0, 1));
+        auto newDoc =
+            rs->updateWithDamages(opCtx.get(), recordId, oldRecordData, damageSource, damageVector);
+        ASSERT_TRUE(newDoc.isOK());
+        oldRecordData = newDoc.getValue().getOwned();
+        ASSERT_EQ(std::memcmp(oldRecordData.data(), "234", 3), 0);
+        ASSERT_EQ(getDataSize(), 3);
+        uow.commit();
+    }
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        const auto damageSource = "3456";
+        DamageVector damageVector;
+        damageVector.push_back(DamageEvent(0, 4, 1, 2));
+        ASSERT_TRUE(
+            rs->updateWithDamages(opCtx.get(), recordId, oldRecordData, damageSource, damageVector)
+                .isOK());
+        ASSERT_EQ(getDataSize(), 5);
+        uow.commit();
+    }
 }
+
+// Verify that the size storer contains accurate data after a transaction rollback just before a
+// flush (simulating a shutdown). That is, that the rollback marks the size info as dirty, and is
+// properly flushed to disk.
+TEST_F(SizeStorerUpdateTest, ReloadAfterRollbackAndFlush) {
+    ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
+    // Do an op for which the sizeInfo is persisted, for safety so we don't check against 0.
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        auto rId = rs->insertRecord(opCtx.get(), "12345", 5, Timestamp{1});
+        ASSERT_TRUE(rId.isOK());
+
+        uow.commit();
+    }
+
+    // An operation to rollback, with a flush between the original modification and the rollback.
+    {
+        WriteUnitOfWork uow(opCtx.get());
+        auto rId = rs->insertRecord(opCtx.get(), "12345", 5, Timestamp{2});
+        ASSERT_TRUE(rId.isOK());
+
+        ASSERT_EQ(getNumRecords(), 2);
+        ASSERT_EQ(getDataSize(), 10);
+        // Mark size info as clean, before rollback is done.
+        sizeStorer->flush(false);
+    }
+
+    // Simulate a shutdown and restart, which loads the size storer from disk.
+    sizeStorer->flush(true);
+    sizeStorer.reset(new WiredTigerSizeStorer(harnessHelper->conn(),
+                                              WiredTigerKVEngine::kTableUriPrefix + "sizeStorer"));
+    WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
+    wtrs->setSizeStorer(sizeStorer.get());
+
+    // As the operation was rolled back, numRecords and dataSize should be for the first op only. If
+    // rollback does not properly mark the sizeInfo as dirty, on load sizeInfo will account for the
+    // two operations, as the rollback sizeInfo update has not been flushed.
+    ASSERT_EQ(getNumRecords(), 1);
+    ASSERT_EQ(getDataSize(), 5);
+};
 
 }  // namespace
 }  // namespace mongo

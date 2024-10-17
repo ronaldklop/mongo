@@ -27,42 +27,73 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
-
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <functional>
 #include <string>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
 class DBRAIITestFixture : public CatalogTestFixture {
 public:
-    DBRAIITestFixture() : CatalogTestFixture("wiredTiger") {}
     typedef std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>
         ClientAndCtx;
 
     ClientAndCtx makeClientWithLocker(const std::string& clientName) {
-        auto client = getServiceContext()->makeClient(clientName);
+        auto client = getServiceContext()->getService()->makeClient(clientName);
         auto opCtx = client->makeOperationContext();
-        client->swapLockState(std::make_unique<LockerImpl>());
         return std::make_pair(std::move(client), std::move(opCtx));
     }
 
-    const NamespaceString nss = NamespaceString("test", "coll");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
     const Milliseconds timeoutMs = Seconds(1);
     const ClientAndCtx client1 = makeClientWithLocker("client1");
     const ClientAndCtx client2 = makeClientWithLocker("client2");
@@ -79,19 +110,15 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeTailableQueryPlan(
         opCtx->getServiceContext()->getPreciseClockSource()->now() + Seconds(1);
     CurOp::get(opCtx)->ensureStarted();
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
-
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx,
-                                                     std::move(findCommand),
-                                                     false,
-                                                     expCtx,
-                                                     ExtensionsCallbackNoop(),
-                                                     MatchExpressionParser::kBanAllSpecialFeatures);
-    ASSERT_OK(statusWithCQ.getStatus());
-    std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-    bool permitYield = true;
-    auto swExec = getExecutorFind(opCtx, &collection, std::move(cq), permitYield);
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = makeExpressionContext(opCtx, *findCommand),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kBanAllSpecialFeatures}});
+    auto swExec = getExecutorFind(opCtx,
+                                  MultipleCollectionAccessor{collection},
+                                  std::move(cq),
+                                  PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
     ASSERT_OK(swExec.getStatus());
     return std::move(swExec.getValue());
 }
@@ -109,79 +136,85 @@ void failsWithLockTimeout(std::function<void()> func, Milliseconds timeoutMillis
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadCollLockDeadline) {
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
     Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
-    ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isCollectionLockedForMode(nss, MODE_X));
     failsWithLockTimeout(
         [&] {
-            AutoGetCollectionForRead acfr(client2.second.get(),
-                                          nss,
-                                          AutoGetCollectionViewMode::kViewsForbidden,
-                                          Date_t::now() + timeoutMs);
+            AutoGetCollectionForRead acfr(
+                client2.second.get(),
+                nss,
+                AutoGetCollection::Options{}.deadline(Date_t::now() + timeoutMs));
         },
         timeoutMs);
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDBLockDeadline) {
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_X);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_X);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_X));
     failsWithLockTimeout(
         [&] {
-            AutoGetCollectionForRead coll(client2.second.get(),
-                                          nss,
-                                          AutoGetCollectionViewMode::kViewsForbidden,
-                                          Date_t::now() + timeoutMs);
+            AutoGetCollectionForRead coll(
+                client2.second.get(),
+                nss,
+                AutoGetCollection::Options{}.deadline(Date_t::now() + timeoutMs));
         },
         timeoutMs);
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadGlobalLockDeadline) {
     Lock::GlobalLock gLock1(client1.second.get(), MODE_X);
-    ASSERT(client1.second->lockState()->isLocked());
+    ASSERT(shard_role_details::getLocker(client1.second.get())->isLocked());
     failsWithLockTimeout(
         [&] {
-            AutoGetCollectionForRead coll(client2.second.get(),
-                                          nss,
-                                          AutoGetCollectionViewMode::kViewsForbidden,
-                                          Date_t::now() + timeoutMs);
+            AutoGetCollectionForRead coll(
+                client2.second.get(),
+                nss,
+                AutoGetCollection::Options{}.deadline(Date_t::now() + timeoutMs));
         },
         timeoutMs);
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDeadlineNow) {
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
     Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
-    ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isCollectionLockedForMode(nss, MODE_X));
 
     failsWithLockTimeout(
         [&] {
-            AutoGetCollectionForRead coll(client2.second.get(),
-                                          nss,
-                                          AutoGetCollectionViewMode::kViewsForbidden,
-                                          Date_t::now());
+            AutoGetCollectionForRead coll(
+                client2.second.get(), nss, AutoGetCollection::Options{}.deadline(Date_t::now()));
         },
         Milliseconds(0));
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDeadlineMin) {
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
     Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
-    ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isCollectionLockedForMode(nss, MODE_X));
 
     failsWithLockTimeout(
         [&] {
             AutoGetCollectionForRead coll(
-                client2.second.get(), nss, AutoGetCollectionViewMode::kViewsForbidden, Date_t());
+                client2.second.get(), nss, AutoGetCollection::Options{}.deadline(Date_t()));
         },
         Milliseconds(0));
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDBLockCompatibleXNoCollection) {
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
 
     AutoGetCollectionForRead coll(client2.second.get(), nss);
 }
@@ -191,10 +224,12 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDBLockCompatibleXCollectionExi
     ASSERT_OK(
         storageInterface()->createCollection(client1.second.get(), nss, defaultCollectionOptions));
 
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
 
     AutoGetCollectionForRead coll(client2.second.get(), nss);
+    ASSERT(coll.getCollection());
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDBLockCompatibleXCollectionExistsReadSource) {
@@ -202,13 +237,17 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadDBLockCompatibleXCollectionExi
     ASSERT_OK(
         storageInterface()->createCollection(client1.second.get(), nss, defaultCollectionOptions));
 
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
     auto opCtx = client2.second.get();
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
-                                                  Timestamp(1, 2));
-    ASSERT_THROWS_CODE(
-        AutoGetCollectionForRead(opCtx, nss), AssertionException, ErrorCodes::SnapshotUnavailable);
+    shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+        RecoveryUnit::ReadSource::kProvided, Timestamp(1, 2));
+
+    // We can instantiate AutoGetCollectionForRead but not find a collection at the provided
+    // timestamp
+    AutoGetCollectionForRead coll(opCtx, nss);
+    ASSERT(!coll.getCollection());
 }
 
 
@@ -219,8 +258,9 @@ TEST_F(DBRAIITestFixture,
         storageInterface()->createCollection(client1.second.get(), nss, defaultCollectionOptions));
     ASSERT_OK(repl::ReplicationCoordinator::get(client1.second.get())
                   ->setFollowerMode(repl::MemberState::RS_SECONDARY));
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
 
     // Simulate using a DBDirectClient to test this behavior for user reads.
     client2.first->setInDirectClient(true);
@@ -240,57 +280,19 @@ TEST_F(DBRAIITestFixture,
     auto snapshotManager =
         client1.second.get()->getServiceContext()->getStorageEngine()->getSnapshotManager();
     snapshotManager->setLastApplied(replCoord->getMyLastAppliedOpTime().getTimestamp());
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    Lock::DBLock dbLock1(client1.second.get(), nss.dbName(), MODE_IX);
+    ASSERT(shard_role_details::getLocker(client1.second.get())
+               ->isDbLockedForMode(nss.dbName(), MODE_IX));
 
     // Simulate using a DBDirectClient to test this behavior for user reads.
     client2.first->setInDirectClient(true);
     AutoGetCollectionForRead coll(client2.second.get(), nss);
 }
 
-TEST_F(DBRAIITestFixture,
-       AutoGetCollectionForReadDBLockCompatibleXCollectionExistsSecondaryLastAppliedNested) {
-    // This test simulates a nested lock situation where the code would normally attempt to acquire
-    // the PBWM, but is stymied.
-    auto replCoord = repl::ReplicationCoordinator::get(client1.second.get());
-    CollectionOptions defaultCollectionOptions;
-    ASSERT_OK(
-        storageInterface()->createCollection(client1.second.get(), nss, defaultCollectionOptions));
-    ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
-    // Note that when the collection was created, above, the system chooses a minimum snapshot time
-    // for the collection.  If we now manually set our last applied time to something very early, we
-    // will be guaranteed to hit the logic that triggers when the minimum snapshot time is greater
-    // than the read-at time, since we default to reading at last-applied when in SECONDARY state.
-
-    // Don't call into the ReplicationCoordinator to update lastApplied because it is only a mock
-    // class and does not update the correct state in the SnapshotManager.
-    repl::OpTime opTime(Timestamp(2, 1), 1);
-    auto snapshotManager =
-        client1.second.get()->getServiceContext()->getStorageEngine()->getSnapshotManager();
-    snapshotManager->setLastApplied(opTime.getTimestamp());
-
-    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
-    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-
-    // Simulate using a DBDirectClient to test this behavior for user reads.
-    client2.first->setInDirectClient(true);
-    AutoGetCollectionForRead coll(client2.second.get(), NamespaceString("local.system.js"));
-    // Reading from an unreplicated collection does not change the ReadSource to kLastApplied.
-    ASSERT_EQ(client2.second.get()->recoveryUnit()->getTimestampReadSource(),
-              RecoveryUnit::ReadSource::kNoTimestamp);
-
-    // Reading from a replicated collection will try to switch to kLastApplied. Because we are
-    // already reading without a timestamp and we can't reacquire the PBWM lock to continue reading
-    // without a timestamp, we uassert in this situation.
-    ASSERT_THROWS_CODE(AutoGetCollectionForRead(client2.second.get(), nss),
-                       DBException,
-                       ErrorCodes::SnapshotUnavailable);
-}
-
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadLastAppliedConflict) {
-    // This test simulates a situation where AutoGetCollectionForRead cant read at lastApplied
-    // because it is set to a point earlier than the catalog change. We expect to read without a
-    // timestamp and hold the PBWM lock.
+    // This test simulates a situation where we read from the last applied timestamp but that point
+    // in time is earlier than the catalog change. We expect to reconstruct the state from that
+    // point in time in order to read at last applied.
     auto replCoord = repl::ReplicationCoordinator::get(client1.second.get());
     CollectionOptions defaultCollectionOptions;
     ASSERT_OK(
@@ -312,22 +314,10 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadLastAppliedConflict) {
     // Simulate using a DBDirectClient to test this behavior for user reads.
     client1.first->setInDirectClient(true);
 
-    auto timeoutError = client1.second->getTimeoutError();
-    auto waitForLock = [&] {
-        auto deadline = Date_t::now() + Milliseconds(10);
-        client1.second->runWithDeadline(deadline, timeoutError, [&] {
-            AutoGetCollectionForRead coll(client1.second.get(), nss);
-        });
-    };
-
-    // Expect that the lock acquisition eventually times out because lastApplied is not advancing.
-    ASSERT_THROWS_CODE(waitForLock(), DBException, timeoutError);
-
-    // Advance lastApplied and ensure the lock acquisition succeeds.
-    snapshotManager->setLastApplied(replCoord->getMyLastAppliedOpTime().getTimestamp());
-
+    // We can perform the lock acquisition even though lastApplied is earlier than the minimum valid
+    // time on the namespace.
     AutoGetCollectionForRead coll(client1.second.get(), nss);
-    ASSERT_EQ(client1.second.get()->recoveryUnit()->getTimestampReadSource(),
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(client1.second.get())->getTimestampReadSource(),
               RecoveryUnit::ReadSource::kLastApplied);
 }
 
@@ -351,12 +341,10 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadLastAppliedUnavailable) {
     client1.first->setInDirectClient(true);
     AutoGetCollectionForRead coll(client1.second.get(), nss);
 
-    ASSERT_EQ(client1.second.get()->recoveryUnit()->getTimestampReadSource(),
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(client1.second.get())->getTimestampReadSource(),
               RecoveryUnit::ReadSource::kLastApplied);
     ASSERT_FALSE(
-        client1.second.get()->recoveryUnit()->getPointInTimeReadTimestamp(client1.second.get()));
-    ASSERT_FALSE(client1.second.get()->lockState()->isLockHeldForMode(
-        resourceIdParallelBatchWriterMode, MODE_IS));
+        shard_role_details::getRecoveryUnit(client1.second.get())->getPointInTimeReadTimestamp());
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadOplogOnSecondary) {
@@ -366,7 +354,7 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadOplogOnSecondary) {
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
 
     // Ensure the default ReadSource is used.
-    ASSERT_EQ(client1.second.get()->recoveryUnit()->getTimestampReadSource(),
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(client1.second.get())->getTimestampReadSource(),
               RecoveryUnit::ReadSource::kNoTimestamp);
 
     // Don't call into the ReplicationCoordinator to update lastApplied because it is only a mock
@@ -380,10 +368,8 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadOplogOnSecondary) {
     client1.first->setInDirectClient(true);
     AutoGetCollectionForRead coll(client1.second.get(), NamespaceString::kRsOplogNamespace);
 
-    ASSERT_EQ(client1.second.get()->recoveryUnit()->getTimestampReadSource(),
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(client1.second.get())->getTimestampReadSource(),
               RecoveryUnit::ReadSource::kLastApplied);
-    ASSERT_FALSE(client1.second.get()->lockState()->isLockHeldForMode(
-        resourceIdParallelBatchWriterMode, MODE_IS));
 }
 
 TEST_F(DBRAIITestFixture, AutoGetCollectionForReadUsesLastAppliedOnSecondary) {
@@ -402,7 +388,7 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadUsesLastAppliedOnSecondary) {
 
     // The collection scan should use the default ReadSource on a primary.
     ASSERT_EQ(RecoveryUnit::ReadSource::kNoTimestamp,
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     // When the tailable query recovers from its yield, it should discover that the node is
     // secondary and change its read source.
@@ -415,7 +401,7 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadUsesLastAppliedOnSecondary) {
     // After restoring, the collection scan should now be reading with kLastApplied, the default on
     // secondaries.
     ASSERT_EQ(RecoveryUnit::ReadSource::kLastApplied,
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
     ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&unused, nullptr));
 }
 
@@ -437,7 +423,7 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadChangedReadSourceAfterStepUp) 
 
     // The collection scan should use the default ReadSource on a secondary.
     ASSERT_EQ(RecoveryUnit::ReadSource::kLastApplied,
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     // When the tailable query recovers from its yield, it should discover that the node is primary
     // and change its ReadSource.
@@ -450,34 +436,42 @@ TEST_F(DBRAIITestFixture, AutoGetCollectionForReadChangedReadSourceAfterStepUp) 
     // After restoring, the collection scan should now be reading with kUnset, the default on
     // primaries.
     ASSERT_EQ(RecoveryUnit::ReadSource::kNoTimestamp,
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
     ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&unused, nullptr));
 }
 
-DEATH_TEST_F(DBRAIITestFixture, AutoGetCollectionForReadUnsafe, "Fatal assertion") {
+TEST_F(DBRAIITestFixture, AutoGetCollectionForReadSecondaryReadSource) {
     auto opCtx = client1.second.get();
-    ASSERT_OK(storageInterface()->createCollection(opCtx, nss, {}));
 
+    ASSERT_OK(storageInterface()->createCollection(opCtx, nss, {}));
     ASSERT_OK(
         repl::ReplicationCoordinator::get(opCtx)->setFollowerMode(repl::MemberState::RS_SECONDARY));
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource(),
+              RecoveryUnit::ReadSource::kNoTimestamp);
 
-    // Non-user read on a replicated collection should fail because we are reading on a secondary
-    // without a timestamp.
     AutoGetCollectionForRead autoColl(opCtx, nss);
+
+    // The AutoGetCollectionForRead changes the read source to be last applied.
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource(),
+              RecoveryUnit::ReadSource::kLastApplied);
 }
 
-TEST_F(DBRAIITestFixture, AutoGetCollectionForReadSafe) {
+TEST_F(DBRAIITestFixture, AutoGetCollectionForReadSecondaryReadSourceNotEnforcingConstraints) {
     auto opCtx = client1.second.get();
-    ASSERT_OK(storageInterface()->createCollection(opCtx, nss, {}));
 
+    ASSERT_OK(storageInterface()->createCollection(opCtx, nss, {}));
     ASSERT_OK(
         repl::ReplicationCoordinator::get(opCtx)->setFollowerMode(repl::MemberState::RS_SECONDARY));
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource(),
+              RecoveryUnit::ReadSource::kNoTimestamp);
 
-    // Non-user read on a replicated collection should not fail because of the ShouldNotConflict
-    // block.
-    ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
-
+    opCtx->setEnforceConstraints(false);
     AutoGetCollectionForRead autoColl(opCtx, nss);
+
+    // The AutoGetCollectionForRead does not change the read source since we are not enforcing
+    // constraints.
+    ASSERT_EQ(shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource(),
+              RecoveryUnit::ReadSource::kNoTimestamp);
 }
 
 }  // namespace

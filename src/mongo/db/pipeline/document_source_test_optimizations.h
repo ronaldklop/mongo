@@ -42,11 +42,19 @@ public:
     static constexpr StringData kStageName = "$_internalTestOptimizations"_sd;
     DocumentSourceTestOptimizations(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSource(DocumentSourceTestOptimizations::kStageName, expCtx) {}
-    virtual ~DocumentSourceTestOptimizations() = default;
-    virtual GetNextResult doGetNext() override {
+    ~DocumentSourceTestOptimizations() override = default;
+    const char* getSourceName() const override {
+        return DocumentSourceTestOptimizations::kStageName.rawData();
+    }
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kTestOptimizations;
+    }
+
+    GetNextResult doGetNext() override {
         MONGO_UNREACHABLE;
     }
-    virtual StageConstraints constraints(Pipeline::SplitState) const override {
+    StageConstraints constraints(Pipeline::SplitState) const override {
         // Return the default constraints so that this can be used in test pipelines. Constructing a
         // pipeline needs to do some validation that depends on this.
         return StageConstraints{StreamType::kStreaming,
@@ -59,17 +67,19 @@ public:
                                 UnionRequirement::kAllowed};
     }
 
-    virtual boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
     }
 
-    virtual GetModPathsReturn getModifiedPaths() const override {
+    GetModPathsReturn getModifiedPaths() const override {
         MONGO_UNREACHABLE;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
-    virtual Value serialize(boost::optional<ExplainOptions::Verbosity>) const override {
-        MONGO_UNREACHABLE;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final {
+        MONGO_UNREACHABLE_TASSERT(7484301);
     }
 };
 

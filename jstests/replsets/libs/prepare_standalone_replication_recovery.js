@@ -1,4 +1,7 @@
-"use strict";
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 /*
  * Library used to test that we can recover prepared transactions using the
@@ -6,11 +9,7 @@
  * that have been committed and ones that are still in the prepared state.
  */
 
-var testPrepareRecoverFromOplogAsStandalone = function(name, commitBeforeRecovery) {
-    load("jstests/replsets/rslib.js");
-    load("jstests/libs/write_concern_util.js");
-    load("jstests/core/txns/libs/prepare_helpers.js");
-
+export var testPrepareRecoverFromOplogAsStandalone = function(name, commitBeforeRecovery) {
     const dbName = "test";
     const txnCollName = "txn_coll";
     const nonTxnCollName = "non_txn_coll";
@@ -46,6 +45,10 @@ var testPrepareRecoverFromOplogAsStandalone = function(name, commitBeforeRecover
 
     assert.eq(rst.getPrimary(), node);
 
+    // The default WC is majority and stopServerReplication will prevent satisfying any majority
+    // writes.
+    assert.commandWorked(node.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
     // Create both collections with {w: majority}.
     assert.commandWorked(node.getDB(dbName).runCommand({
         create: nonTxnCollName,

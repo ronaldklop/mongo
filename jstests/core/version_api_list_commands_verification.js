@@ -1,11 +1,11 @@
 /**
  * Checks that listCommands returns the API Version information of a command.
  *
- * @tags: [requires_fcv_47, requires_non_retryable_commands]
+ * @tags: [
+ *   requires_non_retryable_commands,
+ *   no_selinux,
+ * ]
  */
-
-(function() {
-"use strict";
 
 const resListCommands = db.runCommand({listCommands: 1});
 assert.commandWorked(resListCommands);
@@ -16,4 +16,3 @@ assert(JSON.stringify(serverStatus.apiVersions) == "[]");
 assert(JSON.stringify(serverStatus.deprecatedApiVersions) == "[]");
 assert(JSON.stringify(testDeprecation.apiVersions) == "[\"1\"]");
 assert(JSON.stringify(testDeprecation.deprecatedApiVersions) == "[\"1\"]");
-})();

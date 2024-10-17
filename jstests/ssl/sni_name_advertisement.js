@@ -2,13 +2,18 @@
  * Tests that SNI names are advertised if and only if they are a URL, and NOT an IP address.
  */
 
-(function() {
-'use strict';
-load('jstests/ssl/libs/ssl_helpers.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 // Checking index consistency involves reconnecting to the mongos.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckRoutingTableConsistency = true;
+TestData.skipCheckShardFilteringMetadata = true;
+
+// Do not check metadata consistency as mongos is stopped for testing purposes.
+TestData.skipCheckMetadataConsistency = true;
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 let path = "jstests/libs/";
 let pemKeyFile = path + "server.pem";
@@ -80,4 +85,3 @@ jsTestLog("Testing sharded configuration bound to IP " + testIP);
 assert.eq(desiredOutput,
           getSNISharded(ipParams),
           "IP address is advertised as SNI name in sharded mongod");
-})();

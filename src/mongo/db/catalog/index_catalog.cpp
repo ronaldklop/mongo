@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 
 namespace mongo {
@@ -63,20 +65,8 @@ ReadyIndexesIterator::ReadyIndexesIterator(OperationContext* const opCtx,
 
 const IndexCatalogEntry* ReadyIndexesIterator::_advance() {
     while (_iterator != _endIterator) {
-        IndexCatalogEntry* entry = _iterator->get();
+        const IndexCatalogEntry* entry = _iterator->get();
         ++_iterator;
-
-        if (auto minSnapshot = entry->getMinimumVisibleSnapshot()) {
-            auto mySnapshot =
-                _opCtx->recoveryUnit()->getPointInTimeReadTimestamp(_opCtx).get_value_or(
-                    _opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
-
-            if (!mySnapshot.isNull() && mySnapshot < minSnapshot.get()) {
-                // This index isn't finished in my snapshot.
-                continue;
-            }
-        }
-
         return entry;
     }
 
@@ -84,7 +74,8 @@ const IndexCatalogEntry* ReadyIndexesIterator::_advance() {
 }
 
 AllIndexesIterator::AllIndexesIterator(
-    OperationContext* const opCtx, std::unique_ptr<std::vector<IndexCatalogEntry*>> ownedContainer)
+    OperationContext* const opCtx,
+    std::unique_ptr<std::vector<const IndexCatalogEntry*>> ownedContainer)
     : _opCtx(opCtx), _ownedContainer(std::move(ownedContainer)) {
     // Explicitly order calls onto the ownedContainer with respect to its move.
     _iterator = _ownedContainer->begin();
@@ -96,7 +87,7 @@ const IndexCatalogEntry* AllIndexesIterator::_advance() {
         return nullptr;
     }
 
-    IndexCatalogEntry* entry = *_iterator;
+    const IndexCatalogEntry* entry = *_iterator;
     ++_iterator;
     return entry;
 }
@@ -110,5 +101,58 @@ StringData toString(IndexBuildMethod method) {
     }
 
     MONGO_UNREACHABLE;
+}
+
+// Returns normalized versions of 'indexSpecs' for the catalog.
+BSONObj IndexCatalog::normalizeIndexSpecs(OperationContext* opCtx,
+                                          const CollectionPtr& collection,
+                                          const BSONObj& indexSpec) {
+    // This helper function may be called before the collection is created, when we are attempting
+    // to check whether the candidate index collides with any existing indexes. If 'collection' is
+    // nullptr, skip normalization. Since the collection does not exist there cannot be a conflict,
+    // and we will normalize once the candidate spec is submitted to the IndexBuildsCoordinator.
+    if (!collection) {
+        return indexSpec;
+    }
+
+    // Add collection-default collation where needed and normalize the collation in each index spec.
+    auto normalSpec =
+        uassertStatusOK(collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpec));
+
+    // We choose not to normalize the spec's partialFilterExpression at this point, if it exists.
+    // Doing so often reduces the legibility of the filter to the end-user, and makes it difficult
+    // for clients to validate (via the listIndexes output) whether a given partialFilterExpression
+    // is equivalent to the filter that they originally submitted. Omitting this normalization does
+    // not impact our internal index comparison semantics, since we compare based on the parsed
+    // MatchExpression trees rather than the serialized BSON specs.
+    //
+    // For similar reasons we do not normalize index projection objects here, if any, so their
+    // original forms get persisted in the catalog. Projection normalization to detect whether a
+    // candidate new index would duplicate an existing index is done only in the memory-only
+    // 'IndexDescriptor._normalizedProjection' field.
+
+    return normalSpec;
+}
+
+std::vector<BSONObj> IndexCatalog::normalizeIndexSpecs(OperationContext* opCtx,
+                                                       const CollectionPtr& collection,
+                                                       const std::vector<BSONObj>& indexSpecs) {
+    // This helper function may be called before the collection is created, when we are attempting
+    // to check whether the candidate index collides with any existing indexes. If 'collection' is
+    // nullptr, skip normalization. Since the collection does not exist there cannot be a conflict,
+    // and we will normalize once the candidate spec is submitted to the IndexBuildsCoordinator.
+    if (!collection) {
+        return indexSpecs;
+    }
+
+    std::vector<BSONObj> results;
+    results.reserve(indexSpecs.size());
+
+    for (const auto& originalSpec : indexSpecs) {
+        results.emplace_back(uassertStatusOK(
+            collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, originalSpec)));
+    }
+
+    return results;
 }
 }  // namespace mongo

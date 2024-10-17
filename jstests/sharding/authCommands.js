@@ -1,19 +1,18 @@
 /**
  * This tests using DB commands with authentication enabled when sharded.
+ * @tags: [multiversion_incompatible, requires_scripting]
  */
-(function() {
-'use strict';
-
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
-load("jstests/replsets/rslib.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
-// briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+// briefly authenticates as __system and receives clusterTime metadata then will fail trying to
 // gossip that time later in setup.
 //
 
@@ -21,6 +20,12 @@ var st = new ShardingTest({
     shards: 2,
     rs: {oplogSize: 10, useHostname: false},
     other: {keyFile: 'jstests/libs/key1', useHostname: false, chunkSize: 2},
+});
+
+// This test relies on shard1 having no chunks in config.system.sessions.
+authutil.asCluster(st.s, "jstests/libs/key1", function() {
+    assert.commandWorked(st.s.adminCommand(
+        {moveChunk: "config.system.sessions", find: {_id: 0}, to: st.shard0.shardName}));
 });
 
 var mongos = st.s;
@@ -50,15 +55,18 @@ var authenticatedConn = new Mongo(mongos.host);
 authenticatedConn.getDB('admin').auth(rwUser, password);
 
 // Add user to shards to prevent localhost connections from having automatic full access
-st.rs0.getPrimary().getDB('admin').createUser(
-    {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
+if (!TestData.configShard) {
+    // In config shard mode, the first shard is the config server, so the user we made via mongos
+    // already used up this shard's localhost bypass.
+    st.rs0.getPrimary().getDB('admin').createUser(
+        {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
+}
 st.rs1.getPrimary().getDB('admin').createUser(
     {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
 
 jsTestLog('Creating initial data');
 
-st.adminCommand({enablesharding: "test"});
-st.ensurePrimaryShard('test', st.shard0.shardName);
+st.adminCommand({enablesharding: "test", primaryShard: st.shard0.shardName});
 st.adminCommand({shardcollection: "test.foo", key: {i: 1, j: 1}});
 
 // Balancer is stopped by default, so no moveChunks will interfere with the splits we're testing
@@ -88,12 +96,8 @@ st.startBalancer();
 // Make sure we've done at least some splitting, so the balancer will work
 assert.gt(findChunksUtil.findChunksByNs(configDB, 'test.foo').count(), 2);
 
-// Make sure we eventually balance all the chunks we've created
-assert.soon(function() {
-    var x = st.chunkDiff("foo", "test");
-    print("chunk diff: " + x);
-    return x < 2 && configDB.locks.findOne({_id: 'test.foo'}).state == 0;
-}, "no balance happened", 5 * 60 * 1000);
+// Make sure we eventually balance the 'test.foo' collection
+st.awaitBalance('foo', 'test', 60 * 5 * 1000);
 
 var map = function() {
     emit(this.i, this.j);
@@ -127,9 +131,6 @@ var checkReadOps = function(hasReadAuth) {
         assert.eq(expectedDocs, testDB.foo.find().itcount());
         assert.eq(expectedDocs, testDB.foo.count());
 
-        // NOTE: This is an explicit check that GLE can be run with read prefs, not the result
-        // of above.
-        assert.eq(null, testDB.runCommand({getlasterror: 1}).err);
         checkCommandSucceeded(testDB, {dbstats: 1});
         checkCommandSucceeded(testDB, {collstats: 'foo'});
 
@@ -211,6 +212,7 @@ var checkWriteOps = function(hasWriteAuth) {
 };
 
 var checkAdminOps = function(hasAuth) {
+    const isMultiversion = Boolean(jsTest.options().useRandomBinVersionsWithinReplicaSet);
     if (hasAuth) {
         checkCommandSucceeded(adminDB, {getCmdLineOpts: 1});
         checkCommandSucceeded(adminDB, {serverStatus: 1});
@@ -220,17 +222,21 @@ var checkAdminOps = function(hasAuth) {
         checkCommandSucceeded(adminDB, {ismaster: 1});
         checkCommandSucceeded(adminDB, {hello: 1});
         checkCommandSucceeded(adminDB, {split: 'test.foo', find: {i: 1, j: 1}});
-        var chunk = findChunksUtil.findOneChunkByNs(configDB, 'test.foo', {shard: st.rs0.name});
+        var chunk =
+            findChunksUtil.findOneChunkByNs(configDB, 'test.foo', {shard: st.shard0.shardName});
         checkCommandSucceeded(
             adminDB,
             {moveChunk: 'test.foo', find: chunk.min, to: st.rs1.name, _waitForDelete: true});
+        if (!isMultiversion) {
+            checkCommandSucceeded(adminDB, {lockInfo: 1});
+        }
     } else {
         checkCommandFailed(adminDB, {getCmdLineOpts: 1});
         checkCommandFailed(adminDB, {serverStatus: 1});
         checkCommandFailed(adminDB, {listShards: 1});
+        checkCommandFailed(adminDB, {whatsmyuri: 1});
+        checkCommandFailed(adminDB, {isdbgrid: 1});
         // whatsmyuri, isdbgrid, ismaster, and hello don't require any auth
-        checkCommandSucceeded(adminDB, {whatsmyuri: 1});
-        checkCommandSucceeded(adminDB, {isdbgrid: 1});
         checkCommandSucceeded(adminDB, {ismaster: 1});
         checkCommandSucceeded(adminDB, {hello: 1});
         checkCommandFailed(adminDB, {split: 'test.foo', find: {i: 1, j: 1}});
@@ -238,6 +244,9 @@ var checkAdminOps = function(hasAuth) {
         checkCommandFailed(
             adminDB,
             {moveChunk: 'test.foo', find: chunkKey, to: st.rs1.name, _waitForDelete: true});
+        if (!isMultiversion) {
+            checkCommandFailed(adminDB, {lockInfo: 1});
+        }
     }
 };
 
@@ -285,6 +294,7 @@ checkWriteOps(false);
 
 // Authenticate as read-write user
 jsTestLog("Checking commands with read-write auth credentials");
+assert(testDB.logout().ok);
 assert(testDB.auth(rwUser, password));
 checkReadOps(true);
 checkWriteOps(true);
@@ -305,4 +315,3 @@ checkAddShard(true);
 st.printShardingStatus();
 
 st.stop();
-})();

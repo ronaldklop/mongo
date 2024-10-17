@@ -27,9 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 
 #include "mongo/util/assert_util.h"
 #include "mongo/util/processinfo.h"
@@ -98,7 +99,7 @@ public:
 
     void SetUp(benchmark::State& state) override {
         if (state.thread_index == 0) {
-            fassert(data.get() == nullptr, "'data' is not null");
+            fassert(9097910, !data);
 
             /*
              * Create a circular list of pointers using a simple striding
@@ -125,7 +126,7 @@ public:
 
     void TearDown(benchmark::State& state) override {
         if (state.thread_index == 0) {
-            fassert(data.get() != nullptr, "'data' is null");
+            fassert(9097911, !!data);
             data.reset();
         }
     }

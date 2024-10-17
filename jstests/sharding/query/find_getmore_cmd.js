@@ -3,9 +3,11 @@
  *
  * Always run on a fully upgraded cluster, so that {$meta: "sortKey"} projections use the newest
  * sort key format.
+ * @tags: [
+ *   requires_scripting,
+ * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var cmdRes;
 var cursorId;
@@ -15,9 +17,10 @@ st.stopBalancer();
 
 // Set up a collection sharded by "_id" with one chunk on each of the two shards.
 var db = st.s.getDB("test");
+assert.commandWorked(
+    db.adminCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
 var coll = db.getCollection("find_getmore_cmd");
 
-coll.drop();
 assert.commandWorked(coll.insert({_id: -9, a: 4, b: "foo foo"}));
 assert.commandWorked(coll.insert({_id: -5, a: 8}));
 assert.commandWorked(coll.insert({_id: -1, a: 10, b: "foo"}));
@@ -27,8 +30,6 @@ assert.commandWorked(coll.insert({_id: 9, a: 3}));
 
 assert.commandWorked(coll.createIndex({b: "text"}));
 
-assert.commandWorked(db.adminCommand({enableSharding: db.getName()}));
-st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
 db.adminCommand({shardCollection: coll.getFullName(), key: {_id: 1}});
 assert.commandWorked(db.adminCommand({split: coll.getFullName(), middle: {_id: 0}}));
 assert.commandWorked(
@@ -81,14 +82,11 @@ assert.eq(cmdRes.cursor.ns, coll.getFullName());
 assert.eq(cmdRes.cursor.firstBatch.length, 1);
 assert.eq(cmdRes.cursor.firstBatch[0], {_id: -5, a: 8});
 
-// Find where adding limit/ntoreturn and skip overflows.
-var largeInt = new NumberLong('9223372036854775807');
+// Find where adding limit and skip overflows.
+const largeInt = new NumberLong('9223372036854775807');
 cmdRes = db.runCommand({find: coll.getName(), skip: largeInt, limit: largeInt});
 assert.commandFailed(cmdRes);
-cmdRes = db.runCommand({find: coll.getName(), skip: largeInt, ntoreturn: largeInt});
-assert.commandFailed(cmdRes);
-cmdRes =
-    db.runCommand({find: coll.getName(), skip: largeInt, ntoreturn: largeInt, singleBatch: true});
+cmdRes = db.runCommand({find: coll.getName(), skip: largeInt, limit: largeInt, singleBatch: true});
 assert.commandFailed(cmdRes);
 
 // A predicate with $where.
@@ -164,4 +162,3 @@ assert.eq(cmdRes.cursor.firstBatch[4], {key: [5]});
 assert.eq(cmdRes.cursor.firstBatch[5], {key: [9]});
 
 st.stop();
-})();

@@ -1,4 +1,6 @@
 // Multiple users cannot be authenticated on one connection within a session.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 TestData.disableImplicitSessions = true;
 
 var replTest = new ReplSetTest({nodes: 3, useHostName: false, keyFile: 'jstests/libs/key1'});
@@ -39,7 +41,7 @@ jsTest.log('Sending an authorized query that should be ok');
 assert.commandWorked(testColl.insert({x: 1}, {writeConcern: {w: nodeCount}}));
 
 conn.setSecondaryOk();
-doc = testColl.findOne();
+let doc = testColl.findOne();
 assert(doc != null);
 
 doc = testColl.find().readPref('secondary').next();

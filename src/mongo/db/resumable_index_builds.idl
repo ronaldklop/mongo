@@ -25,18 +25,14 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 
-# This IDL file describes the BSON format for ElectionMetrics,
-# ElectionCandidateMetrics and ElectionParticipantMetrics, and
-# handles the serialization to and deserialization from their BSON
-# representations for those classes.
-
 global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/util/uuid.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/record_id.idl"
     - "mongo/db/sorter/sorter.idl"
 
 enums:
@@ -116,8 +112,7 @@ structs:
                 type: uuid
             collectionScanPosition:
                 description: "The last record id inserted into the sorter before shutdown"
-                type:
-                    variant: [objectid, safeInt64]
+                type: RecordId
                 optional: true
             indexes:
                 description: "The information needed to resume each specific index in this build"

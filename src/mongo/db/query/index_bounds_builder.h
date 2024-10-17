@@ -29,11 +29,22 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/interval_evaluation_tree.h"
 
 namespace mongo {
 
@@ -46,25 +57,48 @@ class IndexBoundsBuilder {
 public:
     static const Interval kUndefinedPointInterval;
     static const Interval kNullPointInterval;
+    static const Interval kEmptyArrayPointInterval;
 
     /**
      * Describes various degrees of precision with which predicates can be evaluated based
      * on the index bounds.
      *
+     * Exact vs. inexact is about whether or not you will need to apply a predicate after scanning,
+     * and fetch vs. not fetch is whether you need data which is not in the index to answer the
+     * query. Often if you have inexact bounds it causes you to need more than the index data, but
+     * not always. For example, to correctly match null predicates like {a: {$eq: null}} you may
+     * need to fetch the data to distinguish between a null and missing 'a' value (the index stores
+     * both with a literal null), so would need INEXACT_FETCH bounds. And as an INEXACT_COVERED
+     * example you could think of something like $mod where you can apply the predicate to the data
+     * directly in the index, but $mod won't generate tight bounds so you still need to apply the
+     * predicate.
+     *
      * The integer values of the enum are significant, and are assigned in order of
      * increasing tightness. These values are used when we need to do comparison between two
      * BoundsTightness values. Such comparisons can answer questions such as "Does predicate
      * X have tighter or looser bounds than predicate Y?".
+     *
+     * These enum values are ordered from loosest to tightest.
      */
     enum BoundsTightness {
         // Index bounds are inexact, and a fetch is required.
         INEXACT_FETCH = 0,
 
-        // Index bounds are inexact, but no fetch is required
-        INEXACT_COVERED = 1,
+        // Index bounds are inexact, and a fetch may be required depending on the projection.
+        // For example, a count $in query on null + a regex can be covered, but a find query with
+        // the same filter and no projection cannot.
+        INEXACT_MAYBE_COVERED = 1,
+
+        // Index bounds are exact, but a fetch may be required depending on the projection.
+        // For example, a find query on null may be covered, depending on which fields we project
+        // out.
+        EXACT_MAYBE_COVERED = 2,
+
+        // Index bounds are inexact, but no fetch is required.
+        INEXACT_COVERED = 3,
 
         // Index bounds are exact.
-        EXACT = 2
+        EXACT = 4
     };
 
     /**
@@ -92,32 +126,53 @@ public:
      *
      * The expression must be a predicate over one field.  That is, expression category must be
      * kLeaf or kArrayMatching.
+     *
+     * If 'ietBuilder' is not null the given `expr` is turned into a Interval Evaluation Tree which
+     * might be used to restore index bounds from a cached plan.
      */
     static void translate(const MatchExpression* expr,
                           const BSONElement& elt,
                           const IndexEntry& index,
                           OrderedIntervalList* oilOut,
-                          BoundsTightness* tightnessOut);
+                          BoundsTightness* tightnessOut,
+                          interval_evaluation_tree::Builder* ietBuilder);
 
+    /**
+     * Turn the MatchExpression in 'expr' into a set of index bounds.  The field that 'expr' is
+     * concerned with is indexed according to the keypattern element 'elt' from index 'index'. This
+     * function is used to evaluate index bounds from cached Interval Evaluation Trees.
+     */
+    static void translate(const MatchExpression* expr,
+                          const BSONElement& elt,
+                          const IndexEntry& index,
+                          OrderedIntervalList* oilOut);
     /**
      * Creates bounds for 'expr' (indexed according to 'elt').  Intersects those bounds
      * with the bounds in oilOut, which is an in/out parameter.
+     *
+     * If 'ietBuilder' is not null the given `expr` is turned into a Interval Evaluation Tree which
+     * might be used to restore index bounds from a cached plan.
      */
     static void translateAndIntersect(const MatchExpression* expr,
                                       const BSONElement& elt,
                                       const IndexEntry& index,
                                       OrderedIntervalList* oilOut,
-                                      BoundsTightness* tightnessOut);
+                                      BoundsTightness* tightnessOut,
+                                      interval_evaluation_tree::Builder* ietBuilder);
 
     /**
      * Creates bounds for 'expr' (indexed according to 'elt').  Unions those bounds
      * with the bounds in oilOut, which is an in/out parameter.
+     *
+     * If 'ietBuilder' is not null the given `expr` is turned into a Interval Evaluation Tree which
+     * might be used to restore index bounds from a cached plan.
      */
     static void translateAndUnion(const MatchExpression* expr,
                                   const BSONElement& elt,
                                   const IndexEntry& index,
                                   OrderedIntervalList* oilOut,
-                                  BoundsTightness* tightnessOut);
+                                  BoundsTightness* tightnessOut,
+                                  interval_evaluation_tree::Builder* ietBuilder);
 
     /**
      * Make a range interval from the provided object.
@@ -178,7 +233,15 @@ public:
                                OrderedIntervalList* oil,
                                BoundsTightness* tightnessOut);
 
-    static void translateEquality(const BSONElement& data,
+
+    /**
+     * Convert the value at 'data' to an Interval. Populate the out-params, 'oil' and 'tightnessOut'
+     * accordingly. If 'holder' is specified, use that BSONObj as the '_intervalData' for the
+     * construted Interval, otherwise construct a new BSONObj from 'data'.
+     */
+    static void translateEquality(const PathMatchExpression* matchExpr,
+                                  const BSONElement& data,
+                                  boost::optional<BSONObj> holder,
                                   const IndexEntry& index,
                                   bool isHashed,
                                   OrderedIntervalList* oil,
@@ -191,14 +254,19 @@ public:
      * Fills out 'bounds' with the bounds for an index scan over all values of the
      * index described by 'keyPattern' in the default forward direction.
      */
-    static void allValuesBounds(const BSONObj& keyPattern, IndexBounds* bounds);
+    static void allValuesBounds(const BSONObj& keyPattern,
+                                IndexBounds* bounds,
+                                bool hasNonSimpleCollation);
 
     /**
      * Assumes each OIL in 'bounds' is increasing.
      *
      * Aligns OILs (and bounds) according to the 'kp' direction * the scanDir.
      */
-    static void alignBounds(IndexBounds* bounds, const BSONObj& kp, int scanDir = 1);
+    static void alignBounds(IndexBounds* bounds,
+                            const BSONObj& kp,
+                            bool hasNonSimpleCollation,
+                            int scanDir = 1);
 
     /**
      * Returns 'true' if the bounds 'bounds' can be represented as one interval between
@@ -210,12 +278,6 @@ public:
                                  bool* startKeyInclusive,
                                  BSONObj* endKey,
                                  bool* endKeyInclusive);
-
-    /**
-     * Returns 'true' if the ordered intervals 'oil' represent a strict null equality predicate.
-     * Returns 'false' otherwise.
-     */
-    static bool isNullInterval(const OrderedIntervalList& oil);
 
     /**
      * Appends the startKey and endKey of the given "all values" 'interval' (which is either
@@ -255,7 +317,13 @@ private:
                                     const BSONElement& elt,
                                     const IndexEntry& index,
                                     OrderedIntervalList* oilOut,
-                                    BoundsTightness* tightnessOut);
+                                    BoundsTightness* tightnessOut,
+                                    interval_evaluation_tree::Builder* ietBuilder);
+
+    /**
+     * Helper method for merging interval tightness for $in expressions.
+     */
+    static void _mergeTightness(const BoundsTightness& tightness, BoundsTightness& tightnessOut);
 };
 
 }  // namespace mongo

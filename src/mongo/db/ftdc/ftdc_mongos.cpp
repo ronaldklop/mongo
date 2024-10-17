@@ -26,26 +26,37 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
-#include "mongo/platform/basic.h"
+#include <functional>
+#include <memory>
+#include <string>
 
-#include "mongo/db/ftdc/ftdc_mongos.h"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
 
-#include <boost/filesystem.hpp>
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/global_conn_pool.h"
-#include "mongo/db/ftdc/controller.h"
+#include "mongo/client/replica_set_monitor_manager.h"
+#include "mongo/db/ftdc/collector.h"
+#include "mongo/db/ftdc/ftdc_mongos.h"
 #include "mongo/db/ftdc/ftdc_server.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/ftdc/util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/util/synchronized_value.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
@@ -60,13 +71,13 @@ public:
         // Sharding connections.
         {
             auto const grid = Grid::get(opCtx);
-            if (grid->getExecutorPool()) {
+            if (grid->isInitialized()) {
                 grid->getExecutorPool()->appendConnectionStats(&stats);
-            }
 
-            auto const customConnPoolStatsFn = grid->getCustomConnectionPoolStatsFn();
-            if (customConnPoolStatsFn) {
-                customConnPoolStatsFn(&stats);
+                auto const customConnPoolStatsFn = grid->getCustomConnectionPoolStatsFn();
+                if (customConnPoolStatsFn) {
+                    customConnPoolStatsFn(&stats);
+                }
             }
         }
 
@@ -84,19 +95,54 @@ public:
     }
 };
 
-void registerMongoSCollectors(FTDCController* controller) {
-    // PoolStats
-    controller->addPeriodicCollector(std::make_unique<ConnPoolStatsCollector>());
+class NetworkInterfaceStatsCollector final : public FTDCCollectorInterface {
+public:
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        auto const grid = Grid::get(opCtx);
+        if (grid->isInitialized()) {
+            grid->getExecutorPool()->appendNetworkInterfaceStats(builder);
+        }
 
-    // GetDefaultRWConcern
-    controller->addOnRotateCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
-        "getDefaultRWConcern",
-        "getDefaultRWConcern",
-        "",
-        BSON("getDefaultRWConcern" << 1 << "inMemory" << true)));
+        if (auto executor = ReplicaSetMonitorManager::get()->getExecutor()) {
+            executor->appendNetworkInterfaceStats(builder);
+        }
+    }
+
+    std::string name() const override {
+        return "networkInterfaceStats";
+    }
+};
+
+void registerRouterCollectors(FTDCController* controller) {
+    registerServerCollectorsForRole(controller, ClusterRole::RouterServer);
+
+    // PoolStats
+    controller->addPeriodicCollector(std::make_unique<ConnPoolStatsCollector>(),
+                                     ClusterRole::RouterServer);
+
+    controller->addPeriodicCollector(std::make_unique<NetworkInterfaceStatsCollector>(),
+                                     ClusterRole::RouterServer);
+
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>(
+            "getParameter",
+            "getParameter",
+            DatabaseName::kEmpty,
+            BSON("getParameter" << BSON("allParameters" << true << "setAt"
+                                                        << "runtime"))),
+        ClusterRole::RouterServer);
+
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>("getClusterParameter",
+                                                             "getClusterParameter",
+                                                             DatabaseName::kEmpty,
+                                                             BSON("getClusterParameter"
+                                                                  << "*"
+                                                                  << "omitInFTDC" << true)),
+        ClusterRole::RouterServer);
 }
 
-void startMongoSFTDC() {
+void startMongoSFTDC(ServiceContext* serviceContext) {
     // Get the path to use for FTDC:
     // 1. Check if the user set one.
     // 2. If not, check if the user has a logpath and derive one.
@@ -122,7 +168,11 @@ void startMongoSFTDC() {
         }
     }
 
-    startFTDC(directory, startMode, registerMongoSCollectors);
+    // (Ignore FCV check): This code is only executed in mongoS, and they're not FCV-gated anyway.
+    const UseMultiServiceSchema multiServiceSchema{
+        feature_flags::gMultiServiceLogAndFTDCFormat.isEnabledAndIgnoreFCVUnsafe()};
+
+    startFTDC(serviceContext, directory, startMode, {registerRouterCollectors}, multiServiceSchema);
 }
 
 void stopMongoSFTDC() {

@@ -1,6 +1,7 @@
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForAllMembers} from "jstests/replsets/rslib.js";
 
-doTest = function(signal) {
+let doTest = function(signal) {
     // Test replication with write concern.
 
     // Replica set testing API
@@ -50,7 +51,7 @@ doTest = function(signal) {
 
     print("replset2.js **** TEMP 1a ****");
 
-    m1 = primary.getDB(testDB).foo.findOne({n: 1});
+    let m1 = primary.getDB(testDB).foo.findOne({n: 1});
     printjson(m1);
     assert(m1['n'] == 1, "replset2.js Failed to save to primary on multiple inserts");
 
@@ -90,7 +91,7 @@ doTest = function(signal) {
         print("replset2.js **** V1 ");
 
         var verifyReplication = function(nodeName, collection) {
-            data = collection.findOne({n: 1});
+            let data = collection.findOne({n: 1});
             assert(data['n'] == 1, "replset2.js Failed to save to " + nodeName);
             data = collection.findOne({n: 999});
             assert(data['n'] == 999, "replset2.js Failed to save to " + nodeName);

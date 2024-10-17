@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +40,7 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -53,10 +52,14 @@
 #endif
 #endif
 
+#include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/itoa.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 namespace {
@@ -69,24 +72,36 @@ struct AddrInfoDeleter {
 };
 using AddrInfoPtr = std::unique_ptr<addrinfo, AddrInfoDeleter>;
 
-struct AddrErr {
-    AddrInfoPtr addr;
-    int err;
-};
+AddrInfoPtr resolveAddrInfo(StringData hostOrIp, int port, sa_family_t familyHint) {
+    struct AddrError {
+        AddrInfoPtr addr;
+        int err;
+    };
 
-AddrErr resolveAddrInfo(const std::string& hostOrIp, int port, sa_family_t familyHint) {
-    const std::string portStr{StringData{ItoA(port)}};
-    auto tryResolve = [&](bool allowDns) noexcept->AddrErr {
+    // Convert to std::string to ensure null-termination.
+    const auto hostString = std::string(hostOrIp);
+    const auto portString = ItoA(port).toString();
+
+    auto tryResolve = [&](bool allowDns) noexcept {
+        AddrError result;
+
         addrinfo hints;
         memset(&hints, 0, sizeof(addrinfo));
         hints.ai_socktype = SOCK_STREAM;
         if (!allowDns)
             hints.ai_flags |= AI_NUMERICHOST;
         hints.ai_family = familyHint;
+
         addrinfo* addrs = nullptr;
-        int ret = getaddrinfo(hostOrIp.c_str(), portStr.c_str(), &hints, &addrs);
-        AddrInfoPtr rvPtr(addrs);
-        return {std::move(rvPtr), ret};
+        result.err = getaddrinfo(hostString.c_str(), portString.c_str(), &hints, &addrs);
+        result.addr = AddrInfoPtr(addrs);
+        return result;
+    };
+
+    auto validateResolution = [](AddrError addrErr) -> AddrInfoPtr {
+        auto ec = addrInfoError(addrErr.err);
+        uassert(ErrorCodes::HostUnreachable, errorMessage(ec), !ec);
+        return std::move(addrErr.addr);
     };
 
     switch (auto r = tryResolve(false); r.err) {
@@ -96,22 +111,13 @@ AddrErr resolveAddrInfo(const std::string& hostOrIp, int port, sa_family_t famil
         case EAI_NODATA:        // Old IPv6-capable hosts can return EAI_NODATA.
 #endif
 #endif
-            return tryResolve(true);  // Not an IP address. Retry with DNS.
+            return validateResolution(tryResolve(true));  // Not an IP address. Retry with DNS.
         default:
-            return r;
+            return validateResolution(std::move(r));
     }
 }
 
 }  // namespace
-
-std::string getAddrInfoStrError(int code) {
-#if !defined(_WIN32)
-    return gai_strerror(code);
-#else
-    /* gai_strerrorA is not threadsafe on windows. don't use it. */
-    return errnoWithDescription(code);
-#endif
-}
 
 SockAddr::SockAddr() {
     addressSize = sizeof(sa);
@@ -129,90 +135,87 @@ SockAddr::SockAddr(int sourcePort) {
     _isValid = true;
 }
 
-void SockAddr::initUnixDomainSocket(const std::string& path, int port) {
+void SockAddr::initUnixDomainSocket(StringData path, int port) {
 #ifdef _WIN32
     uassert(13080, "no unix socket support on windows", false);
 #endif
     uassert(
         13079, "path to unix socket too long", path.size() < sizeof(as<sockaddr_un>().sun_path));
     as<sockaddr_un>().sun_family = AF_UNIX;
-    strcpy(as<sockaddr_un>().sun_path, path.c_str());
+    str::copyAsCString(as<sockaddr_un>().sun_path, path);
     addressSize = sizeof(sockaddr_un);
     _isValid = true;
 }
 
-SockAddr::SockAddr(StringData target, int port, sa_family_t familyHint)
-    : _hostOrIp(target.toString()) {
-    if (_hostOrIp == "localhost") {
-        _hostOrIp = "127.0.0.1";
+SockAddr SockAddr::create(StringData target, int port, sa_family_t familyHint) {
+    if (target == "localhost") {
+        target = "127.0.0.1"_sd;
     }
 
-    if (str::contains(_hostOrIp, '/') || familyHint == AF_UNIX) {
-        initUnixDomainSocket(_hostOrIp, port);
-        return;
+    if (str::contains(target, '/') || familyHint == AF_UNIX) {
+        SockAddr ret;
+        ret.initUnixDomainSocket(target, port);
+        return ret;
     }
 
-    auto addrErr = resolveAddrInfo(_hostOrIp, port, familyHint);
+    try {
+        const auto ownedAddrs = resolveAddrInfo(target, port, familyHint);
 
-    if (addrErr.err) {
+        // This throws away all but the first address.
+        // Use SockAddr::createAll() to get all addresses.
+        const auto* addrs = ownedAddrs.get();
+        fassert(16501, static_cast<size_t>(addrs->ai_addrlen) <= sizeof(struct sockaddr_storage));
+        return SockAddr(addrs->ai_addr, addrs->ai_addrlen, target);
+    } catch (const DBException&) {
         // we were unsuccessful
-        if (_hostOrIp != "0.0.0.0") {  // don't log if this as it is a
-                                       // CRT construction and log() may not work yet.
-            LOGV2(23175,
-                  "getaddrinfo(\"{host}\") failed: {error}",
-                  "Command getaddrinfo failed",
-                  "host"_attr = _hostOrIp,
-                  "error"_attr = getAddrInfoStrError(addrErr.err));
-            _isValid = false;
-            return;
-        }
-        *this = SockAddr(port);
-        return;
-    }
 
-    // This throws away all but the first address.
-    // Use SockAddr::createAll() to get all addresses.
-    const auto* addrs = addrErr.addr.get();
-    fassert(16501, static_cast<size_t>(addrs->ai_addrlen) <= sizeof(sa));
-    memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
-    addressSize = addrs->ai_addrlen;
-    _isValid = true;
+        if (target == "0.0.0.0") {
+            // don't log if this as it is a CRT construction and log() may not work yet.
+            return SockAddr(port);
+        }
+
+        throw;
+    }
 }
 
 std::vector<SockAddr> SockAddr::createAll(StringData target, int port, sa_family_t familyHint) {
-    std::string hostOrIp = target.toString();
-    if (str::contains(hostOrIp, '/')) {
+    if (str::contains(target, '/')) {
         std::vector<SockAddr> ret = {SockAddr()};
-        ret[0].initUnixDomainSocket(hostOrIp, port);
+        ret[0].initUnixDomainSocket(target, port);
         // Currently, this is always valid since initUnixDomainSocket()
         // will uassert() on failure. Be defensive against future changes.
         return ret[0].isValid() ? ret : std::vector<SockAddr>();
     }
 
-    auto addrErr = resolveAddrInfo(hostOrIp, port, familyHint);
-    if (addrErr.err) {
+    try {
+        const auto ownedAddrs = resolveAddrInfo(target, port, familyHint);
+
+        std::set<SockAddr> ret;
+        for (const auto* addrs = ownedAddrs.get(); addrs; addrs = addrs->ai_next) {
+            fassert(40594,
+                    static_cast<size_t>(addrs->ai_addrlen) <= sizeof(struct sockaddr_storage));
+            ret.emplace(addrs->ai_addr, addrs->ai_addrlen, target);
+        }
+        return std::vector<SockAddr>(ret.begin(), ret.end());
+    } catch (const DBException& ex) {
         LOGV2(23176,
-              "getaddrinfo(\"{host}\") failed: {error}",
               "getaddrinfo invocation failed",
-              "host"_attr = hostOrIp,
-              "error"_attr = getAddrInfoStrError(addrErr.err));
+              "host"_attr = target,
+              "error"_attr = ex.toStatus());
         return {};
     }
-
-    std::set<SockAddr> ret;
-    struct sockaddr_storage storage;
-    memset(&storage, 0, sizeof(storage));
-    for (const auto* addrs = addrErr.addr.get(); addrs; addrs = addrs->ai_next) {
-        fassert(40594, static_cast<size_t>(addrs->ai_addrlen) <= sizeof(struct sockaddr_storage));
-        ret.emplace(addrs->ai_addr, addrs->ai_addrlen);
-    }
-    return std::vector<SockAddr>(ret.begin(), ret.end());
 }
 
-SockAddr::SockAddr(const sockaddr* other, socklen_t size)
-    : addressSize(size), _hostOrIp(), sa(), _isValid(true) {
+SockAddr::SockAddr(const sockaddr* other, socklen_t size) : addressSize(size), _hostOrIp(), sa() {
     memcpy(&sa, other, size);
     _hostOrIp = toString(true);
+    _isValid = true;
+}
+
+SockAddr::SockAddr(const sockaddr* other, socklen_t size, StringData hostOrIp)
+    : addressSize(size), _hostOrIp(hostOrIp.toString()), sa() {
+    memcpy(&sa, other, size);
+    _isValid = true;
 }
 
 bool SockAddr::isIP() const {
@@ -290,6 +293,16 @@ unsigned SockAddr::getPort() const {
     }
 }
 
+void SockAddr::setPort(int port) {
+    if (auto type = getType(); type == AF_INET) {
+        as<sockaddr_in>().sin_port = htons(port);
+    } else if (type == AF_INET6) {
+        as<sockaddr_in6>().sin6_port = htons(port);
+    } else {
+        massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
+    }
+}
+
 std::string SockAddr::getAddr() const {
     switch (getType()) {
         case AF_INET:
@@ -297,8 +310,9 @@ std::string SockAddr::getAddr() const {
             const int buflen = 128;
             char buffer[buflen];
             int ret = getnameinfo(raw(), addressSize, buffer, buflen, nullptr, 0, NI_NUMERICHOST);
-            massert(
-                13082, str::stream() << "getnameinfo error " << getAddrInfoStrError(ret), ret == 0);
+            massert(13082,
+                    str::stream() << "getnameinfo error " << errorMessage(addrInfoError(ret)),
+                    ret == 0);
             return buffer;
         }
 
@@ -318,6 +332,8 @@ constexpr auto kIPField = "ip"_sd;
 constexpr auto kPortField = "port"_sd;
 constexpr auto kUnixField = "unix"_sd;
 constexpr auto kAnonymous = "anonymous"_sd;
+
+constexpr auto kOCSFInterfaceNameField = "interface_name"_sd;
 }  // namespace
 
 void SockAddr::serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {

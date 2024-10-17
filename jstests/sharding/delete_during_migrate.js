@@ -7,17 +7,21 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
-(function() {
-'use strict';
 
-var st = new ShardingTest({shards: 2, mongos: 1});
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+var st = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    rs: {nodes: 2, setParameter: {defaultConfigCommandTimeoutMS: 5 * 60 * 1000}}
+});
 
 var dbname = "test";
 var coll = "foo";
 var ns = dbname + "." + coll;
 
-assert.commandWorked(st.s0.adminCommand({enablesharding: dbname}));
-st.ensurePrimaryShard(dbname, st.shard1.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enablesharding: dbname, primaryShard: st.shard1.shardName}));
 
 var t = st.s0.getDB(dbname).getCollection(coll);
 
@@ -42,4 +46,3 @@ assert.commandWorked(st.s0.adminCommand(
 join();
 
 st.stop();
-})();

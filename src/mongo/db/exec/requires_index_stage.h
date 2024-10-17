@@ -29,9 +29,15 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
 
@@ -49,11 +55,11 @@ class RequiresIndexStage : public RequiresCollectionStage {
 public:
     RequiresIndexStage(const char* stageType,
                        ExpressionContext* expCtx,
-                       const CollectionPtr& collection,
+                       VariantCollectionPtrOrAcquisition collection,
                        const IndexDescriptor* indexDescriptor,
                        WorkingSet* workingSet);
 
-    virtual ~RequiresIndexStage() = default;
+    ~RequiresIndexStage() override = default;
 
 protected:
     /**
@@ -66,16 +72,16 @@ protected:
      */
     virtual void doRestoreStateRequiresIndex() = 0;
 
-    void doSaveStateRequiresCollection() override final;
+    void doSaveStateRequiresCollection() final;
 
-    void doRestoreStateRequiresCollection() override final;
+    void doRestoreStateRequiresCollection() final;
 
     const IndexDescriptor* indexDescriptor() const {
-        return _indexDescriptor;
+        return _entry ? _entry->descriptor() : nullptr;
     }
 
-    const IndexAccessMethod* indexAccessMethod() const {
-        return _indexAccessMethod;
+    const SortedDataIndexAccessMethod* indexAccessMethod() const {
+        return _entry ? _entry->accessMethod()->asSortedData() : nullptr;
     }
 
     WorkingSetRegisteredIndexId workingSetIndexId() const {
@@ -83,23 +89,16 @@ protected:
     }
 
 private:
-    // This is necessary to protect against that case that our index is dropped and then recreated
-    // during yield. Such an event should cause the query to be killed, since index cursors may have
-    // pointers into catalog objects that no longer exist. Since indices do not have UUIDs,
-    // different epochs of the index cannot be distinguished. The weak_ptr allows us to safely
-    // determine whether the pointed-to object has been destroyed during yield recovery via the
-    // shared_ptr control block. We need to call `isDropped()` on the index catalog entry after
-    // locking the weak_ptr to determine whether the index was dropped or destructed during yield.
-    std::weak_ptr<const IndexCatalogEntry> _weakIndexCatalogEntry;
+    const std::string _indexIdent;
+    const std::string _indexName;
 
-    const IndexDescriptor* _indexDescriptor;
-    const IndexAccessMethod* _indexAccessMethod;
+    // Set to nullptr during a yield. During a restore, we do an index catalog lookup using the
+    // index ident to determine whether the index still exists and reset the entry pointer.
+    const IndexCatalogEntry* _entry;
 
-    std::string _indexName;
-
-    // An indentifier for the index required by this stage. Any working set member allocated to
+    // An identifier for the index required by this stage. Any working set member allocated to
     // represent an index key from this index must include this id.
-    WorkingSetRegisteredIndexId _workingSetIndexId;
+    const WorkingSetRegisteredIndexId _workingSetIndexId;
 };
 
 }  // namespace mongo

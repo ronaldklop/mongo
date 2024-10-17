@@ -27,32 +27,48 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <absl/meta/type_traits.h>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/bson_scan.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace sbe {
-BSONScanStage::BSONScanStage(const char* bsonBegin,
-                             const char* bsonEnd,
+BSONScanStage::BSONScanStage(std::vector<BSONObj> bsons,
                              boost::optional<value::SlotId> recordSlot,
-                             std::vector<std::string> fields,
-                             value::SlotVector vars,
-                             PlanNodeId planNodeId)
-    : PlanStage("bsonscan"_sd, planNodeId),
-      _bsonBegin(bsonBegin),
-      _bsonEnd(bsonEnd),
+                             PlanNodeId planNodeId,
+                             std::vector<std::string> scanFieldNames,
+                             value::SlotVector scanFieldSlots,
+                             bool participateInTrialRunTracking)
+    : PlanStage(
+          "bsonscan"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _bsons(std::move(bsons)),
       _recordSlot(recordSlot),
-      _fields(std::move(fields)),
-      _vars(std::move(vars)),
-      _bsonCurrent(bsonBegin) {}
+      _scanFieldNames(std::move(scanFieldNames)),
+      _scanFieldSlots(std::move(scanFieldSlots)) {
+    _bsonCurrent = _bsons.begin();
+}
 
 std::unique_ptr<PlanStage> BSONScanStage::clone() const {
-    return std::make_unique<BSONScanStage>(
-        _bsonBegin, _bsonEnd, _recordSlot, _fields, _vars, _commonStats.nodeId);
+    return std::make_unique<BSONScanStage>(_bsons,
+                                           _recordSlot,
+                                           _commonStats.nodeId,
+                                           _scanFieldNames,
+                                           _scanFieldSlots,
+                                           participateInTrialRunTracking());
 }
 
 void BSONScanStage::prepare(CompileCtx& ctx) {
@@ -60,12 +76,14 @@ void BSONScanStage::prepare(CompileCtx& ctx) {
         _recordAccessor = std::make_unique<value::ViewOfValueAccessor>();
     }
 
-    for (size_t idx = 0; idx < _fields.size(); ++idx) {
-        auto [it, inserted] =
-            _fieldAccessors.emplace(_fields[idx], std::make_unique<value::ViewOfValueAccessor>());
-        uassert(4822841, str::stream() << "duplicate field: " << _fields[idx], inserted);
-        auto [itRename, insertedRename] = _varAccessors.emplace(_vars[idx], it->second.get());
-        uassert(4822842, str::stream() << "duplicate field: " << _vars[idx], insertedRename);
+    for (size_t idx = 0; idx < _scanFieldNames.size(); ++idx) {
+        auto [it, inserted] = _scanFieldAccessors.emplace(
+            _scanFieldNames[idx], std::make_unique<value::ViewOfValueAccessor>());
+        uassert(4822841, str::stream() << "duplicate field: " << _scanFieldNames[idx], inserted);
+        auto [itRename, insertedRename] =
+            _scanFieldAccessorsMap.emplace(_scanFieldSlots[idx], it->second.get());
+        uassert(
+            4822842, str::stream() << "duplicate field: " << _scanFieldSlots[idx], insertedRename);
     }
 }
 
@@ -74,7 +92,7 @@ value::SlotAccessor* BSONScanStage::getAccessor(CompileCtx& ctx, value::SlotId s
         return _recordAccessor.get();
     }
 
-    if (auto it = _varAccessors.find(slot); it != _varAccessors.end()) {
+    if (auto it = _scanFieldAccessorsMap.find(slot); it != _scanFieldAccessorsMap.end()) {
         return it->second;
     }
 
@@ -85,30 +103,28 @@ void BSONScanStage::open(bool reOpen) {
     auto optTimer(getOptTimer(_opCtx));
 
     _commonStats.opens++;
-    _bsonCurrent = _bsonBegin;
+    _bsonCurrent = _bsons.begin();
 }
 
 PlanState BSONScanStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    if (_bsonCurrent < _bsonEnd) {
+    if (_bsonCurrent != _bsons.end()) {
         if (_recordAccessor) {
             _recordAccessor->reset(value::TypeTags::bsonObject,
-                                   value::bitcastFrom<const char*>(_bsonCurrent));
+                                   value::bitcastFrom<const char*>(_bsonCurrent->objdata()));
         }
 
-        if (auto fieldsToMatch = _fieldAccessors.size(); fieldsToMatch != 0) {
-            auto be = _bsonCurrent + 4;
-            auto end = _bsonCurrent + value::readFromMemory<uint32_t>(_bsonCurrent);
-            for (auto& [name, accessor] : _fieldAccessors) {
+        if (auto fieldsToMatch = _scanFieldAccessors.size(); fieldsToMatch != 0) {
+            for (auto& [name, accessor] : _scanFieldAccessors) {
                 accessor->reset();
             }
-            while (*be != 0) {
-                auto sv = bson::fieldNameView(be);
-                if (auto it = _fieldAccessors.find(sv); it != _fieldAccessors.end()) {
+            for (const auto& element : *_bsonCurrent) {
+                auto fieldName = element.fieldNameStringData();
+                if (auto it = _scanFieldAccessors.find(fieldName);
+                    it != _scanFieldAccessors.end()) {
                     // Found the field so convert it to Value.
-                    auto [tag, val] = bson::convertFrom(true, be, end, sv.size());
-
+                    auto [tag, val] = bson::convertFrom</*View = */ true>(element);
                     it->second->reset(tag, val);
 
                     if ((--fieldsToMatch) == 0) {
@@ -116,26 +132,23 @@ PlanState BSONScanStage::getNext() {
                         break;
                     }
                 }
-
-                be = bson::advance(be, sv.size());
             }
         }
 
         // Advance to the next document.
-        _bsonCurrent += value::readFromMemory<uint32_t>(_bsonCurrent);
+        ++_bsonCurrent;
 
         _specificStats.numReads++;
         return trackPlanState(PlanState::ADVANCED);
     }
 
-    _commonStats.isEOF = true;
     return trackPlanState(PlanState::IS_EOF);
 }
 
 void BSONScanStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 }
 
 std::unique_ptr<PlanStageStats> BSONScanStage::getStats(bool includeDebugInfo) const {
@@ -147,8 +160,8 @@ std::unique_ptr<PlanStageStats> BSONScanStage::getStats(bool includeDebugInfo) c
         if (_recordSlot) {
             bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }
-        bob.append("field", _fields);
-        bob.append("outputSlots", _vars);
+        bob.append("field", _scanFieldNames);
+        bob.append("outputSlots", _scanFieldSlots.begin(), _scanFieldSlots.end());
         ret->debugInfo = bob.obj();
     }
 
@@ -163,22 +176,30 @@ std::vector<DebugPrinter::Block> BSONScanStage::debugPrint() const {
     auto ret = PlanStage::debugPrint();
 
     if (_recordSlot) {
-        DebugPrinter::addIdentifier(ret, _recordSlot.get());
+        DebugPrinter::addIdentifier(ret, _recordSlot.value());
     }
 
     ret.emplace_back(DebugPrinter::Block("[`"));
-    for (size_t idx = 0; idx < _fields.size(); ++idx) {
+    for (size_t idx = 0; idx < _scanFieldNames.size(); ++idx) {
         if (idx) {
             ret.emplace_back(DebugPrinter::Block("`,"));
         }
 
-        DebugPrinter::addIdentifier(ret, _vars[idx]);
+        DebugPrinter::addIdentifier(ret, _scanFieldSlots[idx]);
         ret.emplace_back("=");
-        DebugPrinter::addIdentifier(ret, _fields[idx]);
+        DebugPrinter::addIdentifier(ret, _scanFieldNames[idx]);
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     return ret;
 }
+
+size_t BSONScanStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_scanFieldNames);
+    size += size_estimator::estimate(_scanFieldSlots);
+    return size;
+}
+
 }  // namespace sbe
 }  // namespace mongo

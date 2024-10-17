@@ -1,13 +1,8 @@
 // Tests that $geoNear can be within a $lookup stage.
-// TODO SERVER-29159: Enable test on passthroughs with sharded collections.
 // $geoNear is not allowed in a facet even within a lookup.
 // @tags: [
-//   assumes_unsharded_collection,
 //   do_not_wrap_aggregations_in_facets,
 // ]
-(function() {
-"use strict";
-
 const coll = db.lookup_subpipeline_geonear;
 const from = db.from;
 
@@ -40,4 +35,3 @@ let pipeline = [
 
 assert.eq(coll.aggregate(pipeline).toArray(),
           [{"_id": 4, "x": 4, "c": [{"_id": 1, "geo": [0, 0], "distance": 0}]}]);
-}());

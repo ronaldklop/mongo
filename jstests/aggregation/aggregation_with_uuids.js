@@ -1,34 +1,27 @@
 /**
  * Tests for aggregation requests with the collectionUUID parameter.
  * @tags: [
- *   requires_fcv_47,
  *   # Change stream aggregations don't support read concerns other than 'majority'
  *   assumes_read_concern_unchanged,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For 'isMongos'
-
 const dbName = jsTestName();
 const collName = "foo";
 
 const testDB = db.getSiblingDB(dbName);
 const testColl = testDB.getCollection(collName);
 
-if (FixtureHelpers.isMongos(db)) {
-    // collectionUUID is not supported on mongos.
-    assert.commandFailedWithCode(
-        testDB.runCommand(
-            {aggregate: 1, collectionUUID: UUID(), pipeline: [{$match: {}}], cursor: {}}),
-        4928902);
-    return;
-}
+const validateErrorResponse = function(
+    res, db, collectionUUID, expectedCollection, actualCollection) {
+    assert.eq(res.db, db);
+    assert.eq(res.collectionUUID, collectionUUID);
+    assert.eq(res.expectedCollection, expectedCollection);
+    assert.eq(res.actualCollection, actualCollection);
+};
 
 const docs = [{_id: 1}, {_id: 2}];
 
-testColl.drop({writeConcern: {w: "majority"}});
+assert.commandWorked(testDB.dropDatabase());
 assert.commandWorked(testColl.insert(docs));
 
 // Get the namespace's initial UUID.
@@ -60,32 +53,47 @@ assert.eq(0, getMoreRes.cursor.id, tojson(getMoreRes));
 
 // An aggregation with collectionUUID throws NamespaceNotFound if the namespace does not exist, even
 // if a collection does exist with the given uuid.
-assert.commandFailedWithCode(
+let res = assert.commandFailedWithCode(
     testDB.runCommand(
         {aggregate: "doesNotExist", collectionUUID: uuid, pipeline: [{$match: {}}], cursor: {}}),
-    ErrorCodes.NamespaceNotFound);
+    ErrorCodes.CollectionUUIDMismatch);
+validateErrorResponse(res, dbName, uuid, 'doesNotExist', testColl.getName());
 
 // Drop the collection.
 testColl.drop({writeConcern: {w: "majority"}});
 
 // An aggregation with the initial UUID should fail since the namespace doesn't exist.
-assert.commandFailedWithCode(
+res = assert.commandFailedWithCode(
     testDB.runCommand(
         {aggregate: collName, collectionUUID: uuid, pipeline: [{$match: {}}], cursor: {}}),
-    ErrorCodes.NamespaceNotFound);
+    ErrorCodes.CollectionUUIDMismatch);
+validateErrorResponse(res, dbName, uuid, testColl.getName(), null);
 
 // Now recreate the collection.
 assert.commandWorked(testColl.insert(docs));
 
 // An aggregation with the initial UUID should still fail despite the namespace existing.
-assert.commandFailedWithCode(
+res = assert.commandFailedWithCode(
     testDB.runCommand(
         {aggregate: collName, collectionUUID: uuid, pipeline: [{$match: {}}], cursor: {}}),
-    ErrorCodes.NamespaceNotFound);
+    ErrorCodes.CollectionUUIDMismatch);
+validateErrorResponse(res, dbName, uuid, testColl.getName(), null);
 
 collNameRes = assert.commandWorked(
     testDB.runCommand({aggregate: collName, pipeline: [{$match: {}}], cursor: {}}));
 assert.sameMembers(collNameRes.cursor.firstBatch, docs);
+
+// An aggregation with a collectionUUID should fail with CollectionUUIDMismatch if the namespace is
+// a view.
+const viewName = 'view';
+assert.commandWorked(testDB.runCommand(
+    {create: viewName, viewOn: testColl.getName(), pipeline: [], writeConcern: {w: "majority"}}));
+
+res = assert.commandFailedWithCode(
+    testDB.runCommand(
+        {aggregate: "viewCollection", collectionUUID: uuid, pipeline: [{$match: {}}], cursor: {}}),
+    ErrorCodes.CollectionUUIDMismatch);
+validateErrorResponse(res, dbName, uuid, 'viewCollection', null);
 
 //
 // Tests for rejecting invalid collectionUUIDs and cases where collectionUUID is not allowed.
@@ -105,18 +113,6 @@ assert.commandFailedWithCode(
 
 // collectionUUID is not allowed with collectionless aggregations.
 assert.commandFailedWithCode(
-    testDB.runCommand(
-        {aggregate: 1, collectionUUID: uuid, pipeline: [{$listLocalSessions: {}}], cursor: {}}),
+    testDB.adminCommand(
+        {aggregate: 1, collectionUUID: uuid, pipeline: [{$currentOp: {}}], cursor: {}}),
     4928901);
-
-// Aggregation with collectionUUID throws OptionNotSupportedOnView if the namespace is a view.
-const testView = testDB.getCollection("viewCollection");
-testView.drop({writeConcern: {w: "majority"}});
-assert.commandWorked(testView.runCommand(
-    "create", {viewOn: testColl.getName(), pipeline: [], writeConcern: {w: "majority"}}));
-
-assert.commandFailedWithCode(
-    testDB.runCommand(
-        {aggregate: "viewCollection", collectionUUID: uuid, pipeline: [{$match: {}}], cursor: {}}),
-    ErrorCodes.OptionNotSupportedOnView);
-})();

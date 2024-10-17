@@ -1,9 +1,7 @@
 // Tests for $multiply aggregation expression.
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");        // For assertErrorCode().
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.jstests_aggregation_multiply;
 coll.drop();
@@ -55,6 +53,7 @@ const binaryTestCases = [
     },
     {document: {left: NumberDecimal("12.5"), right: null}, expected: null},
 
+    // Test null
     {document: {left: null, right: NumberInt(2)}, expected: null},
     {document: {left: null, right: 2.55}, expected: null},
     {document: {left: null, right: NumberLong("2")}, expected: null},
@@ -124,6 +123,48 @@ const nAryTestCases = [
     {values: [null, 2, 3, 4, 5, 6, 7, 8, 9, 10], expected: null},
     {values: [1, 2, 3, 4, 5, null, 7, 8, 9, 10], expected: null},
     {values: [1, 2, 3, 4, 5, 6, 7, 8, 9, null], expected: null},
+
+    // Test different combinations of types.
+    {
+        values: [NumberInt(12345), NumberLong(67890), NumberDecimal(2.71828)],
+        expected: NumberDecimal("2278196040.47400000000000")
+    },
+    {values: [NumberInt(12345), 67890, NumberLong(23456)], expected: 19658521684800},
+    {
+        values: [NumberInt(12345), 67890, NumberDecimal(2.71828)],
+        expected: NumberDecimal("2278196040.47400000000000000000")
+    },
+    {
+        values: [NumberLong(67890), 12345, NumberDecimal(2.71828)],
+        expected: NumberDecimal("2278196040.47400000000000000000")
+    },
+
+    // Test edge cases.
+    {
+        values: [1, NumberLong("314159265358979393"), NumberLong("-314159265358979323")],
+        expected: -9.86960440108936e+34
+    },
+    {
+        values: [NumberInt(1), NumberDecimal(1.1), 1.0e+35],
+        expected: NumberDecimal("1.1000000000000000000000000000E+35")
+    },
+    {
+        values: [NumberInt(2147483647), 9223372036854, NumberLong(-9223372036854)],
+        expected: -1.8268770458126154e+35
+    },
+    {
+        values: [NumberInt(2147483647), 9223372036854, NumberDecimal(3.14)],
+        expected: NumberDecimal("62194107544730740000000.000000")
+    },
+    {values: [NumberInt(1), NumberDecimal(1.1), NaN], expected: NumberDecimal("NaN")},
+    {
+        values: [-NaN, NumberLong("314159265358979393"), NumberLong("-314159265358979323")],
+        expected: NaN
+    },
+    {values: [undefined, 9223372036854, NumberDecimal(3.14)], expected: undefined},
+    {values: [NumberInt(2147483647), Infinity, NumberLong(-9223372036854)], expected: -Infinity},
+    {values: [-Infinity, NumberDecimal(-1.1), 1.0e+35], expected: NumberDecimal("Infinity")},
+    {values: [], expected: 1},
 ];
 
 nAryTestCases.forEach(function(testCase) {
@@ -157,4 +198,3 @@ errorTestCases.forEach(function(testCase) {
 
     assert(coll.drop());
 });
-}());

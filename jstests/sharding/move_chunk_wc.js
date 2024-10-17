@@ -7,10 +7,8 @@
  * a writeConcern too high for the from shard and sees that that fails. moveChunk does not yield
  * a writeConcernError. It should simply fail when the writeConcern is not met on the shards.
  */
-load('jstests/libs/write_concern_util.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-"use strict";
 var st = new ShardingTest({
     shards: {
         rs0: {nodes: 3, settings: {chainingAllowed: false}},
@@ -23,15 +21,17 @@ var st = new ShardingTest({
 
 var mongos = st.s;
 var dbName = "move-chunk-wc-test";
+var s0 = st.shard0.shardName;
+var s1 = st.shard1.shardName;
+
+assert.commandWorked(st.s.adminCommand({enableSharding: dbName, primaryShard: s0}));
+
 var db = mongos.getDB(dbName);
 var collName = 'leaves';
 var coll = db[collName];
 var numberDoc = 20;
-var s0 = st.shard0.shardName;
-var s1 = st.shard1.shardName;
 
 coll.createIndex({x: 1}, {unique: true});
-st.ensurePrimaryShard(db.toString(), s0);
 st.shardColl(collName, {x: 1}, {x: numberDoc / 2}, {x: numberDoc / 2}, db.toString(), true);
 
 for (var i = 0; i < numberDoc; i++) {
@@ -113,4 +113,3 @@ assert.commandFailed(res);
 assert(!res.writeConcernError, 'moveChunk had writeConcernError: ' + tojson(res));
 checkChunkCount(1, 1);
 st.stop();
-})();

@@ -27,13 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
+#include <mutex>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
@@ -75,7 +81,7 @@ private:
 
 TEST_F(CancelableOperationContextTest, ActsAsNormalOperationContext) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
     auto opCtx = CancelableOperationContext{
         client->makeOperationContext(), CancellationToken::uncancelable(), executor()};
 
@@ -89,7 +95,7 @@ TEST_F(CancelableOperationContextTest, ActsAsNormalOperationContext) {
 
 TEST_F(CancelableOperationContextTest, KilledWhenCancellationSourceIsCanceled) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     CancellationSource cancelSource;
     auto opCtx = CancelableOperationContext{
@@ -99,12 +105,27 @@ TEST_F(CancelableOperationContextTest, KilledWhenCancellationSourceIsCanceled) {
 
     cancelSource.cancel();
     waitForAllEarlierTasksToComplete();
-    ASSERT_EQ(opCtx->checkForInterruptNoAssert(), ErrorCodes::CallbackCanceled);
+    ASSERT_EQ(opCtx->checkForInterruptNoAssert(), ErrorCodes::Interrupted);
+}
+
+TEST_F(CancelableOperationContextTest,
+       KilledUponConstructionWhenCancellationSourceAlreadyCanceled) {
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
+
+    shutDownExecutor();
+    CancellationSource cancelSource;
+    cancelSource.cancel();
+
+    auto opCtx = CancelableOperationContext{
+        client->makeOperationContext(), cancelSource.token(), executor()};
+
+    ASSERT_EQ(opCtx->checkForInterruptNoAssert(), ErrorCodes::Interrupted);
 }
 
 TEST_F(CancelableOperationContextTest, SafeWhenCancellationSourceIsCanceledUnderClientMutex) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     CancellationSource cancelSource;
     auto opCtx = CancelableOperationContext{
@@ -119,12 +140,12 @@ TEST_F(CancelableOperationContextTest, SafeWhenCancellationSourceIsCanceledUnder
         cancelSource.cancel();
     }
     waitForAllEarlierTasksToComplete();
-    ASSERT_EQ(opCtx->checkForInterruptNoAssert(), ErrorCodes::CallbackCanceled);
+    ASSERT_EQ(opCtx->checkForInterruptNoAssert(), ErrorCodes::Interrupted);
 }
 
 TEST_F(CancelableOperationContextTest, SafeWhenDestructedBeforeCancellationSourceIsCanceled) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     CancellationSource cancelSource;
     boost::optional<CancelableOperationContext> opCtx;
@@ -136,7 +157,7 @@ TEST_F(CancelableOperationContextTest, SafeWhenDestructedBeforeCancellationSourc
 
 TEST_F(CancelableOperationContextTest, NotKilledWhenCancellationSourceIsDestructed) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     boost::optional<CancellationSource> cancelSource;
     cancelSource.emplace();
@@ -152,7 +173,7 @@ TEST_F(CancelableOperationContextTest, NotKilledWhenCancellationSourceIsDestruct
 TEST_F(CancelableOperationContextTest,
        NotKilledWhenCancellationSourceIsCanceledAndTaskExecutorAlreadyShutDown) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     CancellationSource cancelSource;
     auto opCtx = CancelableOperationContext{
@@ -167,7 +188,7 @@ TEST_F(CancelableOperationContextTest,
 
 TEST_F(CancelableOperationContextTest, SafeWhenOperationContextOwnCancellationTokenIsUsed) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     auto opCtx = client->makeOperationContext();
     auto cancelToken = opCtx->getCancellationToken();
@@ -187,7 +208,7 @@ TEST_F(CancelableOperationContextTest, SafeWhenOperationContextOwnCancellationTo
 
 TEST_F(CancelableOperationContextTest, SafeWhenOperationContextKilledManually) {
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("CancelableOperationContextTest");
+    auto client = serviceCtx->getService()->makeClient("CancelableOperationContextTest");
 
     CancellationSource cancelSource;
     auto opCtx = CancelableOperationContext{

@@ -28,7 +28,26 @@
  */
 
 #include "mongo/db/geo/shapes.h"
-#include "mongo/db/jsobj.h"
+
+#include <cstdlib>
+#include <r1interval.h>
+#include <s1angle.h>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2latlng.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <util/math/vector2-inl.h>
+#include <util/math/vector2.h>
+
+#include <s2cellid.h>
+#include <util/math/vector3-inl.h>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 using std::abs;
@@ -105,8 +124,8 @@ bool Box::onBoundary(double bound, double val, double fudge) const {
 }
 
 bool Box::mid(double amin, double amax, double bmin, double bmax, bool min, double* res) const {
-    verify(amin <= amax);
-    verify(bmin <= bmax);
+    MONGO_verify(amin <= amax);
+    MONGO_verify(bmin <= bmax);
 
     if (amin < bmin) {
         if (amax < bmin)
@@ -440,6 +459,102 @@ string R2Annulus::toString() const {
                          << " outer: " << _outer;
 }
 
+std::unique_ptr<PointWithCRS> PointWithCRS::clone() const {
+    auto cloned = std::make_unique<PointWithCRS>();
+    cloned->crs = crs;
+
+    cloned->point = point;
+    cloned->cell = cell;
+    cloned->oldPoint = oldPoint;
+
+    return cloned;
+}
+
+std::unique_ptr<LineWithCRS> LineWithCRS::clone() const {
+    auto cloned = std::make_unique<LineWithCRS>();
+    cloned->crs = crs;
+
+    std::vector<S2Point> vertices;
+    vertices.reserve(line.num_vertices());
+    for (int i = 0; i < line.num_vertices(); ++i) {
+        vertices.emplace_back(line.vertex(i));
+    }
+    cloned->line.Init(vertices);
+
+    return cloned;
+}
+
+std::unique_ptr<CapWithCRS> CapWithCRS::clone() const {
+    auto cloned = std::make_unique<CapWithCRS>();
+    cloned->crs = crs;
+
+    cloned->cap = cap;
+
+    return cloned;
+}
+
+std::unique_ptr<BoxWithCRS> BoxWithCRS::clone() const {
+    auto cloned = std::make_unique<BoxWithCRS>();
+    cloned->crs = crs;
+
+    cloned->box = box;
+
+    return cloned;
+}
+
+std::unique_ptr<PolygonWithCRS> PolygonWithCRS::clone() const {
+    auto cloned = std::make_unique<PolygonWithCRS>();
+    cloned->crs = crs;
+
+    if (s2Polygon) {
+        cloned->s2Polygon.reset(s2Polygon->Clone());
+    }
+    if (bigPolygon) {
+        cloned->bigPolygon.reset(bigPolygon->Clone());
+    }
+    cloned->oldPolygon.init(oldPolygon);
+
+    return cloned;
+}
+
+std::unique_ptr<MultiPointWithCRS> MultiPointWithCRS::clone() const {
+    auto cloned = std::make_unique<MultiPointWithCRS>();
+    cloned->crs = crs;
+
+    cloned->points = points;
+    cloned->cells = cells;
+
+    return cloned;
+}
+
+std::unique_ptr<MultiLineWithCRS> MultiLineWithCRS::clone() const {
+    auto cloned = std::make_unique<MultiLineWithCRS>();
+    cloned->crs = crs;
+
+    for (const auto& line : lines) {
+        invariant(line);
+        cloned->lines.emplace_back(line->Clone());
+    }
+
+    return cloned;
+}
+
+std::unique_ptr<MultiPolygonWithCRS> MultiPolygonWithCRS::clone() const {
+    auto cloned = std::make_unique<MultiPolygonWithCRS>();
+    cloned->crs = crs;
+
+    for (const auto& polygon : polygons) {
+        invariant(polygon);
+        cloned->polygons.emplace_back(polygon->Clone());
+    }
+
+    return cloned;
+}
+
+std::unique_ptr<GeometryCollection> GeometryCollection::clone() const {
+    return std::make_unique<GeometryCollection>(*this);
+}
+
 /////// Other methods
 
 double S2Distance::distanceRad(const S2Point& pointA, const S2Point& pointB) {
@@ -534,7 +649,7 @@ double spheredist_rad(const Point& p1, const Point& p2) {
 
     if (cross_prod >= 1 || cross_prod <= -1) {
         // fun with floats
-        verify(fabs(cross_prod) - 1 < 1e-6);
+        MONGO_verify(fabs(cross_prod) - 1 < 1e-6);
         return cross_prod > 0 ? 0 : M_PI;
     }
 

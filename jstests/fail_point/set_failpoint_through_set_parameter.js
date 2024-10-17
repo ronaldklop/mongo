@@ -1,18 +1,19 @@
 /**
  * Tests that failpoints can be set via --setParameter on the command line for mongos and mongod
  * only when running with enableTestCommands=1.
+ * @tags: [
+ *   disables_test_commands,
+ * ]
  */
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-"use strict";
-
-var assertStartupSucceeds = function(conn) {
+function assertStartupSucceeds(conn) {
     assert.commandWorked(conn.adminCommand({hello: 1}));
-};
+}
 
-var assertStartupFails = function(conn) {
-    assert.eq(null, conn);
-};
+function assertStartupFails(fun) {
+    assert.throws(fun, [], "Server started, when it was expected to fail");
+}
 
 var validFailpointPayload = {'mode': 'alwaysOn'};
 var validFailpointPayloadWithData = {'mode': 'alwaysOn', 'data': {x: 1}};
@@ -26,18 +27,18 @@ configRS.initiate();
 
 // Setting a failpoint via --setParameter fails if enableTestCommands is not on.
 TestData.enableTestCommands = false;
-assertStartupFails(
-    MongoRunner.runMongod({setParameter: "failpoint.dummy=" + tojson(validFailpointPayload)}));
-assertStartupFails(MongoRunner.runMongos({
+assertStartupFails(() => MongoRunner.runMongod(
+                       {setParameter: "failpoint.dummy=" + tojson(validFailpointPayload)}));
+assertStartupFails(() => MongoRunner.runMongos({
     setParameter: "failpoint.dummy=" + tojson(validFailpointPayload),
     configdb: configRS.getURL()
 }));
 TestData.enableTestCommands = true;
 
 // Passing an invalid failpoint payload fails.
-assertStartupFails(
-    MongoRunner.runMongod({setParameter: "failpoint.dummy=" + tojson(invalidFailpointPayload)}));
-assertStartupFails(MongoRunner.runMongos({
+assertStartupFails(() => MongoRunner.runMongod(
+                       {setParameter: "failpoint.dummy=" + tojson(invalidFailpointPayload)}));
+assertStartupFails(() => MongoRunner.runMongos({
     setParameter: "failpoint.dummy=" + tojson(invalidFailpointPayload),
     configdb: configRS.getURL()
 }));
@@ -137,4 +138,3 @@ for (var parameter in res) {  // for-in loop valid only for top-level field chec
 MongoRunner.stopMongod(mongod);
 MongoRunner.stopMongos(mongos);
 configRS.stopSet();
-})();

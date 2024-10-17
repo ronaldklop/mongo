@@ -3,16 +3,15 @@
  * sets the multikey flag.
  *
  * @tags: [
- *  uses_transactions,
- *  uses_prepare_transaction,
- *  requires_persistence,
- *  # Multiversion testing does not support tests that kill and restart nodes.
- *  multiversion_incompatible
+ *   # Multiversion testing does not support tests that kill and restart nodes.
+ *   multiversion_incompatible,
+ *   requires_persistence,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 
@@ -53,4 +52,3 @@ jsTestLog("Committing the prepared transaction.");
 assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
 
 rst.stopSet();
-}());

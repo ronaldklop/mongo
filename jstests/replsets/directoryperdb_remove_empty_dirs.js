@@ -3,13 +3,11 @@
  * replicated collection with two-phase drops.
  *
  * @tags: [
- *   requires_fcv_48,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbToDropName = jsTestName() + "_drop";
 const dbToKeepName = jsTestName() + "_keep";
@@ -45,7 +43,6 @@ const runTest = function(dropDatabase) {
     assert.commandWorked(primary.adminCommand({fsync: 1}));
 
     // Ensure that the empty database directory was removed.
-    checkLog.containsJson(primary, 22237, {namespace: dbToDropName + "." + collToDrop.getName()});
     checkLog.containsJson(primary, 4888200, {db: dbToDropName});
     const files = listFiles(rst.getDbPath(primary));
     assert(!files.some(file => file.baseName === dbToDropName),
@@ -57,4 +54,3 @@ runTest(false);
 runTest(true);
 
 rst.stopSet();
-})();

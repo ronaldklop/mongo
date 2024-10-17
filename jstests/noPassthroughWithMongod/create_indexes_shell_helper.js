@@ -1,5 +1,3 @@
-(function() {
-"use strict";
 var t = db.create_indexes_shell_helper;
 t.drop();
 
@@ -9,9 +7,6 @@ try {
     var commandsRan = [];
     var insertsRan = [];
     var mockMongo = {
-        writeMode: function() {
-            return "commands";
-        },
         getSecondaryOk: function() {
             return true;
         },
@@ -21,12 +16,6 @@ try {
         },
         getWriteConcern: function() {
             return null;
-        },
-        useWriteCommands: function() {
-            return true;
-        },
-        hasWriteCommands: function() {
-            return true;
         },
         getMinWireVersion: function() {
             return mongo.getMinWireVersion();
@@ -74,4 +63,3 @@ try {
     db._mongo = mongo;
     db._session = new _DummyDriverSession(mongo);
 }
-}());

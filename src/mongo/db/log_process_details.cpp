@@ -27,25 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/log_process_details.h"
-
+#include <fmt/format.h>
 #include <ostream>
+#include <string>
 
-#include "mongo/bson/bsonobj.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/log_process_details.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_server_helpers.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/process_id.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -61,7 +67,7 @@ void logProcessDetails(std::ostream* os) {
     auto&& vii = VersionInfoInterface::instance();
     if (ProcessInfo::getMemSizeMB() < ProcessInfo::getSystemMemSizeMB()) {
         LOGV2_WARNING(20720,
-                      "Available memory is less than system memory",
+                      "Memory available to mongo process is less than total system memory",
                       "availableMemSizeMB"_attr = ProcessInfo::getMemSizeMB(),
                       "systemMemSizeMB"_attr = ProcessInfo::getSystemMemSizeMB());
     }
@@ -89,8 +95,7 @@ void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
           "host"_attr = getHostNameCached());
 
     auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
-    if (replCoord != nullptr &&
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
+    if (replCoord != nullptr && replCoord->getSettings().isReplSet()) {
         auto rsConfig = replCoord->getConfig();
 
         if (rsConfig.isInitialized()) {
@@ -103,6 +108,8 @@ void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
         }
     }
 
+    serverGlobalParams.featureCompatibility.acquireFCVSnapshot().logFCVWithContext(
+        "log rotation"_sd);
     logProcessDetails(nullptr);
 }
 

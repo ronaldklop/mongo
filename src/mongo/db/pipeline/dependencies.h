@@ -30,13 +30,45 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <compare>
+#include <cstddef>
 #include <set>
 #include <string>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/pipeline/variables.h"
 
 namespace mongo {
+
+/**
+ * Custom comparator that orders fieldpath strings by path prefix first, then by field.
+ * This ensures that a parent field is ordered directly before its children.
+ */
+struct PathComparator {
+    using is_transparent = void;
+
+    /* Returns true if the lhs value should sort before the rhs, false otherwise. */
+    bool operator()(StringData lhs, StringData rhs) const;
+};
+
+/**
+ * Three way (<=>) version of PathComparator.
+ * See PathComparator for sorting semantics.
+ */
+struct ThreeWayPathComparator {
+    using is_transparent = void;
+
+    /* Returns strong_ordering::less, equal, greater indicating the relation lhs <=> rhs */
+    std::strong_ordering operator()(StringData lhs, StringData rhs) const;
+};
+
+/**
+ * Set of field paths strings.  When iterated over, a parent path is seen directly before its
+ * children (or descendants, more generally).  Eg., "a", "a.a", "a.b", "a-plus", "b".
+ */
+typedef std::set<std::string, PathComparator> OrderedPathSet;
 
 /**
  * This struct allows components in an agg pipeline to report what they need from their input.
@@ -104,10 +136,21 @@ struct DepsTracker {
     enum class TruncateToRootLevel : bool { no, yes };
 
     /**
-     * Returns a projection object covering the non-metadata dependencies tracked by this class, or
-     * empty BSONObj if the entire document is required. By default, the resulting project will
-     * include the full, dotted field names of the dependencies. If 'truncationBehavior' is set to
-     * TruncateToRootLevel::yes, the project will contain only the root-level field names.
+     * Return the set of dependencies with descendant paths removed.
+     * For example ["a.b", "a.b.f", "c"] --> ["a.b", "c"].
+     *
+     * TruncateToRootLevel::yes requires all dependencies to be top-level.
+     * The example above would return ["a", "c"]
+     */
+    static OrderedPathSet simplifyDependencies(OrderedPathSet dependencies,
+                                               TruncateToRootLevel truncation);
+
+    /**
+     * Returns a projection object covering the non-metadata dependencies tracked by this class,
+     * or empty BSONObj if the entire document is required. By default, the resulting project
+     * will include the full, dotted field names of the dependencies. If 'truncationBehavior' is
+     * set to TruncateToRootLevel::yes, the project will contain only the root-level field
+     * names.
      */
     BSONObj toProjectionWithoutMetadata(
         TruncateToRootLevel truncationBehavior = TruncateToRootLevel::no) const;
@@ -120,16 +163,6 @@ struct DepsTracker {
      */
     bool hasNoRequirements() const {
         return fields.empty() && !needWholeDocument && !_metadataDeps.any();
-    }
-
-    /**
-     * Returns 'true' if any of the DepsTracker's variables appear in the passed 'ids' set.
-     */
-    bool hasVariableReferenceTo(const std::set<Variables::Id>& ids) const {
-        std::vector<Variables::Id> match;
-        std::set_intersection(
-            vars.begin(), vars.end(), ids.begin(), ids.end(), std::back_inserter(match));
-        return !match.empty();
     }
 
     /**
@@ -173,6 +206,16 @@ struct DepsTracker {
     }
 
     /**
+     * Return all of the search metadata dependencies.
+     */
+    QueryMetadataBitSet& searchMetadataDeps() {
+        return _searchMetadataDeps;
+    }
+    const QueryMetadataBitSet& searchMetadataDeps() const {
+        return _searchMetadataDeps;
+    }
+
+    /**
      * Request that all metadata in the given QueryMetadataBitSet be added as dependencies. Throws a
      * UserException if any of the requested metadata fields have been marked as unavailable.
      */
@@ -184,8 +227,12 @@ struct DepsTracker {
         }
     }
 
-    std::set<std::string> fields;    // Names of needed fields in dotted notation.
-    std::set<Variables::Id> vars;    // IDs of referenced variables.
+    /**
+     * Return names of needed fields in dotted notation.  A custom comparator orders the fields
+     * such that a parent is immediately before its children.
+     */
+    OrderedPathSet fields;
+
     bool needWholeDocument = false;  // If true, ignore 'fields'; the whole document is needed.
 
     // The output of some operators (such as $sample and $rand) depends on a source of fresh random
@@ -197,8 +244,12 @@ private:
     // Represents all metadata not available to the pipeline.
     QueryMetadataBitSet _unavailableMetadata;
 
-    // Represents which metadata is used by the pipeline. This is populated while performing
-    // dependency analysis.
+    // Represents which metadata stored in collection is used by the pipeline. This is populated
+    // while performing dependency analysis.
     QueryMetadataBitSet _metadataDeps;
+    // Represents which search metadata is used by the pipeline. This is populated while performing
+    // dependency analysis.
+    QueryMetadataBitSet _searchMetadataDeps;
 };
+
 }  // namespace mongo

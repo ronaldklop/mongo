@@ -27,25 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_facet.h"
-
+#include <bitset>
 #include <deque>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source_facet.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_skip.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 using std::deque;
@@ -116,7 +127,8 @@ TEST_F(DocumentSourceFacetTest, ShouldSucceedWhenNamespaceIsCollectionless) {
     auto ctx = getExpCtx();
     auto spec = fromjson("{$facet: {a: [{$match: {}}]}}");
 
-    ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("unittests");
+    ctx->ns = NamespaceString::makeCollectionlessAggregateNSS(
+        DatabaseName::createDatabaseName_forTest(boost::none, "unittests"));
 
     ASSERT_TRUE(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx).get());
 }
@@ -186,9 +198,19 @@ TEST_F(DocumentSourceFacetTest, ShouldAcceptLegalSpecification) {
     ASSERT_TRUE(facetStage.get());
 }
 
+/*
+ * Override the stub interface to allow full execution in these tests.
+ */
+class ExecutableStubMongoProcessInterface : public StubMongoProcessInterface {
+    bool isExpectedToExecuteQueries() override {
+        return true;
+    }
+};
+
 TEST_F(DocumentSourceFacetTest, ShouldRejectConflictingHostTypeRequirementsWithinSinglePipeline) {
     auto ctx = getExpCtx();
-    ctx->inMongos = true;
+    ctx->inRouter = true;
+    ctx->mongoProcessInterface = std::make_unique<ExecutableStubMongoProcessInterface>();
 
     auto spec = fromjson(
         "{$facet: {badPipe: [{$_internalSplitPipeline: {mergeType: 'anyShard'}}, "
@@ -201,7 +223,8 @@ TEST_F(DocumentSourceFacetTest, ShouldRejectConflictingHostTypeRequirementsWithi
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectConflictingHostTypeRequirementsAcrossPipelines) {
     auto ctx = getExpCtx();
-    ctx->inMongos = true;
+    ctx->inRouter = true;
+    ctx->mongoProcessInterface = std::make_unique<ExecutableStubMongoProcessInterface>();
 
     auto spec = fromjson(
         "{$facet: {shardPipe: [{$_internalSplitPipeline: {mergeType: 'anyShard'}}], mongosPipe: "
@@ -761,52 +784,60 @@ TEST_F(DocumentSourceFacetTest, ShouldThrowIfAnyPipelineRequiresTextScoreButItIs
 }
 
 /**
- * A dummy DocumentSource which needs to run on the primary shard.
+ * A dummy DocumentSource which needs to be run on a specific shard as a merger.
  */
-class DocumentSourceNeedsPrimaryShard final : public DocumentSourcePassthrough {
+class DocumentSourceNeedsSpecificShardMerger final : public DocumentSourcePassthrough {
 public:
-    DocumentSourceNeedsPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    static const ShardId kMergeShard;
+    DocumentSourceNeedsSpecificShardMerger(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSourcePassthrough(expCtx) {}
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kPrimaryShard,
-                DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed,
-                UnionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.mergeShardId = kMergeShard;
+        return constraints;
     }
 
-    static boost::intrusive_ptr<DocumentSourceNeedsPrimaryShard> create(
+    static boost::intrusive_ptr<DocumentSourceNeedsSpecificShardMerger> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-        return new DocumentSourceNeedsPrimaryShard(expCtx);
+        return new DocumentSourceNeedsSpecificShardMerger(expCtx);
     }
 };
+const ShardId DocumentSourceNeedsSpecificShardMerger::kMergeShard = ShardId("merge_shard_name");
 
-TEST_F(DocumentSourceFacetTest, ShouldRequirePrimaryShardIfAnyStageRequiresPrimaryShard) {
+TEST_F(DocumentSourceFacetTest, ShouldRequirePrimaryShardIfAnyStageRequiresSpecificShardMerger) {
     auto ctx = getExpCtx();
 
     auto passthrough = DocumentSourcePassthrough::create(ctx);
     auto firstPipeline = Pipeline::create({passthrough}, ctx);
 
-    auto needsPrimaryShard = DocumentSourceNeedsPrimaryShard::create(ctx);
-    auto secondPipeline = Pipeline::create({needsPrimaryShard}, ctx);
+    auto needsSpecificShardMerger = DocumentSourceNeedsSpecificShardMerger::create(ctx);
+    auto secondPipeline = Pipeline::create({needsSpecificShardMerger}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("passthrough", std::move(firstPipeline));
-    facets.emplace_back("needsPrimaryShard", std::move(secondPipeline));
+    facets.emplace_back("needsSpecificShardMerger", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).hostRequirement ==
-           StageConstraints::HostTypeRequirement::kPrimaryShard);
+           StageConstraints::HostTypeRequirement::kNone);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
            StageConstraints::DiskUseRequirement::kNoDiskUse);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
            StageConstraints::TransactionRequirement::kAllowed);
+    auto msi = facetStage->constraints(Pipeline::SplitState::kUnsplit).mergeShardId;
+    ASSERT(msi.has_value());
+    ASSERT(*msi == DocumentSourceNeedsSpecificShardMerger::kMergeShard);
 }
 
-TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPrimaryShard) {
+TEST_F(DocumentSourceFacetTest,
+       ShouldNotRequireSpecificShardMergerIfNoStagesRequiresSpecificShardMerger) {
     auto ctx = getExpCtx();
 
     auto firstPassthrough = DocumentSourcePassthrough::create(ctx);
@@ -826,32 +857,41 @@ TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPr
            StageConstraints::DiskUseRequirement::kNoDiskUse);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
            StageConstraints::TransactionRequirement::kAllowed);
+    ASSERT_FALSE(facetStage->constraints(Pipeline::SplitState::kUnsplit).mergeShardId.has_value());
 }
 
 /**
- * A dummy DocumentSource that must run on the primary shard, can write temporary data and can't be
- * used in a transaction.
+ * A dummy DocumentSource that must run on a specific shard as a merger, can write temporary data
+ * and can't be used in a transaction.
  */
-class DocumentSourcePrimaryShardTmpDataNoTxn final : public DocumentSourcePassthrough {
+class DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn final : public DocumentSourcePassthrough {
 public:
-    DocumentSourcePrimaryShardTmpDataNoTxn(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    static const ShardId kMergeShard;
+
+    DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSourcePassthrough(expCtx) {}
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kPrimaryShard,
-                DiskUseRequirement::kWritesTmpData,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kNotAllowed,
-                LookupRequirement::kAllowed,
-                UnionRequirement::kAllowed};
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kWritesTmpData,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.mergeShardId = kMergeShard;
+        return constraints;
     }
 
-    static boost::intrusive_ptr<DocumentSourcePrimaryShardTmpDataNoTxn> create(
+    static boost::intrusive_ptr<DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-        return new DocumentSourcePrimaryShardTmpDataNoTxn(expCtx);
+        return new DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn(expCtx);
     }
 };
+
+const ShardId DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn::kMergeShard =
+    ShardId("merge_shard_name_no_txn");
 
 /**
  * A DocumentSource which cannot be used in a $lookup pipeline.
@@ -883,7 +923,7 @@ TEST_F(DocumentSourceFacetTest, ShouldSurfaceStrictestRequirementsOfEachConstrai
     auto firstPassthrough = DocumentSourcePassthrough::create(ctx);
     auto firstPipeline = Pipeline::create({firstPassthrough}, ctx);
 
-    auto secondPassthrough = DocumentSourcePrimaryShardTmpDataNoTxn::create(ctx);
+    auto secondPassthrough = DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn::create(ctx);
     auto secondPipeline = Pipeline::create({secondPassthrough}, ctx);
 
     auto thirdPassthrough = DocumentSourceBannedInLookup::create(ctx);
@@ -896,13 +936,176 @@ TEST_F(DocumentSourceFacetTest, ShouldSurfaceStrictestRequirementsOfEachConstrai
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).hostRequirement ==
-           StageConstraints::HostTypeRequirement::kPrimaryShard);
+           StageConstraints::HostTypeRequirement::kAnyShard);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
            StageConstraints::DiskUseRequirement::kWritesTmpData);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
            StageConstraints::TransactionRequirement::kNotAllowed);
     ASSERT_FALSE(
         facetStage->constraints(Pipeline::SplitState::kUnsplit).isAllowedInLookupPipeline());
+    auto msi = facetStage->constraints(Pipeline::SplitState::kUnsplit).mergeShardId;
+    ASSERT(msi.has_value());
+    ASSERT(*msi == DocumentSourceNeedsSpecificShardMergerTmpDataNoTxn::kMergeShard);
+}
+
+TEST_F(DocumentSourceFacetTest, RedactsCorrectly) {
+    auto spec = fromjson(R"({
+        $facet: {
+            a: [
+                { $unwind: "$foo" },
+                { $sortByCount: "$foo" }
+            ],
+            b: [
+                {
+                    $match: {
+                        bar: { $exists: 1 }
+                    }
+                },
+                {
+                    $bucket: {
+                        groupBy: "$bar.foo",
+                        boundaries: [0, 50, 100, 200],
+                        output: {
+                            z: { $sum : 1 }
+                        }
+                    }
+                }
+            ],
+            c: [
+                {
+                    $bucketAuto: {
+                        groupBy: "$bar.baz",
+                        buckets: 4
+                    }
+                }
+            ]
+        }
+    })");
+    auto docSource = DocumentSourceFacet::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$facet": {
+                "HASH<a>": [
+                    {
+                        "$unwind": {
+                            "path": "$HASH<foo>"
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$HASH<foo>",
+                            "HASH<count>": {
+                                "$sum": "?number"
+                            }
+                        }
+                    },
+                    {
+                        "$sort": {
+                            "HASH<count>": -1
+                        }
+                    }
+                ],
+                "HASH<b>": [
+                    {
+                        "$match": {
+                            "HASH<bar>": {
+                                "$exists": "?bool"
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": {
+                                "$switch": {
+                                    "branches": [
+                                        {
+                                            "case": {
+                                                "$and": [
+                                                    {
+                                                        "$gte": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    },
+                                                    {
+                                                        "$lt": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    }
+                                                ]
+                                            },
+                                            "then": "?number"
+                                        },
+                                        {
+                                            "case": {
+                                                "$and": [
+                                                    {
+                                                        "$gte": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    },
+                                                    {
+                                                        "$lt": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    }
+                                                ]
+                                            },
+                                            "then": "?number"
+                                        },
+                                        {
+                                            "case": {
+                                                "$and": [
+                                                    {
+                                                        "$gte": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    },
+                                                    {
+                                                        "$lt": [
+                                                            "$HASH<bar>.HASH<foo>",
+                                                            "?number"
+                                                        ]
+                                                    }
+                                                ]
+                                            },
+                                            "then": "?number"
+                                        }
+                                    ]
+                                }
+                            },
+                            "HASH<z>": {
+                                "$sum": "?number"
+                            }
+                        }
+                    },
+                    {
+                        "$sort": {
+                            "HASH<_id>": 1
+                        }
+                    }
+                ],
+                "HASH<c>": [
+                    {
+                        "$bucketAuto": {
+                            "groupBy": "$HASH<bar>.HASH<baz>",
+                            "buckets": "?number",
+                            "output": {
+                                "HASH<count>": {
+                                    "$sum": "?number"
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*docSource));
 }
 }  // namespace
 }  // namespace mongo

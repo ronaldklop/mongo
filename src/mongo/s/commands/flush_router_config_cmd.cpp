@@ -27,14 +27,33 @@
  *    it in the license file.
  */
 
+
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/routing_information_cache.h"
+#include "mongo/util/assert_util.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/commands.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/is_mongos.h"
 
 namespace mongo {
 namespace {
@@ -65,16 +84,21 @@ public:
                "{flushRouterconfig: 'db.coll'} flushes only the given collection";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::flushRouterConfig);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()),
+                ActionType::flushRouterConfig)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto const grid = Grid::get(opCtx);
@@ -90,27 +114,53 @@ public:
             catalogCache->purgeAllDatabases();
         } else {
             const auto ns = argumentElem.checkAndGetStringData();
-            if (nsIsDbOnly(ns)) {
+            const auto nss = NamespaceStringUtil::deserialize(
+                boost::none, ns, SerializationContext::stateCommandRequest());
+            if (nss.isDbOnly()) {
                 LOGV2(22762,
-                      "Routing metadata flushed for database {db}",
                       "Routing metadata flushed for database",
-                      "db"_attr = ns);
-                catalogCache->purgeDatabase(ns);
+                      "db"_attr = toStringForLogging(nss));
+                catalogCache->purgeDatabase(nss.dbName());
             } else {
-                const NamespaceString nss(ns);
-                LOGV2(22763,
-                      "Routing metadata flushed for collection {namespace}",
-                      "Routing metadata flushed for collection",
-                      "namespace"_attr = nss);
+                LOGV2(22763, "Routing metadata flushed for collection", logAttrs(nss));
                 catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+                LOGV2(7343300, "Index information flushed for collection", logAttrs(nss));
+                catalogCache->invalidateIndexEntry_LINEARIZABLE(nss);
+            }
+        }
+
+        // TODO SERVER-84243 Remove / adapt the block below.
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+            auto const routingInfoCache = RoutingInformationCache::get(opCtx);
+
+            if (argumentElem.isNumber() || argumentElem.isBoolean()) {
+                LOGV2(8778001, "CSRS routing info cache flushed for all databases");
+                routingInfoCache->purgeAllDatabases();
+            } else {
+                const auto ns = argumentElem.checkAndGetStringData();
+                const auto nss = NamespaceStringUtil::deserialize(
+                    boost::none, ns, SerializationContext::stateCommandRequest());
+                if (nss.isDbOnly()) {
+                    LOGV2(8778002,
+                          "CSRS routing info cache flushed for database",
+                          "db"_attr = toStringForLogging(nss));
+                    routingInfoCache->purgeDatabase(nss.dbName());
+                } else {
+                    LOGV2(8778003, "CSRS routing info cache flushed for collection", logAttrs(nss));
+                    routingInfoCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+                    LOGV2(8778004,
+                          "Index information within CSRS routing info cache flushed for collection",
+                          logAttrs(nss));
+                    routingInfoCache->invalidateIndexEntry_LINEARIZABLE(nss);
+                }
             }
         }
 
         result.appendBool("flushed", true);
         return true;
     }
-
-} flushRouterConfigCmd;
+};
+MONGO_REGISTER_COMMAND(FlushRouterConfigCmd).forRouter().forShard();
 
 }  // namespace
 }  // namespace mongo

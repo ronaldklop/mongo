@@ -37,17 +37,30 @@
 
 #include <algorithm>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+#include <strings.h>
+#endif
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/bits.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/ctype.h"
+#include "mongo/util/str_basic.h"  // IWYU pragma: export
 
-namespace mongo::str {
+namespace mongo {
+namespace str {
 
 /** the idea here is to make one liners easy.  e.g.:
 
@@ -394,10 +407,6 @@ private:
     bool _lexOnly;
 };
 
-// TODO: Sane-ify core std::string functionality
-// For now, this needs to be near the LexNumCmp or else
-int versionCmp(StringData rhs, StringData lhs);
-
 /**
  * A method to escape whitespace and control characters in strings. For example, the string "\t"
  * goes to "\\t". If `escape_slash` is true, then "/" goes to "\\/".
@@ -417,4 +426,29 @@ boost::optional<size_t> parseUnsignedBase10Integer(StringData integer);
  */
 std::string convertDoubleToString(double d, int prec = 17);
 
-}  // namespace mongo::str
+}  // namespace str
+
+inline namespace literals {
+/**
+ * In C++20, the "u8" prefix yields a new type, char8_t. However, many of our
+ * interfaces really want to deal in plain char*. Since the u8 is about the encoding
+ * not the type, provide a widget that converts the type back to a const char*. So when
+ * you say:
+ *
+ *     const auto testString = u8"..."_as_char_ptr;
+ *
+ * You get back a vanilla const char* but to something with a known
+ * encoding. In C++17 mode, there is nothing to do.
+ */
+#if defined(__cpp_char8_t) && (__cpp_char8_t >= 201811L)
+inline auto operator"" _as_char_ptr(const char8_t* p, std::size_t s) {
+    return static_cast<const char*>(static_cast<const void*>(p));
+}
+#else
+inline auto operator"" _as_char_ptr(const char* p, std::size_t s) {
+    return p;
+}
+#endif
+}  // namespace literals
+
+}  // namespace mongo

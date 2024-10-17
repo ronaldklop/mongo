@@ -3,8 +3,7 @@
  * collections.
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(st, badViewDefinition) {
     const mongos = st.s;
@@ -12,8 +11,8 @@ function runTest(st, badViewDefinition) {
     const db = mongos.getDB("invalid_system_views");
     assert.commandWorked(db.dropDatabase());
 
-    assert.commandWorked(config.adminCommand({enableSharding: db.getName()}));
-    st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
+    assert.commandWorked(
+        config.adminCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
 
     // Create sharded and unsharded collections, then insert an invalid view into system.views.
     const viewsCollection = db.getCollection("coll");
@@ -135,4 +134,3 @@ runTest(st, {_id: "invalidNotFullyQualifiedNs", viewOn: "coll", pipeline: []});
 runTest(st, {_id: "invalid_system_views.missingViewOnField", pipeline: []});
 
 st.stop();
-}());

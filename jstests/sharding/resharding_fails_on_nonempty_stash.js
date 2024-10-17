@@ -3,17 +3,10 @@
  * recipient.
  *
  * @tags: [
- *   requires_fcv_49,
- *   uses_atclustertime,
+ *   uses_atclustertime
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
-load("jstests/sharding/libs/resharding_test_util.js");
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest({numDonors: 2, numRecipients: 2});
 reshardingTest.setup();
@@ -29,8 +22,6 @@ const inputCollection = reshardingTest.createShardedCollection({
 });
 
 const recipientShardNames = reshardingTest.recipientShardNames;
-const topology = DiscoverTopology.findConnectedNodes(inputCollection.getMongo());
-const recipient1Conn = new Mongo(topology.shards[recipientShardNames[1]].primary);
 
 reshardingTest.withReshardingInBackground(
     {
@@ -46,7 +37,7 @@ reshardingTest.withReshardingInBackground(
             const coordinatorDoc = mongos.getCollection("config.reshardingOperations").findOne({
                 ns: inputCollection.getFullName()
             });
-            return coordinatorDoc !== null && coordinatorDoc.fetchTimestamp !== undefined;
+            return coordinatorDoc !== null && coordinatorDoc.cloneTimestamp !== undefined;
         });
 
         // The following documents violate the global _id uniqueness assumption of sharded
@@ -60,11 +51,6 @@ reshardingTest.withReshardingInBackground(
     },
     {
         expectedErrorCode: 5356800,
-        postDecisionPersistedFn: () => {
-            ReshardingTestUtil.assertRecipientAbortsLocally(
-                recipient1Conn, recipient1Conn.shardName, "reshardingDb.coll", 5356800);
-        }
     });
 
 reshardingTest.teardown();
-})();

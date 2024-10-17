@@ -4,8 +4,11 @@
  *
  * @tags: [requires_sharding, uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const collName = "restart_transactions";
 
@@ -14,6 +17,9 @@ function runTest(routerDB, directDB) {
     const routerColl = routerDB[collName];
     assert.commandWorked(
         routerDB.createCollection(routerColl.getName(), {writeConcern: {w: "majority"}}));
+
+    // Read from the mongoS to ensure the shard has refreshed its filtering information.
+    assert.eq(0, routerDB.getCollection(collName).countDocuments({}));
 
     //
     // Can restart a transaction that has been aborted.
@@ -148,7 +154,7 @@ function runTest(routerDB, directDB) {
                                  50911);
 }
 
-const st = new ShardingTest({shards: 1, mongos: 1, config: 1});
+const st = new ShardingTest({shards: 1, mongos: 1});
 
 // Directly connect to the shard primary to simulate internal retries by mongos.
 const shardDBName = "test";
@@ -165,4 +171,3 @@ const configDB = configSession.getDatabase(configDBName);
 runTest(st.s.getDB(configDBName), configDB);
 
 st.stop();
-})();

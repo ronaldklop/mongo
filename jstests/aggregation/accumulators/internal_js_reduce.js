@@ -1,9 +1,10 @@
 // Tests basic functionality of the $_internalJsReduce accumulator, which provides capability for
 // the reduce stage of MapReduce.
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');
+//
+// @tags: [
+//   requires_scripting,
+// ]
+import {resultsEq} from "jstests/aggregation/extras/utils.js";
 
 db.js_reduce.drop();
 
@@ -113,4 +114,3 @@ groupPipe[0].$group.wordCount.$_internalJsReduce.data = {
     value: 1
 };
 assert.commandFailedWithCode(db.runCommand(command), 31251);
-})();

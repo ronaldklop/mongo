@@ -27,298 +27,53 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
+#include <memory>
+#include <vector>
 
-#include "mongo/db/matcher/expression_parser.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_bm_fixture.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
-void testExpression(BSONObj expressionSpec, benchmark::State& state) {
-    QueryTestServiceContext testServiceContext;
-    auto opContext = testServiceContext.makeOperationContext();
-    NamespaceString nss("test.bm");
-    boost::intrusive_ptr<ExpressionContextForTest> exprContext =
-        new ExpressionContextForTest(opContext.get(), nss);
 
-    // Build an expression.
-    auto expression = Expression::parseExpression(
-        exprContext.get(), expressionSpec, exprContext->variablesParseState);
+class ClassicExpressionBenchmarkFixture : public ExpressionBenchmarkFixture {
+    void benchmarkExpression(BSONObj expressionSpec,
+                             benchmark::State& state,
+                             const std::vector<Document>& documents) final {
+        QueryTestServiceContext testServiceContext;
+        auto opContext = testServiceContext.makeOperationContext();
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.bm");
+        auto exprContext = make_intrusive<ExpressionContextForTest>(opContext.get(), nss);
 
-    // Prepare parameters for the 'evaluate()' call.
-    auto variables = &(exprContext->variables);
-    Document document;
+        // Build an expression.
+        auto expression = Expression::parseExpression(
+            exprContext.get(), expressionSpec, exprContext->variablesParseState);
 
-    // Run the test.
-    for (auto keepRunning : state) {
-        benchmark::DoNotOptimize(expression->evaluate(document, variables));
-        benchmark::ClobberMemory();
+        expression = expression->optimize();
+
+        // Prepare parameters for the 'evaluate()' call.
+        auto variables = &(exprContext->variables);
+
+        // Run the test.
+        for (auto keepRunning : state) {
+            for (const auto& document : documents) {
+                benchmark::DoNotOptimize(expression->evaluate(document, variables));
+            }
+            benchmark::ClobberMemory();
+        }
     }
-}
+};
 
-/**
- * Tests performance of 'evaluate()' of $dateDiff expression.
- *
- * startDate - start date in milliseconds from the UNIX epoch.
- * endDate - end date in milliseconds from the UNIX epoch.
- * unit - a string expression of units to use for date difference calculation.
- * timezone - a string representation of timezone to use for date difference calculation.
- * startOfWeek - a string representation of the first day of the week to use for date difference
- * calculation when unit is a week.
- * state - benchmarking state.
- */
-void testDateDiffExpression(long long startDate,
-                            long long endDate,
-                            std::string unit,
-                            boost::optional<std::string> timezone,
-                            boost::optional<std::string> startOfWeek,
-                            benchmark::State& state) {
-    // Build a $dateDiff expression.
-    BSONObjBuilder objBuilder;
-    objBuilder << "startDate" << Date_t::fromMillisSinceEpoch(startDate) << "endDate"
-               << Date_t::fromMillisSinceEpoch(endDate) << "unit" << unit;
-    if (timezone) {
-        objBuilder << "timezone" << *timezone;
-    }
-    if (startOfWeek) {
-        objBuilder << "startOfWeek" << *startOfWeek;
-    }
-    testExpression(BSON("$dateDiff" << objBuilder.obj()), state);
-}
+BENCHMARK_EXPRESSIONS(ClassicExpressionBenchmarkFixture)
 
-void BM_DateDiffEvaluateMinute300Years(benchmark::State& state) {
-    testDateDiffExpression(-1640989478000LL /* 1918-01-01*/,
-                           7826117722000LL /* 2218-01-01*/,
-                           "minute",
-                           boost::none /*timezone*/,
-                           boost::none /*startOfWeek*/,
-                           state);
-}
-
-void BM_DateDiffEvaluateMinute2Years(benchmark::State& state) {
-    testDateDiffExpression(1542448721000LL /* 2018-11-17*/,
-                           1605607121000LL /* 2020-11-17*/,
-                           "minute",
-                           boost::none /*timezone*/,
-                           boost::none /*startOfWeek*/,
-                           state);
-}
-
-void BM_DateDiffEvaluateMinute2YearsWithTimezone(benchmark::State& state) {
-    testDateDiffExpression(1542448721000LL /* 2018-11-17*/,
-                           1605607121000LL /* 2020-11-17*/,
-                           "minute",
-                           std::string{"America/New_York"},
-                           boost::none /*startOfWeek*/,
-                           state);
-}
-
-void BM_DateDiffEvaluateWeek(benchmark::State& state) {
-    testDateDiffExpression(7826117722000LL /* 2218-01-01*/,
-                           4761280721000LL /*2120-11-17*/,
-                           "week",
-                           boost::none /*timezone*/,
-                           std::string("Sunday") /*startOfWeek*/,
-                           state);
-}
-
-BENCHMARK(BM_DateDiffEvaluateMinute300Years);
-BENCHMARK(BM_DateDiffEvaluateMinute2Years);
-BENCHMARK(BM_DateDiffEvaluateMinute2YearsWithTimezone);
-BENCHMARK(BM_DateDiffEvaluateWeek);
-
-/**
- * Tests performance of evaluate() method of $dateAdd
- */
-void testDateAddExpression(long long startDate,
-                           std::string unit,
-                           long long amount,
-                           boost::optional<std::string> timezone,
-                           benchmark::State& state) {
-    BSONObjBuilder objBuilder;
-    objBuilder << "startDate" << Date_t::fromMillisSinceEpoch(startDate) << "unit" << unit
-               << "amount" << amount;
-    if (timezone) {
-        objBuilder << "timezone" << *timezone;
-    }
-    testExpression(BSON("$dateAdd" << objBuilder.obj()), state);
-}
-
-void BM_DateAddEvaluate10Days(benchmark::State& state) {
-    testDateAddExpression(1604131115000LL,
-                          "day",
-                          10LL,
-                          boost::none, /* timezone */
-                          state);
-}
-
-void BM_DateAddEvaluate100KSeconds(benchmark::State& state) {
-    testDateAddExpression(1604131115000LL,
-                          "second",
-                          100000LL,
-                          boost::none, /* timezone */
-                          state);
-}
-
-void BM_DateAddEvaluate100Years(benchmark::State& state) {
-    testDateAddExpression(1604131115000LL,
-                          "year",
-                          100LL,
-                          boost::none, /* timezone */
-                          state);
-}
-
-void BM_DateAddEvaluate12HoursWithTimezone(benchmark::State& state) {
-    testDateAddExpression(1604131115000LL, "hour", 12LL, std::string{"America/New_York"}, state);
-}
-
-BENCHMARK(BM_DateAddEvaluate10Days);
-BENCHMARK(BM_DateAddEvaluate100KSeconds);
-BENCHMARK(BM_DateAddEvaluate100Years);
-BENCHMARK(BM_DateAddEvaluate12HoursWithTimezone);
-
-/**
- * Tests performance of 'evaluate()' of $dateTrunc expression.
- *
- * date - start date in milliseconds from the UNIX epoch.
- * unit - a string expression of units to use for date difference calculation.
- * timezone - a string representation of timezone to use for date difference calculation.
- * startOfWeek - a string representation of the first day of the week to use for date difference
- * calculation when unit is a week.
- * state - benchmarking state.
- */
-void testDateTruncExpression(long long date,
-                             std::string unit,
-                             unsigned long binSize,
-                             boost::optional<std::string> timezone,
-                             boost::optional<std::string> startOfWeek,
-                             benchmark::State& state) {
-    // Build a $dateTrunc expression.
-    BSONObjBuilder objBuilder;
-    objBuilder << "date" << Date_t::fromMillisSinceEpoch(date) << "unit" << unit << "binSize"
-               << static_cast<long long>(binSize);
-    if (timezone) {
-        objBuilder << "timezone" << *timezone;
-    }
-    if (startOfWeek) {
-        objBuilder << "startOfWeek" << *startOfWeek;
-    }
-    testExpression(BSON("$dateTrunc" << objBuilder.obj()), state);
-}
-
-void BM_DateTruncEvaluateMinute15NewYork(benchmark::State& state) {
-    testDateTruncExpression(1615460825000LL /* year 2021*/,
-                            "minute",
-                            15,
-                            std::string{"America/New_York"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateMinute15UTC(benchmark::State& state) {
-    testDateTruncExpression(1615460825000LL /* year 2021*/,
-                            "minute",
-                            15,
-                            boost::none,
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateHour1UTCMinus0700(benchmark::State& state) {
-    testDateTruncExpression(1615460825000LL /* year 2021*/,
-                            "hour",
-                            1,
-                            std::string{"-07:00"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateWeek2NewYorkValue2100(benchmark::State& state) {
-    testDateTruncExpression(4108446425000LL /* year 2100*/,
-                            "week",
-                            2,
-                            std::string{"America/New_York"},
-                            std::string{"monday"} /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateWeek2UTCValue2100(benchmark::State& state) {
-    testDateTruncExpression(4108446425000LL /* year 2100*/,
-                            "week",
-                            2,
-                            std::string{"UTC"},
-                            std::string{"monday"} /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateMonth6NewYorkValue2100(benchmark::State& state) {
-    testDateTruncExpression(4108446425000LL /* year 2100*/,
-                            "month",
-                            6,
-                            std::string{"America/New_York"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateMonth6NewYorkValue2030(benchmark::State& state) {
-    testDateTruncExpression(1893466800000LL /* year 2030*/,
-                            "month",
-                            6,
-                            std::string{"America/New_York"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateMonth6UTCValue2030(benchmark::State& state) {
-    testDateTruncExpression(1893466800000LL /* year 2030*/,
-                            "month",
-                            8,
-                            boost::none,
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateYear1NewYorkValue2020(benchmark::State& state) {
-    testDateTruncExpression(1583924825000LL /* year 2020*/,
-                            "year",
-                            1,
-                            std::string{"America/New_York"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateYear1UTCValue2020(benchmark::State& state) {
-    testDateTruncExpression(1583924825000LL /* year 2020*/,
-                            "year",
-                            1,
-                            boost::none,
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-void BM_DateTruncEvaluateYear1NewYorkValue2100(benchmark::State& state) {
-    testDateTruncExpression(4108446425000LL /* year 2100*/,
-                            "year",
-                            1,
-                            std::string{"America/New_York"},
-                            boost::none /* startOfWeek */,
-                            state);
-}
-
-BENCHMARK(BM_DateTruncEvaluateMinute15NewYork);
-BENCHMARK(BM_DateTruncEvaluateMinute15UTC);
-BENCHMARK(BM_DateTruncEvaluateHour1UTCMinus0700);
-BENCHMARK(BM_DateTruncEvaluateWeek2NewYorkValue2100);
-BENCHMARK(BM_DateTruncEvaluateWeek2UTCValue2100);
-BENCHMARK(BM_DateTruncEvaluateMonth6NewYorkValue2100);
-BENCHMARK(BM_DateTruncEvaluateMonth6NewYorkValue2030);
-BENCHMARK(BM_DateTruncEvaluateMonth6UTCValue2030);
-BENCHMARK(BM_DateTruncEvaluateYear1NewYorkValue2020);
-BENCHMARK(BM_DateTruncEvaluateYear1UTCValue2020);
-BENCHMARK(BM_DateTruncEvaluateYear1NewYorkValue2100);
 }  // namespace
 }  // namespace mongo

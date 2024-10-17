@@ -29,8 +29,13 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/util/cancellation.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
@@ -78,7 +83,7 @@ public:
 
     /*
      * This is the preferred way to get a CancelableExecutor, since the ExecutorFuture interface
-     * expects shared_ptrs to executors it recieves in its constructor or .thenRunOn.
+     * expects shared_ptrs to executors it receives in its constructor or .thenRunOn.
      */
     static std::shared_ptr<CancelableExecutor> make(ExecutorPtr exec, CancellationToken token) {
         return std::make_shared<CancelableExecutor>(std::move(exec), std::move(token));

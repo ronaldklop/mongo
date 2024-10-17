@@ -29,16 +29,22 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
+#include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "mongo/client/connection_string.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -95,8 +101,7 @@ public:
 private:
     void _addListener(std::shared_ptr<Listener> listener);
 
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ReplicaSetChangeNotifier::_mutex");
+    stdx::mutex _mutex;
     std::vector<std::weak_ptr<Listener>> _listeners;
     stdx::unordered_map<Key, State> _replicaSetStates;
 };

@@ -27,18 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
+#include <list>
+#include <ostream>
 
-#include <boost/optional.hpp>
-#include <functional>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/future.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/invalidating_lru_cache.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -528,7 +535,7 @@ TEST(InvalidatingLRUCacheParallelTest, CacheSizeZeroInsertOrAssignAndGet) {
 
 TEST(InvalidatingLRUCacheParallelTest, AdvanceTime) {
     AtomicWord<uint64_t> counter{1};
-    Mutex insertOrAssignMutex = MONGO_MAKE_LATCH("ReadThroughCacheBase::_cancelTokenMutex");
+    stdx::mutex insertOrAssignMutex;
 
     parallelTest<TestValueCacheCausallyConsistent>(0, [&](auto& cache) {
         const int key = 300;

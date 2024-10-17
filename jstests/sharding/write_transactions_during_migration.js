@@ -3,8 +3,6 @@
  * new writes are being sent to the source shard.
  */
 
-load('./jstests/libs/chunk_manipulation_util.js');
-
 /**
  * Test outline:
  * 1. Pause migration.
@@ -12,21 +10,20 @@ load('./jstests/libs/chunk_manipulation_util.js');
  * 3. Unpause migration.
  * 4. Retry writes and confirm that writes are not duplicated.
  */
-(function() {
-"use strict";
 
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
 
 var st = new ShardingTest({shards: {rs0: {nodes: 1}, rs1: {nodes: 1}}});
-st.adminCommand({enableSharding: 'test'});
-st.ensurePrimaryShard('test', st.shard0.shardName);
+st.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName});
 st.adminCommand({shardCollection: 'test.user', key: {x: 1}});
 assert.commandWorked(st.s.adminCommand({split: 'test.user', middle: {x: 0}}));
 
@@ -167,4 +164,3 @@ assert.eq(1, testDB.user.findOne({x: -30}).y);
 st.stop();
 
 MongoRunner.stopMongod(staticMongod);
-})();

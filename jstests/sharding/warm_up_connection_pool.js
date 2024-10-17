@@ -1,17 +1,21 @@
 /**
  * @tags: [
  *   multiversion_incompatible,
+ *   # This test requires restarting mongos alone to test the warm-up of the connection pool. The
+ *   # embedded router seems to have a different behavior, breaking the test.
+ *   # TODO (SERVER-88486): investigate a way to adapt this tests for embedded router, if needed.
+ *   embedded_router_incompatible,
  * ]
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // Checking UUID and index consistency involves talking to a shard node, which in this
 // test is shutdown.
-TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
 
 function runTest(setParams, connPoolStatsCheck, extraOptions) {
     const test = new ShardingTest({shards: 2, mongosOptions: setParams});
@@ -73,7 +77,11 @@ var warmUpDisabledConnPoolStatsCheck = function(connPoolStats, currentShard) {
     return undefined === connPoolStats["hosts"][currentShard];
 };
 
-runTest(warmUpDisabledParams, warmUpDisabledConnPoolStatsCheck);
+if (!TestData.configShard) {
+    // In config shard mode we have RSM entries for the config shard without warming up its conn
+    // pool.
+    runTest(warmUpDisabledParams, warmUpDisabledConnPoolStatsCheck);
+}
 
 jsTest.log("Tests establishes more connections when parameter is set.");
 // Increase the amount of time to establish more connections to avoid timing out
@@ -116,5 +124,8 @@ var shutdownNodeExtraOptions = function(test) {
     return {connString: nodeList[pId], nodeId: pId};
 };
 
-runTest(shutdownNodeParams, shutdownNodeConnPoolStatsCheck, shutdownNodeExtraOptions);
-})();
+if (!TestData.configShard) {
+    // In config shard mode this shuts down the config server, which prevents mongos from starting
+    // up.
+    runTest(shutdownNodeParams, shutdownNodeConnPoolStatsCheck, shutdownNodeExtraOptions);
+}

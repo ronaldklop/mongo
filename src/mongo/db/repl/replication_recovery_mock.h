@@ -42,12 +42,20 @@ class ReplicationRecoveryMock : public ReplicationRecovery {
 public:
     ReplicationRecoveryMock() = default;
 
-    void recoverFromOplog(OperationContext* opCtx,
-                          boost::optional<Timestamp> stableTimestamp) override {}
+    boost::optional<Timestamp> recoverFromOplog(
+        OperationContext* opCtx, boost::optional<Timestamp> stableTimestamp) override {
+        return stableTimestamp;
+    }
 
-    void recoverFromOplogAsStandalone(OperationContext* opCtx) override {}
+    void recoverFromOplogAsStandalone(OperationContext* opCtx,
+                                      bool duringInitialSync = false) override {}
 
     void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override {}
+
+    void truncateOplogToTimestamp(OperationContext* opCtx,
+                                  Timestamp truncateAfterTimestamp) override {}
+
+    void applyOplogEntriesForRestore(OperationContext* opCtx, Timestamp stableTimestamp) override {}
 };
 
 }  // namespace repl

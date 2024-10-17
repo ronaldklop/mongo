@@ -27,32 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/db/pipeline/document_source_change_stream.h"
 
-#include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/db/bson/bson_helper.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/pipeline/change_stream_constants.h"
-#include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/db/pipeline/document_source_change_stream_close_cursor.h"
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/basic_types.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/pipeline/change_stream_filter_helpers.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream_add_post_image.h"
+#include "mongo/db/pipeline/document_source_change_stream_add_pre_image.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_invalidate.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_topology_change.h"
+#include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
+#include "mongo/db/pipeline/document_source_change_stream_handle_topology_change.h"
+#include "mongo/db/pipeline/document_source_change_stream_oplog_match.h"
 #include "mongo/db/pipeline/document_source_change_stream_transform.h"
-#include "mongo/db/pipeline/document_source_check_invalidate.h"
-#include "mongo/db/pipeline/document_source_check_resume_token.h"
-#include "mongo/db/pipeline/document_source_limit.h"
-#include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
-#include "mongo/db/pipeline/document_source_lookup_change_pre_image.h"
-#include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/resume_token.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/intrusive_counter.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -62,14 +72,16 @@ using std::list;
 using std::string;
 using std::vector;
 
-// The $changeStream stage is an alias for many stages, but we need to be able to serialize
-// and re-parse the pipeline. To make this work, the 'transformation' stage will serialize itself
-// with the original specification, and all other stages that are created during the alias expansion
-// will not serialize themselves.
+namespace {
+auto& changeStreamsShowExpandedEvents =
+    *MetricBuilder<Counter64>{"changeStreams.showExpandedEvents"};
+}
+
+// The $changeStream stage is an alias for many stages.
 REGISTER_DOCUMENT_SOURCE(changeStream,
                          DocumentSourceChangeStream::LiteParsed::parse,
                          DocumentSourceChangeStream::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kConditionally);
 
 constexpr StringData DocumentSourceChangeStream::kDocumentKeyField;
 constexpr StringData DocumentSourceChangeStream::kFullDocumentBeforeChangeField;
@@ -77,7 +89,9 @@ constexpr StringData DocumentSourceChangeStream::kFullDocumentField;
 constexpr StringData DocumentSourceChangeStream::kIdField;
 constexpr StringData DocumentSourceChangeStream::kNamespaceField;
 constexpr StringData DocumentSourceChangeStream::kUuidField;
+constexpr StringData DocumentSourceChangeStream::kReshardingUuidField;
 constexpr StringData DocumentSourceChangeStream::kUpdateDescriptionField;
+constexpr StringData DocumentSourceChangeStream::kRawUpdateDescriptionField;
 constexpr StringData DocumentSourceChangeStream::kOperationTypeField;
 constexpr StringData DocumentSourceChangeStream::kStageName;
 constexpr StringData DocumentSourceChangeStream::kClusterTimeField;
@@ -92,114 +106,32 @@ constexpr StringData DocumentSourceChangeStream::kDropCollectionOpType;
 constexpr StringData DocumentSourceChangeStream::kRenameCollectionOpType;
 constexpr StringData DocumentSourceChangeStream::kDropDatabaseOpType;
 constexpr StringData DocumentSourceChangeStream::kInvalidateOpType;
+constexpr StringData DocumentSourceChangeStream::kReshardBeginOpType;
+constexpr StringData DocumentSourceChangeStream::kReshardDoneCatchUpOpType;
 constexpr StringData DocumentSourceChangeStream::kNewShardDetectedOpType;
 
 constexpr StringData DocumentSourceChangeStream::kRegexAllCollections;
+constexpr StringData DocumentSourceChangeStream::kRegexAllCollectionsShowSystemEvents;
+
 constexpr StringData DocumentSourceChangeStream::kRegexAllDBs;
 constexpr StringData DocumentSourceChangeStream::kRegexCmdColl;
 
-namespace {
-
-static constexpr StringData kOplogMatchExplainName = "$_internalOplogMatch"_sd;
-}  // namespace
-
-intrusive_ptr<DocumentSourceOplogMatch> DocumentSourceOplogMatch::create(
-    BSONObj filter, const intrusive_ptr<ExpressionContext>& expCtx) {
-    return new DocumentSourceOplogMatch(std::move(filter), expCtx);
-}
-
-const char* DocumentSourceOplogMatch::getSourceName() const {
-    // This is used in error reporting, particularly if we find this stage in a position other
-    // than first, so report the name as $changeStream.
-    return DocumentSourceChangeStream::kStageName.rawData();
-}
-
-StageConstraints DocumentSourceOplogMatch::constraints(Pipeline::SplitState pipeState) const {
-    StageConstraints constraints(StreamType::kStreaming,
-                                 PositionRequirement::kFirst,
-                                 HostTypeRequirement::kAnyShard,
-                                 DiskUseRequirement::kNoDiskUse,
-                                 FacetRequirement::kNotAllowed,
-                                 TransactionRequirement::kNotAllowed,
-                                 LookupRequirement::kNotAllowed,
-                                 UnionRequirement::kNotAllowed,
-                                 ChangeStreamRequirement::kChangeStreamStage);
-    constraints.isIndependentOfAnyCollection =
-        pExpCtx->ns.isCollectionlessAggregateNS() ? true : false;
-    return constraints;
-}
-
-/**
- * Only serialize this stage for explain purposes, otherwise keep it hidden so that we can
- * properly alias.
- */
-Value DocumentSourceOplogMatch::serialize(optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
-        return Value(Document{{kOplogMatchExplainName, Document{}}});
-    }
-    return Value();
-}
-
 void DocumentSourceChangeStream::checkValueType(const Value v,
-                                                const StringData filedName,
+                                                const StringData fieldName,
                                                 BSONType expectedType) {
     uassert(40532,
-            str::stream() << "Entry field \"" << filedName << "\" should be "
+            str::stream() << "Entry field \"" << fieldName << "\" should be "
                           << typeName(expectedType) << ", found: " << typeName(v.getType()),
             (v.getType() == expectedType));
 }
 
-//
-// Helpers for building the oplog filter.
-//
-namespace {
-
-/**
- * Constructs a filter matching any 'applyOps' commands that commit a transaction. An 'applyOps'
- * command implicitly commits a transaction if _both_ of the following are true:
- * 1) it is not marked with the 'partialTxn' field, which would indicate that there are more entries
- *    to come in the transaction and
- * 2) it is not marked with the 'prepare' field, which would indicate that the transaction is only
- *    committed if there is a follow-up 'commitTransaction' command in the oplog.
- *
- * This filter will ignore all but the last 'applyOps' command in a transaction comprising multiple
- * 'applyOps' commands, and it will ignore all 'applyOps' commands in a prepared transaction. The
- * change stream traverses back through the oplog to recover the ignored commands when it sees an
- * entry that commits a transaction.
- *
- * As an optimization, this filter also ignores any transaction with just a single 'applyOps' if
- * that 'applyOps' does not contain any updates that modify the namespace that the change stream is
- * watching.
- */
-BSONObj getTxnApplyOpsFilter(BSONElement nsMatch, const NamespaceString& nss) {
-    BSONObjBuilder applyOpsBuilder;
-    applyOpsBuilder.append("op", "c");
-
-    // "o.applyOps" stores the list of operations, so it must be an array.
-    applyOpsBuilder.append("o.applyOps",
-                           BSON("$type"
-                                << "array"));
-    applyOpsBuilder.append("lsid", BSON("$exists" << true));
-    applyOpsBuilder.append("txnNumber", BSON("$exists" << true));
-    applyOpsBuilder.append("o.prepare", BSON("$not" << BSON("$eq" << true)));
-    applyOpsBuilder.append("o.partialTxn", BSON("$not" << BSON("$eq" << true)));
-    {
-        // Include this 'applyOps' if it has an operation with a matching namespace _or_ if it has a
-        // 'prevOpTime' link to another 'applyOps' command, indicating a multi-entry transaction.
-        BSONArrayBuilder orBuilder(applyOpsBuilder.subarrayStart("$or"));
-        {
-            {
-                BSONObjBuilder nsMatchBuilder(orBuilder.subobjStart());
-                nsMatchBuilder.appendAs(nsMatch, "o.applyOps.ns"_sd);
-            }
-            // The default repl::OpTime is the value used to indicate a null "prevOpTime" link.
-            orBuilder.append(BSON(repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName
-                                  << BSON("$ne" << repl::OpTime().toBSON())));
-        }
+void DocumentSourceChangeStream::checkValueTypeOrMissing(const Value v,
+                                                         const StringData fieldName,
+                                                         BSONType expectedType) {
+    if (!v.missing()) {
+        checkValueType(v, fieldName, expectedType);
     }
-    return applyOpsBuilder.obj();
 }
-}  // namespace
 
 DocumentSourceChangeStream::ChangeStreamType DocumentSourceChangeStream::getChangeStreamType(
     const NamespaceString& nss) {
@@ -211,338 +143,264 @@ DocumentSourceChangeStream::ChangeStreamType DocumentSourceChangeStream::getChan
                                                      : ChangeStreamType::kSingleCollection));
 }
 
-std::string DocumentSourceChangeStream::getNsRegexForChangeStream(const NamespaceString& nss) {
-    auto regexEscape = [](const std::string& source) {
-        std::string result = "";
-        std::string escapes = "*+|()^?[]./\\$";
-        for (const char& c : source) {
-            if (escapes.find(c) != std::string::npos) {
-                result.append("\\");
-            }
-            result += c;
-        }
-        return result;
-    };
+StringData DocumentSourceChangeStream::resolveAllCollectionsRegex(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    // We never expect this method to be called except when building a change stream pipeline.
+    tassert(6189300,
+            "Expected change stream spec to be set on the expression context",
+            expCtx->changeStreamSpec);
+    // If 'showSystemEvents' is set, return a less stringent regex.
+    return (expCtx->changeStreamSpec->getShowSystemEvents()
+                ? DocumentSourceChangeStream::kRegexAllCollectionsShowSystemEvents
+                : DocumentSourceChangeStream::kRegexAllCollections);
+}
 
-    auto type = getChangeStreamType(nss);
+std::string DocumentSourceChangeStream::getNsRegexForChangeStream(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const auto type = getChangeStreamType(expCtx->ns);
+    const auto& nss = expCtx->ns;
     switch (type) {
         case ChangeStreamType::kSingleCollection:
             // Match the target namespace exactly.
-            return "^" + regexEscape(nss.ns()) + "$";
+            return "^" +
+                // Change streams will only be enabled in serverless when multitenancy and
+                // featureFlag are on, therefore we don't have a tenantid prefix.
+                regexEscapeNsForChangeStream(
+                       NamespaceStringUtil::serialize(nss, expCtx->serializationCtxt)) +
+                "$";
         case ChangeStreamType::kSingleDatabase:
             // Match all namespaces that start with db name, followed by ".", then NOT followed by
-            // '$' or 'system.'
-            return "^" + regexEscape(nss.db().toString()) + "\\." + kRegexAllCollections;
+            // '$' or 'system.' unless 'showSystemEvents' is set.
+            return "^" +
+                // Change streams will only be enabled in serverless when multitenancy and
+                // featureFlag are on, therefore we don't have a tenantid prefix.
+                regexEscapeNsForChangeStream(
+                       DatabaseNameUtil::serialize(nss.dbName(), expCtx->serializationCtxt)) +
+                "\\." + resolveAllCollectionsRegex(expCtx);
         case ChangeStreamType::kAllChangesForCluster:
             // Match all namespaces that start with any db name other than admin, config, or local,
-            // followed by ".", then NOT followed by '$' or 'system.'.
-            return kRegexAllDBs + "\\." + kRegexAllCollections;
+            // followed by ".", then NOT '$' or 'system.' unless 'showSystemEvents' is set.
+            return kRegexAllDBs + "\\." + resolveAllCollectionsRegex(expCtx);
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-BSONObj DocumentSourceChangeStream::buildMatchFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    Timestamp startFromInclusive,
-    bool showMigrationEvents) {
-    auto nss = expCtx->ns;
-
-    ChangeStreamType sourceType = getChangeStreamType(nss);
-
-    // 1) Supported commands that have the target db namespace (e.g. test.$cmd) in "ns" field.
-    BSONArrayBuilder relevantCommands;
-
-    if (sourceType == ChangeStreamType::kSingleCollection) {
-        relevantCommands.append(BSON("o.drop" << nss.coll()));
-        // Generate 'rename' entries if the change stream is open on the source or target namespace.
-        relevantCommands.append(BSON("o.renameCollection" << nss.ns()));
-        relevantCommands.append(BSON("o.to" << nss.ns()));
-    } else {
-        // For change streams on an entire database, include notifications for drops and renames of
-        // non-system collections which will not invalidate the stream. Also include the
-        // 'dropDatabase' command which will invalidate the stream.
-        relevantCommands.append(BSON("o.drop" << BSONRegEx("^" + kRegexAllCollections)));
-        relevantCommands.append(BSON("o.dropDatabase" << BSON("$exists" << true)));
-        relevantCommands.append(
-            BSON("o.renameCollection" << BSONRegEx(getNsRegexForChangeStream(nss))));
+std::string DocumentSourceChangeStream::getViewNsRegexForChangeStream(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const auto& nss = expCtx->ns;
+    switch (getChangeStreamType(nss)) {
+        case ChangeStreamType::kSingleDatabase:
+            // For a single database, match any events on the system.views collection on that
+            // database.
+            return "^" +
+                regexEscapeNsForChangeStream(
+                       DatabaseNameUtil::serialize(nss.dbName(), expCtx->serializationCtxt)) +
+                "\\.system.views$";
+        case ChangeStreamType::kAllChangesForCluster:
+            // Match all system.views collections on all databases.
+            return kRegexAllDBs + "\\.system.views$";
+        default:
+            // We should never attempt to generate this regex for a single-collection stream.
+            MONGO_UNREACHABLE_TASSERT(6394400);
     }
-
-    // For cluster-wide $changeStream, match the command namespace of any database other than admin,
-    // config, or local. Otherwise, match only against the target db's command namespace.
-    auto cmdNsFilter = (sourceType == ChangeStreamType::kAllChangesForCluster
-                            ? BSON("ns" << BSONRegEx(kRegexAllDBs + "\\." + kRegexCmdColl))
-                            : BSON("ns" << nss.getCommandNS().ns()));
-
-    // 1.1) Commands that are on target db(s) and one of the above supported commands.
-    auto commandsOnTargetDb =
-        BSON("$and" << BSON_ARRAY(cmdNsFilter << BSON("$or" << relevantCommands.arr())));
-
-    // 1.2) Supported commands that have arbitrary db namespaces in "ns" field.
-    auto renameDropTarget = BSON("o.to" << BSONRegEx(getNsRegexForChangeStream(nss)));
-
-    // 1.3) Transaction commit commands.
-    auto transactionCommit = BSON("o.commitTransaction" << 1);
-
-    // All supported commands that are either (1.1), (1.2) or (1.3).
-    BSONObj commandMatch = BSON("op"
-                                << "c"
-                                << OR(commandsOnTargetDb, renameDropTarget, transactionCommit));
-
-    // 2) Supported operations on the operation namespace, optionally including those from
-    // migrations.
-    BSONObj opNsMatch = BSON("ns" << BSONRegEx(getNsRegexForChangeStream(nss)));
-
-    // 2.1) Normal CRUD ops.
-    auto normalOpTypeMatch = BSON("op" << NE << "n");
-
-    // TODO SERVER-44039: we continue to generate 'kNewShardDetected' events for compatibility
-    // with 4.2, even though we no longer rely on them to detect new shards. We may wish to remove
-    // this mechanism in 4.7+, or retain it for future cases where a change stream is targeted to a
-    // subset of shards. See SERVER-44039 for details.
-
-    // 2.2) A chunk gets migrated to a new shard that doesn't have any chunks.
-    auto chunkMigratedNewShardMatch = BSON("op"
-                                           << "n"
-                                           << "o2.type"
-                                           << "migrateChunkToNewShard");
-
-    // Supported operations that are either (2.1) or (2.2).
-    BSONObj normalOrChunkMigratedMatch =
-        BSON(opNsMatch["ns"] << OR(normalOpTypeMatch, chunkMigratedNewShardMatch));
-
-    // Filter excluding entries resulting from chunk migration.
-    BSONObj notFromMigrateFilter = BSON("fromMigrate" << NE << true);
-
-    BSONObj opMatch =
-        (showMigrationEvents
-             ? normalOrChunkMigratedMatch
-             : BSON("$and" << BSON_ARRAY(normalOrChunkMigratedMatch << notFromMigrateFilter)));
-
-    // 3) Look for 'applyOps' which were created as part of a transaction.
-    BSONObj applyOps = getTxnApplyOpsFilter(opNsMatch["ns"], nss);
-
-    // Either (1) or (3), excluding those resulting from chunk migration.
-    BSONObj commandAndApplyOpsMatch =
-        BSON("$and" << BSON_ARRAY(BSON(OR(commandMatch, applyOps)) << notFromMigrateFilter));
-
-    // Match oplog entries after "start" that are either supported (1) commands or (2) operations.
-    // Only include CRUD operations tagged "fromMigrate" when the "showMigrationEvents" option is
-    // set - exempt all other operations and commands with that tag. Include the resume token, if
-    // resuming, so we can verify it was still present in the oplog.
-    return BSON("$and" << BSON_ARRAY(BSON("ts" << GTE << startFromInclusive)
-                                     << BSON(OR(opMatch, commandAndApplyOpsMatch))));
 }
 
-namespace {
-
-list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<ExpressionContext>& expCtx,
-                                                  const DocumentSourceChangeStreamSpec spec,
-                                                  BSONElement elem) {
-    list<intrusive_ptr<DocumentSource>> stages;
-    boost::optional<Timestamp> startFrom;
-    intrusive_ptr<DocumentSource> resumeStage = nullptr;
-    boost::optional<ResumeTokenData> startAfterInvalidate;
-    bool showMigrationEvents = spec.getShowMigrationEvents();
-    uassert(31123,
-            "Change streams from mongos may not show migration events.",
-            !(expCtx->inMongos && showMigrationEvents));
-
-    auto resumeAfter = spec.getResumeAfter();
-    auto startAfter = spec.getStartAfter();
-    if (resumeAfter || startAfter) {
-        uassert(50865,
-                "Do not specify both 'resumeAfter' and 'startAfter' in a $changeStream stage",
-                !startAfter || !resumeAfter);
-
-        ResumeToken token = resumeAfter ? resumeAfter.get() : startAfter.get();
-        ResumeTokenData tokenData = token.getData();
-
-        // If resuming from an "invalidate" using "startAfter", pass along the resume token data to
-        // DocumentSourceCheckInvalidate to signify that another invalidate should not be generated.
-        if (startAfter && tokenData.fromInvalidate) {
-            startAfterInvalidate = tokenData;
-        }
-
-        uassert(ErrorCodes::InvalidResumeToken,
-                "Attempting to resume a change stream using 'resumeAfter' is not allowed from an "
-                "invalidate notification.",
-                !resumeAfter || !tokenData.fromInvalidate);
-
-        // If we are resuming a single-collection stream, the resume token should always contain a
-        // UUID unless the token is a high water mark.
-        uassert(ErrorCodes::InvalidResumeToken,
-                "Attempted to resume a single-collection stream, but the resume token does not "
-                "include a UUID.",
-                tokenData.uuid || !expCtx->isSingleNamespaceAggregation() ||
-                    ResumeToken::isHighWaterMarkToken(tokenData));
-
-        // Store the resume token as the initial postBatchResumeToken for this stream.
-        expCtx->initialPostBatchResumeToken = token.toDocument().toBson();
-
-        // For a regular resume token, we must ensure that (1) all shards are capable of resuming
-        // from the given clusterTime, and (2) that we observe the resume token event in the stream
-        // before any event that would sort after it. High water mark tokens, however, do not refer
-        // to a specific event; we thus only need to check (1), similar to 'startAtOperationTime'.
-        startFrom = tokenData.clusterTime;
-        if (expCtx->needsMerge || ResumeToken::isHighWaterMarkToken(tokenData)) {
-            resumeStage = DocumentSourceCheckResumability::create(expCtx, tokenData);
-        } else {
-            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, tokenData);
-        }
+std::string DocumentSourceChangeStream::getCollRegexForChangeStream(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const auto type = getChangeStreamType(expCtx->ns);
+    const auto& nss = expCtx->ns;
+    switch (type) {
+        case ChangeStreamType::kSingleCollection:
+            // Match the target collection exactly.
+            return "^" + regexEscapeNsForChangeStream(nss.coll()) + "$";
+        case ChangeStreamType::kSingleDatabase:
+        case ChangeStreamType::kAllChangesForCluster:
+            // Match any collection; database filtering will be done elsewhere.
+            return "^" + resolveAllCollectionsRegex(expCtx);
+        default:
+            MONGO_UNREACHABLE;
     }
+}
 
-    // If we do not have a 'resumeAfter' starting point, check for 'startAtOperationTime'.
-    if (auto startAtOperationTime = spec.getStartAtOperationTime()) {
-        uassert(40674,
-                "Only one type of resume option is allowed, but multiple were found.",
-                !resumeStage);
-        startFrom = *startAtOperationTime;
-        resumeStage = DocumentSourceCheckResumability::create(expCtx, *startFrom);
+std::string DocumentSourceChangeStream::getCmdNsRegexForChangeStream(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const auto type = getChangeStreamType(expCtx->ns);
+    const auto& nss = expCtx->ns;
+    switch (type) {
+        case ChangeStreamType::kSingleCollection:
+        case ChangeStreamType::kSingleDatabase:
+            // Match the target database command namespace exactly.
+            return "^" +
+                regexEscapeNsForChangeStream(NamespaceStringUtil::serialize(
+                    nss.getCommandNS(), SerializationContext::stateDefault())) +
+                "$";
+        case ChangeStreamType::kAllChangesForCluster:
+            // Match all command namespaces on any database.
+            return kRegexAllDBs + "\\." + kRegexCmdColl;
+        default:
+            MONGO_UNREACHABLE;
     }
+}
 
-    // We can only run on a replica set, or through mongoS. Confirm that this is the case.
-    auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
-    uassert(
-        40573,
-        "The $changeStream stage is only supported on replica sets",
-        expCtx->inMongos ||
-            (replCoord &&
-             replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet));
+std::string DocumentSourceChangeStream::regexEscapeNsForChangeStream(StringData source) {
+    std::string result = "";
+    std::string escapes = "*+|()^?[]./\\$";
+    for (const char& c : source) {
+        if (escapes.find(c) != std::string::npos) {
+            result.append("\\");
+        }
+        result += c;
+    }
+    return result;
+}
 
+Timestamp DocumentSourceChangeStream::getStartTimeForNewStream(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     // If we do not have an explicit starting point, we should start from the latest majority
     // committed operation. If we are on mongoS and do not have a starting point, set it to the
-    // current clusterTime so that all shards start in sync. We always start one tick beyond the
-    // most recent operation, to ensure that the stream does not return it.
-    if (!startFrom) {
-        const auto currentTime = !expCtx->inMongos
-            ? LogicalTime{replCoord->getMyLastAppliedOpTime().getTimestamp()}
-            : [&] {
-                  const auto currentTime = VectorClock::get(expCtx->opCtx)->getTime();
-                  return currentTime.clusterTime();
-              }();
-        startFrom = currentTime.addTicks(1).asTimestamp();
-    }
+    // current clusterTime so that all shards start in sync.
+    auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+    const auto currentTime =
+        !expCtx->inRouter ? LogicalTime{replCoord->getMyLastAppliedOpTime().getTimestamp()} : [&] {
+            const auto currentTime = VectorClock::get(expCtx->opCtx)->getTime();
+            return currentTime.clusterTime();
+        }();
 
-    // We must always build the DSOplogMatch stage even on mongoS, since our validation logic relies
-    // upon the fact that it is always the first stage in the pipeline.
-    stages.push_back(DocumentSourceOplogMatch::create(
-        DocumentSourceChangeStream::buildMatchFilter(expCtx, *startFrom, showMigrationEvents),
-        expCtx));
-
-    // If we haven't already populated the initial PBRT, then we are starting from a specific
-    // timestamp rather than a resume token. Initialize the PBRT to a high water mark token.
-    if (expCtx->initialPostBatchResumeToken.isEmpty()) {
-        expCtx->initialPostBatchResumeToken =
-            ResumeToken::makeHighWaterMarkToken(*startFrom).toDocument().toBson();
-    }
-
-    // Obtain the current FCV and use it to create the DocumentSourceChangeStreamTransform stage.
-    const auto fcv = serverGlobalParams.featureCompatibility.getVersion();
-    stages.push_back(
-        DocumentSourceChangeStreamTransform::create(expCtx, fcv, elem.embeddedObject()));
-
-    // The resume stage must come after the check invalidate stage so that the former can determine
-    // whether the event that matches the resume token should be followed by an "invalidate" event.
-    stages.push_back(DocumentSourceCheckInvalidate::create(expCtx, startAfterInvalidate));
-    if (resumeStage) {
-        stages.push_back(resumeStage);
-    }
-
-    return stages;
+    // We always start one tick beyond the most recent operation, to ensure that the stream does not
+    // return it.
+    return currentTime.addTicks(1).asTimestamp();
 }
-
-}  // namespace
 
 list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(50808,
-            "$changeStream stage expects a document as argument.",
+            "$changeStream stage expects a document as argument",
             elem.type() == BSONType::Object);
 
-    // A change stream is a tailable + awaitData cursor.
-    expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
-
-    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
+    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserContext("$changeStream"),
                                                       elem.embeddedObject());
 
     // Make sure that it is legal to run this $changeStream before proceeding.
     DocumentSourceChangeStream::assertIsLegalSpecification(expCtx, spec);
 
-    auto fullDocOption = spec.getFullDocument();
-    uassert(40575,
-            str::stream() << "unrecognized value for the 'fullDocument' option to the "
-                             "$changeStream stage. Expected 'default' or 'updateLookup', got '"
-                          << fullDocOption << "'",
-            fullDocOption == "updateLookup"_sd || fullDocOption == "default"_sd);
-
-    const bool shouldLookupPostImage = (fullDocOption == "updateLookup"_sd);
-
-    const bool shouldLookupPreImage =
-        (spec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
-
-    // TODO SERVER-36941: We do not currently support sharded pre-image lookup.
-    uassert(51771,
-            "the 'fullDocumentBeforeChange' option is not supported in a sharded cluster",
-            !(shouldLookupPreImage && (expCtx->inMongos || expCtx->needsMerge)));
-
-    auto stages = buildPipeline(expCtx, spec, elem);
-
-    if (!expCtx->needsMerge) {
-        // There should only be one close cursor stage. If we're on the shards and producing input
-        // to be merged, do not add a close cursor stage, since the mongos will already have one.
-        stages.push_back(DocumentSourceCloseCursor::create(expCtx));
-
-        // We only create a pre-image lookup stage on a non-merging mongoD. We place this stage here
-        // so that any $match stages which follow the $changeStream pipeline prefix may be able to
-        // skip ahead of the DSLPreImage stage. This allows a whole-db or whole-cluster stream to
-        // run on an instance where only some collections have pre-images enabled, so long as the
-        // user filters for only those namespaces.
-        // TODO SERVER-36941: figure out how to get this to work in a sharded cluster.
-        if (shouldLookupPreImage) {
-            invariant(!expCtx->inMongos);
-            stages.push_back(DocumentSourceLookupChangePreImage::create(expCtx, spec));
-        }
-
-        // There should be only one post-image lookup stage.  If we're on the shards and producing
-        // input to be merged, the lookup is done on the mongos.
-        if (shouldLookupPostImage) {
-            stages.push_back(DocumentSourceLookupChangePostImage::create(expCtx));
-        }
+    // If the user did not specify an explicit starting point, set it to the current time.
+    if (!spec.getResumeAfter() && !spec.getStartAfter() && !spec.getStartAtOperationTime()) {
+        // Make sure we update the 'startAtOperationTime' in the 'spec' so that we serialize the
+        // correct start point when sending it to the shards.
+        spec.setStartAtOperationTime(DocumentSourceChangeStream::getStartTimeForNewStream(expCtx));
     }
-    return stages;
+
+    // If the stream's default version differs from the client's token version, adopt the higher.
+    // This is the token version that will be used once the stream has passed the resume token.
+    const auto clientToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
+    expCtx->changeStreamTokenVersion =
+        std::max(expCtx->changeStreamTokenVersion, clientToken.version);
+
+    // If the user explicitly requested to resume from a high water mark token, but its version
+    // differs from the version chosen above, regenerate it with the new version. There is no need
+    // for a resumed HWM stream to adopt the old token version for events at the same clusterTime.
+    const bool tokenVersionsDiffer = (clientToken.version != expCtx->changeStreamTokenVersion);
+    const bool isHighWaterMark = ResumeToken::isHighWaterMarkToken(clientToken);
+    if (isHighWaterMark && tokenVersionsDiffer && (spec.getResumeAfter() || spec.getStartAfter())) {
+        spec.setResumeAfter(ResumeToken(ResumeToken::makeHighWaterMarkToken(
+            clientToken.clusterTime, expCtx->changeStreamTokenVersion)));
+        spec.setStartAfter(boost::none);
+    }
+
+    // Save a copy of the spec on the expression context. Used when building the oplog filter.
+    expCtx->changeStreamSpec = spec;
+
+    return _buildPipeline(expCtx, spec);
 }
 
-BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(BSONObj originalCmdObj,
-                                                                Document resumeToken) {
-    Document originalCmd(originalCmdObj);
-    auto pipeline = originalCmd[AggregateCommandRequest::kPipelineFieldName].getArray();
-    // A $changeStream must be the first element of the pipeline in order to be able
-    // to replace (or add) a resume token.
-    invariant(!pipeline[0][DocumentSourceChangeStream::kStageName].missing());
+std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::_buildPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, DocumentSourceChangeStreamSpec spec) {
+    std::list<boost::intrusive_ptr<DocumentSource>> stages;
 
-    MutableDocument changeStreamStage(
-        pipeline[0][DocumentSourceChangeStream::kStageName].getDocument());
-    changeStreamStage[DocumentSourceChangeStreamSpec::kResumeAfterFieldName] = Value(resumeToken);
+    // Obtain the resume token from the spec. This will be used when building the pipeline.
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
 
-    // If the command was initially specified with a startAtOperationTime, we need to remove it to
-    // use the new resume token.
-    changeStreamStage[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName] = Value();
-    pipeline[0] =
-        Value(Document{{DocumentSourceChangeStream::kStageName, changeStreamStage.freeze()}});
-    MutableDocument newCmd(std::move(originalCmd));
-    newCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline);
-    return newCmd.freeze().toBson();
+    // Unfold the $changeStream into its constituent stages and add them to the pipeline.
+    stages.push_back(DocumentSourceChangeStreamOplogMatch::create(expCtx, spec));
+    stages.push_back(DocumentSourceChangeStreamUnwindTransaction::create(expCtx));
+    stages.push_back(DocumentSourceChangeStreamTransform::create(expCtx, spec));
+    tassert(5666900,
+            "'DocumentSourceChangeStreamTransform' stage should populate "
+            "'initialPostBatchResumeToken' field",
+            !expCtx->initialPostBatchResumeToken.isEmpty());
+
+    // The resume stage must come after the check invalidate stage so that the former can determine
+    // whether the event that matches the resume token should be followed by an "invalidate" event.
+    stages.push_back(DocumentSourceChangeStreamCheckInvalidate::create(expCtx, spec));
+
+    // Always include a DSCSCheckResumability stage, both to verify that there is enough history to
+    // cover the change stream's starting point, and to swallow all events up to the resume point.
+    stages.push_back(DocumentSourceChangeStreamCheckResumability::create(expCtx, spec));
+
+    // If the pipeline is built on router, we check for topology change events here. If a topology
+    // change event is detected, this stage forwards the event directly to the executor via an
+    // exception (bypassing the rest of the pipeline). Router must see all topology change events,
+    // so it's important that this stage occurs before any filtering is performed.
+    if (expCtx->inRouter) {
+        stages.push_back(DocumentSourceChangeStreamCheckTopologyChange::create(expCtx));
+    }
+
+    // If 'fullDocumentBeforeChange' is not set to 'off', add the DSCSAddPreImage stage into the
+    // pipeline. We place this stage here so that any $match stages which follow the $changeStream
+    // pipeline may be able to skip ahead of the DSCSAddPreImage stage. This allows a whole-db or
+    // whole-cluster stream to run on an instance where only some collections have pre-images
+    // enabled, so long as the user filters for only those namespaces.
+    if (spec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff) {
+        stages.push_back(DocumentSourceChangeStreamAddPreImage::create(expCtx, spec));
+    }
+
+    // If 'fullDocument' is not set to "default", add the DSCSAddPostImage stage here.
+    if (spec.getFullDocument() != FullDocumentModeEnum::kDefault) {
+        stages.push_back(DocumentSourceChangeStreamAddPostImage::create(expCtx, spec));
+    }
+
+    // If the pipeline is built on router, then the DSCSHandleTopologyChange stage acts as the
+    // split point for the pipline. All stages before this stages will run on shards and all
+    // stages after and inclusive of this stage will run on the router.
+    if (expCtx->inRouter) {
+        stages.push_back(DocumentSourceChangeStreamHandleTopologyChange::create(expCtx));
+    }
+
+    // If the resume point is an event, we must include a DSCSEnsureResumeTokenPresent stage.
+    if (!ResumeToken::isHighWaterMarkToken(resumeToken)) {
+        stages.push_back(DocumentSourceChangeStreamEnsureResumeTokenPresent::create(expCtx, spec));
+    }
+
+    // If 'showExpandedEvents' is NOT set, add a filter that returns only classic change events.
+    if (!spec.getShowExpandedEvents()) {
+        stages.push_back(DocumentSourceInternalChangeStreamMatch::create(
+            change_stream_filter::getMatchFilterForClassicOperationTypes(), expCtx));
+    }
+    changeStreamsShowExpandedEvents.increment(spec.getShowExpandedEvents());
+    return stages;
 }
 
 void DocumentSourceChangeStream::assertIsLegalSpecification(
     const intrusive_ptr<ExpressionContext>& expCtx, const DocumentSourceChangeStreamSpec& spec) {
+    // We can only run on a replica set, or through mongoS. Confirm that this is the case.
+    auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+    uassert(40573,
+            "The $changeStream stage is only supported on replica sets",
+            expCtx->inRouter || (replCoord && replCoord->getSettings().isReplSet()));
+
+    // We will not validate user specified options when we are not expecting to execute queries,
+    // such as during $queryStats.
+    if (!expCtx->mongoProcessInterface->isExpectedToExecuteQueries()) {
+        return;
+    }
+
     // If 'allChangesForCluster' is true, the stream must be opened on the 'admin' database with
     // {aggregate: 1}.
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "A $changeStream with 'allChangesForCluster:true' may only be opened "
                              "on the 'admin' database, and with no collection name; found "
-                          << expCtx->ns.ns(),
+                          << expCtx->ns.toStringForErrorMsg(),
             !spec.getAllChangesForCluster() ||
                 (expCtx->ns.isAdminDB() && expCtx->ns.isCollectionlessAggregateNS()));
 
@@ -550,17 +408,53 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
     // 'admin' database iff 'allChangesForCluster' is true. A stream may run against the 'config'
     // database iff 'allowToRunOnConfigDB' is true.
     const bool isNotBannedInternalDB =
-        !expCtx->ns.isLocal() && (!expCtx->ns.isConfigDB() || spec.getAllowToRunOnConfigDB());
+        !expCtx->ns.isLocalDB() && (!expCtx->ns.isConfigDB() || spec.getAllowToRunOnConfigDB());
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "$changeStream may not be opened on the internal " << expCtx->ns.db()
-                          << " database",
-            expCtx->ns.isAdminDB() ? spec.getAllChangesForCluster() : isNotBannedInternalDB);
+            str::stream() << "$changeStream may not be opened on the internal "
+                          << expCtx->ns.dbName().toStringForErrorMsg() << " database",
+            expCtx->ns.isAdminDB() ? static_cast<bool>(spec.getAllChangesForCluster())
+                                   : isNotBannedInternalDB);
 
-    // Prevent $changeStream from running on internal collections in any database.
+    // Prevent $changeStream from running on internal collections in any database. A stream may run
+    // against the internal collections iff 'allowToRunOnSystemNS' is true and the stream is not
+    // opened through a mongos process.
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "$changeStream may not be opened on the internal " << expCtx->ns.ns()
-                          << " collection",
-            !expCtx->ns.isSystem());
+            str::stream() << "$changeStream may not be opened on the internal "
+                          << expCtx->ns.toStringForErrorMsg() << " collection"
+                          << (spec.getAllowToRunOnSystemNS() ? " through router" : ""),
+            !expCtx->ns.isSystem() || (spec.getAllowToRunOnSystemNS() && !expCtx->inRouter));
+
+    uassert(31123,
+            "Change streams from router may not show migration events",
+            !(expCtx->inRouter && spec.getShowMigrationEvents()));
+
+    uassert(50865,
+            "Do not specify both 'resumeAfter' and 'startAfter' in a $changeStream stage",
+            !spec.getResumeAfter() || !spec.getStartAfter());
+
+    auto resumeToken = (spec.getResumeAfter() || spec.getStartAfter())
+        ? change_stream::resolveResumeTokenFromSpec(expCtx, spec)
+        : boost::optional<ResumeTokenData>();
+
+    uassert(40674,
+            "Only one type of resume option is allowed, but multiple were found",
+            !(spec.getStartAtOperationTime() && resumeToken));
+
+    uassert(ErrorCodes::InvalidResumeToken,
+            "Attempting to resume a change stream using 'resumeAfter' is not allowed from an "
+            "invalidate notification",
+            !(spec.getResumeAfter() && resumeToken->fromInvalidate));
+
+    // If we are resuming a single-collection stream, the resume token should always contain a
+    // UUID unless the token is from endOfTransaction event or a high water mark.
+    uassert(ErrorCodes::InvalidResumeToken,
+            "Attempted to resume a single-collection stream, but the resume token does not "
+            "include a UUID",
+            !resumeToken || resumeToken->uuid || !expCtx->isSingleNamespaceAggregation() ||
+                ResumeToken::isHighWaterMarkToken(*resumeToken) ||
+                Value::compare(resumeToken->eventIdentifier["operationType"],
+                               Value("endOfTransaction"_sd),
+                               nullptr) == 0);
 }
 
 }  // namespace mongo

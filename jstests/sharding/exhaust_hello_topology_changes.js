@@ -1,8 +1,8 @@
 /**
- * Test to check that the RSM receives an isMaster reply "immediately" (or "quickly") after a RS
+ * Test to check that the RSM receives a hello reply "immediately" (or "quickly") after a RS
  * topology change when using the exhaust protocol. In order to test this, we'll set the
  * maxAwaitTimeMS to much higher than the default (5 mins). This will allow us to assert that the
- * RSM receives the isMaster replies because of a topology change rather than maxAwaitTimeMS being
+ * RSM receives the hello replies because of a topology change rather than maxAwaitTimeMS being
  * hit. A replica set node should send a response to the mongos as soon as it processes a topology
  * change, so "immediately"/"quickly" can vary - we specify 5 seconds in this test ('timeoutMS').
  *
@@ -14,21 +14,20 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 let overrideMaxAwaitTimeMS = {'mode': 'alwaysOn', 'data': {maxAwaitTimeMS: 5 * 60 * 1000}};
 let st = new ShardingTest({
     mongos:
-        {s0: {setParameter: "failpoint.overrideMaxAwaitTimeMS=" + tojson(overrideMaxAwaitTimeMS)}},
+        {s0: {setParameter: {"failpoint.overrideMaxAwaitTimeMS": tojson(overrideMaxAwaitTimeMS)}}},
     shards: {rs0: {nodes: [{}, {}, {rsConfig: {priority: 0}}]}}
 });
 
-let timeoutMS = 5000;
+let timeoutMS = 20000;
 let mongos = st.s;
 let rsPrimary = st.rs0.getPrimary();
 let electableRsSecondary;
@@ -77,7 +76,7 @@ awaitRSClientHosts(
 
 // Restart the node we shut down
 jsTestLog("Restarting the node that was just killed.");
-st.rs0.start(rsPrimary);
+st.rs0.start(rsPrimary, {}, true /* restart */);
 
 rsPrimary = st.rs0.getPrimary();
 st.rs0.getReplSetConfig().members.forEach(node => {
@@ -85,6 +84,9 @@ st.rs0.getReplSetConfig().members.forEach(node => {
         electableRsSecondary = st.rs0.nodes[node._id];
     }
 });
+
+jsTestLog("Wait for the electable secondary to reach the SECONDARY after initial sync.");
+st.rs0.waitForState(electableRsSecondary, ReplSetTest.State.SECONDARY);
 
 // Terminate the primary and wait for the secondary to step up, trigger a topology change
 jsTestLog("Terminating the primary.");
@@ -95,4 +97,3 @@ awaitRSClientHosts(
     mongos, {host: electableRsSecondary.name}, {ok: true, ismaster: true}, st.rs0, timeoutMS);
 
 st.stop();
-}());

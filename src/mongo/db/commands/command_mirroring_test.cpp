@@ -27,15 +27,33 @@
  *    it in the license file.
  */
 
+#include <algorithm>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/shard_version_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -46,7 +64,7 @@ public:
 
     void setUp() override {
         setGlobalServiceContext(ServiceContext::make());
-        Client::initThread("CommandMirroringTest"_sd);
+        Client::initThread("CommandMirroringTest"_sd, getGlobalServiceContext()->getService());
     }
 
     void tearDown() override {
@@ -61,11 +79,14 @@ public:
         bob << commandName() << coll;
         bob << "lsid" << _lsid.toBSON();
 
-        for (auto arg : args) {
+        for (const auto& arg : args) {
             bob << arg.firstElement();
         }
 
-        auto request = OpMsgRequest::fromDBAndBody(kDB, bob.obj());
+        auto request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, kDB),
+                                        bob.obj());
         return request;
     }
 
@@ -79,35 +100,75 @@ public:
         return (a == b).type == BSONObj::DeferredComparison::Type::kEQ;
     }
 
-    static constexpr auto kDB = "test"_sd;
+    static constexpr auto kDB = "testDB"_sd;
+    const ShardVersionBase kShardVersion = []() {
+        ShardVersionBase sv;
+        sv.setEpoch(OID());
+        sv.setTimestamp(Timestamp(0, 1));
+        sv.setVersion(Timestamp(0, 1));
+        return sv;
+    }();
+
+    const DatabaseVersionBase kDatabaseVersion = []() {
+        DatabaseVersionBase dv;
+        dv.setLastMod(123);
+        dv.setTimestamp(Timestamp(0, 1));
+        return dv;
+    }();
 
 private:
     BSONObj getMirroredCommand(OpMsgRequest& request) {
-        auto cmd = globalCommandRegistry()->findCommand(request.getCommandName());
-        ASSERT(cmd);
-
         auto opCtx = cc().makeOperationContext();
         opCtx->setLogicalSessionId(_lsid);
 
+        auto cmd = getCommandRegistry(opCtx.get())->findCommand(request.getCommandName());
+        ASSERT(cmd);
+
         auto invocation = cmd->parse(opCtx.get(), request);
-        ASSERT(invocation->supportsReadMirroring());
+        if (!invocation->supportsReadMirroring()) {
+            uasserted(ErrorCodes::CommandNotSupported, "command does not support read mirroring");
+        }
+        ASSERT_EQ(invocation->getDBForReadMirroring(),
+                  DatabaseName::createDatabaseName_forTest(boost::none, kDB));
 
         BSONObjBuilder bob;
         invocation->appendMirrorableRequest(&bob);
+
         return bob.obj();
     }
 
     const LogicalSessionId _lsid;
+
+protected:
+    const std::string kCollection = "testColl";
+    const std::string kNss = kDB + "." + kCollection;
 };
 
 class UpdateCommandTest : public CommandMirroringTest {
 public:
+    void setUp() override {
+        CommandMirroringTest::setUp();
+        shardVersion = boost::none;
+        databaseVersion = boost::none;
+    }
+
     std::string commandName() override {
         return "update";
     }
 
     OpMsgRequest makeCommand(std::string coll, std::vector<BSONObj> updates) override {
-        auto request = CommandMirroringTest::makeCommand(coll, {});
+        std::vector<BSONObj> args;
+        if (shardVersion) {
+            args.push_back(shardVersion.value());
+        }
+        if (databaseVersion) {
+            args.push_back(databaseVersion.value());
+        }
+        if (encryptionInformation) {
+            args.push_back(encryptionInformation.value());
+        }
+
+        auto request = CommandMirroringTest::makeCommand(coll, args);
 
         // Directly add `updates` to `OpMsg::sequences` to emulate `OpMsg::parse()` behavior.
         OpMsg::DocumentSequence seq;
@@ -120,13 +181,17 @@ public:
 
         return request;
     }
+
+    boost::optional<BSONObj> shardVersion;
+    boost::optional<BSONObj> databaseVersion;
+    boost::optional<BSONObj> encryptionInformation;
 };
 
 TEST_F(UpdateCommandTest, NoQuery) {
     auto update = BSON("q" << BSONObj() << "u" << BSON("$set" << BSON("_id" << 1)));
-    auto mirroredObj = createCommandAndGetMirrored("my_collection", {update});
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
 
-    ASSERT_EQ(mirroredObj["find"].String(), "my_collection");
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{}");
     ASSERT(!mirroredObj.hasField("hint"));
     ASSERT(mirroredObj["singleBatch"].Bool());
@@ -136,9 +201,9 @@ TEST_F(UpdateCommandTest, NoQuery) {
 TEST_F(UpdateCommandTest, SingleQuery) {
     auto update =
         BSON("q" << BSON("qty" << BSON("$lt" << 50.0)) << "u" << BSON("$inc" << BSON("qty" << 1)));
-    auto mirroredObj = createCommandAndGetMirrored("products", {update});
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
 
-    ASSERT_EQ(mirroredObj["find"].String(), "products");
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ qty: { $lt: 50.0 } }");
     ASSERT(!mirroredObj.hasField("hint"));
     ASSERT(mirroredObj["singleBatch"].Bool());
@@ -152,9 +217,9 @@ TEST_F(UpdateCommandTest, SingleQueryWithHintAndCollation) {
                                    << "fr")
                            << "u" << BSON("$inc" << BSON("price" << 10)));
 
-    auto mirroredObj = createCommandAndGetMirrored("products", {update});
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
 
-    ASSERT_EQ(mirroredObj["find"].String(), "products");
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ price: { $gt: 100 } }");
     ASSERT_EQ(mirroredObj["hint"].Obj().toString(), "{ price: 1 }");
     ASSERT_EQ(mirroredObj["collation"].Obj().toString(), "{ locale: \"fr\" }");
@@ -169,13 +234,195 @@ TEST_F(UpdateCommandTest, MultipleQueries) {
         updates.emplace_back(BSON("q" << BSON("_id" << BSON("$eq" << i)) << "u"
                                       << BSON("$inc" << BSON("qty" << 1))));
     }
-    auto mirroredObj = createCommandAndGetMirrored("products", updates);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, updates);
 
-    ASSERT_EQ(mirroredObj["find"].String(), "products");
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ _id: { $eq: 0 } }");
     ASSERT(!mirroredObj.hasField("hint"));
     ASSERT(mirroredObj["singleBatch"].Bool());
     ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+}
+
+TEST_F(UpdateCommandTest, ValidateShardVersionAndDatabaseVersion) {
+    auto update = BSON("q" << BSONObj() << "u" << BSON("$set" << BSON("_id" << 1)));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
+
+        ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+        ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+    }
+
+    shardVersion = BSON("shardVersion" << kShardVersion.toBSON());
+    databaseVersion = BSON("databaseVersion" << kDatabaseVersion.toBSON());
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
+
+        ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+        ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+        ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+        ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+    }
+}
+
+TEST_F(UpdateCommandTest, ValidateEncryptionInformation) {
+    auto update = BSON("q" << BSONObj() << "u" << BSON("$set" << BSON("_id" << 1)));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
+        ASSERT_FALSE(mirroredObj.hasField("encryptionInformation"));
+    }
+
+    const auto encInfoValue = BSON("type" << 1 << "schema" << BSONObj::kEmptyObject);
+    encryptionInformation = BSON("encryptionInformation" << encInfoValue);
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, {update});
+
+        ASSERT_TRUE(mirroredObj.hasField("encryptionInformation"));
+        ASSERT(compareBSONObjs(mirroredObj["encryptionInformation"].Obj(), encInfoValue));
+    }
+}
+
+class BulkWriteTest : public CommandMirroringTest {
+public:
+    std::string commandName() override {
+        return "bulkWrite";
+    }
+
+private:
+    RAIIServerParameterControllerForTest controller{"featureFlagBulkWriteCommand", true};
+};
+
+TEST_F(BulkWriteTest, NoUpdateOp) {
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("insert" << 0 << "document" << BSON("_id" << 1))
+                                 << BSON("delete" << 0 << "filter" << BSON("_id" << 2)))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss)))};
+
+    ASSERT_THROWS_CODE(createCommandAndGetMirrored("1", bulkWriteArgs),
+                       DBException,
+                       ErrorCodes::CommandNotSupported);
+}
+
+TEST_F(BulkWriteTest, NoQueryInUpdateOp) {
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("insert" << 0 << "document" << BSON("_id" << 1))
+                                 << BSON("update" << 0 << "filter" << BSONObj() << "updateMods"
+                                                  << BSON("$set" << BSON("_id" << 1))))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss)))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
+    ASSERT_FALSE(mirroredObj.hasField("filter"));
+    ASSERT_FALSE(mirroredObj.hasField("hint"));
+    ASSERT_TRUE(mirroredObj["singleBatch"].Bool());
+    ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+    ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+    ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+}
+
+TEST_F(BulkWriteTest, SingleQueryInUpdateOp) {
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("insert" << 0 << "document" << BSON("_id" << 1))
+                                 << BSON("update"
+                                         << 0 << "filter" << BSON("qty" << BSON("$lt" << 50.0))
+                                         << "updateMods" << BSON("$inc" << BSON("qty" << 1))))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss)))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
+    ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ qty: { $lt: 50.0 } }");
+    ASSERT_FALSE(mirroredObj.hasField("hint"));
+    ASSERT_TRUE(mirroredObj["singleBatch"].Bool());
+    ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+    ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+    ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+}
+
+TEST_F(BulkWriteTest, SingleQueryInUpdateOpWithHintCollationSort) {
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("insert" << 0 << "document" << BSON("_id" << 1))
+                                 << BSON("update"
+                                         << 0 << "filter" << BSON("price" << BSON("$gt" << 100))
+                                         << "updateMods" << BSON("$inc" << BSON("price" << 1))
+                                         << "hint" << BSON("price" << 1) << "collation"
+                                         << BSON("locale"
+                                                 << "fr")
+                                         << "sort" << BSON("price" << 1)))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss)))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
+    ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ price: { $gt: 100 } }");
+    ASSERT_EQ(mirroredObj["hint"].Obj().toString(), "{ price: 1 }");
+    ASSERT_EQ(mirroredObj["collation"].Obj().toString(), "{ locale: \"fr\" }");
+    ASSERT_EQ(mirroredObj["sort"].Obj().toString(), "{ price: 1 }");
+    ASSERT_TRUE(mirroredObj["singleBatch"].Bool());
+    ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+    ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+    ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+}
+
+TEST_F(BulkWriteTest, MultipleUpdateOpsAndNamespaces) {
+    const std::string kCollection2 = "testColl2";
+    const std::string kNss2 = kDB + "." + kCollection2;
+
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(
+                 BSON("delete" << 0 << "filter" << BSON("_id" << 1))
+                 << BSON("update" << 1 << "filter" << BSON("_id" << BSON("$eq" << 1))
+                                  << "updateMods" << BSON("$inc" << BSON("qty" << 1)))
+                 << BSON("update" << 0 << "filter" << BSON("_id" << BSON("$eq" << 0))
+                                  << "updateMods" << BSON("$inc" << BSON("qty" << -1))))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss) << BSON("ns" << kNss2)))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection2);
+    ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ _id: { $eq: 1 } }");
+    ASSERT_FALSE(mirroredObj.hasField("hint"));
+    ASSERT_TRUE(mirroredObj["singleBatch"].Bool());
+    ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+    ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+    ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+}
+
+TEST_F(BulkWriteTest, ValidateShardVersionAndDatabaseVersion) {
+    auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("insert" << 0 << "document" << BSON("_id" << 1))
+                                 << BSON("update"
+                                         << 0 << "filter" << BSON("qty" << BSON("$lt" << 50.0))
+                                         << "updateMods" << BSON("$inc" << BSON("qty" << 1))))),
+        BSON("nsInfo" << BSON_ARRAY(BSON("ns" << kNss << "shardVersion" << kShardVersion.toBSON()
+                                              << "databaseVersion" << kDatabaseVersion.toBSON())))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
+    ASSERT_EQ(mirroredObj["filter"].Obj().toString(), "{ qty: { $lt: 50.0 } }");
+    ASSERT_FALSE(mirroredObj.hasField("hint"));
+    ASSERT_TRUE(mirroredObj["singleBatch"].Bool());
+    ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
+    ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+    ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+    ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+    ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+}
+
+TEST_F(BulkWriteTest, ValidateEncryptionInformation) {
+    const auto encInfoValue = BSON("type" << 1 << "schema" << BSONObj::kEmptyObject);
+    const auto encryptionInformation = BSON("encryptionInformation" << encInfoValue);
+    const auto bulkWriteArgs = {
+        BSON("ops" << BSON_ARRAY(BSON("update" << 0 << "filter" << BSON("_id" << 0) << "updateMods"
+                                               << BSON("$inc" << BSON("qty" << -1))))),
+        BSON(
+            "nsInfo" << BSON_ARRAY(BSON("ns" << kNss << "encryptionInformation" << encInfoValue)))};
+
+    auto mirroredObj = createCommandAndGetMirrored("1", bulkWriteArgs);
+
+    ASSERT_TRUE(mirroredObj.hasField("encryptionInformation"));
+    ASSERT(compareBSONObjs(mirroredObj["encryptionInformation"].Obj(), encInfoValue));
 }
 
 class FindCommandTest : public CommandMirroringTest {
@@ -195,12 +442,15 @@ public:
                 "min",
                 "max",
                 "batchSize",
-                "singleBatch"};
+                "singleBatch",
+                "shardVersion",
+                "databaseVersion",
+                "encryptionInformation"};
     }
 
     void checkFieldNamesAreAllowed(BSONObj& mirroredObj) {
         const auto possibleKeys = getAllowedKeys();
-        for (auto key : mirroredObj.getFieldNames<std::set<std::string>>()) {
+        for (const auto& key : mirroredObj.getFieldNames<std::set<std::string>>()) {
             ASSERT(std::find(possibleKeys.begin(), possibleKeys.end(), key) != possibleKeys.end());
         }
     }
@@ -214,24 +464,27 @@ TEST_F(FindCommandTest, MirrorableKeys) {
                      BSON("skip" << 1),
                      BSON("limit" << 1),
                      BSON("batchSize" << 1),
-                     BSON("singleBatch" << true),
+                     BSON("singleBatch" << false),
                      BSON("comment"
                           << "This is a comment."),
                      BSON("maxTimeMS" << 100),
-                     BSON("readConcern"
-                          << "primary"),
+                     BSON("readConcern" << BSON("level"
+                                                << "local")),
                      BSON("max" << BSONObj()),
                      BSON("min" << BSONObj()),
                      BSON("returnKey" << true),
                      BSON("showRecordId" << false),
-                     BSON("tailable" << false),
+                     BSON("tailable" << true),
                      BSON("oplogReplay" << true),
                      BSON("noCursorTimeout" << true),
                      BSON("awaitData" << true),
                      BSON("allowPartialResults" << true),
-                     BSON("collation" << BSONObj())};
+                     BSON("collation" << BSONObj()),
+                     BSON("shardVersion" << kShardVersion.toBSON()),
+                     BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+                     BSON("encryptionInformation" << BSON("schema" << BSONObj::kEmptyObject))};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", findArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findArgs);
     checkFieldNamesAreAllowed(mirroredObj);
 }
 
@@ -239,13 +492,12 @@ TEST_F(FindCommandTest, BatchSizeReconfiguration) {
     auto findArgs = {
         BSON("filter" << BSONObj()), BSON("batchSize" << 100), BSON("singleBatch" << false)};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", findArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findArgs);
     ASSERT_EQ(mirroredObj["singleBatch"].Bool(), true);
     ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
 }
 
 TEST_F(FindCommandTest, ValidateMirroredQuery) {
-    constexpr auto collection = "restaurants";
     const auto filter = BSON("rating" << BSON("$gte" << 9) << "cuisine"
                                       << "Italian");
     constexpr auto skip = 10;
@@ -258,6 +510,8 @@ TEST_F(FindCommandTest, ValidateMirroredQuery) {
     const auto min = BSONObj();
     const auto max = BSONObj();
 
+    const auto encryptionInformation = BSON("type" << 1 << "schema" << BSONObj::kEmptyObject);
+
     auto findArgs = {BSON("filter" << filter),
                      BSON("skip" << skip),
                      BSON("limit" << limit),
@@ -265,11 +519,14 @@ TEST_F(FindCommandTest, ValidateMirroredQuery) {
                      BSON("hint" << hint),
                      BSON("collation" << collation),
                      BSON("min" << min),
-                     BSON("max" << max)};
+                     BSON("max" << max),
+                     BSON("shardVersion" << kShardVersion.toBSON()),
+                     BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+                     BSON("encryptionInformation" << encryptionInformation)};
 
-    auto mirroredObj = createCommandAndGetMirrored(collection, findArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findArgs);
 
-    ASSERT_EQ(mirroredObj["find"].String(), collection);
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT(compareBSONObjs(mirroredObj["filter"].Obj(), filter));
     ASSERT_EQ(mirroredObj["skip"].Int(), skip);
     ASSERT_EQ(mirroredObj["limit"].Int(), limit);
@@ -278,6 +535,28 @@ TEST_F(FindCommandTest, ValidateMirroredQuery) {
     ASSERT(compareBSONObjs(mirroredObj["collation"].Obj(), collation));
     ASSERT(compareBSONObjs(mirroredObj["min"].Obj(), min));
     ASSERT(compareBSONObjs(mirroredObj["max"].Obj(), max));
+    ASSERT(compareBSONObjs(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["encryptionInformation"].Obj(), encryptionInformation));
+}
+
+TEST_F(FindCommandTest, ValidateShardVersionAndDatabaseVersion) {
+    std::vector<BSONObj> findArgs = {BSON("filter" << BSONObj())};
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, findArgs);
+        ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+        ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+    }
+
+    findArgs.push_back(BSON("shardVersion" << kShardVersion.toBSON()));
+    findArgs.push_back(BSON("databaseVersion" << kDatabaseVersion.toBSON()));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, findArgs);
+        ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+        ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+        ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+        ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+    }
 }
 
 class FindAndModifyCommandTest : public FindCommandTest {
@@ -287,25 +566,37 @@ public:
     }
 
     std::vector<std::string> getAllowedKeys() const override {
-        return {"sort", "collation", "find", "filter", "batchSize", "singleBatch"};
+        return {"sort",
+                "collation",
+                "find",
+                "filter",
+                "batchSize",
+                "singleBatch",
+                "shardVersion",
+                "databaseVersion",
+                "encryptionInformation"};
     }
 };
 
 TEST_F(FindAndModifyCommandTest, MirrorableKeys) {
-    auto findAndModifyArgs = {BSON("query" << BSONObj()),
-                              BSON("sort" << BSONObj()),
-                              BSON("remove" << false),
-                              BSON("update" << BSONObj()),
-                              BSON("new" << true),
-                              BSON("fields" << BSONObj()),
-                              BSON("upsert" << true),
-                              BSON("bypassDocumentValidation" << false),
-                              BSON("writeConcern" << BSONObj()),
-                              BSON("maxTimeMS" << 100),
-                              BSON("collation" << BSONObj()),
-                              BSON("arrayFilters" << BSONArray())};
+    auto findAndModifyArgs = {
+        BSON("query" << BSONObj()),
+        BSON("sort" << BSONObj()),
+        BSON("remove" << false),
+        BSON("update" << BSONObj()),
+        BSON("new" << true),
+        BSON("fields" << BSONObj()),
+        BSON("upsert" << true),
+        BSON("bypassDocumentValidation" << false),
+        BSON("writeConcern" << BSONObj()),
+        BSON("maxTimeMS" << 100),
+        BSON("collation" << BSONObj()),
+        BSON("arrayFilters" << BSONArray()),
+        BSON("shardVersion" << kShardVersion.toBSON()),
+        BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+        BSON("encryptionInformation" << BSON("type" << 1 << "schema" << BSONObj::kEmptyObject))};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", findAndModifyArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findAndModifyArgs);
     checkFieldNamesAreAllowed(mirroredObj);
 }
 
@@ -315,13 +606,12 @@ TEST_F(FindAndModifyCommandTest, BatchSizeReconfiguration) {
                               BSON("batchSize" << 100),
                               BSON("singleBatch" << false)};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", findAndModifyArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findAndModifyArgs);
     ASSERT_EQ(mirroredObj["singleBatch"].Bool(), true);
     ASSERT_EQ(mirroredObj["batchSize"].Int(), 1);
 }
 
 TEST_F(FindAndModifyCommandTest, ValidateMirroredQuery) {
-    constexpr auto collection = "people";
     const auto query = BSON("name"
                             << "Andy");
     const auto sortObj = BSON("rating" << 1);
@@ -329,20 +619,49 @@ TEST_F(FindAndModifyCommandTest, ValidateMirroredQuery) {
     constexpr auto upsert = true;
     const auto collation = BSON("locale"
                                 << "\"fr\"");
+    const auto encInfoValue = BSON("type" << 1 << "schema" << BSONObj::kEmptyObject);
 
     auto findAndModifyArgs = {BSON("query" << query),
                               BSON("sort" << sortObj),
                               BSON("update" << update),
                               BSON("upsert" << upsert),
-                              BSON("collation" << collation)};
+                              BSON("collation" << collation),
+                              BSON("shardVersion" << kShardVersion.toBSON()),
+                              BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+                              BSON("encryptionInformation" << encInfoValue)};
 
-    auto mirroredObj = createCommandAndGetMirrored(collection, findAndModifyArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, findAndModifyArgs);
 
-    ASSERT_EQ(mirroredObj["find"].String(), collection);
+    ASSERT_EQ(mirroredObj["find"].String(), kCollection);
     ASSERT(!mirroredObj.hasField("upsert"));
     ASSERT(compareBSONObjs(mirroredObj["filter"].Obj(), query));
     ASSERT(compareBSONObjs(mirroredObj["sort"].Obj(), sortObj));
     ASSERT(compareBSONObjs(mirroredObj["collation"].Obj(), collation));
+    ASSERT(compareBSONObjs(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["encryptionInformation"].Obj(), encInfoValue));
+}
+
+TEST_F(FindAndModifyCommandTest, ValidateShardVersionAndDatabaseVersion) {
+    std::vector<BSONObj> findAndModifyArgs = {BSON("query" << BSON("name"
+                                                                   << "Andy")),
+                                              BSON("update" << BSON("$inc" << BSON("score" << 1)))};
+
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, findAndModifyArgs);
+        ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+        ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+    }
+
+    findAndModifyArgs.push_back(BSON("shardVersion" << kShardVersion.toBSON()));
+    findAndModifyArgs.push_back(BSON("databaseVersion" << kDatabaseVersion.toBSON()));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, findAndModifyArgs);
+        ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+        ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+        ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+        ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+    }
 }
 
 class DistinctCommandTest : public FindCommandTest {
@@ -352,7 +671,7 @@ public:
     }
 
     std::vector<std::string> getAllowedKeys() const override {
-        return {"distinct", "key", "query", "collation"};
+        return {"distinct", "key", "query", "collation", "shardVersion", "databaseVersion"};
     }
 };
 
@@ -361,14 +680,15 @@ TEST_F(DistinctCommandTest, MirrorableKeys) {
                               << ""),
                          BSON("query" << BSONObj()),
                          BSON("readConcern" << BSONObj()),
-                         BSON("collation" << BSONObj())};
+                         BSON("collation" << BSONObj()),
+                         BSON("shardVersion" << kShardVersion.toBSON()),
+                         BSON("databaseVersion" << kDatabaseVersion.toBSON())};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", distinctArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, distinctArgs);
     checkFieldNamesAreAllowed(mirroredObj);
 }
 
 TEST_F(DistinctCommandTest, ValidateMirroredQuery) {
-    constexpr auto collection = "restaurants";
     constexpr auto key = "rating";
     const auto query = BSON("cuisine"
                             << "italian");
@@ -379,15 +699,38 @@ TEST_F(DistinctCommandTest, ValidateMirroredQuery) {
     auto distinctArgs = {BSON("key" << key),
                          BSON("query" << query),
                          BSON("readConcern" << readConcern),
-                         BSON("collation" << collation)};
+                         BSON("collation" << collation),
+                         BSON("shardVersion" << kShardVersion.toBSON()),
+                         BSON("databaseVersion" << kDatabaseVersion.toBSON())};
 
-    auto mirroredObj = createCommandAndGetMirrored(collection, distinctArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, distinctArgs);
 
-    ASSERT_EQ(mirroredObj["distinct"].String(), collection);
+    ASSERT_EQ(mirroredObj["distinct"].String(), kCollection);
     ASSERT(!mirroredObj.hasField("readConcern"));
     ASSERT_EQ(mirroredObj["key"].String(), key);
     ASSERT(compareBSONObjs(mirroredObj["query"].Obj(), query));
     ASSERT(compareBSONObjs(mirroredObj["collation"].Obj(), collation));
+    ASSERT(compareBSONObjs(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON()));
+}
+
+TEST_F(DistinctCommandTest, ValidateShardVersionAndDatabaseVersion) {
+    std::vector<BSONObj> distinctArgs = {};
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, distinctArgs);
+        ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+        ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+    }
+
+    distinctArgs.push_back(BSON("shardVersion" << kShardVersion.toBSON()));
+    distinctArgs.push_back(BSON("databaseVersion" << kDatabaseVersion.toBSON()));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, distinctArgs);
+        ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+        ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+        ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+        ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+    }
 }
 
 class CountCommandTest : public FindCommandTest {
@@ -397,7 +740,15 @@ public:
     }
 
     std::vector<std::string> getAllowedKeys() const override {
-        return {"count", "query", "skip", "limit", "hint", "collation"};
+        return {"count",
+                "query",
+                "skip",
+                "limit",
+                "hint",
+                "collation",
+                "shardVersion",
+                "databaseVersion",
+                "encryptionInformation"};
     }
 };
 
@@ -407,28 +758,58 @@ TEST_F(CountCommandTest, MirrorableKeys) {
                       BSON("skip" << 10),
                       BSON("hint" << BSONObj()),
                       BSON("readConcern" << BSONObj()),
-                      BSON("collation" << BSONObj())};
+                      BSON("collation" << BSONObj()),
+                      BSON("shardVersion" << kShardVersion.toBSON()),
+                      BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+                      BSON("encryptionInformation" << BSON("schema" << BSONObj::kEmptyObject))};
 
-    auto mirroredObj = createCommandAndGetMirrored("test", countArgs);
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, countArgs);
     checkFieldNamesAreAllowed(mirroredObj);
 }
 
 TEST_F(CountCommandTest, ValidateMirroredQuery) {
-    constexpr auto collection = "orders";
     const auto query = BSON("status"
                             << "Delivered");
     const auto hint = BSON("status" << 1);
     constexpr auto limit = 1000;
+    const auto encInfoValue = BSON("type" << 1 << "schema" << BSONObj::kEmptyObject);
 
-    auto countArgs = {BSON("query" << query), BSON("hint" << hint), BSON("limit" << limit)};
-    auto mirroredObj = createCommandAndGetMirrored(collection, countArgs);
+    auto countArgs = {BSON("query" << query),
+                      BSON("hint" << hint),
+                      BSON("limit" << limit),
+                      BSON("shardVersion" << kShardVersion.toBSON()),
+                      BSON("databaseVersion" << kDatabaseVersion.toBSON()),
+                      BSON("encryptionInformation" << encInfoValue)};
+    auto mirroredObj = createCommandAndGetMirrored(kCollection, countArgs);
 
-    ASSERT_EQ(mirroredObj["count"].String(), collection);
+    ASSERT_EQ(mirroredObj["count"].String(), kCollection);
     ASSERT(!mirroredObj.hasField("skip"));
     ASSERT(!mirroredObj.hasField("collation"));
     ASSERT(compareBSONObjs(mirroredObj["query"].Obj(), query));
     ASSERT(compareBSONObjs(mirroredObj["hint"].Obj(), hint));
-    ASSERT_EQ(mirroredObj["limit"].Int(), limit);
+    ASSERT_EQ(mirroredObj["limit"].Long(), limit);
+    ASSERT(compareBSONObjs(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON()));
+    ASSERT(compareBSONObjs(mirroredObj["encryptionInformation"].Obj(), encInfoValue));
+}
+
+TEST_F(CountCommandTest, ValidateShardVersionAndDatabaseVersion) {
+    std::vector<BSONObj> countArgs = {};
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, countArgs);
+        ASSERT_FALSE(mirroredObj.hasField("shardVersion"));
+        ASSERT_FALSE(mirroredObj.hasField("databaseVersion"));
+    }
+
+    countArgs.push_back(BSON("shardVersion" << kShardVersion.toBSON()));
+    countArgs.push_back(BSON("databaseVersion" << kDatabaseVersion.toBSON()));
+    {
+        auto mirroredObj = createCommandAndGetMirrored(kCollection, countArgs);
+        ASSERT_TRUE(mirroredObj.hasField("shardVersion"));
+        ASSERT_TRUE(mirroredObj.hasField("databaseVersion"));
+        ASSERT_BSONOBJ_EQ(mirroredObj["shardVersion"].Obj(), kShardVersion.toBSON());
+        ASSERT_BSONOBJ_EQ(mirroredObj["databaseVersion"].Obj(), kDatabaseVersion.toBSON());
+    }
 }
 
 }  // namespace

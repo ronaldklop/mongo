@@ -27,16 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
-#include "mongo/db/fts/fts_spec.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/fts/fts_element_iterator.h"
+#include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_tokenizer.h"
 #include "mongo/db/fts/fts_util.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -109,7 +118,7 @@ FTSSpec::FTSSpec(const BSONObj& indexInfo) {
                                    " correct options.");
     }
 
-    _languageOverrideField = indexInfo["language_override"].valuestrsafe();
+    _languageOverrideField = indexInfo.getStringField("language_override").toString();
 
     _wildcard = false;
 
@@ -118,23 +127,23 @@ FTSSpec::FTSSpec(const BSONObj& indexInfo) {
         BSONObjIterator i(indexInfo["weights"].Obj());
         while (i.more()) {
             BSONElement e = i.next();
-            verify(e.isNumber());
+            MONGO_verify(e.isNumber());
 
             if (WILDCARD == e.fieldName()) {
                 _wildcard = true;
             } else {
                 double num = e.number();
                 _weights[e.fieldName()] = num;
-                verify(num > 0 && num < MAX_WORD_WEIGHT);
+                MONGO_verify(num > 0 && num < MAX_WORD_WEIGHT);
             }
         }
-        verify(_wildcard || _weights.size());
+        MONGO_verify(_wildcard || _weights.size());
     }
 
     // extra information
     {
         BSONObj keyPattern = indexInfo["key"].Obj();
-        verify(keyPattern.nFields() >= 2);
+        MONGO_verify(keyPattern.nFields() >= 2);
         BSONObjIterator i(keyPattern);
 
         bool passedFTS = false;
@@ -228,7 +237,7 @@ void FTSSpec::_scoreStringV2(FTSTokenizer* tokenizer,
 
         double& score = (*docScores)[term];
         score += (weight * data.freq * coeff * adjustment);
-        verify(score <= MAX_WEIGHT);
+        MONGO_verify(score <= MAX_WEIGHT);
     }
 }
 
@@ -273,7 +282,7 @@ Status verifyFieldNameNotReserved(StringData s) {
 }  // namespace
 
 StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
-    if (spec["textIndexVersion"].numberInt() == TEXT_INDEX_VERSION_1) {
+    if (spec["textIndexVersion"].safeNumberInt() == TEXT_INDEX_VERSION_1) {
         return _fixSpecV1(spec);
     }
 
@@ -290,7 +299,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
             while (i.more()) {
                 BSONElement e = i.next();
                 if (e.fieldNameStringData() == "_fts") {
-                    if (INDEX_NAME != e.valuestrsafe()) {
+                    if (INDEX_NAME != e.str()) {
                         return {ErrorCodes::CannotCreateIndex, "expecting _fts:\"text\""};
                     }
                     addedFtsStuff = true;
@@ -300,7 +309,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
                         return {ErrorCodes::CannotCreateIndex, "expecting _ftsx:1"};
                     }
                     b.append(e);
-                } else if (e.type() == String && INDEX_NAME == e.valuestr()) {
+                } else if (e.type() == String && INDEX_NAME == e.str()) {
                     if (!addedFtsStuff) {
                         _addFTSStuff(&b);
                         addedFtsStuff = true;
@@ -308,14 +317,15 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
 
                     m[e.fieldName()] = 1;
                 } else {
-                    if (e.numberInt() != 1 && e.numberInt() != -1) {
+                    auto intVal = e.safeNumberInt();
+                    if (intVal != 1 && intVal != -1) {
                         return {ErrorCodes::CannotCreateIndex,
                                 "expected value 1 or -1 for non-text key in compound index"};
                     }
                     b.append(e);
                 }
             }
-            verify(addedFtsStuff);
+            MONGO_verify(addedFtsStuff);
         }
         keyPattern = b.obj();
 
@@ -323,7 +333,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
         // fields, then extraAfter fields.
         {
             BSONObjIterator i(spec["key"].Obj());
-            verify(i.more());
+            MONGO_verify(i.more());
             BSONElement e = i.next();
 
             // extraBefore fields
@@ -384,7 +394,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
             if (!e.isNumber()) {
                 return {ErrorCodes::CannotCreateIndex, "weight for text index needs numeric type"};
             }
-            m[e.fieldName()] = e.numberInt();
+            m[e.fieldName()] = e.safeNumberInt();
         }
     } else if (spec["weights"].str() == WILDCARD) {
         m[WILDCARD] = 1;
@@ -484,7 +494,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
                         "text index option 'textIndexVersion' must be a number"};
             }
 
-            textIndexVersion = e.numberInt();
+            textIndexVersion = e.safeNumberInt();
             if (textIndexVersion != TEXT_INDEX_VERSION_2 &&
                 textIndexVersion != TEXT_INDEX_VERSION_3) {
                 return {ErrorCodes::CannotCreateIndex,
@@ -510,6 +520,33 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
     b.append("textIndexVersion", textIndexVersion);
 
     return b.obj();
+}
+
+size_t FTSSpec::getApproximateSize() const {
+    auto computeVectorSize = [](const std::vector<std::string>& v) {
+        size_t size = 0;
+        for (const auto& str : v) {
+            size += sizeof(std::string) + str.size() + 1;
+        }
+        return size;
+    };
+
+    auto computeWeightsSize = [](const Weights& w) {
+        size_t size = 0;
+        for (const auto& p : w) {
+            size += sizeof(p) + p.first.size() + 1;
+        }
+        return size;
+    };
+
+    // _defaultLanguage is owned by the LanguageRegistry class and may be shared across many
+    // FTSSpec's, so we don't account for the size of _defaultLanguage here.
+    auto size = sizeof(FTSSpec);
+    size += _languageOverrideField.size() + 1;
+    size += computeWeightsSize(_weights);
+    size += computeVectorSize(_extraBefore);
+    size += computeVectorSize(_extraAfter);
+    return size;
 }
 }  // namespace fts
 }  // namespace mongo

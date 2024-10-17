@@ -1,41 +1,20 @@
 /**
  * Tests that a drop can't happen while resharding is in progress.
- *
  * @tags: [
- *   requires_fcv_49,
+ *  requires_fcv_53,
+ *  featureFlagRecoverableShardsvrReshardCollectionCoordinator,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
-
-function awaitReshardingStarted() {
-    assert.soon(() => {
-        const op = st.admin
-                       .aggregate([
-                           {$currentOp: {allUsers: true, localOps: true}},
-                           {$match: {"command.reshardCollection": ns}},
-                       ])
-                       .toArray()[0];
-
-        return op !== undefined;
-    }, "failed to find reshardCollection in $currentOp output");
-}
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({
-    shards: 1,
-    config: 1,
+    shards: {rs0: {nodes: 2}},
+    config: TestData.configShard ? 2 : 1,
     mongos: 1,
     other: {
-        mongosOptions: {setParameter: {featureFlagResharding: true}},
-        configOptions: {
-            setParameter: {
-                featureFlagResharding: true,
-                reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000
-            }
-        }
+        configOptions: {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}}
     }
 });
 
@@ -47,21 +26,35 @@ const db = st.s.getDB(dbName);
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
-const pauseCoordinatorBeforeDecisionPersistedFailpoint = configureFailPoint(
-    st.configRS.getPrimary(), "reshardingPauseCoordinatorBeforeDecisionPersisted");
+const reshardingPauseCoordinatorBeforeInitializingFailpoint =
+    configureFailPoint(st.configRS.getPrimary(), "reshardingPauseCoordinatorBeforeInitializing");
 
-const awaitReshardResult = startParallelShell(
-    funWithArgs(function(ns) {
-        assert.commandWorked(db.adminCommand({reshardCollection: ns, key: {newKey: 1}}));
-    }, ns), st.s.port);
+assert.commandFailedWithCode(
+    db.adminCommand({reshardCollection: ns, key: {newKey: 1}, maxTimeMS: 1000}),
+    ErrorCodes.MaxTimeMSExpired);
 
-awaitReshardingStarted();
+// Wait for resharding to start running on the configsvr
+reshardingPauseCoordinatorBeforeInitializingFailpoint.wait();
 
+// Drop cannot progress while resharding is in progress
 assert.commandFailedWithCode(db.runCommand({drop: collName, maxTimeMS: 5000}),
                              ErrorCodes.MaxTimeMSExpired);
 
-pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
-awaitReshardResult();
+// Stepdown the DB primary shard
+const shard0Primary = st.rs0.getPrimary();
+assert.commandWorked(
+    shard0Primary.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
+st.rs0.awaitNodesAgreeOnPrimary();
+
+// Even after stepdown, drop cannot progress due to the in-progress resharding
+assert.commandFailedWithCode(db.runCommand({drop: collName, maxTimeMS: 5000}),
+                             ErrorCodes.MaxTimeMSExpired);
+
+// Finish resharding
+reshardingPauseCoordinatorBeforeInitializingFailpoint.off();
+assert.commandWorked(db.adminCommand({reshardCollection: ns, key: {newKey: 1}}));
+
+// Now the drop can complete
+assert.commandWorked(db.runCommand({drop: collName}));
 
 st.stop();
-})();

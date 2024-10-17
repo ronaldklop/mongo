@@ -3,17 +3,8 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-
-"use strict";
-
-load("jstests/libs/retryable_writes_util.js");
-load("jstests/libs/write_concern_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {runWriteConcernRetryabilityTest} from "jstests/libs/write_concern_util.js";
 
 const kNodes = 2;
 
@@ -213,4 +204,3 @@ runWriteConcernRetryabilityTest(priConn,
                                 'admin');
 
 replTest.stopSet();
-})();

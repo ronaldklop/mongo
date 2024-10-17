@@ -29,9 +29,37 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <list>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/common_mongod_process_interface.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/db/pipeline/process_interface/common_process_interface.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/pipeline/sharded_agg_helpers_targeting_policy.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -42,9 +70,6 @@ class ShardServerProcessInterface final : public CommonMongodProcessInterface {
 public:
     using CommonMongodProcessInterface::CommonMongodProcessInterface;
 
-    ShardServerProcessInterface(OperationContext* opCtx,
-                                std::shared_ptr<executor::TaskExecutor> executor);
-
     /**
      * Note: Cannot be called while holding a lock. Refreshes from the config servers if the
      * metadata for the given namespace does not exist. Otherwise, will not automatically refresh,
@@ -53,12 +78,20 @@ public:
      */
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
+
+    boost::optional<ShardId> determineSpecificMergeShard(OperationContext* opCtx,
+                                                         const NamespaceString& ns) const final {
+        return CommonProcessInterface::findOwningShard(opCtx, ns);
+    }
+
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion targetCollectionVersion) const final;
+                                      ChunkVersion targetCollectionPlacementVersion) const final;
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
-        OperationContext* opCtx, const NamespaceString&, UUID) const final;
+    std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
+        OperationContext* opCtx, const NamespaceString& ns) const final {
+        return std::make_unique<TargetPrimaryWriteSizeEstimator>();
+    }
 
     std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
         OperationContext*, const NamespaceString&) const final {
@@ -71,23 +104,22 @@ public:
         uasserted(50997, "Unexpected attempt to consult catalog cache on a shard server");
     }
 
-    /**
-     * Inserts the documents 'objs' into the namespace 'ns' using the ClusterWriter for locking,
-     * routing, stale config handling, etc.
-     */
+    boost::optional<Document> lookupSingleDocument(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        UUID collectionUUID,
+        const Document& documentKey,
+        boost::optional<BSONObj> readConcern) final;
+
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
-                  std::vector<BSONObj>&& objs,
+                  std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
                   const WriteConcernOptions& wc,
                   boost::optional<OID> targetEpoch) final;
 
-    /**
-     * Replaces the documents matching 'queries' with 'updates' using the ClusterWriter for locking,
-     * routing, stale config handling, etc.
-     */
     StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     const NamespaceString& ns,
-                                    BatchedObjects&& batch,
+                                    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
                                     const WriteConcernOptions& wc,
                                     UpsertType upsert,
                                     bool multi,
@@ -96,26 +128,34 @@ public:
     BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
                                       ExplainOptions::Verbosity verbosity) final;
 
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override final;
-
     BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) final;
+
+    query_shape::CollectionType getCollectionType(OperationContext* opCtx,
+                                                  const NamespaceString& nss) final;
 
     std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
                                      const NamespaceString& ns,
                                      bool includeBuildUUIDs) final;
     void renameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
-                                                 const BSONObj& renameCommandObj,
+                                                 const NamespaceString& sourceNs,
                                                  const NamespaceString& targetNs,
+                                                 bool dropTarget,
+                                                 bool stayTemp,
                                                  const BSONObj& originalCollectionOptions,
                                                  const std::list<BSONObj>& originalIndexes) final;
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj) final;
+    void createTempCollection(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const BSONObj& collectionOptions,
+                              boost::optional<ShardId> dataShard) final;
     void createIndexesOnEmptyCollection(OperationContext* opCtx,
                                         const NamespaceString& ns,
                                         const std::vector<BSONObj>& indexSpecs) final;
     void dropCollection(OperationContext* opCtx, const NamespaceString& collection) final;
+
+    void dropTempCollection(OperationContext* opCtx, const NamespaceString& nss) final;
 
     /**
      * If 'allowTargetingShards' is true, splits the pipeline and dispatch half to the shards,
@@ -123,31 +163,53 @@ public:
      * retry on network errors and also on StaleConfig errors to avoid restarting the entire
      * operation.
      */
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        Pipeline* pipeline, bool allowTargetingShards) final;
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
+        Pipeline* pipeline,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final;
 
-    void setExpectedShardVersion(OperationContext* opCtx,
-                                 const NamespaceString& nss,
-                                 boost::optional<ChunkVersion> chunkVersion) final;
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final;
+
+    std::unique_ptr<ScopedExpectUnshardedCollection> expectUnshardedCollectionInScope(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const boost::optional<DatabaseVersion>& dbVersion) override;
+
+    void createTimeseriesView(OperationContext* opCtx,
+                              const NamespaceString& ns,
+                              const BSONObj& cmdObj,
+                              const TimeseriesOptions& userOpts) final;
+
+    Status insertTimeseries(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            const NamespaceString& ns,
+                            std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+                            const WriteConcernOptions& wc,
+                            boost::optional<OID> targetEpoch) final;
+
+protected:
+    /**
+     * Utility to share a common collection creation implementation.
+     */
+    void _createCollectionCommon(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj,
+                                 boost::optional<ShardId> dataShard = boost::none);
 
 private:
-    // If the current operation is versioned, then we attach the DB version to the command object;
-    // otherwise, it is returned unmodified. Used when running internal commands, as the parent
-    // operation may be unversioned if run by a client connecting directly to the shard. If a shard
-    // version is supplied it will be set on the command, otherwise no shard version is attached.
-    // This allows sub-operations to set a version where necessary (e.g. to enforce that only
-    // unsharded collections can be renamed) while omitting it in cases where it is not relevant
-    // (e.g. obtaining a list of indexes for a collection that may be sharded or unsharded).
-    BSONObj _versionCommandIfAppropriate(BSONObj cmdObj,
-                                         const CachedDatabaseInfo& cachedDbInfo,
-                                         boost::optional<ChunkVersion> shardVersion = boost::none);
+    boost::optional<TimeseriesOptions> _getTimeseriesOptions(OperationContext* opCtx,
+                                                             const NamespaceString& ns) final;
 
-    // Records whether the initial operation which creates this MongoProcessInterface is versioned.
-    // We want to avoid applying versions to sub-operations in cases where the client has connected
-    // directly to a shard. Since getMores are never versioned, we must retain the versioning state
-    // of the original operation so that we can decide whether we should version sub-operations
-    // across the entire lifetime of the pipeline that owns this MongoProcessInterface.
-    bool _opIsVersioned = false;
+    /**
+     * Utility to run a 'listCollections' command on the primary. This is used to confirm different
+     * collection properties, such as collection options and if the collection exists.
+     */
+    BSONObj _runListCollectionsCommand(OperationContext* opCtx, const NamespaceString& nss);
 };
 
 }  // namespace mongo

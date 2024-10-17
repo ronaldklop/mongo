@@ -27,22 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/list_indexes.h"
-
+#include <cstddef>
 #include <list>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 #include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 // Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
 MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
@@ -51,65 +68,105 @@ namespace mongo {
 
 StatusWith<std::list<BSONObj>> listIndexes(OperationContext* opCtx,
                                            const NamespaceStringOrUUID& ns,
-                                           boost::optional<bool> includeBuildUUIDs) {
+                                           ListIndexesInclude additionalInclude) {
     AutoGetCollectionForReadCommandMaybeLockFree collection(opCtx, ns);
     auto nss = collection.getNss();
     if (!collection) {
-        return StatusWith<std::list<BSONObj>>(ErrorCodes::NamespaceNotFound,
-                                              str::stream() << "ns does not exist: "
-                                                            << collection.getNss().ns());
+        return StatusWith<std::list<BSONObj>>(
+            ErrorCodes::NamespaceNotFound,
+            str::stream() << "ns does not exist: " << collection.getNss().toStringForErrorMsg());
     }
     return StatusWith<std::list<BSONObj>>(
-        listIndexesInLock(opCtx, collection.getCollection(), nss, includeBuildUUIDs));
+        listIndexesInLock(opCtx, collection.getCollection(), nss, additionalInclude));
 }
 
 std::list<BSONObj> listIndexesInLock(OperationContext* opCtx,
                                      const CollectionPtr& collection,
                                      const NamespaceString& nss,
-                                     boost::optional<bool> includeBuildUUIDs) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
-
-    auto durableCatalog = DurableCatalog::get(opCtx);
-
+                                     ListIndexesInclude additionalInclude) {
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, nss);
 
-    return writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-        std::vector<std::string> indexNames;
-        std::list<BSONObj> indexSpecs;
-        durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &indexNames);
+    std::vector<std::string> indexNames;
+    std::list<BSONObj> indexSpecs;
+    collection->getAllIndexes(&indexNames);
 
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            if (!includeBuildUUIDs.value_or(false) ||
-                durableCatalog->isIndexReady(opCtx, collection->getCatalogId(), indexNames[i])) {
-                indexSpecs.push_back(
-                    durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), indexNames[i]));
-                continue;
-            }
-            // The durable catalog will not have a build UUID for the given index name if it was
-            // not being built with two-phase.
-            const auto durableBuildUUID = DurableCatalog::get(opCtx)->getIndexBuildUUID(
-                opCtx, collection->getCatalogId(), indexNames[i]);
-            if (!durableBuildUUID) {
-                indexSpecs.push_back(
-                    durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), indexNames[i]));
-                continue;
-            }
-
-            BSONObjBuilder builder;
-            builder.append(
-                "spec"_sd,
-                durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), indexNames[i]));
-            durableBuildUUID->appendToBuilder(&builder, "buildUUID"_sd);
-            indexSpecs.push_back(builder.obj());
+    if (collection->isClustered() && !collection->ns().isTimeseriesBucketsCollection()) {
+        BSONObj collation;
+        if (auto collator = collection->getDefaultCollator()) {
+            collation = collator->getSpec().toBSON();
         }
-        return indexSpecs;
-    });
+        auto clusteredSpec = clustered_util::formatClusterKeyForListIndexes(
+            collection->getClusteredInfo().value(),
+            collation,
+            collection->getCollectionOptions().expireAfterSeconds);
+        if (additionalInclude == ListIndexesInclude::IndexBuildInfo) {
+            indexSpecs.push_back(BSON("spec"_sd << clusteredSpec));
+        } else {
+            indexSpecs.push_back(clusteredSpec);
+        }
+    }
+    for (size_t i = 0; i < indexNames.size(); i++) {
+        auto spec = collection->getIndexSpec(indexNames[i]);
+        auto durableBuildUUID = collection->getIndexBuildUUID(indexNames[i]);
+        // The durable catalog will not have a build UUID for the given index name if it was
+        // not being built with two-phase -- in this case we have no relevant index build info
+        bool inProgressInformationExists =
+            !collection->isIndexReady(indexNames[i]) && durableBuildUUID;
+        switch (additionalInclude) {
+            case ListIndexesInclude::Nothing:
+                indexSpecs.push_back(spec);
+                break;
+            case ListIndexesInclude::BuildUUID:
+                if (inProgressInformationExists) {
+                    indexSpecs.push_back(
+                        BSON("spec"_sd << spec << "buildUUID"_sd << *durableBuildUUID));
+                } else {
+                    indexSpecs.push_back(spec);
+                }
+                break;
+            case ListIndexesInclude::IndexBuildInfo:
+                if (inProgressInformationExists) {
+                    // Constructs a sub-document "indexBuildInfo" in the following
+                    // format with sample values:
+                    //
+                    // indexBuildInfo: {
+                    //     buildUUID: UUID("00836550-d10e-4ec8-84df-cb5166bc085b"),
+                    //     method: "Hybrid",
+                    //     phase: 1,
+                    //     phaseStr: "collection scan",
+                    //     opid: 654,
+                    //     resumable: true,
+                    //     replicationState: {
+                    //         state: "In progress"
+                    //     }
+                    // }
+                    //
+                    // The information here is gathered by querying the various index build
+                    // classes accessible through the IndexBuildCoordinator interface. The
+                    // example above is intended to provide a general idea of the information
+                    // gathered for an in-progress index build and is subject to change.
+
+                    BSONObjBuilder builder;
+                    durableBuildUUID->appendToBuilder(&builder, "buildUUID"_sd);
+                    IndexBuildsCoordinator::get(opCtx)->appendBuildInfo(*durableBuildUUID,
+                                                                        &builder);
+                    indexSpecs.push_back(
+                        BSON("spec"_sd << spec << "indexBuildInfo"_sd << builder.obj()));
+                } else {
+                    indexSpecs.push_back(BSON("spec"_sd << spec));
+                }
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+    return indexSpecs;
 }
 std::list<BSONObj> listIndexesEmptyListIfMissing(OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nss,
-                                                 boost::optional<bool> includeBuildUUIDs) {
-    auto listStatus = listIndexes(opCtx, nss, includeBuildUUIDs);
-    return listStatus.isOK() ? listStatus.getValue() : std::list<BSONObj>();
+                                                 ListIndexesInclude additionalInclude) {
+    auto listStatus = listIndexes(opCtx, nss, additionalInclude);
+    return listStatus.isOK() ? std::move(listStatus.getValue()) : std::list<BSONObj>();
 }
 }  // namespace mongo

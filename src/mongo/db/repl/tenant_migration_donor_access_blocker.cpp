@@ -27,51 +27,111 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/client.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tenant_migration_access_blocker_executor.h"
+#include "mongo/db/repl/tenant_migration_access_blocker.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/repl/tenant_migration_donor_access_blocker.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/future_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(tenantMigrationDonorAllowsNonTimestampedReads);
+
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
+
+// Commands that are not allowed to run against the donor after a committed migration so that we
+// typically provide read-your-own-write guarantees for primary reads across tenant migrations.
+const StringMap<int> commandDenyListAfterMigration = {
+    {"find", 1},
+    {"count", 1},
+    {"distinct", 1},
+    {"aggregate", 1},
+    {"mapReduce", 1},
+    {"mapreduce", 1},
+    {"findAndModify", 1},
+    {"findandmodify", 1},
+    {"listCollections", 1},
+    {"listIndexes", 1},
+    {"update", 1},
+    {"delete", 1},
+};
 
 }  // namespace
 
-TenantMigrationDonorAccessBlocker::TenantMigrationDonorAccessBlocker(
-    ServiceContext* serviceContext, std::string tenantId, std::string recipientConnString)
-    : _serviceContext(serviceContext),
-      _tenantId(std::move(tenantId)),
-      _recipientConnString(std::move(recipientConnString)) {
-    _asyncBlockingOperationsExecutor = TenantMigrationAccessBlockerExecutor::get(serviceContext)
-                                           .getOrCreateBlockedOperationsExecutor();
-}
+TenantMigrationDonorAccessBlocker::TenantMigrationDonorAccessBlocker(ServiceContext* serviceContext,
+                                                                     const UUID& migrationId)
+    : TenantMigrationAccessBlocker(BlockerType::kDonor, migrationId),
+      _serviceContext(serviceContext) {}
 
-Status TenantMigrationDonorAccessBlocker::checkIfCanWrite() {
-    stdx::lock_guard<Latch> lg(_mutex);
+Status TenantMigrationDonorAccessBlocker::checkIfCanWrite(Timestamp writeTs) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    switch (_state) {
-        case State::kAllow:
-        case State::kAborted:
+    switch (_state.getState()) {
+        case BlockerState::State::kAllow:
+            // As a sanity check, we track the highest allowed write timestamp to ensure no
+            // writes are allowed with a timestamp higher than the block timestamp.
+            _highestAllowedWriteTimestamp = std::max(writeTs, _highestAllowedWriteTimestamp);
+            [[fallthrough]];
+        case BlockerState::State::kAborted:
             return Status::OK();
-        case State::kBlockWrites:
-        case State::kBlockWritesAndReads:
-            return {TenantMigrationConflictInfo(_tenantId, shared_from_this()),
+        case BlockerState::State::kBlockWrites:
+        case BlockerState::State::kBlockWritesAndReads:
+            return {TenantMigrationConflictInfo(getMigrationId(), shared_from_this()),
                     "Write must block until this tenant migration commits or aborts"};
-        case State::kReject:
+        case BlockerState::State::kReject:
             return {ErrorCodes::TenantMigrationCommitted,
                     "Write must be re-routed to the new owner of this tenant"};
         default:
@@ -79,11 +139,11 @@ Status TenantMigrationDonorAccessBlocker::checkIfCanWrite() {
     }
 }
 
-Status TenantMigrationDonorAccessBlocker::waitUntilCommittedOrAborted(OperationContext* opCtx,
-                                                                      OperationType operationType) {
+Status TenantMigrationDonorAccessBlocker::waitUntilCommittedOrAborted(OperationContext* opCtx) {
     // Source to cancel the timeout if the operation completed in time.
     CancellationSource cancelTimeoutSource;
-    auto executor = getAsyncBlockingOperationsExecutor();
+    auto executor = TenantMigrationAccessBlockerRegistry::get(_serviceContext)
+                        .getAsyncBlockingOperationsExecutor();
     std::vector<ExecutorFuture<void>> futures;
 
     futures.emplace_back(_onCompletion().thenRunOn(executor));
@@ -107,17 +167,27 @@ Status TenantMigrationDonorAccessBlocker::waitUntilCommittedOrAborted(OperationC
         return status;
     } else if (idx == 1) {
         // Deadline finished first, return error
-        return Status(opCtx->getTimeoutError(),
-                      "Operation timed out waiting for tenant migration to commit or abort",
-                      getDebugInfo());
+        return Status(
+            opCtx->getTimeoutError(),
+            "Operation timed out waiting for an internal data migration to commit or abort");
     }
     MONGO_UNREACHABLE;
 }
 
-SharedSemiFuture<void> TenantMigrationDonorAccessBlocker::getCanReadFuture(
-    OperationContext* opCtx) {
+SharedSemiFuture<void> TenantMigrationDonorAccessBlocker::getCanRunCommandFuture(
+    OperationContext* opCtx, StringData command) {
+    // Exclude internal client requests
+    if (tenant_migration_access_blocker::shouldExclude(opCtx)) {
+        LOGV2_DEBUG(6397500,
+                    1,
+                    "Internal tenant command got excluded from the MTAB filtering",
+                    "migrationId"_attr = getMigrationId(),
+                    "opId"_attr = opCtx->getOpID());
+        return SharedSemiFuture<void>();
+    }
+
     auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readTimestamp = [opCtx, &readConcernArgs]() -> std::optional<Timestamp> {
+    auto readTimestamp = [opCtx, &readConcernArgs]() -> boost::optional<Timestamp> {
         if (auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime()) {
             return afterClusterTime->asTimestamp();
         }
@@ -127,39 +197,49 @@ SharedSemiFuture<void> TenantMigrationDonorAccessBlocker::getCanReadFuture(
         if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
             return repl::StorageInterface::get(opCtx)->getPointInTimeReadTimestamp(opCtx);
         }
-        return std::nullopt;
+        return boost::none;
     }();
-    if (!readTimestamp) {
-        return SharedSemiFuture<void>();
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    switch (_state.getState()) {
+        case BlockerState::State::kAllow:
+        case BlockerState::State::kBlockWrites:
+        case BlockerState::State::kAborted:
+            return SharedSemiFuture<void>();
+
+        case BlockerState::State::kBlockWritesAndReads:
+            if (!readTimestamp || *readTimestamp < *_blockTimestamp) {
+                return SharedSemiFuture<void>();
+            } else {
+                _stats.numBlockedReads.addAndFetch(1);
+                return _transitionOutOfBlockingPromise.getFuture();
+            }
+
+        case BlockerState::State::kReject:
+            if (!readTimestamp) {
+                if (MONGO_unlikely(tenantMigrationDonorAllowsNonTimestampedReads.shouldFail()) ||
+                    commandDenyListAfterMigration.find(command) ==
+                        commandDenyListAfterMigration.end()) {
+                    return SharedSemiFuture<void>();
+                }
+            } else if (*readTimestamp < *_blockTimestamp) {
+                return SharedSemiFuture<void>();
+            }
+
+            return SharedSemiFuture<void>(
+                Status(ErrorCodes::TenantMigrationCommitted,
+                       "Command must be re-routed to the new owner of this tenant"));
+
+        default:
+            MONGO_UNREACHABLE;
     }
-    return _getCanDoClusterTimeReadFuture(opCtx, *readTimestamp);
-}
-
-SharedSemiFuture<void> TenantMigrationDonorAccessBlocker::_getCanDoClusterTimeReadFuture(
-    OperationContext* opCtx, Timestamp readTimestamp) {
-    stdx::unique_lock<Latch> ul(_mutex);
-
-    auto canRead = _state == State::kAllow || _state == State::kAborted ||
-        _state == State::kBlockWrites || readTimestamp < *_blockTimestamp;
-
-    if (canRead) {
-        return SharedSemiFuture<void>();
-    }
-
-    if (_state == State::kReject) {
-        return SharedSemiFuture<void>(
-            Status(ErrorCodes::TenantMigrationCommitted,
-                   "Read must be re-routed to the new owner of this tenant"));
-    }
-
-    _stats.numBlockedReads.addAndFetch(1);
-    return _transitionOutOfBlockingPromise.getFuture();
 }
 
 Status TenantMigrationDonorAccessBlocker::checkIfLinearizableReadWasAllowed(
     OperationContext* opCtx) {
-    stdx::lock_guard<Latch> lg(_mutex);
-    if (_state == State::kReject) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    if (_state.isReject()) {
         return {ErrorCodes::TenantMigrationCommitted,
                 "Read must be re-routed to the new owner of this tenant"};
     }
@@ -167,70 +247,122 @@ Status TenantMigrationDonorAccessBlocker::checkIfLinearizableReadWasAllowed(
 }
 
 Status TenantMigrationDonorAccessBlocker::checkIfCanBuildIndex() {
-    stdx::lock_guard<Latch> lg(_mutex);
-    switch (_state) {
-        case State::kAllow:
-        case State::kBlockWrites:
-        case State::kBlockWritesAndReads:
-            return {TenantMigrationConflictInfo(_tenantId, shared_from_this(), kIndexBuild),
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    switch (_state.getState()) {
+        case BlockerState::State::kAllow:
+        case BlockerState::State::kBlockWrites:
+        case BlockerState::State::kBlockWritesAndReads:
+            return {TenantMigrationConflictInfo(getMigrationId(), shared_from_this()),
                     "Index build must block until tenant migration is committed or aborted."};
-        case State::kReject:
+        case BlockerState::State::kReject:
             return {ErrorCodes::TenantMigrationCommitted,
                     "Index build must be re-routed to the new owner of this tenant"};
-        case State::kAborted:
+        case BlockerState::State::kAborted:
+            return Status::OK();
+    }
+    MONGO_UNREACHABLE;
+}
+
+Status TenantMigrationDonorAccessBlocker::checkIfCanOpenChangeStream() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    switch (_state.getState()) {
+        case BlockerState::State::kAllow:
+            return Status::OK();
+        case BlockerState::State::kBlockWrites:
+        case BlockerState::State::kBlockWritesAndReads:
+            return {TenantMigrationConflictInfo(getMigrationId(), shared_from_this()),
+                    "Change stream must wait for commit or abort to get a safe start time"};
+        case BlockerState::State::kReject:
+            // At this point checkIfCanReadOrBlock should have blocked this at the command level.
+            return {ErrorCodes::TenantMigrationCommitted,
+                    "Change stream must be resumed on the new owner of this tenant"};
+        case BlockerState::State::kAborted:
+            return Status::OK();
+    }
+    MONGO_UNREACHABLE;
+}
+
+Status TenantMigrationDonorAccessBlocker::checkIfCanGetMoreChangeStream() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    switch (_state.getState()) {
+        case BlockerState::State::kAllow:
+        case BlockerState::State::kBlockWrites:
+        case BlockerState::State::kBlockWritesAndReads:
+            return Status::OK();
+        case BlockerState::State::kReject:
+            return {ErrorCodes::ResumeTenantChangeStream,
+                    "Change stream must be resumed on the new owner of this tenant"};
+        case BlockerState::State::kAborted:
             return Status::OK();
     }
     MONGO_UNREACHABLE;
 }
 
 void TenantMigrationDonorAccessBlocker::startBlockingWrites() {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    LOGV2(5093800, "Tenant migration starting to block writes", "tenantId"_attr = _tenantId);
+    LOGV2(5093800, "Starting to block writes", "migrationId"_attr = getMigrationId());
 
-    invariant(_state == State::kAllow);
     invariant(!_blockTimestamp);
     invariant(!_commitOpTime);
     invariant(!_abortOpTime);
 
-    _state = State::kBlockWrites;
+    _state.transitionTo(BlockerState::State::kBlockWrites);
 }
 
 void TenantMigrationDonorAccessBlocker::startBlockingReadsAfter(const Timestamp& blockTimestamp) {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
     LOGV2(5093801,
-          "Tenant migration starting to block reads after blockTimestamp",
-          "tenantId"_attr = _tenantId,
+          "Starting to block reads after blockTimestamp",
+          "migrationId"_attr = getMigrationId(),
           "blockTimestamp"_attr = blockTimestamp);
 
-    invariant(_state == State::kBlockWrites);
     invariant(!_blockTimestamp);
     invariant(!_commitOpTime);
     invariant(!_abortOpTime);
 
-    _state = State::kBlockWritesAndReads;
+    invariant(
+        blockTimestamp > _highestAllowedWriteTimestamp,
+        str::stream() << "The block timestamp must be higher than the timestamp of any allowed "
+                         "write, blockTimestamp: "
+                      << blockTimestamp.toString() << ", highestAllowedWriteTimestamp: "
+                      << _highestAllowedWriteTimestamp.toString());
+
+    _state.transitionTo(BlockerState::State::kBlockWritesAndReads);
     _blockTimestamp = blockTimestamp;
 }
 
 void TenantMigrationDonorAccessBlocker::rollBackStartBlocking() {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    invariant(_state == State::kBlockWrites || _state == State::kBlockWritesAndReads);
     invariant(!_commitOpTime);
     invariant(!_abortOpTime);
 
-    _state = State::kAllow;
+    _state.transitionTo(BlockerState::State::kAllow);
     _blockTimestamp.reset();
     _transitionOutOfBlockingPromise.setFrom(Status::OK());
+}
+
+void TenantMigrationDonorAccessBlocker::interrupt() {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    const Status status(
+        ErrorCodes::Interrupted,
+        "Blocked read or write interrupted while waiting for tenant migration to commit or abort");
+    if (!_transitionOutOfBlockingPromise.getFuture().isReady()) {
+        _transitionOutOfBlockingPromise.setFrom(status);
+    }
+    if (!_completionPromise.getFuture().isReady()) {
+        _completionPromise.setError(status);
+    }
 }
 
 void TenantMigrationDonorAccessBlocker::setCommitOpTime(OperationContext* opCtx,
                                                         repl::OpTime opTime) {
     {
-        stdx::lock_guard<Latch> lg(_mutex);
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-        invariant(_state == State::kBlockWritesAndReads);
+        invariant(_state.isBlockWritesAndReads());
         invariant(!_commitOpTime);
         invariant(!_abortOpTime);
 
@@ -238,15 +370,15 @@ void TenantMigrationDonorAccessBlocker::setCommitOpTime(OperationContext* opCtx,
     }
 
     LOGV2(5107300,
-          "Tenant migration starting to wait for commit OpTime to be majority-committed",
-          "tenantId"_attr = _tenantId,
+          "Starting to wait for commit OpTime to be majority-committed",
+          "migrationId"_attr = getMigrationId(),
           "commitOpTime"_attr = opTime);
 
     if (opTime > repl::ReplicationCoordinator::get(opCtx)->getCurrentCommittedSnapshotOpTime()) {
         return;
     }
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_completionPromise.getFuture().isReady()) {
         // onMajorityCommitPointUpdate() was called during the time that this thread is not holding
         // the lock.
@@ -258,7 +390,7 @@ void TenantMigrationDonorAccessBlocker::setCommitOpTime(OperationContext* opCtx,
 void TenantMigrationDonorAccessBlocker::setAbortOpTime(OperationContext* opCtx,
                                                        repl::OpTime opTime) {
     {
-        stdx::lock_guard<Latch> lg(_mutex);
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
 
         invariant(!_commitOpTime);
         invariant(!_abortOpTime);
@@ -267,15 +399,15 @@ void TenantMigrationDonorAccessBlocker::setAbortOpTime(OperationContext* opCtx,
     }
 
     LOGV2(5107301,
-          "Tenant migration starting to wait for abort OpTime to be majority-committed",
-          "tenantId"_attr = _tenantId,
+          "Starting to wait for abort OpTime to be majority-committed",
+          "migrationId"_attr = getMigrationId(),
           "abortOpTime"_attr = opTime);
 
     if (opTime > repl::ReplicationCoordinator::get(opCtx)->getCurrentCommittedSnapshotOpTime()) {
         return;
     }
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_completionPromise.getFuture().isReady()) {
         // onMajorityCommitPointUpdate() was called during the time that this thread is not holding
         // the lock.
@@ -285,7 +417,7 @@ void TenantMigrationDonorAccessBlocker::setAbortOpTime(OperationContext* opCtx,
 }
 
 void TenantMigrationDonorAccessBlocker::onMajorityCommitPointUpdate(repl::OpTime opTime) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     if (_completionPromise.getFuture().isReady()) {
         return;
@@ -301,13 +433,12 @@ void TenantMigrationDonorAccessBlocker::onMajorityCommitPointUpdate(repl::OpTime
 }
 
 void TenantMigrationDonorAccessBlocker::_onMajorityCommitCommitOpTime(
-    stdx::unique_lock<Latch>& lk) {
-    invariant(_state == State::kBlockWritesAndReads);
+    stdx::unique_lock<stdx::mutex>& lk) {
     invariant(_blockTimestamp);
     invariant(_commitOpTime);
     invariant(!_abortOpTime);
 
-    _state = State::kReject;
+    _state.transitionTo(BlockerState::State::kReject);
     Status error{ErrorCodes::TenantMigrationCommitted,
                  "Write or read must be re-routed to the new owner of this tenant"};
     _completionPromise.setError(error);
@@ -315,64 +446,41 @@ void TenantMigrationDonorAccessBlocker::_onMajorityCommitCommitOpTime(
 
     lk.unlock();
     LOGV2(5093803,
-          "Tenant migration finished waiting for commit OpTime to be majority-committed",
-          "tenantId"_attr = _tenantId);
+          "Finished waiting for commit OpTime to be majority-committed",
+          "migrationId"_attr = getMigrationId());
 }
 
-void TenantMigrationDonorAccessBlocker::_onMajorityCommitAbortOpTime(stdx::unique_lock<Latch>& lk) {
-    invariant(_state != State::kReject);
+void TenantMigrationDonorAccessBlocker::_onMajorityCommitAbortOpTime(
+    stdx::unique_lock<stdx::mutex>& lk) {
     invariant(!_commitOpTime);
-    invariant(_state != State::kAborted);
     invariant(_abortOpTime);
 
-    _state = State::kAborted;
+    _state.transitionTo(BlockerState::State::kAborted);
     _transitionOutOfBlockingPromise.setFrom(Status::OK());
     _completionPromise.setError({ErrorCodes::TenantMigrationAborted, "Tenant migration aborted"});
 
     lk.unlock();
     LOGV2(5093805,
-          "Tenant migration finished waiting for abort OpTime to be majority-committed",
-          "tenantId"_attr = _tenantId);
+          "Finished waiting for abort OpTime to be majority-committed",
+          "migrationId"_attr = getMigrationId());
 }
 
 void TenantMigrationDonorAccessBlocker::appendInfoForServerStatus(BSONObjBuilder* builder) const {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     invariant(!_commitOpTime || !_abortOpTime);
 
-    BSONObjBuilder tenantBuilder;
-    tenantBuilder.append("state", _stateToString(_state));
+    getMigrationId().appendToBuilder(builder, "migrationId");
+    builder->append("state", _state.toString());
     if (_blockTimestamp) {
-        tenantBuilder.append("blockTimestamp", _blockTimestamp.get());
+        builder->append("blockTimestamp", _blockTimestamp.value());
     }
     if (_commitOpTime) {
-        tenantBuilder.append("commitOpTime", _commitOpTime->toBSON());
+        builder->append("commitOpTime", _commitOpTime->toBSON());
     }
     if (_abortOpTime) {
-        tenantBuilder.append("abortOpTime", _abortOpTime->toBSON());
+        builder->append("abortOpTime", _abortOpTime->toBSON());
     }
-    _stats.report(&tenantBuilder);
-    builder->append(_tenantId, tenantBuilder.obj());
-}
-
-std::string TenantMigrationDonorAccessBlocker::_stateToString(State state) const {
-    switch (state) {
-        case State::kAllow:
-            return "allow";
-        case State::kBlockWrites:
-            return "blockWrites";
-        case State::kBlockWritesAndReads:
-            return "blockWritesAndReads";
-        case State::kReject:
-            return "reject";
-        case State::kAborted:
-            return "aborted";
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-BSONObj TenantMigrationDonorAccessBlocker::getDebugInfo() const {
-    return BSON("tenantId" << _tenantId << "recipientConnectionString" << _recipientConnString);
+    _stats.report(builder);
 }
 
 void TenantMigrationDonorAccessBlocker::recordTenantMigrationError(Status status) {
@@ -390,6 +498,71 @@ void TenantMigrationDonorAccessBlocker::Stats::report(BSONObjBuilder* builder) c
     builder->append("numBlockedWrites", numBlockedWrites.load());
     builder->append("numTenantMigrationCommittedErrors", numTenantMigrationCommittedErrors.load());
     builder->append("numTenantMigrationAbortedErrors", numTenantMigrationAbortedErrors.load());
+}
+
+std::string TenantMigrationDonorAccessBlocker::BlockerState::toString(State state) {
+    switch (state) {
+        case State::kAllow:
+            return "allow";
+        case State::kBlockWrites:
+            return "blockWrites";
+        case State::kBlockWritesAndReads:
+            return "blockWritesAndReads";
+        case State::kReject:
+            return "reject";
+        case State::kAborted:
+            return "aborted";
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+bool TenantMigrationDonorAccessBlocker::BlockerState::_isLegalTransition(State oldState,
+                                                                         State newState) {
+    switch (oldState) {
+        case State::kAllow:
+            switch (newState) {
+                case State::kBlockWrites:
+                case State::kAborted:
+                    return true;
+                default:
+                    return false;
+            }
+            MONGO_UNREACHABLE;
+        case State::kBlockWrites:
+            switch (newState) {
+                case State::kAllow:
+                case State::kBlockWritesAndReads:
+                case State::kAborted:
+                    return true;
+                default:
+                    return false;
+            }
+            MONGO_UNREACHABLE;
+        case State::kBlockWritesAndReads:
+            switch (newState) {
+                case State::kAllow:
+                case State::kReject:
+                case State::kAborted:
+                    return true;
+                default:
+                    return false;
+            }
+            MONGO_UNREACHABLE;
+        case State::kReject:
+            return false;
+        case State::kAborted:
+            return false;
+    }
+    MONGO_UNREACHABLE;
+}
+
+void TenantMigrationDonorAccessBlocker::BlockerState::transitionTo(State newState) {
+    invariant(BlockerState::_isLegalTransition(_state, newState),
+              str::stream() << "Current state: " << toString(_state)
+                            << ", Illegal attempted next state: " << toString(newState));
+
+    _state = newState;
 }
 
 }  // namespace mongo

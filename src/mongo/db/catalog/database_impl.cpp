@@ -27,66 +27,102 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/database_impl.h"
 
 #include <algorithm>
-#include <memory>
-#include <vector>
-
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
-#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/collection_options_gen.h"
+#include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uncommitted_collections.h"
-#include "mongo/db/clientcursor.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
+#include "mongo/db/catalog/uncommitted_catalog_updates.h"
+#include "mongo/db/catalog/virtual_collection_impl.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/introspect.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/durable_catalog_entry.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_util.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/system_index.h"
-#include "mongo/db/views/view_catalog.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/db/views/view.h"
+#include "mongo/db/views/view_catalog_helpers.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/random.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/synchronized_value.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+#include "mongo/util/version/releases.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(throwWCEDuringTxnCollCreate);
 MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
+MONGO_FAIL_POINT_DEFINE(overrideRecordIdsReplicatedDefault);
 MONGO_FAIL_POINT_DEFINE(hangAndFailAfterCreateCollectionReservesOpTime);
 MONGO_FAIL_POINT_DEFINE(openCreateCollectionWindowFp);
+
 
 Status validateDBNameForWindows(StringData dbname) {
     const std::vector<std::string> windowsReservedNames = {
@@ -103,37 +139,24 @@ Status validateDBNameForWindows(StringData dbname) {
     return Status::OK();
 }
 
-// Random number generator used to create unique collection namespaces suitable for temporary
-// collections.
-PseudoRandom uniqueCollectionNamespacePseudoRandom(Date_t::now().asInt64());
-
-Mutex uniqueCollectionNamespaceMutex = MONGO_MAKE_LATCH("DatabaseUniqueCollectionNamespaceMutex");
-
-void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
-    Lock::DBLock dblock(opCtx, nss.db(), MODE_IS);
-    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
-    if (!dss) {
-        return;
-    }
-
-    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-    auto mpsm = dss->getMovePrimarySourceManager(dssLock);
-
-    if (mpsm) {
-        LOGV2(4909100, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
+void assertNoMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
+    const auto scopedDss =
+        DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, nss.dbName());
+    if (scopedDss->isMovePrimaryInProgress()) {
+        LOGV2(4909100, "assertNoMovePrimaryInProgress", logAttrs(nss));
 
         uasserted(ErrorCodes::MovePrimaryInProgress,
-                  "movePrimary is in progress for namespace " + nss.toString());
+                  "movePrimary is in progress for namespace " + nss.toStringForErrorMsg());
     }
 }
-
 }  // namespace
 
-Status DatabaseImpl::validateDBName(StringData dbname) {
+Status DatabaseImpl::validateDBName(const DatabaseName& dbName) {
+    const auto dbname = dbName.serializeWithoutTenantPrefix_UNSAFE();
     if (dbname.size() <= 0)
         return Status(ErrorCodes::BadValue, "db name is empty");
 
-    if (dbname.size() >= 64)
+    if (dbname.size() > DatabaseName::kMaxDatabaseNameLength)
         return Status(ErrorCodes::BadValue, "db name is too long");
 
     if (dbname.find('.') != std::string::npos)
@@ -149,107 +172,103 @@ Status DatabaseImpl::validateDBName(StringData dbname) {
     return Status::OK();
 }
 
-DatabaseImpl::DatabaseImpl(const StringData name)
-    : _name(name.toString()),
-      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()) {
-    auto durableViewCatalog = std::make_unique<DurableViewCatalogImpl>(this);
-    auto viewCatalog = std::make_unique<ViewCatalog>(std::move(durableViewCatalog));
+DatabaseImpl::DatabaseImpl(const DatabaseName& dbName)
+    : _name(dbName), _viewsName(NamespaceString::makeSystemDotViewsNamespace(_name)) {}
 
-    ViewCatalog::set(this, std::move(viewCatalog));
-}
-
-void DatabaseImpl::init(OperationContext* const opCtx) const {
+void DatabaseImpl::init(OperationContext* const opCtx) {
     Status status = validateDBName(_name);
 
     if (!status.isOK()) {
-        LOGV2_WARNING(20325,
-                      "tried to open invalid db: {name}",
-                      "Tried to open invalid db",
-                      "db"_attr = _name);
+        LOGV2_WARNING(20325, "Tried to open invalid db", logAttrs(_name));
         uasserted(10028, status.toString());
     }
 
     auto catalog = CollectionCatalog::get(opCtx);
     for (const auto& uuid : catalog->getAllCollectionUUIDsFromDb(_name)) {
-        CollectionWriter collection(
-            opCtx,
-            uuid,
-            opCtx->lockState()->isW() ? CollectionCatalog::LifetimeMode::kInplace
-                                      : CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
+        const Collection* collection = catalog->lookupCollectionByUUID(opCtx, uuid);
         invariant(collection);
         // If this is called from the repair path, the collection is already initialized.
         if (!collection->isInitialized()) {
-            collection.getWritableCollection()->init(opCtx);
-        }
-    }
-
-    // When in repair mode, record stores are not loaded. Thus the ViewsCatalog cannot be reloaded.
-    if (!storageGlobalParams.repair) {
-        // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized
-        // yet, so no system.views collection would be found. Now that we're sufficiently
-        // initialized, reload the viewCatalog to populate its in-memory state. If there are
-        // problems with the catalog contents as might be caused by incorrect mongod versions or
-        // similar, they are found right away.
-        Status reloadStatus =
-            ViewCatalog::reload(opCtx, this, ViewCatalogLookupBehavior::kValidateDurableViews);
-        if (!reloadStatus.isOK()) {
-            LOGV2_WARNING_OPTIONS(20326,
-                                  {logv2::LogTag::kStartupWarnings},
-                                  "Unable to parse views; remove any invalid views "
-                                  "from the collection to restore server functionality",
-                                  "error"_attr = redact(reloadStatus),
-                                  "namespace"_attr = _viewsName);
-        }
-    }
-}
-
-void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
-
-    CollectionCatalog::CollectionInfoFn callback = [&](const CollectionPtr& collection) {
-        try {
             WriteUnitOfWork wuow(opCtx);
-            Status status = dropCollection(opCtx, collection->ns(), {});
-            if (!status.isOK()) {
-                LOGV2_WARNING(20327,
-                              "could not drop temp collection '{namespace}': {error}",
-                              "could not drop temp collection",
-                              "namespace"_attr = collection->ns(),
-                              "error"_attr = redact(status));
-            }
+            catalog->lookupCollectionByUUIDForMetadataWrite(opCtx, uuid)->init(opCtx);
             wuow.commit();
-        } catch (const WriteConflictException&) {
-            LOGV2_WARNING(
-                20328,
-                "could not drop temp collection '{namespace}' due to WriteConflictException",
-                "could not drop temp collection due to WriteConflictException",
-                "namespace"_attr = collection->ns());
-            opCtx->recoveryUnit()->abandonSnapshot();
         }
-        return true;
-    };
+    }
 
-    CollectionCatalog::CollectionInfoFn predicate = [&](const CollectionPtr& collection) {
-        return DurableCatalog::get(opCtx)
-            ->getCollectionOptions(opCtx, collection->getCatalogId())
-            .temp;
-    };
+    // When in restore mode, views created on collections that weren't restored will be removed. We
+    // only do this during startup when the global lock is held.
+    if (storageGlobalParams.restore && shard_role_details::getLocker(opCtx)->isW()) {
+        // Refresh our copy of the catalog, since we may have modified it above.
+        catalog = CollectionCatalog::get(opCtx);
+        try {
+            struct ViewToDrop {
+                NamespaceString name;
+                NamespaceString viewOn;
+                NamespaceString resolvedNs;
+            };
+            std::vector<ViewToDrop> viewsToDrop;
+            catalog->iterateViews(opCtx, _name, [&](const ViewDefinition& view) {
+                auto swResolvedView =
+                    view_catalog_helpers::resolveView(opCtx, catalog, view.name(), boost::none);
+                if (!swResolvedView.isOK()) {
+                    LOGV2_WARNING(6260802,
+                                  "Could not resolve view during restore",
+                                  "view"_attr = view.name(),
+                                  "viewOn"_attr = view.viewOn(),
+                                  "reason"_attr = swResolvedView.getStatus().reason());
+                    return true;
+                }
 
-    catalog::forEachCollectionFromDb(opCtx, name(), MODE_X, callback, predicate);
+                // The name of the most resolved namespace, which is a collection.
+                auto resolvedNs = swResolvedView.getValue().getNamespace();
+
+                if (catalog->lookupCollectionByNamespace(opCtx, resolvedNs)) {
+                    // The collection exists for this view.
+                    return true;
+                }
+
+                // Defer the view to drop so we don't do it while iterating. In case we're updating
+                // the catalog inplace, we cannot modify the same data structure as we're iterating
+                // on.
+                viewsToDrop.push_back({view.name(), view.viewOn(), resolvedNs});
+
+                return true;
+            });
+
+            // Drop all collected views from above.
+            for (const auto& view : viewsToDrop) {
+                LOGV2(6260803,
+                      "Removing view on collection not restored",
+                      "view"_attr = view.name,
+                      "viewOn"_attr = view.viewOn,
+                      "resolvedNs"_attr = view.resolvedNs);
+
+                WriteUnitOfWork wuow(opCtx);
+                Status status = catalog->dropView(opCtx, view.name);
+                if (!status.isOK()) {
+                    LOGV2_WARNING(6260804,
+                                  "Failed to remove view on unrestored collection",
+                                  "view"_attr = view.name,
+                                  "viewOn"_attr = view.viewOn,
+                                  "resolvedNs"_attr = view.resolvedNs,
+                                  "reason"_attr = status.reason());
+                    continue;
+                }
+                wuow.commit();
+            }
+        } catch (const ExceptionFor<ErrorCodes::InvalidViewDefinition>& e) {
+            LOGV2_WARNING(6260805,
+                          "Failed to access the view catalog during restore",
+                          logAttrs(_name),
+                          "reason"_attr = e.reason());
+        }
+    }
 }
 
-void DatabaseImpl::setDropPending(OperationContext* opCtx, bool dropPending) {
-    auto mode = dropPending ? MODE_X : MODE_IX;
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), mode));
-    _dropPending.store(dropPending);
-}
-
-bool DatabaseImpl::isDropPending(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
-    return _dropPending.load();
-}
-
-void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale) const {
+void DatabaseImpl::getStats(OperationContext* opCtx,
+                            DBStats* output,
+                            bool includeFreeStorage,
+                            double scale) const {
 
     long long nCollections = 0;
     long long nViews = 0;
@@ -261,44 +280,52 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     long long indexSize = 0;
     long long indexFreeStorageSize = 0;
 
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(name(), MODE_IS));
 
     catalog::forEachCollectionFromDb(
-        opCtx, name(), MODE_IS, [&](const CollectionPtr& collection) -> bool {
+        opCtx, name(), MODE_IS, [&](const Collection* collection) -> bool {
             nCollections += 1;
             objects += collection->numRecords(opCtx);
             size += collection->dataSize(opCtx);
 
             BSONObjBuilder temp;
             storageSize += collection->getRecordStore()->storageSize(opCtx, &temp);
-            freeStorageSize += collection->getRecordStore()->freeStorageSize(opCtx);
 
-            indexes += collection->getIndexCatalog()->numIndexesTotal(opCtx);
+            indexes += collection->getIndexCatalog()->numIndexesTotal();
             indexSize += collection->getIndexSize(opCtx);
-            indexFreeStorageSize += collection->getIndexFreeStorageBytes(opCtx);
+
+            if (includeFreeStorage) {
+                freeStorageSize += collection->getRecordStore()->freeStorageSize(opCtx);
+                indexFreeStorageSize += collection->getIndexFreeStorageBytes(opCtx);
+            }
 
             return true;
         });
 
 
-    ViewCatalog::get(this)->iterate([&](const ViewDefinition& view) {
+    CollectionCatalog::get(opCtx)->iterateViews(opCtx, name(), [&](const ViewDefinition& view) {
         nViews += 1;
         return true;
     });
 
-    output->appendNumber("collections", nCollections);
-    output->appendNumber("views", nViews);
-    output->appendNumber("objects", objects);
-    output->append("avgObjSize", objects == 0 ? 0 : double(size) / double(objects));
-    output->appendNumber("dataSize", size / scale);
-    output->appendNumber("storageSize", storageSize / scale);
-    output->appendNumber("freeStorageSize", freeStorageSize / scale);
-    output->appendNumber("indexes", indexes);
-    output->appendNumber("indexSize", indexSize / scale);
-    output->appendNumber("indexFreeStorageSize", indexFreeStorageSize / scale);
-    output->appendNumber("totalSize", (storageSize + indexSize) / scale);
-    output->appendNumber("totalFreeStorageSize", (freeStorageSize + indexFreeStorageSize) / scale);
-    output->appendNumber("scaleFactor", scale);
+    // Make sure that the same fields are returned for non-existing dbs
+    // in `DBStats::errmsgRun`
+    output->setCollections(nCollections);
+    output->setViews(nViews);
+    output->setObjects(objects);
+    output->setAvgObjSize(objects ? (double(size) / double(objects)) : 0);
+    output->setDataSize(size / scale);
+    output->setStorageSize(storageSize / scale);
+
+    output->setIndexes(indexes);
+    output->setIndexSize(indexSize / scale);
+    output->setTotalSize((storageSize + indexSize) / scale);
+    if (includeFreeStorage) {
+        output->setFreeStorageSize(freeStorageSize / scale);
+        output->setIndexFreeStorageSize(indexFreeStorageSize / scale);
+        output->setTotalFreeStorageSize((freeStorageSize + indexFreeStorageSize) / scale);
+    }
+    output->setScaleFactor(scale);
 
     if (!opCtx->getServiceContext()->getStorageEngine()->isEphemeral()) {
         boost::filesystem::path dbpath(
@@ -306,13 +333,12 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
         boost::system::error_code ec;
         boost::filesystem::space_info spaceInfo = boost::filesystem::space(dbpath, ec);
         if (!ec) {
-            output->appendNumber("fsUsedSize", (spaceInfo.capacity - spaceInfo.available) / scale);
-            output->appendNumber("fsTotalSize", spaceInfo.capacity / scale);
+            output->setFsUsedSize((spaceInfo.capacity - spaceInfo.available) / scale);
+            output->setFsTotalSize(spaceInfo.capacity / scale);
         } else {
-            output->appendNumber("fsUsedSize", -1);
-            output->appendNumber("fsTotalSize", -1);
+            output->setFsUsedSize(-1);
+            output->setFsTotalSize(-1);
             LOGV2(20312,
-                  "Failed to query filesystem disk stats (code: {ec_value}): {ec_message}",
                   "Failed to query filesystem disk stats",
                   "error"_attr = ec.message(),
                   "errorCode"_attr = ec.value());
@@ -321,52 +347,48 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
 }
 
 Status DatabaseImpl::dropView(OperationContext* opCtx, NamespaceString viewName) const {
-    dassert(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_viewsName), MODE_X));
+    dassert(shard_role_details::getLocker(opCtx)->isDbLockedForMode(name(), MODE_IX));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(viewName, MODE_IX));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+        NamespaceString(_viewsName), MODE_X));
 
-    Status status = ViewCatalog::dropView(opCtx, this, viewName);
+    Status status = CollectionCatalog::get(opCtx)->dropView(opCtx, viewName);
     Top::get(opCtx->getServiceContext()).collectionDropped(viewName);
     return status;
 }
 
 Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                                     NamespaceString nss,
-                                    repl::OpTime dropOpTime) const {
+                                    repl::OpTime dropOpTime,
+                                    bool markFromMigrate) const {
     // Cannot drop uncommitted collections.
-    invariant(!UncommittedCollections::getForTxn(opCtx, nss));
+    invariant(!UncommittedCatalogUpdates::isCreatedCollection(opCtx, nss));
 
-    if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
+    auto catalog = CollectionCatalog::get(opCtx);
+
+    if (!catalog->lookupCollectionByNamespace(opCtx, nss)) {
         // Collection doesn't exist so don't bother validating if it can be dropped.
         return Status::OK();
     }
 
-    invariant(nss.db() == _name);
+    invariant(nss.dbName() == _name);
 
-    if (nss.isSystem()) {
-        if (nss.isSystemDotProfile()) {
-            if (CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(_name) != 0)
-                return Status(ErrorCodes::IllegalOperation,
-                              "turn off profiling before dropping system.profile collection");
-        } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
-                     nss == NamespaceString::kLogicalSessionsNamespace ||
-                     nss == NamespaceString::kKeysCollectionNamespace ||
-                     nss.isTemporaryReshardingCollection() ||
-                     nss.isTimeseriesBucketsCollection())) {
-            return Status(ErrorCodes::IllegalOperation,
-                          str::stream() << "can't drop system collection " << nss);
-        }
+    if (auto droppable = isDroppableCollection(opCtx, nss); !droppable.isOK()) {
+        return droppable;
     }
 
-    return dropCollectionEvenIfSystem(opCtx, nss, dropOpTime);
+    assertNoMovePrimaryInProgress(opCtx, nss);
+
+    return dropCollectionEvenIfSystem(opCtx, nss, dropOpTime, markFromMigrate);
 }
 
 Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
                                                 NamespaceString nss,
-                                                repl::OpTime dropOpTime) const {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
+                                                repl::OpTime dropOpTime,
+                                                bool markFromMigrate) const {
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_X));
 
-    LOGV2_DEBUG(20313, 1, "dropCollection: {namespace}", "dropCollection", "namespace"_attr = nss);
+    LOGV2_DEBUG(20313, 1, "dropCollection", logAttrs(nss));
 
     // A valid 'dropOpTime' is not allowed when writes are replicated.
     if (!dropOpTime.isNull() && opCtx->writesAreReplicated()) {
@@ -387,13 +409,13 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // Make sure no indexes builds are in progress.
     // Use massert() to be consistent with IndexCatalog::dropAllIndexes().
-    auto numIndexesInProgress = collection->getIndexCatalog()->numIndexesInProgress(opCtx);
+    auto numIndexesInProgress = collection->getIndexCatalog()->numIndexesInProgress();
     massert(ErrorCodes::BackgroundOperationInProgressForNamespace,
-            str::stream() << "cannot drop collection " << nss << " (" << uuid << ") when "
-                          << numIndexesInProgress << " index builds in progress.",
+            str::stream() << "cannot drop collection " << nss.toStringForErrorMsg() << " (" << uuid
+                          << ") when " << numIndexesInProgress << " index builds in progress.",
             numIndexesInProgress == 0);
 
-    audit::logDropCollection(&cc(), nss);
+    audit::logDropCollection(opCtx->getClient(), nss);
 
     auto serviceContext = opCtx->getServiceContext();
     Top::get(serviceContext).collectionDropped(nss);
@@ -404,10 +426,14 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto opObserver = serviceContext->getOpObserver();
     auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, nss);
     if (dropOpTime.isNull() && isOplogDisabledForNamespace) {
-        _dropCollectionIndexes(opCtx, nss, collection.getWritableCollection());
-        opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
-        return _finishDropCollection(opCtx, nss, collection.getWritableCollection());
+        _dropCollectionIndexes(opCtx, nss, collection.getWritableCollection(opCtx));
+        opObserver->onDropCollection(opCtx,
+                                     nss,
+                                     uuid,
+                                     numRecords,
+                                     OpObserver::CollectionDropType::kOnePhase,
+                                     markFromMigrate);
+        return _finishDropCollection(opCtx, nss, collection.getWritableCollection(opCtx));
     }
 
     // Replicated collections should be dropped in two phases.
@@ -415,51 +441,62 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     // New two-phase drop: Starting in 4.2, pending collection drops will be maintained in the
     // storage engine and will no longer be visible at the catalog layer with 3.6-style
     // <db>.system.drop.* namespaces.
-    if (serviceContext->getStorageEngine()->supportsPendingDrops()) {
-        _dropCollectionIndexes(opCtx, nss, collection.getWritableCollection());
+    _dropCollectionIndexes(opCtx, nss, collection.getWritableCollection(opCtx));
 
-        auto commitTimestamp = opCtx->recoveryUnit()->getCommitTimestamp();
-        LOGV2(20314,
-              "dropCollection: {namespace} ({uuid}) - storage engine will take ownership of "
-              "drop-pending "
-              "collection with optime {dropOpTime} and commit timestamp {commitTimestamp}",
-              "dropCollection: storage engine will take ownership of drop-pending "
-              "collection",
-              "namespace"_attr = nss,
-              "uuid"_attr = uuid,
-              "dropOpTime"_attr = dropOpTime,
-              "commitTimestamp"_attr = commitTimestamp);
-        if (dropOpTime.isNull()) {
-            // Log oplog entry for collection drop and remove the UUID.
-            dropOpTime = opObserver->onDropCollection(
-                opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
-            invariant(!dropOpTime.isNull());
-        } else {
-            // If we are provided with a valid 'dropOpTime', it means we are dropping this
-            // collection in the context of applying an oplog entry on a secondary.
-            auto opTime = opObserver->onDropCollection(
-                opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
-            // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
-            invariant(opTime.isNull(),
-                      str::stream() << "OpTime is not null. OpTime: " << opTime.toString());
-        }
-
-        return _finishDropCollection(opCtx, nss, collection.getWritableCollection());
+    auto commitTimestamp = shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp();
+    LOGV2(20314,
+          "dropCollection: storage engine will take ownership of drop-pending "
+          "collection",
+          logAttrs(nss),
+          "uuid"_attr = uuid,
+          "dropOpTime"_attr = dropOpTime,
+          "commitTimestamp"_attr = commitTimestamp);
+    if (dropOpTime.isNull()) {
+        // Log oplog entry for collection drop and remove the UUID.
+        dropOpTime = opObserver->onDropCollection(opCtx,
+                                                  nss,
+                                                  uuid,
+                                                  numRecords,
+                                                  OpObserver::CollectionDropType::kOnePhase,
+                                                  markFromMigrate);
+        invariant(!dropOpTime.isNull());
+    } else {
+        // If we are provided with a valid 'dropOpTime', it means we are dropping this
+        // collection in the context of applying an oplog entry on a secondary.
+        auto opTime = opObserver->onDropCollection(opCtx,
+                                                   nss,
+                                                   uuid,
+                                                   numRecords,
+                                                   OpObserver::CollectionDropType::kOnePhase,
+                                                   markFromMigrate);
+        // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
+        invariant(opTime.isNull(),
+                  str::stream() << "OpTime is not null. OpTime: " << opTime.toString());
     }
+
+    return _finishDropCollection(opCtx, nss, collection.getWritableCollection(opCtx));
 
     // Old two-phase drop: Replicated collections will be renamed with a special drop-pending
     // namespace and dropped when the replica set optime reaches the drop optime.
 
     if (dropOpTime.isNull()) {
         // Log oplog entry for collection drop.
-        dropOpTime = opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kTwoPhase);
+        dropOpTime = opObserver->onDropCollection(opCtx,
+                                                  nss,
+                                                  uuid,
+                                                  numRecords,
+                                                  OpObserver::CollectionDropType::kTwoPhase,
+                                                  markFromMigrate);
         invariant(!dropOpTime.isNull());
     } else {
         // If we are provided with a valid 'dropOpTime', it means we are dropping this
         // collection in the context of applying an oplog entry on a secondary.
-        auto opTime = opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kTwoPhase);
+        auto opTime = opObserver->onDropCollection(opCtx,
+                                                   nss,
+                                                   uuid,
+                                                   numRecords,
+                                                   OpObserver::CollectionDropType::kTwoPhase,
+                                                   markFromMigrate);
         // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
         invariant(opTime.isNull());
     }
@@ -468,15 +505,15 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto dpns = nss.makeDropPendingNamespace(dropOpTime);
     const bool stayTemp = true;
     LOGV2(20315,
-          "dropCollection: {namespace} ({uuid}) - renaming to drop-pending collection: "
-          "{dropPendingName} with drop "
-          "optime {dropOpTime}",
           "dropCollection: renaming to drop-pending collection",
-          "namespace"_attr = nss,
+          logAttrs(nss),
           "uuid"_attr = uuid,
           "dropPendingName"_attr = dpns,
           "dropOpTime"_attr = dropOpTime);
     {
+        // This is a uniquely generated drop-pending namespace that no other operations are using.
+        AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(
+            shard_role_details::getLocker(opCtx));
         Lock::CollectionLock collLk(opCtx, dpns, MODE_X);
         fassert(40464, renameCollection(opCtx, nss, dpns, stayTemp));
     }
@@ -491,33 +528,33 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           Collection* collection) const {
-    invariant(_name == nss.db());
-    LOGV2_DEBUG(
-        20316, 1, "dropCollection: {namespace} - dropAllIndexes start", "namespace"_attr = nss);
-    collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+    invariant(_name == nss.dbName());
+    LOGV2_DEBUG(20316, 1, "dropCollection: {namespace} - dropAllIndexes start", logAttrs(nss));
+    collection->getIndexCatalog()->dropAllIndexes(opCtx, collection, true, {});
 
-    invariant(DurableCatalog::get(opCtx)->getTotalIndexCount(opCtx, collection->getCatalogId()) ==
-              0);
-    LOGV2_DEBUG(
-        20317, 1, "dropCollection: {namespace} - dropAllIndexes done", "namespace"_attr = nss);
+    invariant(collection->getTotalIndexCount() == 0);
+    LOGV2_DEBUG(20317, 1, "dropCollection: {namespace} - dropAllIndexes done", logAttrs(nss));
 }
 
 Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
                                            const NamespaceString& nss,
                                            Collection* collection) const {
     UUID uuid = collection->uuid();
-    LOGV2(20318,
-          "Finishing collection drop for {namespace} ({uuid}).",
-          "Finishing collection drop",
-          "namespace"_attr = nss,
-          "uuid"_attr = uuid);
 
-    auto status = catalog::dropCollection(
-        opCtx, collection->ns(), collection->getCatalogId(), collection->getSharedIdent());
-    if (!status.isOK())
-        return status;
+    // Reduce log verbosity for virtual collections
+    auto debugLevel = collection->getSharedIdent() ? 0 : 1;
 
-    CollectionCatalog::get(opCtx)->dropCollection(opCtx, collection);
+    LOGV2_DEBUG(20318, debugLevel, "Finishing collection drop", logAttrs(nss), "uuid"_attr = uuid);
+
+    // A virtual collection does not have a durable catalog entry.
+    if (auto sharedIdent = collection->getSharedIdent()) {
+        auto status = catalog::dropCollection(
+            opCtx, collection->ns(), collection->getCatalogId(), sharedIdent);
+        if (!status.isOK())
+            return status;
+    }
+
+    CollectionCatalog::get(opCtx)->dropCollection(opCtx, collection, true /*isDropPending*/);
 
 
     return Status::OK();
@@ -527,16 +564,17 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
                                       NamespaceString fromNss,
                                       NamespaceString toNss,
                                       bool stayTemp) const {
-    audit::logRenameCollection(&cc(), fromNss, toNss);
+    audit::logRenameCollection(opCtx->getClient(), fromNss, toNss);
 
-    invariant(opCtx->lockState()->isCollectionLockedForMode(fromNss, MODE_X));
-    invariant(opCtx->lockState()->isCollectionLockedForMode(toNss, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(fromNss, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(toNss, MODE_X));
 
-    invariant(fromNss.db() == _name);
-    invariant(toNss.db() == _name);
+    invariant(fromNss.dbName() == _name);
+    invariant(toNss.dbName() == _name);
     if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss)) {
         return Status(ErrorCodes::NamespaceExists,
-                      str::stream() << "Cannot rename '" << fromNss << "' to '" << toNss
+                      str::stream() << "Cannot rename '" << fromNss.toStringForErrorMsg()
+                                    << "' to '" << toNss.toStringForErrorMsg()
                                     << "' because the destination namespace already exists");
     }
 
@@ -545,10 +583,9 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "collection not found to rename");
     }
 
-    assertMovePrimaryInProgress(opCtx, fromNss);
+    assertNoMovePrimaryInProgress(opCtx, fromNss);
 
     LOGV2(20319,
-          "renameCollection: renaming collection {collToRename_uuid} from {fromNss} to {toNss}",
           "renameCollection",
           "uuid"_attr = collToRename->uuid(),
           "fromName"_attr = fromNss,
@@ -556,24 +593,15 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
     Top::get(opCtx->getServiceContext()).collectionDropped(fromNss);
 
-    Status status = DurableCatalog::get(opCtx)->renameCollection(
-        opCtx, collToRename->getCatalogId(), toNss, stayTemp);
-
     // Set the namespace of 'collToRename' from within the CollectionCatalog. This is necessary
-    // because the CollectionCatalog mutex synchronizes concurrent access to the collection's
-    // namespace for callers that may not hold a collection lock.
-    auto writableCollection = collToRename.getWritableCollection();
+    // because the CollectionCatalog manages the necessary isolation for this Collection until the
+    // WUOW commits.
+    auto writableCollection = collToRename.getWritableCollection(opCtx);
+    Status status = writableCollection->rename(opCtx, toNss, stayTemp);
+    if (!status.isOK())
+        return status;
 
-    CollectionCatalog::get(opCtx)->setCollectionNamespace(
-        opCtx, writableCollection, fromNss, toNss);
-
-    opCtx->recoveryUnit()->onCommit([writableCollection](boost::optional<Timestamp> commitTime) {
-        // Ban reading from this collection on committed reads on snapshots before now.
-        if (commitTime) {
-            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
-        }
-    });
-
+    CollectionCatalog::get(opCtx)->onCollectionRename(opCtx, writableCollection, fromNss);
     return status;
 }
 
@@ -582,11 +610,13 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                                              const CollectionOptions& options) const {
     if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
         if (options.isView()) {
-            uasserted(17399,
-                      str::stream()
-                          << "Cannot create collection " << nss << " - collection already exists.");
+            uasserted(ErrorCodes::NamespaceExists,
+                      str::stream() << "Cannot create collection " << nss.toStringForErrorMsg()
+                                    << " - collection already exists.");
         } else {
-            throw WriteConflictException();
+            throwWriteConflictException(str::stream()
+                                        << "Collection namespace '" << nss.toStringForErrorMsg()
+                                        << "' is already in use.");
         }
     }
 
@@ -594,39 +624,46 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
         opCtx->inMultiDocumentTransaction()) {
         LOGV2(4696600,
               "Throwing WriteConflictException due to failpoint 'throwWCEDuringTxnCollCreate'");
-        throw WriteConflictException();
+        throwWriteConflictException(str::stream() << "Hit failpoint '"
+                                                  << throwWCEDuringTxnCollCreate.getName() << "'.");
     }
 
     uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
     uassert(ErrorCodes::DatabaseDropPending,
-            str::stream() << "Cannot create collection " << nss
+            str::stream() << "Cannot create collection " << nss.toStringForErrorMsg()
                           << " - database is in the process of being dropped.",
-            !_dropPending.load());
+            !CollectionCatalog::get(opCtx)->isDropPending(nss.dbName()));
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
                                 const NamespaceString& viewName,
                                 const CollectionOptions& options) const {
-    dassert(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_viewsName), MODE_X));
+    dassert(shard_role_details::getLocker(opCtx)->isDbLockedForMode(name(), MODE_IX));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(viewName, MODE_IX));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+        NamespaceString(_viewsName), MODE_X));
 
     invariant(options.isView());
 
-    NamespaceString viewOnNss(viewName.db(), options.viewOn);
+    const auto viewOnNss = NamespaceStringUtil::deserialize(viewName.dbName(), options.viewOn);
     _checkCanCreateCollection(opCtx, viewName, options);
 
     BSONArray pipeline(options.pipeline);
     auto status = Status::OK();
     if (viewName.isOplog()) {
         status = {ErrorCodes::InvalidNamespace,
-                  str::stream() << "invalid namespace name for a view: " + viewName.toString()};
+                  str::stream() << "invalid namespace name for a view: " +
+                          viewName.toStringForErrorMsg()};
     } else {
-        status =
-            ViewCatalog::createView(opCtx, this, viewName, viewOnNss, pipeline, options.collation);
+        status = CollectionCatalog::get(opCtx)->createView(opCtx,
+                                                           viewName,
+                                                           viewOnNss,
+                                                           pipeline,
+                                                           view_catalog_helpers::validatePipeline,
+                                                           options.collation);
     }
 
-    audit::logCreateView(&cc(), viewName, viewOnNss.toString(), pipeline, status.code());
+    audit::logCreateView(opCtx->getClient(), viewName, viewOnNss, pipeline, status.code());
     return status;
 }
 
@@ -634,15 +671,40 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
                                            const NamespaceString& nss,
                                            const CollectionOptions& options,
                                            bool createIdIndex,
-                                           const BSONObj& idIndex) const {
+                                           const BSONObj& idIndex,
+                                           bool fromMigrate) const {
+    return _createCollection(
+        opCtx, nss, options, createIdIndex, idIndex, fromMigrate, /*vopts=*/boost::none);
+}
+
+Collection* DatabaseImpl::createVirtualCollection(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const CollectionOptions& opts,
+                                                  const VirtualCollectionOptions& vopts) const {
+    return _createCollection(opCtx,
+                             nss,
+                             opts,
+                             /*createIdIndex=*/false,
+                             /*idIndex=*/BSONObj(),
+                             /*fromMigrate=*/false,
+                             vopts);
+}
+
+Collection* DatabaseImpl::_createCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptions& options,
+    bool createIdIndex,
+    const BSONObj& idIndex,
+    bool fromMigrate,
+    const boost::optional<VirtualCollectionOptions>& vopts) const {
     invariant(!options.isView());
 
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX));
 
     auto coordinator = repl::ReplicationCoordinator::get(opCtx);
     bool canAcceptWrites =
-        (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
-        coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
+        (!coordinator->getSettings().isReplSet()) || coordinator->canAcceptWritesFor(opCtx, nss);
 
     CollectionOptions optionsWithUUID = options;
     bool generatedUUID = false;
@@ -651,9 +713,9 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
             LOGV2_ERROR_OPTIONS(20329,
                                 {logv2::UserAssertAfterLog(ErrorCodes::InvalidOptions)},
                                 "Attempted to create a new collection without a UUID",
-                                "namespace"_attr = nss);
+                                logAttrs(nss));
         } else {
-            optionsWithUUID.uuid.emplace(CollectionUUID::gen());
+            optionsWithUUID.uuid.emplace(UUID::gen());
             generatedUUID = true;
         }
     }
@@ -673,72 +735,128 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         createOplogSlot = repl::getNextOpTime(opCtx);
     }
 
+    // If we generated a UUID for the collection, then it MUST be the case
+    // that we are creating the collection for the first time - i.e. the collection
+    // isn't being copied over / migrated as in initial sync or a chunk migration.
+    //
+    // Therefore, since we are sure that we are creating the collection for the first
+    // time, set recordIdsReplicated:true on all non-internal collections. We don't set
+    // recordIdsReplicated:true on internal collections because many of these collections
+    // are partially implicitly replicated (for example, on config.image_collection inserts
+    // are implicitly replicated while deletes are not) and this makes it hard to ensure
+    // that they have the same recordIds.
+    //
+    // Additionally, we do not set the recordIdsReplicated:true option on timeseries and
+    // clustered collections because in those cases the recordId is the _id, or on capped
+    // collections which utilizes a separate mechanism for ensuring uniform recordIds.
+    if (generatedUUID && !nss.isOnInternalDb() && !optionsWithUUID.timeseries &&
+        !optionsWithUUID.clusteredIndex && !optionsWithUUID.capped &&
+        gFeatureFlagRecordIdsReplicated.isEnabledUseLastLTSFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        overrideRecordIdsReplicatedDefault.shouldFail()) {
+        LOGV2_DEBUG(8700501,
+                    0,
+                    "Collection will use recordIdsReplicated:true.",
+                    "oldValue"_attr = optionsWithUUID.recordIdsReplicated);
+        optionsWithUUID.recordIdsReplicated = true;
+    }
+
+    uassert(ErrorCodes::CommandNotSupported,
+            fmt::format("Capped collection '{}' can't use recordIdsReplicated:true",
+                        nss.toStringForErrorMsg()),
+            !(optionsWithUUID.recordIdsReplicated && optionsWithUUID.capped));
+
     hangAndFailAfterCreateCollectionReservesOpTime.executeIf(
         [&](const BSONObj&) {
             hangAndFailAfterCreateCollectionReservesOpTime.pauseWhileSet(opCtx);
             uasserted(51267, "hangAndFailAfterCreateCollectionReservesOpTime fail point enabled");
         },
         [&](const BSONObj& data) {
-            auto fpNss = data["nss"].str();
-            return fpNss.empty() || fpNss == nss.toString();
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
+            return fpNss.isEmpty() || fpNss == nss;
         });
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
-    assertMovePrimaryInProgress(opCtx, nss);
-    audit::logCreateCollection(&cc(), nss);
+    assertNoMovePrimaryInProgress(opCtx, nss);
+    audit::logCreateCollection(opCtx->getClient(), nss);
 
-    LOGV2(20320,
-          "createCollection: {namespace} with {generatedUUID_generated_provided} UUID: "
-          "{optionsWithUUID_uuid_get} and options: {options}",
-          "createCollection",
-          "namespace"_attr = nss,
-          "uuidDisposition"_attr = (generatedUUID ? "generated" : "provided"),
-          "uuid"_attr = optionsWithUUID.uuid.get(),
-          "options"_attr = options);
+    // Reduce log verbosity for virtual collections
+    auto debugLevel = vopts ? 1 : 0;
+
+    LOGV2_DEBUG(20320,
+                debugLevel,
+                "createCollection",
+                logAttrs(nss),
+                "uuidDisposition"_attr = (generatedUUID ? "generated" : "provided"),
+                "uuid"_attr = optionsWithUUID.uuid.value(),
+                "options"_attr = options);
 
     // Create Collection object
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    std::pair<RecordId, std::unique_ptr<RecordStore>> catalogIdRecordStorePair =
-        uassertStatusOK(storageEngine->getCatalog()->createCollection(
-            opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
-    auto catalogId = catalogIdRecordStorePair.first;
-    std::shared_ptr<Collection> ownedCollection = Collection::Factory::get(opCtx)->make(
-        opCtx, nss, catalogId, optionsWithUUID, std::move(catalogIdRecordStorePair.second));
+    auto ownedCollection = [&]() -> std::shared_ptr<Collection> {
+        if (!vopts) {
+            if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
+                throwWriteConflictException(str::stream()
+                                            << "Namespace '" << nss.toStringForErrorMsg()
+                                            << "' is already in use.");
+            }
+
+            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+            std::pair<RecordId, std::unique_ptr<RecordStore>> catalogIdRecordStorePair =
+                uassertStatusOK(storageEngine->getCatalog()->createCollection(
+                    opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
+            auto& catalogId = catalogIdRecordStorePair.first;
+
+            auto catalogEntry = DurableCatalog::get(opCtx)->getParsedCatalogEntry(opCtx, catalogId);
+            auto metadata = catalogEntry->metadata;
+
+            return Collection::Factory::get(opCtx)->make(
+                opCtx, nss, catalogId, metadata, std::move(catalogIdRecordStorePair.second));
+        } else {
+            // Virtual collection stays only in memory and its metadata need not persist on disk and
+            // therefore we bypass DurableCatalog.
+            return VirtualCollectionImpl::make(opCtx, nss, optionsWithUUID, *vopts);
+        }
+    }();
     auto collection = ownedCollection.get();
     ownedCollection->init(opCtx);
-    ownedCollection->setCommitted(false);
-    UncommittedCollections::addToTxn(opCtx, std::move(ownedCollection));
-    openCreateCollectionWindowFp.executeIf([&](const BSONObj& data) { sleepsecs(3); },
-                                           [&](const BSONObj& data) {
-                                               const auto collElem = data["collectionNS"];
-                                               return !collElem || nss.toString() == collElem.str();
-                                           });
+
+    CollectionCatalog::get(opCtx)->onCreateCollection(opCtx, std::move(ownedCollection));
+    openCreateCollectionWindowFp.executeIf(
+        [&](const BSONObj& data) { sleepsecs(3); },
+        [&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "collectionNS"_sd);
+            return fpNss.isEmpty() || nss == fpNss;
+        });
 
     BSONObj fullIdIndexSpec;
 
-    if (createIdIndex) {
-        if (collection->requiresIdIndex()) {
-            if (optionsWithUUID.autoIndexId == CollectionOptions::YES ||
-                optionsWithUUID.autoIndexId == CollectionOptions::DEFAULT) {
-                // createCollection() may be called before the in-memory fCV parameter is
-                // initialized, so use the unsafe fCV getter here.
-                IndexCatalog* ic = collection->getIndexCatalog();
-                fullIdIndexSpec = uassertStatusOK(ic->createIndexOnEmptyCollection(
-                    opCtx, !idIndex.isEmpty() ? idIndex : ic->getDefaultIdIndexSpec()));
-            } else {
-                // autoIndexId: false is only allowed on unreplicated collections.
-                uassert(50001,
-                        str::stream() << "autoIndexId:false is not allowed for collection " << nss
-                                      << " because it can be replicated",
-                        !nss.isReplicated());
-            }
+    if (createIdIndex && collection->requiresIdIndex()) {
+        if (optionsWithUUID.autoIndexId == CollectionOptions::YES ||
+            optionsWithUUID.autoIndexId == CollectionOptions::DEFAULT) {
+            auto* ic = collection->getIndexCatalog();
+            fullIdIndexSpec = uassertStatusOK(ic->createIndexOnEmptyCollection(
+                opCtx,
+                collection,
+                !idIndex.isEmpty() ? idIndex
+                                   : ic->getDefaultIdIndexSpec(CollectionPtr(collection))));
+        } else {
+            // autoIndexId: false is only allowed on unreplicated collections.
+            uassert(50001,
+                    str::stream() << "autoIndexId:false is not allowed for collection "
+                                  << nss.toStringForErrorMsg() << " because it can be replicated",
+                    !nss.isReplicated());
         }
     }
 
     hangBeforeLoggingCreateCollection.pauseWhileSet();
 
-    opCtx->getServiceContext()->getOpObserver()->onCreateCollection(
-        opCtx, collection, nss, optionsWithUUID, fullIdIndexSpec, createOplogSlot);
+    opCtx->getServiceContext()->getOpObserver()->onCreateCollection(opCtx,
+                                                                    CollectionPtr(collection),
+                                                                    nss,
+                                                                    optionsWithUUID,
+                                                                    fullIdIndexSpec,
+                                                                    createOplogSlot,
+                                                                    fromMigrate);
 
     // It is necessary to create the system index *after* running the onCreateCollection so that
     // the storage timestamp for the index creation is after the storage timestamp for the
@@ -747,122 +865,18 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     // after the collection is created.
     if (canAcceptWrites && createIdIndex && nss.isSystem()) {
         CollectionWriter collWriter(collection);
-        createSystemIndexes(opCtx, collWriter);
+        createSystemIndexes(opCtx, collWriter, fromMigrate);
     }
 
     return collection;
 }
 
-StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
-    OperationContext* opCtx, StringData collectionNameModel) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
-
-    // There must be at least one percent sign in the collection name model.
-    auto numPercentSign = std::count(collectionNameModel.begin(), collectionNameModel.end(), '%');
-    if (numPercentSign == 0) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream()
-                          << "Cannot generate collection name for temporary collection: "
-                             "model for collection name "
-                          << collectionNameModel << " must contain at least one percent sign.");
-    }
-
-    const auto charsToChooseFrom =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"_sd;
-    invariant((10U + 26U * 2) == charsToChooseFrom.size());
-
-    stdx::lock_guard<Latch> lk(uniqueCollectionNamespaceMutex);
-
-    auto replacePercentSign = [&, this](char c) {
-        if (c != '%') {
-            return c;
-        }
-        auto i = uniqueCollectionNamespacePseudoRandom.nextInt32(charsToChooseFrom.size());
-        return charsToChooseFrom[i];
-    };
-
-    auto numGenerationAttempts = numPercentSign * charsToChooseFrom.size() * 100U;
-    for (decltype(numGenerationAttempts) i = 0; i < numGenerationAttempts; ++i) {
-        auto collectionName = collectionNameModel.toString();
-        std::transform(collectionName.begin(),
-                       collectionName.end(),
-                       collectionName.begin(),
-                       replacePercentSign);
-
-        NamespaceString nss(_name, collectionName);
-        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
-            return nss;
-        }
-    }
-
-    return Status(
-        ErrorCodes::NamespaceExists,
-        str::stream() << "Cannot generate collection name for temporary collection with model "
-                      << collectionNameModel << " after " << numGenerationAttempts
-                      << " attempts due to namespace conflicts with existing collections.");
-}
-
-void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const {
-    if (name() == "local") {
-        // Collections in the local database are not replicated, so we do not need an _id index on
-        // any collection. For the same reason, it is not possible for the local database to contain
-        // any drop-pending collections (drops are effective immediately).
-        return;
-    }
-
-    auto catalog = CollectionCatalog::get(opCtx);
-    for (const auto& nss : catalog->getAllCollectionNamesFromDb(opCtx, _name)) {
-        if (nss.isDropPendingNamespace()) {
-            auto dropOpTime = fassert(40459, nss.getDropPendingNamespaceOpTime());
-            LOGV2(20321,
-                  "Found drop-pending namespace {namespace} with drop optime {dropOpTime}",
-                  "Found drop-pending namespace",
-                  "namespace"_attr = nss,
-                  "dropOpTime"_attr = dropOpTime);
-            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(
-                opCtx, dropOpTime, nss);
-        }
-
-        if (nss.isSystem())
-            continue;
-
-        const CollectionPtr& coll = catalog->lookupCollectionByNamespace(opCtx, nss);
-        if (!coll)
-            continue;
-
-        if (coll->getIndexCatalog()->findIdIndex(opCtx))
-            continue;
-
-        LOGV2_OPTIONS(
-            20322,
-            {logv2::LogTag::kStartupWarnings},
-            "Collection lacks a unique index on _id. This index is "
-            "needed for replication to function properly. To fix this, you need to create a unique "
-            "index on _id. See http://dochub.mongodb.org/core/build-replica-set-indexes",
-            "namespace"_attr = nss);
-    }
-}
-
-Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  CollectionOptions collectionOptions,
-                                  bool createDefaultIndexes,
-                                  const BSONObj& idIndex) const {
-    LOGV2_DEBUG(20324,
-                1,
-                "create collection {namespace} {collectionOptions}",
-                "namespace"_attr = nss,
-                "collectionOptions"_attr = collectionOptions.toBSON());
-    if (!NamespaceString::validCollectionComponent(nss.ns()))
-        return Status(ErrorCodes::InvalidNamespace, str::stream() << "invalid ns: " << nss);
-
-    // Validate the collation, if there is one.
+StatusWith<std::unique_ptr<CollatorInterface>> DatabaseImpl::validateCollator(
+    OperationContext* opCtx, CollectionOptions& opts) const {
     std::unique_ptr<CollatorInterface> collator;
-    if (!collectionOptions.collation.isEmpty()) {
-        auto collatorWithStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                      ->makeFromBSON(collectionOptions.collation);
+    if (!opts.collation.isEmpty()) {
+        auto collatorWithStatus =
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(opts.collation);
 
         if (!collatorWithStatus.isOK()) {
             return collatorWithStatus.getStatus();
@@ -878,21 +892,54 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         // we simply unset the "collation" from the collection options. This ensures that
         // collections created on versions which do not support the collation feature have the same
         // format for representing the simple collation as collections created on this version.
-        collectionOptions.collation = collator ? collator->getSpec().toBSON() : BSONObj();
+        opts.collation = collator ? collator->getSpec().toBSON() : BSONObj();
+    }
+
+    return {std::move(collator)};
+}
+
+Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  CollectionOptions collectionOptions,
+                                  bool createDefaultIndexes,
+                                  const BSONObj& idIndex,
+                                  bool fromMigrate) const {
+    LOGV2_DEBUG(20324,
+                1,
+                "create collection {namespace} {collectionOptions}",
+                logAttrs(nss),
+                "collectionOptions"_attr = collectionOptions.toBSON());
+    if (!NamespaceString::validCollectionComponent(nss))
+        return Status(ErrorCodes::InvalidNamespace,
+                      str::stream() << "invalid ns: " << nss.toStringForErrorMsg());
+
+    // Validate the collation, if there is one.
+    auto swCollator = validateCollator(opCtx, collectionOptions);
+    if (!swCollator.isOK()) {
+        return swCollator.getStatus();
+    }
+
+    if (gFeatureFlagDisallowBucketCollectionWithoutTimeseriesOptions
+            .isEnabledUseLastLTSFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        nss.isTimeseriesBucketsCollection() && !collectionOptions.timeseries) {
+        return Status(ErrorCodes::IllegalOperation,
+                      "Creation of a timeseries bucket collection without timeseries "
+                      "options is not allowed");
     }
 
     if (!collectionOptions.validator.isEmpty()) {
         boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(opCtx, std::move(collator), nss));
+            new ExpressionContext(opCtx, std::move(swCollator.getValue()), nss));
 
         // If the feature compatibility version is not kLatest, and we are validating features as
         // primary, ban the use of new agg features introduced in kLatest to prevent them from being
         // persisted in the catalog.
         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-        ServerGlobalParams::FeatureCompatibility::Version fcv;
+        multiversion::FeatureCompatibilityVersion fcv;
         if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
-            serverGlobalParams.featureCompatibility.isLessThan(
-                ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isLessThan(
+                multiversion::GenericFCV::kLatest, &fcv)) {
             expCtx->maxFeatureCompatibilityVersion = fcv;
         }
 
@@ -900,17 +947,25 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         // validator to apply some additional checks.
         expCtx->isParsingCollectionValidator = true;
 
-        // If the validation action is "warn" or the level is "moderate", then disallow any
-        // encryption keywords. This is to prevent any plaintext data from showing up in the logs.
+        // If the validation action is printing logs or the level is "moderate", or if the user has
+        // defined some encrypted fields in the collection options, then disallow any encryption
+        // keywords. This is to prevent any plaintext data from showing up in the logs.
         auto allowedFeatures = MatchExpressionParser::kDefaultSpecialFeatures;
+
         if (collectionOptions.validationAction == ValidationActionEnum::warn ||
-            collectionOptions.validationLevel == ValidationLevelEnum::moderate)
+            collectionOptions.validationAction == ValidationActionEnum::errorAndLog ||
+            collectionOptions.validationLevel == ValidationLevelEnum::moderate ||
+            collectionOptions.encryptedFieldConfig.has_value())
             allowedFeatures &= ~MatchExpressionParser::AllowedFeatures::kEncryptKeywords;
 
         auto statusWithMatcher = MatchExpressionParser::parse(collectionOptions.validator,
                                                               std::move(expCtx),
                                                               ExtensionsCallbackNoop(),
                                                               allowedFeatures);
+
+        // Increment counters to track the usage of schema validators.
+        validatorCounters.incrementCounters(
+            "create", collectionOptions.validator, statusWithMatcher.isOK());
 
         // We check the status of the parse to see if there are any banned features, but we don't
         // actually need the result for now.
@@ -943,13 +998,45 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
             return Status(
                 ErrorCodes::InvalidNamespace,
                 "View name cannot start with 'system.', which is reserved for system namespaces");
-
-        uassertStatusOK(createView(opCtx, nss, collectionOptions));
+        return createView(opCtx, nss, collectionOptions);
     } else {
-        invariant(createCollection(opCtx, nss, collectionOptions, createDefaultIndexes, idIndex),
-                  str::stream() << "Collection creation failed after validating options: " << nss
+        invariant(_createCollection(
+                      opCtx, nss, collectionOptions, createDefaultIndexes, idIndex, fromMigrate),
+                  str::stream() << "Collection creation failed after validating options: "
+                                << nss.toStringForErrorMsg()
                                 << ". Options: " << collectionOptions.toBSON());
     }
+
+    return Status::OK();
+}
+
+Status DatabaseImpl::userCreateVirtualNS(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         CollectionOptions opts,
+                                         const VirtualCollectionOptions& vopts) const {
+    LOGV2_DEBUG(6968505,
+                1,
+                "create collection {namespace} {collectionOptions}",
+                logAttrs(nss),
+                "collectionOptions"_attr = opts.toBSON());
+    if (!NamespaceString::validCollectionComponent(nss))
+        return Status(ErrorCodes::InvalidNamespace,
+                      str::stream() << "invalid ns: " << nss.toStringForErrorMsg());
+
+    // Validate the collation, if there is one.
+    if (auto swCollator = validateCollator(opCtx, opts); !swCollator.isOK()) {
+        return swCollator.getStatus();
+    }
+
+    invariant(_createCollection(opCtx,
+                                nss,
+                                opts,
+                                /*createDefaultIndexes=*/false,
+                                /*idIndex=*/BSONObj(),
+                                /*fromMigrate=*/false,
+                                vopts),
+              str::stream() << "Collection creation failed after validating options: "
+                            << nss.toStringForErrorMsg() << ". Options: " << opts.toBSON());
 
     return Status::OK();
 }

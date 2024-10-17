@@ -27,15 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <string>
+#include <utility>
 
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/net/hostandport.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
 
 using std::string;
 
@@ -45,7 +52,6 @@ namespace {
 
 struct ReadReplyArgs {
 public:
-    StringData replySource;
     BSONObj metadataObj;
 };
 
@@ -58,11 +64,8 @@ public:
         return Status::OK();
     }
 
-    Status readReplyMetadata(OperationContext* opCtx,
-                             StringData replySource,
-                             const BSONObj& metadataObj) {
+    Status readReplyMetadata(OperationContext* opCtx, const BSONObj& metadataObj) override {
         invariant(_arg != nullptr);
-        _arg->replySource = replySource;
         _arg->metadataObj = metadataObj;
         return Status::OK();
     }
@@ -80,9 +83,7 @@ public:
         return _toRet;
     }
 
-    Status readReplyMetadata(OperationContext* opCtx,
-                             StringData replySource,
-                             const BSONObj& metadataObj) {
+    Status readReplyMetadata(OperationContext* opCtx, const BSONObj& metadataObj) override {
         return _toRet;
     }
 
@@ -95,7 +96,7 @@ TEST(EgressMetadataHookListTest, EmptyHookShouldNotFail) {
     ASSERT_OK(hookList.writeRequestMetadata(nullptr, nullptr));
 
     BSONObj emptyObj;
-    ASSERT_OK(hookList.readReplyMetadata(nullptr, "", emptyObj));
+    ASSERT_OK(hookList.readReplyMetadata(nullptr, emptyObj));
 }
 
 TEST(EgressMetadataHookListTest, SingleHook) {
@@ -110,10 +111,8 @@ TEST(EgressMetadataHookListTest, SingleHook) {
                            << ""),
                       builder.obj());
 
-    string testHost("b:456");
     BSONObj testObj(BSON("x" << 1));
-    ASSERT_OK(hookList.readReplyMetadata(nullptr, testHost, testObj));
-    ASSERT_EQ(testHost, hook1Args.replySource);
+    ASSERT_OK(hookList.readReplyMetadata(nullptr, testObj));
     ASSERT_BSONOBJ_EQ(testObj, hook1Args.metadataObj);
 }
 
@@ -135,14 +134,11 @@ TEST(EgressMetadataHookListTest, MultipleHooks) {
                            << ""),
                       builder.obj());
 
-    string testHost("b:456");
     BSONObj testObj(BSON("x" << 1));
-    ASSERT_OK(hookList.readReplyMetadata(nullptr, testHost, testObj));
+    ASSERT_OK(hookList.readReplyMetadata(nullptr, testObj));
 
-    ASSERT_EQ(testHost, hook1Args.replySource);
     ASSERT_BSONOBJ_EQ(testObj, hook1Args.metadataObj);
 
-    ASSERT_EQ(testHost, hook2Args.replySource);
     ASSERT_BSONOBJ_EQ(testObj, hook2Args.metadataObj);
 }
 
@@ -158,7 +154,7 @@ TEST(EgressMetadataHookListTest, SingleBadHookShouldReturnError) {
 
     BSONObjBuilder builder;
     ASSERT_NOT_OK(hookList.writeRequestMetadata(nullptr, &builder));
-    ASSERT_NOT_OK(hookList.readReplyMetadata(nullptr, "b:456", BSON("x" << 1)));
+    ASSERT_NOT_OK(hookList.readReplyMetadata(nullptr, BSON("x" << 1)));
 }
 
 }  // unnamed namespace

@@ -27,9 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/db/fts/fts_spec.h"
+#include <map>
+#include <string>
+#include <utility>
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/fts/fts_language.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/fts/fts_util.h"
+#include "mongo/db/fts/stemmer.h"
+#include "mongo/db/fts/stop_words.h"
+#include "mongo/db/fts/tokenizer.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -53,8 +72,8 @@ void _addFTSStuff(BSONObjBuilder* b) {
 const FTSLanguage& FTSSpec::_getLanguageToUseV1(const BSONObj& userDoc) const {
     BSONElement e = userDoc[_languageOverrideField];
     if (e.type() == String) {
-        const char* x = e.valuestrsafe();
-        if (strlen(x) > 0) {
+        StringData x = e.valueStringData();
+        if (e.size() > 0) {
             // make() w/ TEXT_INDEX_VERSION_1 guaranteed to not fail.
             return FTSLanguage::make(x, TEXT_INDEX_VERSION_1);
         }
@@ -112,7 +131,7 @@ void FTSSpec::_scoreStringV1(const Tools& tools,
 
         double& score = (*docScores)[term];
         score += (weight * data.freq * coeff * adjustment);
-        verify(score <= MAX_WEIGHT);
+        MONGO_verify(score <= MAX_WEIGHT);
     }
 }
 
@@ -144,7 +163,7 @@ void FTSSpec::_scoreRecurseV1(const Tools& tools,
         if (x.type() == String) {
             double w = 1;
             _weightV1(x.fieldName(), &w);
-            _scoreStringV1(tools, x.valuestr(), term_freqs, w);
+            _scoreStringV1(tools, x.valueStringData(), term_freqs, w);
         } else if (x.isABSONObj()) {
             _scoreRecurseV1(tools, x.Obj(), term_freqs);
         }
@@ -181,10 +200,10 @@ void FTSSpec::_scoreDocumentV1(const BSONObj& obj, TermFrequencyMap* term_freqs)
                 if (leftOverName[0] && x.isABSONObj())
                     x = dps::extractElementAtPath(x.Obj(), leftOverName);
                 if (x.type() == String)
-                    _scoreStringV1(tools, x.valuestr(), term_freqs, weight);
+                    _scoreStringV1(tools, x.valueStringData(), term_freqs, weight);
             }
         } else if (e.type() == String) {
-            _scoreStringV1(tools, e.valuestr(), term_freqs, weight);
+            _scoreStringV1(tools, e.valueStringData(), term_freqs, weight);
         }
     }
 }

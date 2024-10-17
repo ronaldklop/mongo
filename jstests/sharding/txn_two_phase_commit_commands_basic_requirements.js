@@ -3,11 +3,14 @@
  * are only legal in sharded clusters (e.g., the two phase commit commands).
  * @tags: [uses_transactions]
  */
-(function() {
-"use strict";
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const dbName = "test";
-const collName = "foo";
 
 const txnNumber = 0;
 const lsid = {
@@ -61,6 +64,6 @@ jsTest.log(
 const standaloneReplSet = new ReplSetTest({nodes: 1});
 standaloneReplSet.startSet();
 standaloneReplSet.initiate();
-checkCoordinatorCommandsRejected(standaloneReplSet.getPrimary(), ErrorCodes.NoShardingEnabled);
+checkCoordinatorCommandsRejected(standaloneReplSet.getPrimary(),
+                                 ErrorCodes.ShardingStateNotInitialized);
 standaloneReplSet.stopSet();
-})();

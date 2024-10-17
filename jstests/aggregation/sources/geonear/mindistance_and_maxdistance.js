@@ -1,9 +1,6 @@
 /**
  * Tests the behavior of the $geoNear stage with varying values of 'minDistance' and 'maxDistance'.
  */
-(function() {
-"use strict";
-
 const coll = db.getCollection("geonear_mindistance_maxdistance");
 
 const kMaxDistance = Math.PI * 2.0;
@@ -58,8 +55,9 @@ const far = {
     //
 
     // Negative values and non-numeric values are illegal.
-    assert.throws(() => assertGeoNearResults({minDistance: -1.1}));
-    assert.throws(() => assertGeoNearResults({minDistance: "3.2"}));
+    assert.throwsWithCode(() => assertGeoNearResults({minDistance: -1.1}), ErrorCodes.BadValue);
+    assert.throwsWithCode(() => assertGeoNearResults({minDistance: "3.2"}),
+                          ErrorCodes.TypeMismatch);
 
     // A minimum distance of 0 returns all points.
     assertGeoNearResults({minDistance: -0.0}, [origin, near, far]);
@@ -75,8 +73,9 @@ const far = {
     //
 
     // Negative values and non-numeric values are illegal.
-    assert.throws(() => assertGeoNearResults({maxDistance: -1.1}));
-    assert.throws(() => assertGeoNearResults({maxDistance: "3.2"}));
+    assert.throwsWithCode(() => assertGeoNearResults({maxDistance: -1.1}), ErrorCodes.BadValue);
+    assert.throwsWithCode(() => assertGeoNearResults({maxDistance: "3.2"}),
+                          ErrorCodes.TypeMismatch);
 
     // A maximum distance of 0 returns only the origin.
     assertGeoNearResults({maxDistance: 0.0}, [origin]);
@@ -101,4 +100,3 @@ const far = {
     // An impossible range is legal but returns no results.
     assertGeoNearResults({minDistance: 3.0, maxDistance: 1.0}, []);
 });
-}());

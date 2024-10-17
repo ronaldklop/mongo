@@ -29,13 +29,17 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <functional>
 #include <memory>
-#include <random>
+#include <new>
 #include <vector>
 
 #include "mongo/db/repl/hello_response.h"
+#include "mongo/platform/random.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/static_immortal.h"
+#include "mongo/util/synchronized_value.h"
 
 namespace mongo {
 
@@ -48,8 +52,14 @@ class MirroringSampler final {
 public:
     using RandomFunc = std::function<int()>;
 
+    static int threadSafeRandom() {
+        static StaticImmortal<synchronized_value<PseudoRandom>> random{
+            PseudoRandom{SecureRandom{}.nextInt64()}};
+        return (*random)->nextInt32(defaultRandomMax());
+    }
+
     static RandomFunc defaultRandomFunc() {
-        return std::rand;
+        return threadSafeRandom;
     }
 
     static constexpr int defaultRandomMax() {
@@ -63,12 +73,12 @@ public:
      * interpretations of ratio.
      */
     struct SamplingParameters {
-        explicit SamplingParameters(const double ratio, const int rndMax, const int rndValue);
+        explicit SamplingParameters(double ratio, int rndMax, int rndValue);
 
         /**
          * Construct with a value from rnd().
          */
-        explicit SamplingParameters(const double ratio, const int rndMax, RandomFunc rnd);
+        explicit SamplingParameters(double ratio, int rndMax, RandomFunc rnd);
 
         /**
          * Construct with a value from defaultRandomFunc().
@@ -92,7 +102,7 @@ public:
      * Return all eligible hosts from a HelloResponse that we should mirror to.
      */
     std::vector<HostAndPort> getRawMirroringTargets(
-        const std::shared_ptr<const repl::HelloResponse>& isMaster) noexcept;
+        const std::shared_ptr<const repl::HelloResponse>& helloResponse) noexcept;
 
     /**
      * Approximate use of the MirroringSampler for testing.
@@ -100,10 +110,10 @@ public:
      * In practice, we call constituent functions in sequence to pessimistically spare work.
      */
     static std::vector<HostAndPort> getMirroringTargets(
-        const std::shared_ptr<const repl::HelloResponse>& isMaster,
-        const double ratio,
+        const std::shared_ptr<const repl::HelloResponse>& helloResponse,
+        double ratio,
         RandomFunc rnd = defaultRandomFunc(),
-        const int rndMax = defaultRandomMax()) noexcept;
+        int rndMax = defaultRandomMax()) noexcept;
 };
 
 }  // namespace mongo

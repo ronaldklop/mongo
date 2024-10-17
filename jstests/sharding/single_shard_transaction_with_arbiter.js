@@ -1,11 +1,14 @@
 /**
  * Tests that single shard transactions succeed against replica sets that contain arbiters.
  *
- * @tags: [uses_transactions, requires_find_command]
+ * A config server can't have arbiter nodes.
+ * @tags: [
+ *   uses_transactions,
+ *   config_shard_incompatible,
+ * ]
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const name = "single_shard_transaction_with_arbiter";
 const dbName = "test";
@@ -17,7 +20,9 @@ const shardingTest = new ShardingTest({
         nodes: [
             {/* primary */},
             {/* secondary */ rsConfig: {priority: 0}},
-            {/* arbiter */ rsConfig: {arbiterOnly: true}}
+            {/* arbiter */ rsConfig: {arbiterOnly: true}},
+            {/* secondary */ rsConfig: {priority: 0}},
+            {/* secondary */ rsConfig: {priority: 0}},
         ]
     }
 });
@@ -44,4 +49,3 @@ assert.commandWorked(session.commitTransaction_forTesting());
 assert.eq({_id: 0}, sessionColl.findOne({_id: 0}));
 
 shardingTest.stop();
-})();

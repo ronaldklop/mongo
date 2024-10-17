@@ -29,12 +29,27 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_ast.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 /**
@@ -60,8 +75,6 @@ public:
     }
 
 protected:
-    using FieldSet = StringSet;
-
     // The raw BSON projection used to populate projection stats. Optional, since it is required
     // only in explain mode.
     boost::optional<BSONObj> _projObj;
@@ -132,7 +145,7 @@ private:
     void transform(WorkingSetMember* member) const final;
 
     // Field names present in the simple projection.
-    FieldSet _includedFields;
+    StringSet _includedFields;
 
     // This is the key pattern we're extracting covered data from. It is maintained here since
     // strings derived from it depend on its lifetime.
@@ -147,9 +160,8 @@ private:
 };
 
 /**
- * This class is used when we expect an object and the following rules are met: the projection
- * consists only of inclusions e.g. '{field: 1}', it has no $meta projections, it is not a returnKey
- * projection and it has no dotted fields.
+ * This class is used when we expect an object and the following rules are met: it has no $meta
+ * projections, it is not a returnKey projection and it has no dotted fields.
  */
 class ProjectionStageSimple final : public ProjectionStage {
 public:
@@ -166,11 +178,28 @@ public:
         return STAGE_PROJECTION_SIMPLE;
     }
 
+    static BSONObj transform(const BSONObj& doc,
+                             const StringSet& fields,
+                             projection_ast::ProjectType projectType) {
+        return transform<StringSet>(doc, fields, projectType);
+    }
+
+    static BSONObj transform(const BSONObj& doc,
+                             const OrderedPathSet& fields,
+                             projection_ast::ProjectType projectType) {
+        return transform<OrderedPathSet>(doc, fields, projectType);
+    }
+
+    template <typename Container>
+    static BSONObj transform(const BSONObj& doc,
+                             const Container& fields,
+                             projection_ast::ProjectType projectType);
+
 private:
     void transform(WorkingSetMember* member) const final;
 
-    // Has the field names present in the simple projection.
-    stdx::unordered_set<std::string> _includedFields;
+    const projection_ast::ProjectType _projectType;
+    StringSet _fields;
 };
 
 }  // namespace mongo

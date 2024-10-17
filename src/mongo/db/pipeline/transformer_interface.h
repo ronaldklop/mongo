@@ -55,25 +55,43 @@ public:
         kGroupFromFirstDocument,
     };
     virtual ~TransformerInterface() = default;
-    virtual Document applyTransformation(const Document& input) = 0;
+    virtual Document applyTransformation(const Document& input) const = 0;
     virtual TransformerType getType() const = 0;
     virtual void optimize() = 0;
+    virtual Pipeline::SourceContainer::iterator doOptimizeAt(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) = 0;
     virtual DepsTracker::State addDependencies(DepsTracker* deps) const = 0;
+    virtual void addVariableRefs(std::set<Variables::Id>* refs) const = 0;
     virtual DocumentSource::GetModPathsReturn getModifiedPaths() const = 0;
+
+    /**
+     * Method used by optimize() to check if stage is a no-op.
+     */
+    virtual bool isNoop() const {
+        return false;
+    }
 
     /**
      * Returns a document describing this transformation. For example, this function will return
      * {_id: 0, x: 1} for the stage parsed from {$project: {_id: 0, x: 1}}.
      */
-    virtual Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const = 0;
+    virtual Document serializeTransformation(boost::optional<ExplainOptions::Verbosity> explain,
+                                             const SerializationOptions& options = {}) const = 0;
 
-    virtual void substituteFieldPathElement(const StringData& oldName, const StringData& newName) {}
+    /**
+     * Method used by inclusion and add fields projecton executors to extract computed projections
+     * that depend only on the 'oldName' field. Returns a pair of <BSONObj, bool>. The BSONObj
+     * contains the extracted projections. The boolean flag is true if the original projection has
+     * become empty after the extraction and can be deleted by the caller.
+     */
+    virtual std::pair<BSONObj, bool> extractComputedProjections(
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) {
+        return {BSONObj{}, false};
+    }
 
-    virtual BSONObj extractComputedProjections(const std::string& oldName,
-                                               const std::string& newName,
-                                               const std::set<StringData>& reservedNames) {
-        return BSONObj{};
+    virtual std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                                    StringData newName) {
+        return {BSONObj{}, false};
     }
 };
 }  // namespace mongo

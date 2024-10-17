@@ -15,12 +15,12 @@
  * 10. Try to step down primary and expect success
  *
  */
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");  // for stopReplicationOnSecondaries, //
-                                             // restartServerReplication,
-                                             // restartReplSetReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplSetReplication,
+    restartServerReplication,
+    stopReplicationOnSecondaries,
+} from "jstests/libs/write_concern_util.js";
 
 function assertStepDownFailsWithExceededTimeLimit(node) {
     assert.commandFailedWithCode(
@@ -102,4 +102,3 @@ replTest.waitForState(primary, ReplSetTest.State.SECONDARY);
 jsTestLog("Disabling all fail points to allow for clean shutdown");
 restartReplSetReplication(replTest);
 replTest.stopSet();
-}());

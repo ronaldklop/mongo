@@ -27,18 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-
-#include "mongo/db/json.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/str.h"
 
 namespace {
@@ -47,7 +51,7 @@ using namespace mongo;
 
 class WiredTigerFactoryTest : public ServiceContextTest {
 private:
-    virtual void setUp() {
+    void setUp() override {
         ServiceContext* globalEnv = getGlobalServiceContext();
         ASSERT_TRUE(globalEnv);
         ASSERT_TRUE(isRegisteredStorageEngine(globalEnv, kWiredTigerEngineName));
@@ -56,7 +60,7 @@ private:
         _oldOptions = wiredTigerGlobalOptions;
     }
 
-    virtual void tearDown() {
+    void tearDown() override {
         wiredTigerGlobalOptions = _oldOptions;
         factory = nullptr;
     }

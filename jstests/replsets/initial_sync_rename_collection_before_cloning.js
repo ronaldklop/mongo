@@ -4,11 +4,9 @@
  * See SERVER-4941.
  */
 
-(function() {
-'use strict';
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');
 const basename = 'initial_sync_rename_collection_before_cloning';
 
 jsTestLog('Bring up a replica set');
@@ -98,4 +96,3 @@ assert.eq(
 rst.checkReplicatedDataHashes();
 rst.checkOplogs();
 rst.stopSet();
-})();

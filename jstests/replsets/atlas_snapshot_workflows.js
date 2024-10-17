@@ -2,22 +2,20 @@
  * This test simulates workflows which are performed by the Atlas automation agent, where nodes are
  * created or restarted using file system snapshots.
  *
- * @tags: [requires_persistence,requires_wiredtiger]
+ * @tags: [requires_persistence]
  */
 
 // Set up a standard 3-node replica set.  Note the two secondaries are priority 0; this is
 // different than the real Atlas configuration where the secondaries would be electable.
-(function() {
-"use strict";
-
 // Snapshot works only on enterprise.
 if (!buildInfo()["modules"].includes("enterprise")) {
     printjson(buildInfo()["modules"]);
     jsTestLog("Skipping snapshot tests because not running on enterprise.");
-    return 0;
+    quit();
 }
 
-load("jstests/libs/backup_utils.js");
+import {backupData} from "jstests/libs/backup_utils.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = TestData.testName;
 const rst = new ReplSetTest({
@@ -175,4 +173,3 @@ jsTestLog("Test replacing a node with snapshot with two secondaries unreachable.
 testReplaceWithSnapshot(newNode, 2);
 
 rst.stopSet();
-})();

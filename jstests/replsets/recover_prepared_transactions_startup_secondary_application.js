@@ -6,9 +6,8 @@
  * @tags: [requires_persistence, uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 const nodes = replTest.startSet();
@@ -19,6 +18,10 @@ replTest.initiateWithHighElectionTimeout();
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+// The default WC is majority and disableSnapshotting failpoint will prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "recover_prepared_transactions_startup_secondary_application";
@@ -107,7 +110,7 @@ assert.commandWorked(session2.abortTransaction_forTesting());
 replTest.awaitReplication();
 assert.eq(secondaryTestColl.find().sort({_id: 1}).toArray(), [{_id: 1, a: 1}, {_id: 2}]);
 
-jsTestLog("Attempting to run another transction");
+jsTestLog("Attempting to run another transaction");
 
 // Make sure that we can run another conflicting transaction after recovery without any
 // problems and that we can see its changes when we read from the secondary.
@@ -120,4 +123,3 @@ replTest.awaitReplication();
 assert.eq(secondaryTestColl.findOne({_id: 1}), {_id: 1, a: 3});
 
 replTest.stopSet();
-}());

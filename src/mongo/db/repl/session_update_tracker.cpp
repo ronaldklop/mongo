@@ -27,20 +27,44 @@
  *    it in the license file.
  */
 
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <cstdint>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_retryability.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/session_update_tracker.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/session_update_tracker.h"
-
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace repl {
@@ -54,11 +78,11 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                                      const BSONObj& o2Field,
                                                      Date_t wallClockTime) {
     return {repl::DurableOplogEntry(opTime,
-                                    boost::none,  // hash
                                     repl::OpTypeEnum::kUpdate,
                                     NamespaceString::kSessionTransactionsTableNamespace,
                                     boost::none,  // uuid
                                     false,        // fromMigrate
+                                    boost::none,  // checkExistenceForDiffInsert
                                     repl::OplogEntry::kOplogVersion,
                                     updateBSON,
                                     o2Field,
@@ -70,11 +94,12 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                     boost::none,    // preImageOpTime
                                     boost::none,    // postImageOpTime
                                     boost::none,    // destinedRecipient
-                                    boost::none)};  // _id
+                                    boost::none,    // _id
+                                    boost::none)};  // needsRetryImage
 }
 
 /**
- * Constructs a new oplog entry if the given entry has transaction state embedded within in. The new
+ * Constructs a new oplog entry if the given entry has transaction state embedded within it. The new
  * oplog entry will contain the operation needed to replicate the transaction table.
  *
  * Returns boost::none if the given oplog doesn't have any transaction state or does not support
@@ -91,8 +116,13 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
 
     const auto updateBSON = [&] {
         SessionTxnRecord newTxnRecord;
-        newTxnRecord.setSessionId(*sessionInfo.getSessionId());
+        const auto lsid = *sessionInfo.getSessionId();
+        newTxnRecord.setSessionId(lsid);
+        if (isInternalSessionForRetryableWrite(lsid)) {
+            newTxnRecord.setParentSessionId(*getParentSessionId(lsid));
+        }
         newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+        newTxnRecord.setTxnRetryCounter(sessionInfo.getTxnRetryCounter());
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(entry.getWallClockTime());
 
@@ -141,15 +171,7 @@ bool SessionUpdateTracker::isTransactionEntry(const OplogEntry& entry) {
         return true;
     }
 
-    auto sessionInfo = entry.getOperationSessionInfo();
-    if (!sessionInfo.getTxnNumber()) {
-        return false;
-    }
-
-    return entry.isPartialTransaction() ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kAbortTransaction ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
+    return entry.isInTransaction();
 }
 
 boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
@@ -161,8 +183,7 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
         return _flush(entry);
     }
 
-    _updateSessionInfo(entry);
-    return boost::none;
+    return _updateSessionInfo(entry);
 }
 
 boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateSession(
@@ -187,11 +208,12 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateSession(
     return boost::none;
 }
 
-void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
+boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateSessionInfo(
+    const OplogEntry& entry) {
     const auto& sessionInfo = entry.getOperationSessionInfo();
 
     if (!sessionInfo.getTxnNumber()) {
-        return;
+        return {};
     }
 
     const auto& lsid = sessionInfo.getSessionId();
@@ -200,24 +222,34 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
     // Ignore pre/post image no-op oplog entries. These entries will not have an o2 field.
     if (entry.getOpType() == OpTypeEnum::kNoop) {
         if (!entry.getFromMigrate() || !*entry.getFromMigrate()) {
-            return;
+            return {};
         }
 
-        if (!entry.getObject2()) {
-            return;
+        if (!entry.getObject2() ||
+            (entry.getObject2()->isEmpty() && !isWouldChangeOwningShardSentinelOplogEntry(entry))) {
+            return {};
         }
     }
 
     auto iter = _sessionsToUpdate.find(*lsid);
     if (iter == _sessionsToUpdate.end()) {
         _sessionsToUpdate.emplace(*lsid, entry);
-        return;
+        return {};
     }
 
     const auto& existingSessionInfo = iter->second.getOperationSessionInfo();
-    if (*sessionInfo.getTxnNumber() >= *existingSessionInfo.getTxnNumber()) {
+    const auto existingTxnNumber = *existingSessionInfo.getTxnNumber();
+    if (*sessionInfo.getTxnNumber() == existingTxnNumber) {
         iter->second = entry;
-        return;
+        return {};
+    }
+
+    if (*sessionInfo.getTxnNumber() > existingTxnNumber) {
+        // Do not coalesce updates across txn numbers. For more details, see SERVER-55305.
+        auto updateOplog = createMatchingTransactionTableUpdate(iter->second);
+        invariant(updateOplog);
+        iter->second = entry;
+        return std::vector<OplogEntry>{std::move(*updateOplog)};
     }
 
     LOGV2_FATAL_NOTRACE(50843,
@@ -226,8 +258,7 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
                         "oplog entry: {existingEntry}",
                         "lsid"_attr = lsid->toBSON(),
                         "sessionInfo_getTxnNumber"_attr = *sessionInfo.getTxnNumber(),
-                        "existingSessionInfo_getTxnNumber"_attr =
-                            *existingSessionInfo.getTxnNumber(),
+                        "existingSessionInfo_getTxnNumber"_attr = existingTxnNumber,
                         "newEntry"_attr = redact(entry.toBSONForLogging()),
                         "existingEntry"_attr = redact(iter->second.toBSONForLogging()));
 }
@@ -270,7 +301,7 @@ std::vector<OplogEntry> SessionUpdateTracker::flushAll() {
 std::vector<OplogEntry> SessionUpdateTracker::_flushForQueryPredicate(
     const BSONObj& queryPredicate) {
     auto idField = queryPredicate["_id"].Obj();
-    auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsidInOplogQuery"), idField);
+    auto lsid = LogicalSessionId::parse(IDLParserContext("lsidInOplogQuery"), idField);
     auto iter = _sessionsToUpdate.find(lsid);
 
     if (iter == _sessionsToUpdate.end()) {
@@ -298,14 +329,17 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
 
     const auto updateBSON = [&] {
         SessionTxnRecord newTxnRecord;
-        newTxnRecord.setSessionId(*sessionInfo.getSessionId());
+        const auto lsid = *sessionInfo.getSessionId();
+        newTxnRecord.setSessionId(lsid);
+        if (isInternalSessionForRetryableWrite(lsid)) {
+            newTxnRecord.setParentSessionId(*getParentSessionId(lsid));
+        }
         newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+        newTxnRecord.setTxnRetryCounter(sessionInfo.getTxnRetryCounter());
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(entry.getWallClockTime());
 
         if (entry.getFromTenantMigration() && entry.getOpType() == OpTypeEnum::kNoop) {
-            // For tenant migration, we don't need to set the lastWriteOpTime.
-            newTxnRecord.setLastWriteOpTime(OpTime());
             newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
             return newTxnRecord.toBSON();
         }
@@ -324,9 +358,10 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
                         // The prepare oplog entry is the first operation of the transaction.
                         newTxnRecord.setStartOpTime(entry.getOpTime());
                     } else {
-                        // Update the transaction record using $set to avoid overwriting the
-                        // startOpTime.
-                        return BSON("$set" << newTxnRecord.toBSON());
+                        // Update the transaction record using a delta oplog entry to avoid
+                        // overwriting the startOpTime.
+                        return update_oplog_entry::makeDeltaOplogEntry(
+                            BSON(doc_diff::kUpdateSectionFieldName << newTxnRecord.toBSON()));
                     }
                 } else {
                     newTxnRecord.setState(DurableTxnStateEnum::kCommitted);

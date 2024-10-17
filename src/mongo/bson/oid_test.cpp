@@ -29,9 +29,14 @@
 
 #include "mongo/bson/oid.h"
 
+#include <cstring>
+
+#include <absl/hash/hash.h>
+
 #include "mongo/base/parse_number.h"
 #include "mongo/platform/endian.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -166,4 +171,11 @@ TEST(Basic, FromTerm) {
     ASSERT_OK(mongo::NumberParser::strToAny()(oidTail, &oidTailInt));
     ASSERT_EQUALS(term, oidTailInt);
 }
+
+TEST(Basic, AbslHash) {
+    OID o1 = OID::gen();
+    OID o2 = o1;
+    ASSERT_EQUALS(absl::Hash<OID>{}(o1), absl::Hash<OID>{}(o2));
+}
+
 }  // namespace

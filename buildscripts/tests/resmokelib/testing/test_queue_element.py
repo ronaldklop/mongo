@@ -1,11 +1,10 @@
 """Unit tests for the resmokelib.testing.executor module."""
+
 import unittest
 
 import mock
 
 from buildscripts.resmokelib.testing import queue_element
-
-# pylint: disable=missing-docstring,protected-access
 
 
 class TestQueueElemFactory(unittest.TestCase):

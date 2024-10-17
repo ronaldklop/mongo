@@ -1,7 +1,8 @@
-// Test the downgrade of a replica set succeeds, while reads and writes continue.
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load('./jstests/multiVersion/libs/multi_rs.js');
-load('./jstests/libs/test_background_ops.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isFinished, startParallelOps} from "jstests/libs/test_background_ops.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 let newVersion = "latest";
 
@@ -30,7 +31,8 @@ function runDowngradeTest(downgradeVersion) {
     // the replica set in order to ensure that all nodes can be successfully downgraded. This
     // effectively allows us to emulate upgrading to the latest version with existing data files and
     // then trying to downgrade the FCV.
-    assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    assert.commandWorked(
+        primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
     rst.awaitReplication();
 
     jsTest.log("Inserting documents into collection.");

@@ -27,9 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/repl/oplog_entry_test_helpers.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 namespace repl {
@@ -61,11 +68,11 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<UUID> uuid,
                                 boost::optional<OpTime> prevOpTime) {
     return {repl::DurableOplogEntry(opTime,                           // optime
-                                    boost::none,                      // hash
                                     opType,                           // opType
                                     nss,                              // namespace
                                     uuid,                             // uuid
                                     boost::none,                      // fromMigrate
+                                    boost::none,                      // checkExistenceForDiffInsert
                                     repl::OplogEntry::kOplogVersion,  // version
                                     object,                           // o
                                     object2,                          // o2
@@ -77,7 +84,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                     boost::none,    // pre-image optime
                                     boost::none,    // post-image optime
                                     boost::none,    // ShardId of resharding recipient
-                                    boost::none)};  // _id
+                                    boost::none,    // _id
+                                    boost::none)};  // needsRetryImage
 }
 
 OplogEntry makeCommandOplogEntry(OpTime opTime,

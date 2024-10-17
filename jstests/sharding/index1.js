@@ -1,5 +1,5 @@
 // SERVER-2326 - make sure that sharding only works with unique indices
-(function() {
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({name: "shard_index", shards: 2, mongos: 1});
 
@@ -14,11 +14,6 @@ for (var i = 0; i < 22; i++) {
     }
     assert.commandWorked(bulk.execute());
 
-    if (i == 0) {
-        s.adminCommand({enablesharding: "" + coll._db});
-        s.ensurePrimaryShard(coll.getDB().getName(), s.shard1.shardName);
-    }
-
     print("\n\n\n\n\nTest # " + i);
 
     if (i == 0) {
@@ -26,7 +21,7 @@ for (var i = 0; i < 22; i++) {
         coll.createIndex({num: 1}, {unique: true});
         coll.createIndex({x: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: 1}});
             passed = true;
@@ -52,7 +47,7 @@ for (var i = 0; i < 22; i++) {
         coll.createIndex({x: 1});
         coll.createIndex({x: 1, num: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: 1}});
             passed = true;
@@ -141,7 +136,7 @@ for (var i = 0; i < 22; i++) {
 
         // No index exists
 
-        passed = false;
+        let passed = false;
         try {
             assert.eq(coll.find().itcount(), 0);
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}, unique: true});
@@ -168,7 +163,7 @@ for (var i = 0; i < 22; i++) {
         coll.createIndex({num: 1}, {unique: true});
         coll.createIndex({x: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: 1}});
             passed = true;
@@ -179,7 +174,7 @@ for (var i = 0; i < 22; i++) {
     }
     if (i == 10) {
         // try sharding non-empty collection without any index
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}});
             passed = true;
@@ -210,6 +205,7 @@ for (var i = 0; i < 22; i++) {
         // empty collection with useful index. check new index not created
         coll.createIndex({num: 1, x: 1});
 
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}});
             passed = true;
@@ -228,7 +224,7 @@ for (var i = 0; i < 22; i++) {
         coll.save({num: 100, x: [2, 3]});
         coll.createIndex({num: 1, x: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}});
             passed = true;
@@ -241,7 +237,7 @@ for (var i = 0; i < 22; i++) {
         coll.save({num: [100, 200], x: 10});
         coll.createIndex({num: 1, x: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}});
             passed = true;
@@ -254,7 +250,7 @@ for (var i = 0; i < 22; i++) {
         coll.save({num: 100, x: 10, y: [1, 2]});
         coll.createIndex({num: 1, x: 1, y: 1});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: 1}});
             passed = true;
@@ -278,7 +274,7 @@ for (var i = 0; i < 22; i++) {
         // create hashed index, but try to declare it unique when sharding
         coll.createIndex({num: "hashed"});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {num: "hashed"}, unique: true});
             passed = true;
@@ -292,7 +288,7 @@ for (var i = 0; i < 22; i++) {
         coll.createIndex({x: "hashed"});
         coll.createIndex({num: 1}, {unique: true});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: "hashed"}});
             passed = true;
@@ -317,7 +313,7 @@ for (var i = 0; i < 22; i++) {
         // Create sparse index.
         coll.createIndex({x: 1}, {sparse: true});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: 1}});
             passed = true;
@@ -330,7 +326,7 @@ for (var i = 0; i < 22; i++) {
         // Create partial index.
         coll.createIndex({x: 1}, {filter: {num: {$gt: 1}}});
 
-        passed = false;
+        let passed = false;
         try {
             s.adminCommand({shardcollection: "" + coll, key: {x: 1}});
             passed = true;
@@ -357,4 +353,3 @@ for (var i = 0; i < 22; i++) {
 }
 
 s.stop();
-})();

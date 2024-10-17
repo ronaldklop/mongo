@@ -27,18 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/db/catalog/index_builds_manager.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_builds_manager.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-
 namespace {
 
 class IndexBuildsManagerTest : public CatalogTestFixture {
@@ -50,7 +53,7 @@ public:
     void createCollection(const NamespaceString& nss);
 
     const UUID _buildUUID = UUID::gen();
-    const NamespaceString _nss = NamespaceString("test.foo");
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("test.foo");
     IndexBuildsManager _indexBuildsManager;
 };
 
@@ -72,7 +75,7 @@ void IndexBuildsManagerTest::createCollection(const NamespaceString& nss) {
 std::vector<BSONObj> makeSpecs(const NamespaceString& nss, std::vector<std::string> keys) {
     ASSERT(keys.size());
     std::vector<BSONObj> indexSpecs;
-    for (auto keyName : keys) {
+    for (const auto& keyName : keys) {
         indexSpecs.push_back(
             BSON("v" << 2 << "key" << BSON(keyName << 1) << "name" << (keyName + "_1")));
     }
@@ -81,7 +84,7 @@ std::vector<BSONObj> makeSpecs(const NamespaceString& nss, std::vector<std::stri
 
 TEST_F(IndexBuildsManagerTest, IndexBuildsManagerSetUpAndTearDown) {
     AutoGetCollection autoColl(operationContext(), _nss, MODE_X);
-    CollectionWriter collection(autoColl);
+    CollectionWriter collection(operationContext(), autoColl);
 
     auto specs = makeSpecs(_nss, {"a", "b"});
     ASSERT_OK(_indexBuildsManager.setUpIndexBuild(
@@ -89,7 +92,7 @@ TEST_F(IndexBuildsManagerTest, IndexBuildsManagerSetUpAndTearDown) {
 
     _indexBuildsManager.abortIndexBuild(
         operationContext(), collection, _buildUUID, MultiIndexBlock::kNoopOnCleanUpFn);
-    _indexBuildsManager.unregisterIndexBuild(_buildUUID);
+    _indexBuildsManager.tearDownAndUnregisterIndexBuild(_buildUUID);
 }
 }  // namespace
 

@@ -29,12 +29,21 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <cstdint>
 #include <memory>
 
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -85,12 +94,11 @@ private:
 class SortedDataInterfaceThrottleCursor {
 public:
     SortedDataInterfaceThrottleCursor(OperationContext* opCtx,
-                                      const IndexAccessMethod* iam,
+                                      const SortedDataIndexAccessMethod* iam,
                                       DataThrottle* dataThrottle);
 
-    boost::optional<IndexKeyEntry> seek(OperationContext* opCtx, const KeyString::Value& key);
-    boost::optional<KeyStringEntry> seekForKeyString(OperationContext* opCtx,
-                                                     const KeyString::Value& key);
+    boost::optional<IndexKeyEntry> seek(OperationContext* opCtx, StringData key);
+    boost::optional<KeyStringEntry> seekForKeyString(OperationContext* opCtx, StringData key);
 
     boost::optional<IndexKeyEntry> next(OperationContext* opCtx);
     boost::optional<KeyStringEntry> nextKeyString(OperationContext* opCtx);
@@ -111,6 +119,14 @@ public:
         _cursor->reattachToOperationContext(opCtx);
     }
 
+    bool isRecordIdAtEndOfKeyString() const {
+        return _cursor->isRecordIdAtEndOfKeyString();
+    }
+
+    void setEndPosition(const BSONObj& key, bool inclusive) {
+        _cursor->setEndPosition(key, inclusive);
+    }
+
 private:
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
     DataThrottle* _dataThrottle;
@@ -123,13 +139,14 @@ private:
  */
 class DataThrottle {
 public:
-    DataThrottle(OperationContext* opCtx)
+    DataThrottle(OperationContext* opCtx, std::function<int()> maxMBperSec)
         : _startMillis(
               opCtx->getServiceContext()->getFastClockSource()->now().toMillisSinceEpoch()),
           _bytesProcessed(0),
           _totalElapsedTimeSec(0),
           _totalMBProcessed(0),
-          _shouldNotThrottle(false) {}
+          _shouldNotThrottle(false),
+          _maxMBperSec(maxMBperSec) {}
 
     /**
      * If throttling is not enabled by calling turnThrottlingOff(), or if
@@ -142,7 +159,7 @@ public:
      * In addition to throttling, while the thread is waiting, its operation context remains
      * interruptible.
      */
-    void awaitIfNeeded(OperationContext* opCtx, const int64_t dataSize);
+    void awaitIfNeeded(OperationContext* opCtx, int64_t dataSize);
 
     void turnThrottlingOff() {
         _shouldNotThrottle = true;
@@ -161,6 +178,9 @@ private:
 
     // Whether the throttle should be active.
     bool _shouldNotThrottle;
+
+    // Will return the rate to throttle, 0 means turn off throttling.
+    std::function<int()> _maxMBperSec;
 };
 
 }  // namespace mongo

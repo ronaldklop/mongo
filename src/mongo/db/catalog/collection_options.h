@@ -29,32 +29,30 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 #include <string>
 
-#include <boost/optional.hpp>
-
 #include "mongo/base/status.h"
-#include "mongo/db/catalog/clustered_index_options_gen.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/collection_options_gen.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
 class CollatorFactoryInterface;
 class CreateCommand;
-
-/**
- * A CollectionUUID is a 128-bit unique identifier, per RFC 4122, v4. for a database collection.
- * Newly created collections are assigned a new randomly generated CollectionUUID. In a replica-set
- * or a sharded cluster, all nodes will use the same UUID for a given collection. The UUID stays
- * with the collection until it is dropped, so even across renames. A copied collection must have
- * its own new unique UUID though.
- */
-using CollectionUUID = UUID;
-
-using OptionalCollectionUUID = boost::optional<CollectionUUID>;
 
 struct CollectionOptions {
     /**
@@ -91,8 +89,18 @@ struct CollectionOptions {
      */
     static CollectionOptions fromCreateCommand(const CreateCommand& cmd);
 
-    void appendBSON(BSONObjBuilder* builder) const;
-    BSONObj toBSON() const;
+    static StatusWith<long long> checkAndAdjustCappedSize(long long cappedSize);
+    static StatusWith<long long> checkAndAdjustCappedMaxDocs(long long cappedMaxDocs);
+
+    /**
+     * Serialize to BSON. The 'includeUUID' parameter is used for the listCollections command to do
+     * special formatting for the uuid. Aside from the UUID, if 'includeFields' is non-empty, only
+     * the specified fields will be included.
+     */
+    void appendBSON(BSONObjBuilder* builder,
+                    bool includeUUID,
+                    const StringDataSet& includeFields) const;
+    BSONObj toBSON(bool includeUUID = true, const StringDataSet& includeFields = {}) const;
 
     /**
      * Returns true if given options matches to this.
@@ -106,7 +114,7 @@ struct CollectionOptions {
 
     // Collection UUID. If not set, specifies that the storage engine should generate the UUID (for
     // a new collection). For an existing collection parsed for storage, it will always be present.
-    OptionalCollectionUUID uuid;
+    boost::optional<UUID> uuid;
 
     bool capped = false;
     long long cappedSize = 0;
@@ -123,7 +131,11 @@ struct CollectionOptions {
     } autoIndexId = DEFAULT;
 
     bool temp = false;
-    bool recordPreImages = false;
+
+    // Change stream options define whether or not to store the pre-images of the documents affected
+    // by update and delete operations in a dedicated collection, that will be used for reading data
+    // via changeStreams.
+    ChangeStreamPreAndPostImagesOptions changeStreamPreAndPostImagesOptions{false};
 
     // Storage engine collection options. Always owned or empty.
     BSONObj storageEngine;
@@ -142,8 +154,12 @@ struct CollectionOptions {
     // The namespace's default collation.
     BSONObj collation;
 
-    // If present, defines how this collection is clustered on _id.
-    boost::optional<ClusteredIndexOptions> clusteredIndex;
+    // Exists if the collection is clustered.
+    boost::optional<ClusteredCollectionInfo> clusteredIndex;
+
+    // If present, the number of seconds after which old data should be deleted. Only for
+    // collections which are clustered on _id.
+    boost::optional<int64_t> expireAfterSeconds;
 
     // View-related options.
     // The namespace of the view or collection that "backs" this view, or the empty string if this
@@ -155,5 +171,14 @@ struct CollectionOptions {
     // The options that define the time-series collection, or boost::none if not a time-series
     // collection.
     boost::optional<TimeseriesOptions> timeseries;
+
+    // The options for collections with encrypted fields
+    boost::optional<EncryptedFieldConfig> encryptedFieldConfig;
+
+    // When 'true', will use the same recordIds across all nodes in the replica set.
+    bool recordIdsReplicated = false;
 };
+
+Status validateChangeStreamPreAndPostImagesOptionIsPermitted(const NamespaceString& ns);
+
 }  // namespace mongo

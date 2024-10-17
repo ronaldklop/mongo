@@ -29,41 +29,74 @@
 
 #pragma once
 
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
 #include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/async_client.h"
+#include "mongo/db/baton.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/executor/connection_pool_tl.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log_severity.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/notification.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/strong_weak_finish_line.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 
 namespace mongo {
 namespace executor {
 
 class NetworkInterfaceTL : public NetworkInterface {
-    static constexpr int kDiagnosticLogLevel = 4;
-
 public:
     NetworkInterfaceTL(std::string instanceName,
                        ConnectionPool::Options connPoolOpts,
                        ServiceContext* ctx,
                        std::unique_ptr<NetworkConnectionHook> onConnectHook,
                        std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
-    ~NetworkInterfaceTL();
+    ~NetworkInterfaceTL() override;
 
     constexpr static Milliseconds kCancelCommandTimeout{1000};
 
     std::string getDiagnosticString() override;
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
+    void appendStats(BSONObjBuilder&) const override;
     std::string getHostName() override;
     Counters getCounters() const override;
 
@@ -74,24 +107,23 @@ public:
     void waitForWorkUntil(Date_t when) override;
     void signalWorkAvailable() override;
     Date_t now() override;
-    Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                        RemoteCommandRequestOnAny& request,
-                        RemoteCommandCompletionFn&& onFinish,
-                        const BatonHandle& baton) override;
-    Status startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                               RemoteCommandRequestOnAny& request,
-                               RemoteCommandOnReplyFn&& onReply,
-                               const BatonHandle& baton) override;
+    SemiFuture<TaskExecutor::ResponseStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest& request,
+        const BatonHandle& baton,
+        const CancellationToken& token) override;
+    SemiFuture<std::shared_ptr<NetworkInterface::ExhaustResponseReader>> startExhaustCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequest& request,
+        const BatonHandle& baton,
+        const CancellationToken& cancelToken) override;
 
     void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
                        const BatonHandle& baton) override;
-    Status setAlarm(const TaskExecutor::CallbackHandle& cbHandle,
-                    Date_t when,
-                    unique_function<void(Status)> action) override;
+    SemiFuture<void> setAlarm(
+        Date_t when, const CancellationToken& token = CancellationToken::uncancelable()) override;
 
     Status schedule(unique_function<void(Status)> action) override;
-
-    void cancelAlarm(const TaskExecutor::CallbackHandle& cbHandle) override;
 
     bool onNetworkThread() override;
 
@@ -102,173 +134,54 @@ public:
                     Milliseconds timeout,
                     Status status) override;
 
-private:
-    struct RequestState;
-    struct RequestManager;
+    /**
+     * NetworkInterfaceTL's implementation of a leased network-stream
+     * provided for manual use outside of the NITL's usual RPC API.
+     * When this type is destroyed, the destructor of the ConnectionHandle
+     * member will return the connection to this NetworkInterface's ConnectionPool.
+     */
+    class LeasedStream : public NetworkInterface::LeasedStream {
+    public:
+        AsyncDBClient* getClient() override;
 
+        LeasedStream(ConnectionPool::ConnectionHandle&& conn) : _conn{std::move(conn)} {}
+
+        // These pass-through indications of the health of the leased
+        // stream to the underlying ConnectionHandle
+        void indicateSuccess() override;
+        void indicateUsed() override;
+        void indicateFailure(Status) override;
+
+    private:
+        ConnectionPool::ConnectionHandle _conn;
+    };
+
+    SemiFuture<std::unique_ptr<NetworkInterface::LeasedStream>> leaseStream(
+        const HostAndPort& hostAndPort,
+        transport::ConnectSSLMode sslMode,
+        Milliseconds timeout) override;
+
+private:
+    /**
+     * For an RPC, an instance of `CommandState` is created to capture the state of the
+     * remote command. As part of running a remote command, `NITL` sends out a request
+     * to the specified target.
+     */
     struct CommandStateBase : public std::enable_shared_from_this<CommandStateBase> {
         CommandStateBase(NetworkInterfaceTL* interface_,
-                         RemoteCommandRequestOnAny request_,
-                         const TaskExecutor::CallbackHandle& cbHandle_);
-        virtual ~CommandStateBase() = default;
+                         RemoteCommandRequest request_,
+                         const TaskExecutor::CallbackHandle& cbHandle_,
+                         const BatonHandle& baton_,
+                         const CancellationToken& token);
+        virtual ~CommandStateBase();
 
-        /**
-         * Use the current RequestState to send out a command request.
-         */
-        virtual Future<RemoteCommandResponse> sendRequest(
-            std::shared_ptr<RequestState> requestState) = 0;
+        SemiFuture<ConnectionPool::ConnectionHandle> getConnection(ConnectionPool& pool);
 
-        /**
-         * Set a timer to fulfill the promise with a timeout error.
-         */
-        virtual void setTimer();
+        Status handleConnectionAcquisitionError(Status status);
 
-        /**
-         * Fulfill the promise with the response.
-         */
-        virtual void fulfillFinalPromise(StatusWith<RemoteCommandOnAnyResponse> response) = 0;
-
-        /**
-         * Fulfill the promise for the Command.
-         *
-         * This will throw/invariant if called multiple times. In an ideal world, this would do the
-         * swap on CommandState::done for you and return early if it was already true. It does not
-         * do so currently.
-         */
-        void tryFinish(Status status) noexcept;
-
-        /**
-         * Run the NetworkInterface's MetadataHook on a given request if this Command isn't already
-         * finished.
-         */
-        void doMetadataHook(const RemoteCommandOnAnyResponse& response);
-
-        /**
-         * Return the maximum amount of requests that can come from this command.
-         */
-        size_t maxConcurrentRequests() const noexcept {
-            if (!requestOnAny.hedgeOptions) {
-                return 1ull;
-            }
-
-            return requestOnAny.hedgeOptions->count + 1ull;
-        }
-
-        /**
-         * Return the most connections we expect to be able to acquire.
-         */
-        size_t maxPossibleConns() const noexcept {
-            return requestOnAny.target.size();
-        }
-
-        NetworkInterfaceTL* interface;
-
-        RemoteCommandRequestOnAny requestOnAny;
-        TaskExecutor::CallbackHandle cbHandle;
-        Date_t deadline = kNoExpirationDate;
-
-        ClockSource::StopWatch stopwatch;
-
-        BatonHandle baton;
-        std::unique_ptr<transport::ReactorTimer> timer;
-
-        std::unique_ptr<RequestManager> requestManager;
-
-        // TODO replace the finishLine with an atomic bool. It is no longer tracking allowed
-        // failures accurately.
-        StrongWeakFinishLine finishLine;
-
-        boost::optional<UUID> operationKey;
-    };
-
-    struct CommandState final : public CommandStateBase {
-        CommandState(NetworkInterfaceTL* interface_,
-                     RemoteCommandRequestOnAny request_,
-                     const TaskExecutor::CallbackHandle& cbHandle_);
-        ~CommandState() = default;
-
-        // Create a new CommandState in a shared_ptr
-        // Prefer this over raw construction
-        static auto make(NetworkInterfaceTL* interface,
-                         RemoteCommandRequestOnAny request,
-                         const TaskExecutor::CallbackHandle& cbHandle);
-
-        Future<RemoteCommandResponse> sendRequest(
-            std::shared_ptr<RequestState> requestState) override;
-
-        void fulfillFinalPromise(StatusWith<RemoteCommandOnAnyResponse> response) override;
-
-        Promise<RemoteCommandOnAnyResponse> promise;
-
-        const size_t hedgeCount;
-    };
-
-    struct ExhaustCommandState final : public CommandStateBase {
-        ExhaustCommandState(NetworkInterfaceTL* interface_,
-                            RemoteCommandRequestOnAny request_,
-                            const TaskExecutor::CallbackHandle& cbHandle_,
-                            RemoteCommandOnReplyFn&& onReply_);
-        virtual ~ExhaustCommandState() = default;
-
-        // Create a new ExhaustCommandState in a shared_ptr
-        // Prefer this over raw construction
-        static auto make(NetworkInterfaceTL* interface,
-                         RemoteCommandRequestOnAny request,
-                         const TaskExecutor::CallbackHandle& cbHandle,
-                         RemoteCommandOnReplyFn&& onReply);
-
-        Future<RemoteCommandResponse> sendRequest(
-            std::shared_ptr<RequestState> requestState) override;
-
-        void fulfillFinalPromise(StatusWith<RemoteCommandOnAnyResponse> response) override;
-
-        void continueExhaustRequest(std::shared_ptr<RequestState> requestState,
-                                    StatusWith<RemoteCommandResponse> swResponse);
-
-        Promise<void> promise;
-        Promise<RemoteCommandResponse> finalResponsePromise;
-        RemoteCommandOnReplyFn onReplyFn;
-    };
-
-    struct RequestManager {
-        RequestManager(CommandStateBase* cmdState);
-
-        void trySend(StatusWith<ConnectionPool::ConnectionHandle> swConn, size_t idx) noexcept;
-        void cancelRequests();
-        void killOperationsForPendingRequests();
-
-        CommandStateBase* cmdState;
-        std::vector<std::weak_ptr<RequestState>> requests;
-
-        Mutex mutex = MONGO_MAKE_LATCH("NetworkInterfaceTL::RequestManager::mutex");
-
-        // Number of connections we've resolved.
-        size_t connsResolved{0};
-
-        // Number of sent requests.
-        size_t sentIdx{0};
-
-        // Set to true when the command finishes or is canceled to block remaining requests.
-        bool isLocked{false};
-    };
-
-    struct RequestState final : public std::enable_shared_from_this<RequestState> {
-        using ConnectionHandle = std::shared_ptr<ConnectionPool::ConnectionHandle::element_type>;
-        using WeakConnectionHandle = std::weak_ptr<ConnectionPool::ConnectionHandle::element_type>;
-        RequestState(RequestManager* mgr, std::shared_ptr<CommandStateBase> cmdState_, size_t id)
-            : cmdState{std::move(cmdState_)}, requestManager(mgr), reqId(id) {}
-
-        ~RequestState();
-
-        /**
-         * Return the client for a given connection
-         */
-        static AsyncDBClient* getClient(const ConnectionHandle& conn) noexcept;
-
-        /**
-         * Cancel the current client operation or do nothing if there is no client.
-         */
-        void cancel() noexcept;
+        ExecutorFuture<RemoteCommandResponse> sendRequest(ConnectionPool::ConnectionHandle conn);
+        virtual ExecutorFuture<RemoteCommandResponse> sendRequestImpl(
+            RemoteCommandRequest toSend) = 0;
 
         /**
          * Return the current connection to the pool and unset it locally.
@@ -278,71 +191,129 @@ private:
         void returnConnection(Status status) noexcept;
 
         /**
-         * Resolve an eventual response
+         * Set a timer to cancel the request at the requested deadline, if any.
+         * If no timeout was specified on the request, this is a noop.
          */
-        void resolve(Future<RemoteCommandResponse> future) noexcept;
+        void setTimer();
 
-        NetworkInterfaceTL* interface() noexcept {
-            return cmdState->interface;
-        }
+        /**
+         * Return the client for a given connection
+         */
+        static AsyncDBClient* getClient(const ConnectionPool::ConnectionHandle& conn) noexcept;
 
-        std::shared_ptr<CommandStateBase> cmdState;
+        /**
+         * Cancel the operation with the provided status.
+         */
+        void cancel(Status status);
+
+        /**
+         * Run the NetworkInterface's MetadataHook on a given request if this Command isn't already
+         * finished.
+         */
+        void doMetadataHook(const RemoteCommandResponse& response);
+
+        /**
+         * Returns a GuaranteedExecutor that schedules work on the Baton associated with this
+         * CommandStateBase if available or on the reactor otherwise.
+         */
+        ExecutorPtr makeGuaranteedExecutor();
+
+        NetworkInterfaceTL* interface;
+
+        // Original request as received from the caller.
+        const RemoteCommandRequest request;
+
+        TaskExecutor::CallbackHandle cbHandle;
 
         ClockSource::StopWatch stopwatch;
+        Date_t deadline = kNoExpirationDate;
 
-        RequestManager* const requestManager{nullptr};
+        BatonHandle baton;
+        std::unique_ptr<transport::ReactorTimer> timer;
 
-        boost::optional<RemoteCommandRequest> request;
-        HostAndPort host;
-        ConnectionHandle conn;
-        WeakConnectionHandle weakConn;
+        ConnectionPool::ConnectionHandle conn;
 
-        // Internal id of this request as tracked by the RequestManager.
-        size_t reqId;
+        CancellationSource cancelSource;
 
-        // True if this request is an additional request sent to hedge the operation.
-        bool isHedge{false};
+        stdx::mutex cancelMutex;
+        // Overwrites the generic cancellation status when the operation is cancelled.
+        Status cancelStatus = Status::OK();
+    };
 
-        // Set to true if the response to the request is used to fulfill the command's
-        // promise (i.e. arrives before the responses to all other requests and is not
-        // a MaxTimeMSExpired error response if this is a hedged request).
-        bool fulfilledPromise{false};
+    struct CommandState final : public CommandStateBase {
+        using CommandStateBase::CommandStateBase;
+        ~CommandState() override = default;
+        ExecutorFuture<RemoteCommandResponse> sendRequestImpl(RemoteCommandRequest toSend) override;
+    };
+
+    struct ExhaustCommandState final : public CommandStateBase {
+        using CommandStateBase::CommandStateBase;
+        ~ExhaustCommandState() override = default;
+
+        ExecutorFuture<RemoteCommandResponse> sendRequestImpl(RemoteCommandRequest toSend) override;
+
+        void continueExhaustRequest(StatusWith<RemoteCommandResponse> swResponse);
+
+        // Protects against race between reactor thread restarting stopwatch during exhaust
+        // request and main thread reading stopwatch elapsed time during shutdown.
+        stdx::mutex stopwatchMutex;
+
+        Promise<RemoteCommandResponse> finalResponsePromise;
+        RemoteCommandOnReplyFn onReplyFn;
     };
 
     struct AlarmState {
-        AlarmState(Date_t when_,
-                   TaskExecutor::CallbackHandle cbHandle_,
+        AlarmState(NetworkInterfaceTL* interface_,
+                   std::uint64_t id_,
                    std::unique_ptr<transport::ReactorTimer> timer_,
-                   Promise<void> promise_)
-            : cbHandle(std::move(cbHandle_)),
-              when(when_),
-              timer(std::move(timer_)),
-              promise(std::move(promise_)) {}
+                   const CancellationToken& token)
+            : interface(interface_), id(id_), timer(std::move(timer_)), source(token) {}
+        ~AlarmState() {
+            interface->_removeAlarm(id);
+        }
 
-        TaskExecutor::CallbackHandle cbHandle;
-        Date_t when;
+        NetworkInterfaceTL* interface;
+        std::uint64_t id;
         std::unique_ptr<transport::ReactorTimer> timer;
-
-        AtomicWord<bool> done;
-        Promise<void> promise;
+        CancellationSource source;
     };
 
+    bool _inShutdown_inlock(WithLock lk) const;
+
     void _shutdownAllAlarms();
-    void _answerAlarm(Status status, std::shared_ptr<AlarmState> state);
 
     void _run();
 
-    Status _killOperation(std::shared_ptr<RequestState> requestStateToKill);
+    void _killOperation(CommandStateBase* cmdStateToKill);
+
+    /**
+     * Adds the provided cmdState to the list of in-progress commands.
+     * Throws an exception and does not add the state to the list if shutdown has started or
+     * completed.
+     */
+    void _registerCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                          std::shared_ptr<CommandStateBase> cmdState);
+    /**
+     * Removes the provided cmdState to the list of in-progress commands.
+     * This is invoked by the CommandStateBase destructor.
+     * Has no effect if the command was never registered.
+     */
+    void _unregisterCommand(const TaskExecutor::CallbackHandle& cbHandle);
+
+    /**
+     * Removes an alarm from the in progress alarms by its ID.
+     */
+    void _removeAlarm(std::uint64_t id);
+
+    ExecutorFuture<RemoteCommandResponse> _runCommand(std::shared_ptr<CommandStateBase> cmdState);
 
     std::string _instanceName;
     ServiceContext* _svcCtx = nullptr;
-    transport::TransportLayer* _tl = nullptr;
-    // Will be created if ServiceContext is null, or if no TransportLayer was configured at startup
-    std::unique_ptr<transport::TransportLayer> _ownedTransportLayer;
+    transport::TransportLayerManager* _tl = nullptr;
+    // Will be created if ServiceContext is null, or if no TransportLayer was configured at startup.
+    std::unique_ptr<transport::TransportLayerManager> _ownedTransportLayer;
     transport::ReactorHandle _reactor;
 
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(3), "NetworkInterfaceTL::_mutex");
     const ConnectionPool::Options _connPoolOpts;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
     std::shared_ptr<ConnectionPool> _pool;
@@ -352,27 +323,48 @@ private:
 
     std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;
 
-    // We start in kDefault, transition to kStarted after startup() is complete and enter kStopped
-    // at the first call to shutdown()
-    enum State : int {
+    // We start in kDefault, transition to kStarted after a call to startup completes.
+    // Enter kStopping at the first call to shutdown and transition to kStopped
+    // when the call completes.
+    enum State {
         kDefault,
         kStarted,
+        kStopping,
         kStopped,
     };
-    AtomicWord<State> _state;
+
+    friend StringData toString(State s) {
+        return std::array{
+            "Default"_sd,
+            "Started"_sd,
+            "Stopping"_sd,
+            "Stopped"_sd,
+        }
+            .at(s);
+    }
+
+    // Guards _state, _inProgress, and _inProgressAlarms.
+    mutable stdx::mutex _mutex;
+
+    // This condition variable is dedicated to block a thread calling this class
+    // destructor, strictly when another thread is performing the network
+    // interface shutdown which depends on the _ioThread termination and may
+    // take an undeterministic amount of time to return.
+    stdx::condition_variable _stoppedCV;
+    State _state;
+
     stdx::thread _ioThread;
 
-    Mutex _inProgressMutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "NetworkInterfaceTL::_inProgressMutex");
+    // New entries cannot be added once shutdown has begun.
+    // CommandStateBase instances will remove themselves from this map upon destruction.
+    // shutdown() will block until this list is empty.
     stdx::unordered_map<TaskExecutor::CallbackHandle, std::weak_ptr<CommandStateBase>> _inProgress;
 
-    bool _inProgressAlarmsInShutdown = false;
-    stdx::unordered_map<TaskExecutor::CallbackHandle, std::shared_ptr<AlarmState>>
-        _inProgressAlarms;
+    AtomicWord<std::uint64_t> nextAlarmId{0};
+    stdx::unordered_map<std::uint64_t, std::weak_ptr<AlarmState>> _inProgressAlarms;
 
     stdx::condition_variable _workReadyCond;
     bool _isExecutorRunnable = false;
 };
-
 }  // namespace executor
 }  // namespace mongo

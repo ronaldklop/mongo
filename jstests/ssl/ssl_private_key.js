@@ -1,9 +1,4 @@
 // Test that clients support "BEGIN PRIVATE KEY" pems with RSA keys
-load('jstests/ssl/libs/ssl_helpers.js');
-
-(function() {
-"use strict";
-
 const SERVER_CERT = "jstests/libs/server.pem";
 const CA_CERT = "jstests/libs/ca.pem";
 const CLIENT_CERT = "jstests/libs/client_privatekey.pem";
@@ -14,10 +9,10 @@ function authAndTest(port) {
                                   "localhost",
                                   "--port",
                                   port,
-                                  "--ssl",
-                                  "--sslCAFile",
+                                  "--tls",
+                                  "--tlsCAFile",
                                   CA_CERT,
-                                  "--sslPEMKeyFile",
+                                  "--tlsCertificateKeyFile",
                                   CLIENT_CERT,
                                   "--eval",
                                   "1");
@@ -27,9 +22,9 @@ function authAndTest(port) {
 }
 
 const x509_options = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
 };
 
 let mongo = MongoRunner.runMongod(Object.merge(x509_options, {auth: ""}));
@@ -37,4 +32,3 @@ let mongo = MongoRunner.runMongod(Object.merge(x509_options, {auth: ""}));
 authAndTest(mongo.port);
 
 MongoRunner.stopMongod(mongo);
-}());

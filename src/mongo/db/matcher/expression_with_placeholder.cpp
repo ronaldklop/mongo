@@ -27,15 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <new>
 
-#include "mongo/db/matcher/expression_with_placeholder.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include <pcrecpp.h>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_path.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/static_immortal.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -43,8 +50,8 @@ namespace {
 
 bool matchesPlaceholderPattern(StringData placeholder) {
     // The placeholder must begin with a lowercase letter and contain no special characters.
-    static StaticImmortal<pcrecpp::RE> kRe("[[:lower:]][[:alnum:]]*");
-    return kRe->FullMatch(pcrecpp::StringPiece(placeholder.rawData(), placeholder.size()));
+    static StaticImmortal<pcre::Regex> kRe("^[[:lower:]][[:alnum:]]*$");
+    return !!kRe->matchView(placeholder);
 }
 
 /**
@@ -118,7 +125,9 @@ StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder
 }
 
 void ExpressionWithPlaceholder::optimizeFilter() {
-    _filter = MatchExpression::optimize(std::move(_filter));
+    // The Boolean simplifier is disabled since we don't want to simplify sub-expressions, but
+    // simplify the whole expression instead.
+    _filter = MatchExpression::optimize(std::move(_filter), /* enableSimplification */ false);
 
     auto newPlaceholder = parseTopLevelFieldName(_filter.get());
     invariant(newPlaceholder.getStatus());

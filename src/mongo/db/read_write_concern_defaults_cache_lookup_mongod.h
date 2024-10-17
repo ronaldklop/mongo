@@ -29,7 +29,11 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_defaults_gen.h"
 
 namespace mongo {
 
@@ -40,6 +44,6 @@ namespace mongo {
 boost::optional<RWConcernDefault> readWriteConcernDefaultsCacheLookupMongoD(
     OperationContext* opCtx);
 
-void readWriteConcernDefaultsMongodStartupChecks(OperationContext* opCtx);
+void readWriteConcernDefaultsMongodStartupChecks(OperationContext* opCtx, bool isReplicaSet);
 
 }  // namespace mongo

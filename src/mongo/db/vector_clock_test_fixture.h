@@ -29,7 +29,12 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/db/logical_time.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -42,14 +47,13 @@ class VectorClockMutable;
 /**
  * A test fixture that installs a VectorClock instance with a TimeProofService onto a service
  * context, in addition to the mock storage engine, network, and OpObserver provided by
- * ShardingMongodTestFixture.
+ * ShardingMongoDTestFixture.
  */
-class VectorClockTestFixture : public ShardingMongodTestFixture {
-public:
-    VectorClockTestFixture();
-    ~VectorClockTestFixture();
-
+class VectorClockTestFixture : public ShardingMongoDTestFixture {
 protected:
+    VectorClockTestFixture();
+    ~VectorClockTestFixture() override;
+
     /**
      * Sets up this fixture as the primary node in a shard server replica set with a VectorClock
      * (with a TimeProofService), storage engine, DBClient, OpObserver, and a mocked clock source.
@@ -66,17 +70,19 @@ protected:
 
     LogicalTime getClusterTime() const;
 
-    ClockSourceMock* getMockClockSource() const;
+    ClockSourceMock* getMockClockSource();
 
-    void setMockClockSourceTime(Date_t time) const;
+    void setMockClockSourceTime(Date_t time);
 
-    Date_t getMockClockSourceTime() const;
+    Date_t getMockClockSourceTime();
 
     DBDirectClient* getDBClient() const;
 
+    void setupOpObservers() override;
+
 private:
     VectorClock* _clock;
-    std::shared_ptr<ClockSourceMock> _mockClockSource = std::make_shared<ClockSourceMock>();
+    ClockSourceMock _mockClockSource;
     std::unique_ptr<DBDirectClient> _dbDirectClient;
 };
 

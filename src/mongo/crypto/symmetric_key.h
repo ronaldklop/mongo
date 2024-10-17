@@ -29,10 +29,17 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/secure_allocator.h"
+#include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
@@ -65,6 +72,11 @@ public:
 
     const std::string& name() const {
         return _name;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const SymmetricKeyId& keyid) {
+        return H::combine(std::move(h), keyid.toString());
     }
 
 private:

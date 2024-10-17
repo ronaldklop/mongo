@@ -29,15 +29,21 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <map>
+#include <set>
 #include <string>
 
+#include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -87,36 +93,39 @@ class BatchWriteExecStats {
 public:
     BatchWriteExecStats()
         : numRounds(0),
-          numTargetErrors(0),
-          numResolveErrors(0),
           numStaleShardBatches(0),
-          numStaleDbBatches(0) {}
+          numStaleDbBatches(0),
+          numTenantMigrationAbortedErrors(0) {}
 
-    void noteWriteAt(const HostAndPort& host, repl::OpTime opTime, const OID& electionId);
     void noteTargetedShard(const ShardId& shardId);
-    void noteNumShardsOwningChunks(const int nShardsOwningChunks);
+    void noteNumShardsOwningChunks(int nShardsOwningChunks);
+    void noteTargetedCollectionIsSharded(bool isSharded);
 
     const std::set<ShardId>& getTargetedShards() const;
-    const HostOpTimeMap& getWriteOpTimes() const;
-    const boost::optional<int> getNumShardsOwningChunks() const;
+    boost::optional<int> getNumShardsOwningChunks() const;
+    bool hasTargetedShardedCollection() const;
 
     // Expose via helpers if this gets more complex
 
     // Number of round trips required for the batch
     int numRounds;
-    // Number of times targeting failed
-    int numTargetErrors;
-    // Number of times host resolution failed
-    int numResolveErrors;
-    // Number of stale batches due to StaleShardVersion
+    // Number of stale batches due to "retargeting needed" errors
     int numStaleShardBatches;
     // Number of stale batches due to StaleDbVersion
     int numStaleDbBatches;
+    // Number of tenant migration aborted errors
+    int numTenantMigrationAbortedErrors;
 
 private:
     std::set<ShardId> _targetedShards;
-    HostOpTimeMap _writeOpTimes;
     boost::optional<int> _numShardsOwningChunks;
+    bool _hasTargetedShardedCollection = false;
 };
+
+void updateHostsTargetedMetrics(OperationContext* opCtx,
+                                BatchedCommandRequest::BatchType batchType,
+                                int nShardsOwningChunks,
+                                int nShardsTargeted,
+                                bool isSharded);
 
 }  // namespace mongo

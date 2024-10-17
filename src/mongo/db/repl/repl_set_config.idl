@@ -36,7 +36,7 @@ global:
         - "mongo/util/string_map.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/util/net/hostandport.idl"
     - "mongo/db/repl/replication_types.idl"
     - "mongo/db/repl/member_config.idl"
@@ -49,15 +49,19 @@ types:
                       fits in an int32, NumberLong otherwise.  Rejects decimals and doubles that
                       are not integer values."
         cpp_type: std::int64_t
-        serializer: ::smallExactInt64Append
-        deserializer: ::parseSmallExactInt64
+        serializer: ::mongo::repl::smallExactInt64Append
+        deserializer: ::mongo::repl::parseSmallExactInt64
+        # std::int64_t is not a view.
+        is_view: false
 
     termType:
         bson_serialization_type: any
         description: "Same as smallExactInt64, only is only serialized if not -1."
         cpp_type: std::int64_t
-        serializer: ::serializeTermField
-        deserializer: ::parseSmallExactInt64
+        serializer: ::mongo::repl::serializeTermField
+        deserializer: ::mongo::repl::parseSmallExactInt64
+        # std::int64_t is not a view.
+        is_view: false
 
     optionalBoolSerializeIfTrue:
         bson_serialization_type: any
@@ -65,7 +69,9 @@ types:
         cpp_type: "mongo::OptionalBool"
         default: "mongo::OptionalBool()"
         deserializer: "mongo::OptionalBool::parseFromBSON"
-        serializer: "::serializeOptionalBoolIfTrue"
+        serializer: "::mongo::repl::serializeOptionalBoolIfTrue"
+        # OptionalBool is not a view.
+        is_view: false
 
     replSetWriteConcernModeMap:
         bson_serialization_type: any
@@ -73,6 +79,8 @@ types:
         cpp_type: ReplSetWriteConcernModeDefinitions
         serializer: ReplSetWriteConcernModeDefinitions::serializeToBSON
         deserializer: ReplSetWriteConcernModeDefinitions::parseFromBSON
+        # ReplSetWriteConcernModeDefinitions has only non view members.
+        is_view: false
 
 structs:
     ReplSetConfigSettings:
@@ -138,14 +146,14 @@ structs:
                 type: string
                 description: "The name of the replica set. Once set, you cannot change the name of
                               a replica set"
-                validator: { callback: "validateReplSetNameNonEmpty"}
             version:
                 cpp_name: configVersion
                 type: smallExactInt64
                 description: "An incrementing number used to distinguish revisions of the replica
                               set configuration object from previous iterations of the
                               configuration"
-                validator: { gt: 0, lt: 2147483648 }
+                validator: { gt: 0 }
+                #upper limit is implicitly the value of int64_max
             term:
                 cpp_name: configTerm
                 type: termType
@@ -159,7 +167,7 @@ structs:
                 description: "An array of member configuration documents, one for each member of
                               the replica set"
             configsvr:
-                cpp_name: configServer
+                cpp_name: configServer_deprecated
                 type: optionalBoolSerializeIfTrue
                 description: "Indicates whether the replica set is used for a sharded cluster’s
                               config servers. Set to true if the replica set is for a sharded
@@ -185,3 +193,9 @@ structs:
                 description: "This field indicates the replicated data has been repaired, and
                               prevents use of the configuration until it is removed."
                 type: optionalBool
+            recipientConfig:
+                description: "An optional field representing a config for a recipient during a shard
+                              split operation. Due to compiler support issues, the type is set to
+                              any."
+                type: any
+                ignore: true

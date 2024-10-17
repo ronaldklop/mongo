@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
 
 namespace mongo {
@@ -42,7 +43,7 @@ protected:
           _isSamp(isSamp),
           _count(0),
           _nonfiniteValueCount(0) {
-        _memUsageBytes = sizeof(*this);
+        _memUsageTracker.set(sizeof(*this));
     }
 
 public:
@@ -50,19 +51,19 @@ public:
         return Value(BSONNULL);
     }
 
-    void add(Value value) {
+    void add(Value value) override {
         update(std::move(value), +1);
     }
 
-    void remove(Value value) {
+    void remove(Value value) override {
         update(std::move(value), -1);
     }
 
     Value getValue() const final {
         if (_nonfiniteValueCount > 0)
-            return Value(std::numeric_limits<double>::quiet_NaN());
+            return Value(BSONNULL);
         const long long adjustedCount = _isSamp ? _count - 1 : _count;
-        if (adjustedCount == 0)
+        if (adjustedCount <= 0)
             return getDefault();
         double squaredDifferences = _m2->getValue(false).coerceToDouble();
         if (squaredDifferences < 0 || (!_isSamp && _count == 1)) {
@@ -77,10 +78,10 @@ public:
         return Value(sqrt(_m2->getValue(false).coerceToDouble() / adjustedCount));
     }
 
-    void reset() {
+    void reset() override {
         _m2->reset();
         _sum->reset();
-        _memUsageBytes = sizeof(*this);
+        _memUsageTracker.set(sizeof(*this));
         _count = 0;
         _nonfiniteValueCount = 0;
     }
@@ -93,7 +94,6 @@ private:
         if ((value.getType() == NumberDouble && !std::isfinite(value.getDouble())) ||
             (value.getType() == NumberDecimal && !value.getDecimal().isFinite())) {
             _nonfiniteValueCount += quantity;
-            _count += quantity;
             return;
         }
 
@@ -109,7 +109,7 @@ private:
         _count += quantity;
         _sum->process(Value{value.coerceToDouble() * quantity}, false);
         _m2->process(Value{x * x * quantity / (_count * (_count - quantity))}, false);
-        _memUsageBytes = sizeof(*this) + _sum->getMemUsage() + _m2->getMemUsage();
+        _memUsageTracker.set(sizeof(*this) + _sum->getMemUsage() + _m2->getMemUsage());
     }
 
     // Std dev cannot make use of RemovableSum because of its specific handling of non-finite

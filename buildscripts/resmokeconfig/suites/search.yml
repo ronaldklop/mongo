@@ -2,10 +2,12 @@ test_kind: js_test
 
 selector:
   roots:
-  - src/mongo/db/modules/*/jstests/search/*.js
+    - jstests/with_mongot/search_mocked/*.js
+    - jstests/with_mongot/mongotmock/*.js
+  exclude_with_any_tags:
+    - requires_auth
 
 executor:
   config:
     shell_options:
-      nodb: ''
-      readMode: commands
+      nodb: ""

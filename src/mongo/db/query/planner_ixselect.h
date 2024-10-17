@@ -29,15 +29,32 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_array.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_entry.h"
-#include "mongo/db/query/query_solution.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
 class CollatorInterface;
+
+struct IndexProperties {
+    bool isSparse = false;  // 'true' if a sparse index can answer the field.
+};
+
+// A relevant field to index requirement map.
+using RelevantFieldIndexMap = stdx::unordered_map<std::string, IndexProperties>;
 
 /**
  * Methods for determining what fields and predicates can use indices.
@@ -45,10 +62,34 @@ class CollatorInterface;
 class QueryPlannerIXSelect {
 public:
     /**
-     * Return all the fields in the tree rooted at 'node' that we can use an index on
-     * in order to answer the query.
+     * Used to keep track of if any $elemMatch predicates were encountered when walking a
+     * MatchExpression tree. The presence of an outer $elemMatch can impact whether an index is
+     * applicable for an inner MatchExpression. For example, the NOT expression in
+     * {a: {$elemMatch: {b: {$ne: null}}} can only use an "a.b" index if that path is not multikey
+     * on "a.b". Because of the $elemMatch, it's okay to use the "a.b" index if the path is multikey
+     * on "a".
      */
-    static void getFields(const MatchExpression* node, stdx::unordered_set<std::string>* out);
+    struct ElemMatchContext {
+        ArrayMatchingMatchExpression* innermostParentElemMatch{nullptr};
+        StringData fullPathToParentElemMatch{""_sd};
+    };
+
+    /**
+     * This struct works as a container to hold all the query contextual information needed to make
+     * the right indexing decisions.
+     */
+    struct QueryContext {
+        ElemMatchContext elemMatchContext;
+        const CollatorInterface* collator;
+        // Query will require an indexed plan if contains TEXT or GEO predicates
+        bool mustUseIndexedPlan = false;
+    };
+    /**
+     * Return all the fields in the tree rooted at 'node' that we can use an index to answer the
+     * query. The output, 'RelevantFieldIndexMap', contains the requirements of the index that can
+     * answer the field. e.g. Some fields can be supported only by a non-sparse index.
+     */
+    static void getFields(const MatchExpression* node, RelevantFieldIndexMap* out);
 
     /**
      * Similar to other getFields() method, but with 'prefix' argument which is a path prefix to be
@@ -58,7 +99,7 @@ public:
      */
     static void getFields(const MatchExpression* node,
                           std::string prefix,
-                          stdx::unordered_set<std::string>* out);
+                          RelevantFieldIndexMap* out);
 
     /**
      * Finds all indices that correspond to the hinted index. Matches the index both by name and by
@@ -71,8 +112,8 @@ public:
      * Finds all indices prefixed by fields we have predicates over.  Only these indices are
      * useful in answering the query.
      */
-    static std::vector<IndexEntry> findRelevantIndices(
-        const stdx::unordered_set<std::string>& fields, const std::vector<IndexEntry>& allIndices);
+    static std::vector<IndexEntry> findRelevantIndices(const RelevantFieldIndexMap& fields,
+                                                       const std::vector<IndexEntry>& allIndices);
 
     /**
      * Determine how useful all of our relevant 'indices' are to all predicates in the subtree
@@ -90,7 +131,7 @@ public:
     static void rateIndices(MatchExpression* node,
                             std::string prefix,
                             const std::vector<IndexEntry>& indices,
-                            const CollatorInterface* collator);
+                            const QueryContext& queryContex);
 
     /**
      * Amend the RelevantTag lists for all predicates in the subtree rooted at 'node' to remove
@@ -131,9 +172,14 @@ public:
     /**
      * Given a list of IndexEntries and fields used by a query's match expression, return a list
      * "expanded" indexes (where the $** indexes in the given list have been expanded).
+     * 'hintedIndexBson' indicates that the indexes in 'relevantIndices' are the results of the
+     * user's hint. 'inLookip' indicates that this query is for the inner side of a $lookup or
+     * $graphLookup.
      */
-    static std::vector<IndexEntry> expandIndexes(const stdx::unordered_set<std::string>& fields,
-                                                 std::vector<IndexEntry> relevantIndices);
+    static std::vector<IndexEntry> expandIndexes(const RelevantFieldIndexMap& fields,
+                                                 std::vector<IndexEntry> relevantIndices,
+                                                 bool hintedIndexBson = false,
+                                                 bool inLookup = false);
 
     /**
      * Check if this match expression is a leaf and is supported by a wildcard index.
@@ -158,20 +204,21 @@ public:
      */
     static bool logicalNodeMayBeSupportedByAnIndex(const MatchExpression* queryExpr);
 
-private:
     /**
-     * Used to keep track of if any $elemMatch predicates were encountered when walking a
-     * MatchExpression tree. The presence of an outer $elemMatch can impact whether an index is
-     * applicable for an inner MatchExpression. For example, the NOT expression in
-     * {a: {$elemMatch: {b: {$ne: null}}} can only use an "a.b" index if that path is not multikey
-     * on "a.b". Because of the $elemMatch, it's okay to use the "a.b" index if the path is multikey
-     * on "a".
+     * We can use an index for this special case: {$not:{$in:[null, []]}}. Return true if this is
+     * the expression (modulo in-list ordering) and it doesn't contain any regexes.
+     *
+     * Why is this case special? An equality expression for "null" will match both documents with a
+     * literal null for the specified key, and those where the key is not present. An equality
+     * expression for "[]" (which is stored as "undefined" in the index) will match documents with
+     * an empty array or an array with an empty array element. If we negate either of this bounds in
+     * isolation, we may produce incomplete results wrt the other expression. If we negate the
+     * composition of the two, we can properly return complete results excluding both null and empty
+     * array values.
      */
-    struct ElemMatchContext {
-        ArrayMatchingMatchExpression* innermostParentElemMatch{nullptr};
-        StringData fullPathToParentElemMatch{""_sd};
-    };
+    static bool canUseIndexForNin(const InMatchExpression* ime);
 
+private:
     /**
      * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
      * at position 'keyPatternIndex' in the index's keyPattern) can be used to answer the predicate
@@ -187,14 +234,7 @@ private:
                             std::size_t keyPatternIndex,
                             MatchExpression* node,
                             StringData fullPathToNode,
-                            const CollatorInterface* collator,
-                            const ElemMatchContext& elemMatchContext);
-
-    static void _rateIndices(MatchExpression* node,
-                             std::string prefix,
-                             const std::vector<IndexEntry>& indices,
-                             const CollatorInterface* collator,
-                             const ElemMatchContext& elemMatchContext);
+                            const QueryContext& queryContex);
 
     /**
      * Amend the RelevantTag lists for all predicates in the subtree rooted at 'node' to remove

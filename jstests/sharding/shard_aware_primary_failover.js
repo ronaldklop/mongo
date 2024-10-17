@@ -1,10 +1,14 @@
 /**
  * Test that a new primary that gets elected will properly perform shard initialization.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 1});
+
+// Setting CWWC for addShard to work, as implicitDefaultWC is set to w:1.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 var replTest = new ReplSetTest({nodes: 3});
 replTest.startSet({shardsvr: ''});
@@ -56,4 +60,3 @@ assert.soon(() => shardIdentityDoc.configsvrConnectionString ==
 replTest.stopSet();
 
 st.stop();
-})();

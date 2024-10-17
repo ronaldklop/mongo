@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -36,12 +38,19 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 
 namespace mongo {
 class Collection;
@@ -58,41 +67,48 @@ public:
                                     std::vector<NamespaceString> allStashNss,
                                     size_t myStashIdx,
                                     ShardId donorShardId,
-                                    ChunkManager sourceChunkMgr);
+                                    ChunkManager sourceChunkMgr,
+                                    ReshardingOplogApplierMetrics* applierMetrics,
+                                    bool isCapped = false);
+
+    const NamespaceString& getOutputNss() const {
+        return _outputNss;
+    }
 
     /**
      * Wraps the op application in a writeConflictRetry loop and is responsible for creating and
      * committing the WUOW.
      */
-    Status applyOperation(OperationContext* opCtx, const repl::OplogEntry& opOrGroupedInserts);
+    Status applyOperation(OperationContext* opCtx,
+                          const boost::optional<ShardingIndexesCatalogCache>& gii,
+                          const repl::OplogEntry& op) const;
 
 private:
+    // Applies an insert or update operation
+    void _applyInsertOrUpdate(OperationContext* opCtx,
+                              const boost::optional<ShardingIndexesCatalogCache>& gii,
+                              const repl::OplogEntry& op) const;
     // Applies an insert operation
     void _applyInsert_inlock(OperationContext* opCtx,
-                             Database* db,
-                             const CollectionPtr& outputColl,
-                             const CollectionPtr& stashColl,
-                             const repl::OplogEntry& op);
+                             CollectionAcquisition& outputColl,
+                             CollectionAcquisition& stashColl,
+                             const repl::OplogEntry& op) const;
 
     // Applies an update operation
     void _applyUpdate_inlock(OperationContext* opCtx,
-                             Database* db,
-                             const CollectionPtr& outputColl,
-                             const CollectionPtr& stashColl,
-                             const repl::OplogEntry& op);
+                             CollectionAcquisition& outputColl,
+                             CollectionAcquisition& stashColl,
+                             const repl::OplogEntry& op) const;
 
     // Applies a delete operation
-    void _applyDelete_inlock(OperationContext* opCtx,
-                             Database* db,
-                             const CollectionPtr& outputColl,
-                             const CollectionPtr& stashColl,
-                             const repl::OplogEntry& op);
+    void _applyDelete(OperationContext* opCtx,
+                      const boost::optional<ShardingIndexesCatalogCache>& gii,
+                      const repl::OplogEntry& op) const;
 
     // Queries '_stashNss' using 'idQuery'.
     BSONObj _queryStashCollById(OperationContext* opCtx,
-                                Database* db,
                                 const CollectionPtr& coll,
-                                const BSONObj& idQuery);
+                                const BSONObj& idQuery) const;
 
     // Namespace where operations should be applied, unless there is an _id conflict.
     const NamespaceString _outputNss;
@@ -112,6 +128,10 @@ private:
 
     // The chunk manager for the source namespace and original shard key.
     const ChunkManager _sourceChunkMgr;
+
+    ReshardingOplogApplierMetrics* _applierMetrics;
+
+    const bool _isCapped;
 };
 
 }  // namespace mongo

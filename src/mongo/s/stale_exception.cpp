@@ -27,12 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/stale_exception.h"
 
-#include "mongo/base/init.h"
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/bson/bsonelement.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -43,8 +49,62 @@ MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleDbRoutingVersion);
 
 }  // namespace
 
+void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
+    bob->append("ns", NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+    _received.serialize("vReceived", bob);
+    if (_wanted)
+        _wanted->serialize("vWanted", bob);
+
+    invariant(_shardId != "");
+    bob->append("shardId", _shardId.toString());
+}
+
+std::shared_ptr<const ErrorExtraInfo> StaleConfigInfo::parse(const BSONObj& obj) {
+    auto shardId = obj["shardId"].String();
+    uassert(ErrorCodes::NoSuchKey, "The shardId field is missing", !shardId.empty());
+
+    return std::make_shared<StaleConfigInfo>(
+        NamespaceStringUtil::deserialize(
+            boost::none, obj["ns"].String(), SerializationContext::stateDefault()),
+        ShardVersion::parse(obj["vReceived"]),
+        [&] {
+            if (auto vWantedElem = obj["vWanted"])
+                return boost::make_optional(ShardVersion::parse(vWantedElem));
+            return boost::optional<ShardVersion>();
+        }(),
+        ShardId(std::move(shardId)));
+}
+
+void StaleEpochInfo::serialize(BSONObjBuilder* bob) const {
+    bob->append("ns", NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+    _received.serialize("vReceived", bob);
+    _wanted.serialize("vWanted", bob);
+}
+
+std::shared_ptr<const ErrorExtraInfo> StaleEpochInfo::parse(const BSONObj& obj) {
+    boost::optional<ShardVersion> received;
+    if (auto vReceivedElem = obj["vReceived"])
+        received = ShardVersion::parse(vReceivedElem);
+
+    boost::optional<ShardVersion> wanted;
+    if (auto vWantedElem = obj["vWanted"])
+        wanted = ShardVersion::parse(vWantedElem);
+
+    uassert(6375907,
+            str::stream() << "Both vReceived (" << received << ")"
+                          << " and vWanted (" << wanted << ") must be present",
+            received && wanted);
+
+
+    return std::make_shared<StaleEpochInfo>(
+        NamespaceStringUtil::deserialize(
+            boost::none, obj["ns"].String(), SerializationContext::stateDefault()),
+        *received,
+        *wanted);
+}
+
 void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
-    bob->append("db", _db);
+    bob->append("db", _db.toStringForErrorMsg());
     bob->append("vReceived", _received.toBSON());
     if (_wanted) {
         bob->append("vWanted", _wanted->toBSON());
@@ -52,14 +112,11 @@ void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
 }
 
 std::shared_ptr<const ErrorExtraInfo> StaleDbRoutingVersion::parse(const BSONObj& obj) {
-    return std::make_shared<StaleDbRoutingVersion>(parseFromCommandError(obj));
-}
-
-StaleDbRoutingVersion StaleDbRoutingVersion::parseFromCommandError(const BSONObj& obj) {
-    return StaleDbRoutingVersion(obj["db"].String(),
-                                 DatabaseVersion(obj["vReceived"].Obj()),
-                                 !obj["vWanted"].eoo() ? DatabaseVersion(obj["vWanted"].Obj())
-                                                       : boost::optional<DatabaseVersion>{});
+    return std::make_shared<StaleDbRoutingVersion>(
+        DatabaseNameUtil::deserializeForErrorMsg(obj["db"].String()),
+        DatabaseVersion(obj["vReceived"].Obj()),
+        !obj["vWanted"].eoo() ? DatabaseVersion(obj["vWanted"].Obj())
+                              : boost::optional<DatabaseVersion>{});
 }
 
 }  // namespace mongo

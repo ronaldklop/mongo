@@ -29,7 +29,16 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 /**
@@ -42,21 +51,24 @@ public:
     static constexpr auto kUnstableField = "unstable";
     static constexpr auto kDeprecatedField = "deprecated";
 
-    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* expCtx,
                                                   BSONElement expr,
                                                   const VariablesParseState& vps);
 
     Value evaluate(const Document& root, Variables* variables) const final;
 
-    Value serialize(bool explain) const final;
+    Value serialize(const SerializationOptions& options) const final;
 
-    void acceptVisitor(ExpressionVisitor* visitor) final {
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
         return visitor->visit(this);
     }
 
 private:
-    ExpressionTestApiVersion(ExpressionContext* const expCtx, bool unstable, bool deprecated);
-    void _doAddDependencies(DepsTracker* deps) const final override;
+    ExpressionTestApiVersion(ExpressionContext* expCtx, bool unstable, bool deprecated);
 
     bool _unstable;
     bool _deprecated;

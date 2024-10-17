@@ -29,16 +29,36 @@
 
 #pragma once
 
-#include <climits>  // For UINT_MAX
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+#include <string>
 #include <vector>
 
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/concurrency/cond_var_lock_grant_notification.h"
+#include "mongo/db/concurrency/fast_map_noalloc.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
-#include "mongo/db/concurrency/lock_manager.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_stats.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class LockManager;
+class OperationContext;
+namespace admission {
+class TicketHolderManager;
+}
 
 /**
  * Interface for acquiring locks. One of those objects will have to be instantiated for each
@@ -46,35 +66,47 @@ namespace mongo {
  *
  * Lock/unlock methods must always be called from a single thread.
  */
+
+// DO NOT ADD ANY SUBCLASSES, even though there are virtual methods.
+//
+// TODO (SERVER-77213): There are still virtual methods here, even though the class is final. They
+// are required because of cyclic dependency between the service_context and write_unit_of_work
+// libraries, due to Locker being currently owned by the OperationContext. This will go away once
+// SERVER-77213 is done which will move locker entirely under TransactionResources (shard_role_api).
 class Locker {
+public:
+    Locker(ServiceContext* serviceContext);
+    virtual ~Locker();
+
+    // Non-copyable, non-movable
     Locker(const Locker&) = delete;
     Locker& operator=(const Locker&) = delete;
 
-    friend class UninterruptibleLockGuard;
-
-public:
-    virtual ~Locker() {}
-
-    /**
-     * Returns true if this is an instance of LockerNoop. Because LockerNoop doesn't implement many
-     * methods, some users may need to check this first to find out what is safe to call. LockerNoop
-     * is only used in unittests and for a brief period at startup, so you can assume you hold the
-     * equivalent of a MODE_X lock when using it.
-     *
-     * TODO get rid of this once we kill LockerNoop.
-     */
-    virtual bool isNoop() const {
-        return false;
+    LockerId getId() const {
+        return _id;
     }
 
     /**
-     * Require global lock attempts to obtain tickets from 'reading' (for MODE_S and MODE_IS),
-     * and from 'writing' (for MODE_IX), which must have static lifetimes. There is no throttling
-     * for MODE_X, as there can only ever be a single locker using this mode. The throttling is
-     * intended to defend against large drops in throughput under high load due to too much
-     * concurrency.
+     * Returns the platform-specific thread identifier of the thread which currently owns the this
+     * locker, for diagnostics purposes.
      */
-    static void setGlobalThrottling(class TicketHolder* reading, class TicketHolder* writing);
+    stdx::thread::id getThreadId() const {
+        return _threadId;
+    }
+    void updateThreadIdToCurrentThread();
+    void unsetThreadId();
+
+    std::string getDebugInfo() const;
+    void setDebugInfo(std::string info);
+
+    /**
+     * Returns the cumulative lock stats accrued so far. The returned stats are not a snapshot
+     * but a reference to AtomicLockStats, meaning that they can change at any time after they are
+     * returned.
+     */
+    const AtomicLockStats& stats() const {
+        return _stats;
+    }
 
     /**
      * State for reporting the number of active and queued reader and writer clients.
@@ -85,56 +117,56 @@ public:
      * Return whether client is holding any locks (active), or is queued on any locks or waiting
      * for a ticket (throttled).
      */
-    virtual ClientState getClientState() const = 0;
+    ClientState getClientState() const;
 
-    virtual LockerId getId() const = 0;
+    bool shouldWaitForTicket(OperationContext* opCtx) const {
+        return ExecutionAdmissionContext::get(opCtx).getPriority() !=
+            AdmissionContext::Priority::kExempt;
+    }
 
     /**
-     * Get a platform-specific thread identifier of the thread which owns the this locker for
-     * tracing purposes.
+     * Acquire a flow control admission ticket into the system. Flow control is used as a
+     * backpressure mechanism to limit replication majority point lag.
      */
-    virtual stdx::thread::id getThreadId() const = 0;
+    void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode);
 
     /**
-     * Updates any cached thread id values to represent the current thread.
+     * If tracked by an implementation, returns statistics on effort spent acquiring a flow control
+     * ticket.
      */
-    virtual void updateThreadIdToCurrentThread() = 0;
+    FlowControlTicketholder::CurOp getFlowControlStats() const;
 
     /**
-     * Clears any cached thread id values.
-     */
-    virtual void unsetThreadId() = 0;
-
-    /**
-     * Indicate that shared locks should participate in two-phase locking for this Locker instance.
-     */
-    virtual void setSharedLocksShouldTwoPhaseLock(bool sharedLocksShouldTwoPhaseLock) = 0;
-
-    /**
-     * This is useful to ensure that potential deadlocks do not occur.
+     * Reacquires a ticket for the Locker. This must only be called after releaseTicket(). It
+     * restores the ticket under its previous LockMode.
      *
-     * Overrides provided timeouts in lock requests with 'maxTimeout' if the provided timeout
-     * is greater. Basically, no lock acquisition will take longer than 'maxTimeout'.
+     * Requires that all locks granted to this locker are modes IS or IX.
      *
-     * If an UninterruptibleLockGuard is set during a lock request, the max timeout override will
-     * be ignored.
-     *
-     * Future lock requests may throw LockTimeout errors if a lock request provides a Date_t::max()
-     * deadline and 'maxTimeout' is reached. Presumably these callers do not expect to handle lock
-     * acquisition failure, so this is done to ensure the caller does not proceed as if the lock
-     * were successfully acquired.
+     * Note that this ticket acquisition will not time out due to a max lock timeout set on the
+     * locker. However, it may time out if a potential deadlock scenario is detected due to ticket
+     * exhaustion and pending S or X locks.
      */
-    virtual void setMaxLockTimeout(Milliseconds maxTimeout) = 0;
+    void reacquireTicket(OperationContext* opCtx);
 
     /**
-     * Returns whether this Locker has a maximum lock timeout set.
+     * Releases the ticket associated with the Locker. This allows locks to be held without
+     * contributing to reader/writer throttling.
      */
-    virtual bool hasMaxLockTimeout() = 0;
+    void releaseTicket();
 
     /**
-     * Clears the max lock timeout override set by setMaxLockTimeout() above.
+     * Returns true if a read ticket is held for the Locker.
      */
-    virtual void unsetMaxLockTimeout() = 0;
+    bool hasReadTicket() const {
+        return _modeForTicket == MODE_IS || _modeForTicket == MODE_S;
+    }
+
+    /**
+     * Returns true if a write ticket is held for the Locker.
+     */
+    bool hasWriteTicket() const {
+        return _modeForTicket == MODE_IX || _modeForTicket == MODE_X;
+    }
 
     /**
      * This should be the first method invoked for a particular Locker object. It acquires the
@@ -159,14 +191,12 @@ public:
      * It may throw an exception if it is interrupted. The ticket acquisition phase can also be
      * interrupted by killOp or time out, thus throwing an exception.
      */
-    virtual void lockGlobal(OperationContext* opCtx,
-                            LockMode mode,
-                            Date_t deadline = Date_t::max()) = 0;
+    void lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadline = Date_t::max());
 
     /**
      * Decrements the reference count on the global lock.  If the reference count on the
      * global lock hits zero, the transaction is over, and unlockGlobal unlocks all other locks
-     * except for RESOURCE_MUTEX locks.
+     * except for RESOURCE_MUTEX and RESOURCE_DDL_* locks.
      *
      * @return true if this is the last endTransaction call (i.e., the global lock was
      *          released); false if there are still references on the global lock. This value
@@ -174,7 +204,7 @@ public:
      *
      * @return false if the global lock is still held.
      */
-    virtual bool unlockGlobal() = 0;
+    bool unlockGlobal();
 
     /**
      * Requests the RSTL to be acquired in the requested mode (typically mode X) . This should only
@@ -182,15 +212,19 @@ public:
      *
      * See the comments for _lockBegin/Complete for more information on the semantics.
      */
-    virtual LockResult lockRSTLBegin(OperationContext* opCtx, LockMode mode) = 0;
+    LockResult lockRSTLBegin(OperationContext* opCtx, LockMode mode);
 
+    using LockTimeoutCallback = std::function<void()>;
     /**
      * Waits for the completion of acquiring the RSTL. This should only be called inside
      * ReplicationStateTransitionLockGuard.
      *
      * It may throw an exception if it is interrupted.
      */
-    virtual void lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) = 0;
+    void lockRSTLComplete(OperationContext* opCtx,
+                          LockMode mode,
+                          Date_t deadline,
+                          const LockTimeoutCallback& onTimeout = nullptr);
 
     /**
      * Unlocks the RSTL when the transaction becomes prepared. This is used to bypass two-phase
@@ -199,43 +233,7 @@ public:
      * @return true if the RSTL is unlocked; false if we fail to unlock the RSTL or if it was
      * already unlocked.
      */
-    virtual bool unlockRSTLforPrepare() = 0;
-
-    /**
-     * beginWriteUnitOfWork/endWriteUnitOfWork are called at the start and end of WriteUnitOfWorks.
-     * They can be used to implement two-phase locking. Each call to begin or restore should be
-     * matched with an eventual call to end or release.
-     *
-     * endWriteUnitOfWork, if not called in a nested WUOW, will release all two-phase locking held
-     * lock resources.
-     */
-    virtual void beginWriteUnitOfWork() = 0;
-    virtual void endWriteUnitOfWork() = 0;
-
-    virtual bool inAWriteUnitOfWork() const = 0;
-
-    /**
-     * Returns whether we have ever taken a global lock in X or IX mode in this operation.
-     * Should only be called on the thread owning the locker.
-     */
-    virtual bool wasGlobalLockTakenForWrite() const = 0;
-
-    /**
-     * Returns whether we have ever taken a global lock in S, X, or IX mode in this operation.
-     */
-    virtual bool wasGlobalLockTakenInModeConflictingWithWrites() const = 0;
-
-    /**
-     * Returns whether we have ever taken a global lock in this operation.
-     * Should only be called on the thread owning the locker.
-     */
-    virtual bool wasGlobalLockTaken() const = 0;
-
-    /**
-     * Sets the mode bit in _globalLockMode. Once a mode bit is set, we won't clear it. Also sets
-     * _wasGlobalLockTakenInModeConflictingWithWrites to true if the mode is S, X, or IX.
-     */
-    virtual void setGlobalLockTakenInMode(LockMode mode) = 0;
+    bool unlockRSTLforPrepare();
 
     /**
      * Acquires lock on the specified resource in the specified mode and returns the outcome
@@ -260,21 +258,10 @@ public:
      *
      * It may throw an exception if it is interrupted.
      */
-    virtual void lock(OperationContext* opCtx,
-                      ResourceId resId,
-                      LockMode mode,
-                      Date_t deadline = Date_t::max()) = 0;
-
-    /**
-     * Calling lock without an OperationContext does not allow LOCK_WAITING states to be
-     * interrupted.
-     */
-    virtual void lock(ResourceId resId, LockMode mode, Date_t deadline = Date_t::max()) = 0;
-
-    /**
-     * Downgrades the specified resource's lock mode without changing the reference count.
-     */
-    virtual void downgrade(ResourceId resId, LockMode newMode) = 0;
+    void lock(OperationContext* opCtx,
+              ResourceId resId,
+              LockMode mode,
+              Date_t deadline = Date_t::max());
 
     /**
      * Releases a lock previously acquired through a lock call. It is an error to try to
@@ -283,29 +270,28 @@ public:
      * @return true if the lock was actually released; false if only the reference count was
      *              decremented, but the lock is still held.
      */
-    virtual bool unlock(ResourceId resId) = 0;
+    bool unlock(ResourceId resId);
 
     /**
-     * Retrieves the mode in which a lock is held or checks whether the lock held for a
-     * particular resource covers the specified mode.
+     * beginWriteUnitOfWork/endWriteUnitOfWork are called at the start and end of WriteUnitOfWorks.
+     * They can be used to implement two-phase locking. Each call to begin or restore should be
+     * matched with an eventual call to end or release.
      *
-     * For example isLockHeldForMode will return true for MODE_S, if MODE_X is already held,
-     * because MODE_X covers MODE_S.
+     * endWriteUnitOfWork, if not called in a nested WUOW, will release all two-phase locking held
+     * lock resources.
      */
-    virtual LockMode getLockMode(ResourceId resId) const = 0;
-    virtual bool isLockHeldForMode(ResourceId resId, LockMode mode) const = 0;
+    virtual void beginWriteUnitOfWork();
+    virtual void endWriteUnitOfWork();
 
-    // These are shortcut methods for the above calls. They however check that the entire
-    // hierarchy is properly locked and because of this they are very expensive to call.
-    // Do not use them in performance critical code paths.
-    virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const = 0;
-    virtual bool isCollectionLockedForMode(const NamespaceString& nss, LockMode mode) const = 0;
+    bool inAWriteUnitOfWork() const {
+        return _wuowNestingLevel > 0;
+    }
 
     /**
      * Returns the resource that this locker is waiting/blocked on (if any). If the locker is
      * not waiting for a resource the returned value will be invalid (isValid() == false).
      */
-    virtual ResourceId getWaitingResource() const = 0;
+    ResourceId getWaitingResource() const;
 
     /**
      * Describes a single lock acquisition for reporting/serialization purposes.
@@ -324,10 +310,9 @@ public:
     };
 
     /**
-     * Returns information and locking statistics for this instance of the locker. Used to
-     * support the db.currentOp view. This structure is not thread-safe and ideally should
-     * be used only for obtaining the necessary information and then discarded instead of
-     * reused.
+     * Returns information and locking statistics for this instance of the locker. Used to support
+     * the db.currentOp view. This structure is not thread-safe and ideally should be used only for
+     * obtaining the necessary information and then discarded instead of reused.
      */
     struct LockerInfo {
         // List of high-level locks held by this locker, sorted by ResourceId
@@ -345,16 +330,14 @@ public:
      * The precise lock stats of a sub-operation would be the stats from the locker info minus the
      * lockStatsBase.
      */
-    virtual void getLockerInfo(
-        LockerInfo* lockerInfo,
-        const boost::optional<SingleThreadedLockStats> lockStatsBase) const = 0;
+    void getLockerInfo(LockerInfo* lockerInfo,
+                       const boost::optional<SingleThreadedLockStats>& alreadyCountedStats) const;
 
     /**
-     * Returns boost::none if this is an instance of LockerNoop, or a populated LockerInfo
-     * otherwise.
+     * Returns diagnostics information for the locker.
      */
-    virtual boost::optional<LockerInfo> getLockerInfo(
-        const boost::optional<SingleThreadedLockStats> lockStatsBase) const = 0;
+    LockerInfo getLockerInfo(
+        const boost::optional<SingleThreadedLockStats>& alreadyCountedStats) const;
 
     /**
      * LockSnapshot captures the state of all resources that are locked, what modes they're
@@ -370,6 +353,46 @@ public:
     };
 
     /**
+     * Determines if this operation can safely release its locks for yielding. This must precede a
+     * call to saveLockStateAndUnlock() at the risk of failing any invariants.
+     *
+     * Returns false when no locks are held.
+     */
+    bool canSaveLockState();
+
+    /**
+     * Retrieves all locks held by this transaction, other than RESOURCE_MUTEX and RESOURCE_DDL_*
+     * locks, and what mode they're held in.
+     *
+     * Unlocks all locks held by this transaction, and stores them in 'stateOut'. This functionality
+     * is used for yielding, which is voluntary/cooperative lock release and reacquisition in order
+     * to allow for interleaving of otherwise conflicting long-running operations. The LockSnapshot
+     * can then be passed to restoreLockState() after yielding to reacquire all released locks.
+     *
+     * This functionality is also used for releasing locks on databases and collections
+     * when cursors are dormant and waiting for a getMore request.
+     *
+     * Callers are expected to check if locks are yieldable first by calling canSaveLockState(),
+     * otherwise this function will invariant.
+     */
+    void saveLockStateAndUnlock(LockSnapshot* stateOut);
+
+    /**
+     * Re-locks all locks whose state was stored in 'stateToRestore'.
+     *
+     * @param opCtx An operation context that enables the restoration to be interrupted.
+     */
+    void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore);
+
+    /**
+     * releaseWriteUnitOfWorkAndUnlock opts out of two-phase locking and yields the locks after a
+     * WUOW has been released. restoreWriteUnitOfWorkAndLock reacquires the locks and resumes the
+     * two-phase locking behavior of WUOW.
+     */
+    void releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut);
+    void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx, const LockSnapshot& stateToRestore);
+
+    /**
      * WUOWLockSnapshot captures all resources that have pending unlocks when releasing the write
      * unit of work. If a lock has more than one pending unlock, it appears more than once here.
      */
@@ -382,153 +405,335 @@ public:
     };
 
     /**
-     * Retrieves all locks held by this transaction, other than RESOURCE_MUTEX locks, and what mode
-     * they're held in.
-     * Stores these locks in 'stateOut', destroying any previous state.  Unlocks all locks
-     * held by this transaction.  This functionality is used for yielding, which is
-     * voluntary/cooperative lock release and reacquisition in order to allow for interleaving
-     * of otherwise conflicting long-running operations.
-     *
-     * This functionality is also used for releasing locks on databases and collections
-     * when cursors are dormant and waiting for a getMore request.
-     *
-     * Returns true if locks are released.  It is expected that restoreLockerImpl will be called
-     * in the future.
-     *
-     * Returns false if locks are not released.  restoreLockState(...) does not need to be
-     * called in this case.
-     */
-    virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) = 0;
-
-    /**
-     * Re-locks all locks whose state was stored in 'stateToRestore'.
-     * @param opCtx An operation context that enables the restoration to be interrupted.
-     */
-    virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) = 0;
-    virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
-
-    /**
-     * releaseWriteUnitOfWorkAndUnlock opts out of two-phase locking and yields the locks after a
-     * WUOW has been released. restoreWriteUnitOfWorkAndLock reacquires the locks and resumes the
-     * two-phase locking behavior of WUOW.
-     */
-    virtual bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) = 0;
-    virtual void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
-                                               const LockSnapshot& stateToRestore) = 0;
-
-
-    /**
      * releaseWriteUnitOfWork opts out of two-phase locking of the current locks held but keeps
      * holding these locks.
      * restoreWriteUnitOfWork resumes the two-phase locking behavior of WUOW.
      */
-    virtual void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) = 0;
-    virtual void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) = 0;
+    void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut);
+    void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore);
 
     /**
-     * Releases the ticket associated with the Locker. This allows locks to be held without
-     * contributing to reader/writer throttling.
+     * Indicate that shared locks should participate in two-phase locking for this Locker instance.
      */
-    virtual void releaseTicket() = 0;
+    void setSharedLocksShouldTwoPhaseLock(bool sharedLocksShouldTwoPhaseLock) {
+        _sharedLocksShouldTwoPhaseLock = sharedLocksShouldTwoPhaseLock;
+    }
 
     /**
-     * Reacquires a ticket for the Locker. This must only be called after releaseTicket(). It
-     * restores the ticket under its previous LockMode.
-     * An OperationContext is required to interrupt the ticket acquisition to prevent deadlocks.
-     * A dead lock is possible when a ticket is reacquired while holding a lock.
+     * This is useful to ensure that potential deadlocks do not occur.
+     *
+     * Overrides provided timeouts in lock requests with 'maxTimeout' if the provided timeout
+     * is greater. Basically, no lock acquisition will take longer than 'maxTimeout'.
+     *
+     * If an UninterruptibleLockGuard is set during a lock request, the max timeout override will
+     * be ignored.
+     *
+     * Future lock requests may throw LockTimeout errors if a lock request provides a Date_t::max()
+     * deadline and 'maxTimeout' is reached. Presumably these callers do not expect to handle lock
+     * acquisition failure, so this is done to ensure the caller does not proceed as if the lock
+     * were successfully acquired.
+     *
+     * Note that this max lock timeout will not apply to ticket acquisition.
      */
-    virtual void reacquireTicket(OperationContext* opCtx) = 0;
+    void setMaxLockTimeout(Milliseconds maxTimeout) {
+        _maxLockTimeout = maxTimeout;
+    }
+
+    /**
+     * Returns whether this Locker has a maximum lock timeout set.
+     */
+    bool hasMaxLockTimeout() const {
+        return static_cast<bool>(_maxLockTimeout);
+    }
+
+    /**
+     * Clears the max lock timeout override set by setMaxLockTimeout() above.
+     */
+    void unsetMaxLockTimeout() {
+        _maxLockTimeout = boost::none;
+    }
+
+    /**
+     * When true, fatally assert when a lock acquisition or ticket acquisition is attempted.
+     */
+    void setAssertOnLockAttempt(bool assert) {
+        _assertOnLockAttempt = assert;
+    }
+
+    bool getAssertOnLockAttempt() const {
+        return _assertOnLockAttempt;
+    }
+
+    /**
+     * Retrieves the mode in which a lock is held or checks whether the lock held for a particular
+     * resource covers the specified mode.
+     *
+     * For example isLockHeldForMode will return true for MODE_S, if MODE_X is already held, because
+     * MODE_X covers MODE_S.
+     */
+    LockMode getLockMode(ResourceId resId) const;
+
+    /**
+     * These are shortcut methods for the above calls. They however check that the entire hierarchy
+     * is properly locked and because of this they are very expensive to call.
+     *
+     * Do not use them in performance critical code paths.
+     */
+    bool isDbLockedForMode(const DatabaseName& dbName, LockMode mode) const;
+    bool isCollectionLockedForMode(const NamespaceString& nss, LockMode mode) const;
+
+    bool isLockHeldForMode(ResourceId resId, LockMode mode) const {
+        return isModeCovered(mode, getLockMode(resId));
+    }
+
+    bool isGlobalLockedRecursively() const;
+
+    /**
+     * Returns whether we have ever taken a global lock in X or IX mode in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    bool wasGlobalLockTakenForWrite() const {
+        return _globalLockMode & ((1 << MODE_IX) | (1 << MODE_X));
+    }
+
+    /**
+     * Returns whether we have ever taken a global lock in S, X, or IX mode in this operation.
+     */
+    bool wasGlobalLockTakenInModeConflictingWithWrites() const {
+        return _wasGlobalLockTakenInModeConflictingWithWrites.load();
+    }
+
+    /**
+     * Returns whether we have ever taken a global lock in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    bool wasGlobalLockTaken() const {
+        return _globalLockMode != (1 << MODE_NONE);
+    }
+
+    /**
+     * Sets the mode bit in _globalLockMode. Once a mode bit is set, we won't clear it. Also sets
+     * _wasGlobalLockTakenInModeConflictingWithWrites to true if the mode is S, X, or IX.
+     */
+    void setGlobalLockTakenInMode(LockMode mode);
+
+    /**
+     * Pending means we are currently trying to get a lock.
+     */
+    bool hasLockPending() const {
+        return getWaitingResource().isValid();
+    }
+
+    /**
+     * Returns a vector with the lock information from the given resource lock holders.
+     */
+    std::vector<LogDebugInfo> getLockInfoFromResourceHolders(ResourceId resId) const;
+
+    void dump() const;
+
+    bool isLocked() const {
+        return getLockMode(resourceIdGlobal) != MODE_NONE;
+    }
+
+    bool isW() const {
+        return getLockMode(resourceIdGlobal) == MODE_X;
+    }
+
+    bool isR() const {
+        return getLockMode(resourceIdGlobal) == MODE_S;
+    }
+
+    bool isReadLocked() const {
+        return isLockHeldForMode(resourceIdGlobal, MODE_IS);
+    }
+
+    bool isWriteLocked() const {
+        return isLockHeldForMode(resourceIdGlobal, MODE_IX);
+    }
+
+    bool isRSTLLocked() const {
+        return getLockMode(resourceIdReplicationStateTransitionLock) != MODE_NONE;
+    }
+
+    bool isRSTLExclusive() const {
+        return getLockMode(resourceIdReplicationStateTransitionLock) == MODE_X;
+    }
+
+    void addFlowControlTicketQueueTime(Milliseconds queueTime) {
+        _flowControlStats.timeAcquiringMicros +=
+            durationCount<Microseconds>(duration_cast<Microseconds>(queueTime));
+    }
 
     //
-    // These methods are legacy from LockerImpl and will eventually go away or be converted to
-    // calls into the Locker methods
+    // Below functions are for unit-testing only
     //
 
-    virtual void dump() const = 0;
-
-    virtual bool isW() const = 0;
-    virtual bool isR() const = 0;
-
-    virtual bool isLocked() const = 0;
-    virtual bool isWriteLocked() const = 0;
-    virtual bool isReadLocked() const = 0;
-
-    virtual bool isRSTLExclusive() const = 0;
-    virtual bool isRSTLLocked() const = 0;
-
-    virtual bool isGlobalLockedRecursively() = 0;
-
-    /**
-     * Pending means we are currently trying to get a lock (could be the parallel batch writer
-     * lock).
-     */
-    virtual bool hasLockPending() const = 0;
-
-    /**
-     * If set to false, this opts out of conflicting with replication's use of the
-     * ParallelBatchWriterMode lock. Code that opts-out must be ok with seeing an inconsistent view
-     * of data because within a batch, secondaries apply operations in a different order than on the
-     * primary. User operations should *never* opt out.
-     */
-    void setShouldConflictWithSecondaryBatchApplication(bool newValue) {
-        _shouldConflictWithSecondaryBatchApplication = newValue;
-    }
-    bool shouldConflictWithSecondaryBatchApplication() const {
-        return _shouldConflictWithSecondaryBatchApplication;
-    }
-
-    /**
-     * This will opt out of the ticket mechanism. This should be used sparingly for special purpose
-     * threads, such as FTDC and committing or aborting prepared transactions.
-     */
-    void skipAcquireTicket() {
-        // Should not hold or wait for the ticket.
-        invariant(isNoop() || getClientState() == Locker::ClientState::kInactive);
-        _shouldAcquireTicket = false;
-    }
-
-    bool shouldAcquireTicket() const {
-        return _shouldAcquireTicket;
-    }
-
-    /**
-     * Acquire a flow control admission ticket into the system. Flow control is used as a
-     * backpressure mechanism to limit replication majority point lag.
-     */
-    virtual void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {}
-
-    /**
-     * If tracked by an implementation, returns statistics on effort spent acquiring a flow control
-     * ticket.
-     */
-    virtual FlowControlTicketholder::CurOp getFlowControlStats() const {
-        return FlowControlTicketholder::CurOp();
-    }
-
-    /**
-     * This function is for unit testing only.
-     */
     unsigned numResourcesToUnlockAtEndUnitOfWorkForTest() const {
         return _numResourcesToUnlockAtEndUnitOfWork;
     }
 
-    std::string getDebugInfo() const {
-        return _debugInfo;
+    FastMapNoAlloc<ResourceId, LockRequest> getRequestsForTest() const {
+        scoped_spinlock scopedLock(_lock);
+        return _requests;
     }
 
-    void setDebugInfo(const std::string& info) {
-        _debugInfo = info;
+    LockResult lockBeginForTest(OperationContext* opCtx, ResourceId resId, LockMode mode) {
+        return _lockBegin(opCtx, resId, mode);
+    }
+
+    void lockCompleteForTest(OperationContext* opCtx,
+                             ResourceId resId,
+                             LockMode mode,
+                             Date_t deadline) {
+        _lockComplete(opCtx, resId, mode, deadline, nullptr);
     }
 
 protected:
-    Locker() {}
+    using LockRequestsMap = FastMapNoAlloc<ResourceId, LockRequest>;
+
+    friend class UninterruptibleLockGuard;
+    friend class InterruptibleLockGuard;
+    friend class AllowLockAcquisitionOnTimestampedUnitOfWork;
 
     /**
-     * The number of callers that are guarding from lock interruptions.
-     * When 0, all lock acquisitions are interruptible. When positive, no lock acquisitions are
-     * interruptible or can time out.
+     * Allows for lock requests to be requested in a non-blocking way. There can be only one
+     * outstanding pending lock request per locker object.
+     *
+     * _lockBegin posts a request to the lock manager for the specified lock to be acquired,
+     * which either immediately grants the lock, or puts the requestor on the conflict queue
+     * and returns immediately with the result of the acquisition. The result can be one of:
+     *
+     * LOCK_OK - Nothing more needs to be done. The lock is granted.
+     * LOCK_WAITING - The request has been queued up and will be granted as soon as the lock
+     *      is free. If this result is returned, typically _lockComplete needs to be called in
+     *      order to wait for the actual grant to occur. If the caller no longer needs to wait
+     *      for the grant to happen, unlock needs to be called with the same resource passed
+     *      to _lockBegin.
+     *
+     * In other words for each call to _lockBegin, which does not return LOCK_OK, there needs to
+     * be a corresponding call to either _lockComplete or unlock.
+     *
+     * If an operation context is provided that represents an interrupted operation, _lockBegin will
+     * throw an exception whenever it would have been possible to grant the lock with LOCK_OK. This
+     * behavior can be disabled with an UninterruptibleLockGuard.
+     *
+     * NOTE: These methods are not public and should only be used inside the class
+     * implementation and for unit-tests and not called directly.
      */
-    int _uninterruptibleLocksRequested = 0;
+    LockResult _lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode);
+
+    /**
+     * Waits for the completion of a lock, previously requested through _lockBegin/
+     * Must only be called, if _lockBegin returned LOCK_WAITING.
+     *
+     * @param opCtx Operation context that, if not null, will be used to allow interruptible lock
+     * acquisition.
+     * @param resId Resource id which was passed to an earlier _lockBegin call. Must match.
+     * @param mode Mode which was passed to an earlier _lockBegin call. Must match.
+     * @param deadline The absolute time point when this lock acquisition will time out, if not yet
+     * granted.
+     * @param onTimeout Callback which will run if the lock acquisition is about to time out.
+     *
+     * Throws an exception if it is interrupted.
+     */
+    void _lockComplete(OperationContext* opCtx,
+                       ResourceId resId,
+                       LockMode mode,
+                       Date_t deadline,
+                       const LockTimeoutCallback& onTimeout);
+
+    /**
+     * Acquires a ticket for the Locker under 'mode'.
+     * Returns true   if a ticket is successfully acquired.
+     *         false  if it cannot acquire a ticket within 'deadline'.
+     * It may throw an exception when it is interrupted.
+     */
+    bool _acquireTicket(OperationContext* opCtx, LockMode mode, Date_t deadline);
+
+    /**
+     * The main functionality of the unlock method, except accepts iterator in order to avoid
+     * additional lookups during unlockGlobal. Frees locks immediately, so must not be called from
+     * inside a WUOW.
+     */
+    bool _unlockImpl(LockRequestsMap::Iterator* it);
+
+    /**
+     * Releases the ticket for the Locker.
+     */
+    void _releaseTicket();
+
+    /**
+     * Called if a lock acquisition has blocked.
+     */
+    void _setWaitingResource(ResourceId resId);
+
+    /**
+     * Whether we should use two phase locking. Returns true if the particular lock's release should
+     * be delayed until the end of the operation.
+     *
+     * We delay release of write operation locks (X, IX) in order to ensure that the data changes
+     * they protect are committed successfully. endWriteUnitOfWork will release them afterwards.
+     * This protects other threads from seeing inconsistent in-memory state.
+     *
+     * Shared locks (S, IS) will also participate in two-phase locking if
+     * '_sharedLocksShouldTwoPhaseLock' is true. This will protect open storage engine transactions
+     * across network calls.
+     */
+    bool _shouldDelayUnlock(ResourceId resId, LockMode mode) const;
+
+    /**
+     * Determines whether global and tenant lock state implies that some database or lower level
+     * resource, such as a collection, belonging to a tenant identified by 'tenantId' is locked in
+     * 'lockMode'.
+     *
+     * Returns:
+     *   true, if the global and tenant locks imply that the resource is locked for 'mode';
+     *   false, if the global and tenant locks imply that the resource is not locked for 'mode';
+     *   boost::none, if the global and tenant lock state does not imply either outcome and lower
+     * level locks should be consulted.
+     */
+    boost::optional<bool> _globalAndTenantLocksImplyDBOrCollectionLockedForMode(
+        const boost::optional<TenantId>& tenantId, LockMode lockMode) const;
+
+    /**
+     * Calls dump() on this locker instance and the lock manager.
+     */
+    void _dumpLockerAndLockManagerRequests();
+
+    // Used to disambiguate different lockers
+    const LockerId _id;
+
+    // The global lock manager of the service context.
+    LockManager* const _lockManager;
+
+    // The global ticketholders of the service context.
+    admission::TicketHolderManager* const _ticketHolderManager;
+
+    // The only reason we have this spin lock here is for the diagnostic tools, which could iterate
+    // through the LockRequestsMap on a separate thread and need it to be stable. Apart from that,
+    // all accesses to the locker object are always from a single thread.
+    //
+    // This needs to be locked inside const methods, hence the mutable.
+    mutable SpinLock _lock;
+
+    // Track the thread that currently owns the lock, for debugging purposes
+    stdx::thread::id _threadId;
+
+    // Extra info about this locker for debugging purposes
+    std::string _debugInfo;
+
+    // Reuse the notification object across requests so we don't have to create a new mutex
+    // and condition variable every time.
+    CondVarLockGrantNotification _notify;
+
+    // Note: this data structure must always guarantee the continued validity of pointers/references
+    // to its contents (LockRequests). The LockManager maintains a LockRequestList of pointers to
+    // the LockRequests managed by this data structure.
+    LockRequestsMap _requests;
+
+    // Per-locker locking statistics. Reported in the slow-query log message and through
+    // db.currentOp. Complementary to the per-instance locking statistics.
+    AtomicLockStats _stats;
 
     /**
      * The number of LockRequests to unlock at the end of this WUOW. This is used for locks
@@ -536,68 +741,76 @@ protected:
      */
     unsigned _numResourcesToUnlockAtEndUnitOfWork = 0;
 
-private:
-    bool _shouldConflictWithSecondaryBatchApplication = true;
-    bool _shouldAcquireTicket = true;
-    std::string _debugInfo;  // Extra info about this locker for debugging purpose
+    // Delays release of exclusive/intent-exclusive locked resources until the write unit of
+    // work completes. Value of 0 means we are not inside a write unit of work.
+    int _wuowNestingLevel{0};
+
+    // Mode for which the Locker acquired a ticket, or MODE_NONE if no ticket was acquired.
+    LockMode _modeForTicket = MODE_NONE;
+
+    // Indicates whether the client is active reader/writer or is queued.
+    AtomicWord<ClientState> _clientState{kInactive};
+
+    // If true, shared locks will participate in two-phase locking.
+    bool _sharedLocksShouldTwoPhaseLock = false;
+
+    // If this is set, dictates the max number of milliseconds that we will wait for lock
+    // acquisition. Effectively resets lock acquisition deadlines to time out sooner. If set to 0,
+    // for example, lock attempts will time out immediately if the lock is not immediately
+    // available. Note this will be ineffective if uninterruptible lock guard is set.
+    boost::optional<Milliseconds> _maxLockTimeout;
+
+    // A structure for accumulating time spent getting flow control tickets.
+    FlowControlTicketholder::CurOp _flowControlStats;
+
+    // This will only be valid when holding a ticket.
+    boost::optional<Ticket> _ticket;
+
+    // Tracks the global lock modes ever acquired in this Locker's life. This value should only ever
+    // be accessed from the thread that owns the Locker.
+    unsigned char _globalLockMode = (1 << MODE_NONE);
+
+    // Tracks whether this operation should be killed on step down.
+    AtomicWord<bool> _wasGlobalLockTakenInModeConflictingWithWrites{false};
+
+    // If isValid(), the ResourceId of the resource currently waiting for the lock. If not valid,
+    // there is no resource currently waiting.
+    ResourceId _waitingResource;
+
+    // When true, fatally assert when a lock acquisition or ticket acquisition is attempted.
+    bool _assertOnLockAttempt = false;
 };
 
 /**
- * This class prevents lock acquisitions from being interrupted when it is in scope.
- * The default behavior of acquisitions depends on the type of lock that is being requested.
- * Use this in the unlikely case that waiting for a lock can't be interrupted.
+ * RAII-style class to opt out of a fatal assertion where operations that set a timestamp on a
+ * WriteUnitOfWork cannot try to acquire subsequent locks. When an operation is writing at a
+ * specific timestamp, it creates an oplog hole at that timestamp. The oplog visibility rules only
+ * makes oplog entries visible that are before the earliest oplog hole.
  *
- * Lock acquisitions can still return LOCK_TIMEOUT, just not if the parent operation
- * context is killed first.
- *
- * It is possible that multiple callers are requesting uninterruptible behavior, so the guard
- * increments a counter on the Locker class to indicate how may guards are active.
+ * Given that, the following is an example scenario that could result in a resource deadlock:
+ * Op 1: Creates an oplog hole at Timestamp(5), then tries to acquire an exclusive lock.
+ * Op 2: Holds the exclusive lock Op 1 is waiting for, while this operation is waiting for some
+ *       operation beyond Timestamp(5) to become visible in the oplog.
  */
-class UninterruptibleLockGuard {
+class AllowLockAcquisitionOnTimestampedUnitOfWork {
 public:
-    /*
-     * Accepts a Locker, and increments the _uninterruptibleLocksRequested. Decrements the
-     * counter when destoyed.
-     */
-    explicit UninterruptibleLockGuard(Locker* locker) : _locker(locker) {
-        invariant(_locker);
-        invariant(_locker->_uninterruptibleLocksRequested >= 0);
-        invariant(_locker->_uninterruptibleLocksRequested < std::numeric_limits<int>::max());
-        _locker->_uninterruptibleLocksRequested += 1;
+    explicit AllowLockAcquisitionOnTimestampedUnitOfWork(Locker* locker)
+        : _locker(locker), _originalValue(_locker->getAssertOnLockAttempt()) {
+        _locker->setAssertOnLockAttempt(false);
     }
 
-    ~UninterruptibleLockGuard() {
-        invariant(_locker->_uninterruptibleLocksRequested > 0);
-        _locker->_uninterruptibleLocksRequested -= 1;
+    AllowLockAcquisitionOnTimestampedUnitOfWork(
+        const AllowLockAcquisitionOnTimestampedUnitOfWork&) = delete;
+    AllowLockAcquisitionOnTimestampedUnitOfWork& operator=(
+        const AllowLockAcquisitionOnTimestampedUnitOfWork&) = delete;
+
+    ~AllowLockAcquisitionOnTimestampedUnitOfWork() {
+        _locker->setAssertOnLockAttempt(_originalValue);
     }
 
 private:
     Locker* const _locker;
-};
-
-/**
- * RAII-style class to opt out of replication's use of the ParallelBatchWriterMode lock.
- */
-class ShouldNotConflictWithSecondaryBatchApplicationBlock {
-    ShouldNotConflictWithSecondaryBatchApplicationBlock(
-        const ShouldNotConflictWithSecondaryBatchApplicationBlock&) = delete;
-    ShouldNotConflictWithSecondaryBatchApplicationBlock& operator=(
-        const ShouldNotConflictWithSecondaryBatchApplicationBlock&) = delete;
-
-public:
-    explicit ShouldNotConflictWithSecondaryBatchApplicationBlock(Locker* lockState)
-        : _lockState(lockState),
-          _originalShouldConflict(_lockState->shouldConflictWithSecondaryBatchApplication()) {
-        _lockState->setShouldConflictWithSecondaryBatchApplication(false);
-    }
-
-    ~ShouldNotConflictWithSecondaryBatchApplicationBlock() {
-        _lockState->setShouldConflictWithSecondaryBatchApplication(_originalShouldConflict);
-    }
-
-private:
-    Locker* const _lockState;
-    const bool _originalShouldConflict;
+    bool _originalValue;
 };
 
 }  // namespace mongo

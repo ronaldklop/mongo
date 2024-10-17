@@ -2,12 +2,13 @@
  * Tests that test-only replica-set only commands are truly test-only.
  *
  * @tags: [
- *   requires_fcv_47,
+ *   # TODO (SERVER-80568): Re-enable this test in multiversion suites once it has been fixed.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   disables_test_commands,
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const cmdList = [
     {'replSetGetConfig': 1, '$_internalIncludeNewlyAdded': true},
@@ -39,4 +40,3 @@ for (let cmd of cmdList) {
 
 rst.awaitReplication();
 rst.stopSet();
-})();

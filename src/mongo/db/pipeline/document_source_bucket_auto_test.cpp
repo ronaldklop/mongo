@@ -27,18 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <bitset>
+#include <cmath>
+#include <cstddef>
 #include <deque>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
@@ -46,8 +52,12 @@
 #include "mongo/db/pipeline/document_source_bucket_auto.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -89,8 +99,10 @@ public:
         assertBucketAutoType(bucketAutoStage);
 
         vector<Value> explainedStages;
-        bucketAutoStage->serializeToArray(explainedStages,
-                                          ExplainOptions::Verbosity::kQueryPlanner);
+        bucketAutoStage->serializeToArray(
+            explainedStages,
+            SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)});
         ASSERT_EQUALS(explainedStages.size(), 1UL);
 
         Value expectedExplain = Value(expectedObj);
@@ -575,11 +587,26 @@ TEST_F(BucketAutoTests, FailsWithInvalidNumberOfBuckets) {
         40243);
 }
 
-TEST_F(BucketAutoTests, FailsWithNonExpressionGroupBy) {
+TEST_F(BucketAutoTests, FailsWithNonOrInvalidExpressionGroupBy) {
     auto spec = fromjson("{$bucketAuto : {groupBy : 'test', buckets : 1}}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 
     spec = fromjson("{$bucketAuto : {groupBy : {test : 'test'}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '', buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : {}}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '$'}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : []}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : null}, buckets : 1}}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 }
 
@@ -676,22 +703,22 @@ TEST_F(BucketAutoTests, ShouldFailIfBufferingTooManyDocuments) {
     auto expCtx = getExpCtx();
 
     expCtx->allowDiskUse = false;
-    expCtx->inMongos = false;
+    expCtx->inRouter = false;
     assertCannotSpillToDisk(expCtx);
 
     expCtx->allowDiskUse = true;
-    expCtx->inMongos = true;
+    expCtx->inRouter = true;
     assertCannotSpillToDisk(expCtx);
 
     expCtx->allowDiskUse = false;
-    expCtx->inMongos = true;
+    expCtx->inRouter = true;
     assertCannotSpillToDisk(expCtx);
 }
 
 TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
     expCtx->allowDiskUse = false;
-    const size_t maxMemoryUsageBytes = 1000;
+    const size_t maxMemoryUsageBytes = 2000;
 
     VariablesParseState vps = expCtx->variablesParseState;
     auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
@@ -700,7 +727,7 @@ TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
         expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
 
-    string largeStr(maxMemoryUsageBytes / 2, 'x');
+    string largeStr(maxMemoryUsageBytes / 5, 'x');
     auto mock =
         DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
@@ -816,6 +843,80 @@ TEST_F(BucketAutoTests, ShouldNotRoundZeroInFirstBucketWithGranularitySpecified)
                        Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 2}")));
 }
 
+TEST_F(BucketAutoTests, AllValuesZeroWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(
+        bucketAutoSpec,
+        {Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0, max : 0}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, MostValuesZeroWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(
+        bucketAutoSpec,
+        {Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 0}}, Document{{"x", 1}}});
+
+    ASSERT_EQUALS(results.size(), 2UL);
+    ASSERT_DOCUMENT_EQ(results[0], Document(fromjson("{_id : {min : 0, max : 0.63}, count : 3}")));
+    ASSERT_DOCUMENT_EQ(results[1],
+                       Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 1}")));
+}
+
+TEST_F(BucketAutoTests, AllValuesInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : Infinity, max : Infinity}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, MostValuesInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 1}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 1UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : 0.63, max : Infinity}, count : 4}")));
+}
+
+TEST_F(BucketAutoTests, OneValueInfinityWithGranularitySpecified) {
+    auto bucketAutoSpec =
+        fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
+
+    auto results = getResults(bucketAutoSpec,
+                              {Document{{"x", 1}},
+                               Document{{"x", 1}},
+                               Document{{"x", 1}},
+                               Document{{"x", std::numeric_limits<double>::infinity()}}});
+
+    ASSERT_EQUALS(results.size(), 2UL);
+    ASSERT_DOCUMENT_EQ(results[0],
+                       Document(fromjson("{_id : {min : 0.63, max : 1.6}, count : 3}")));
+    ASSERT_DOCUMENT_EQ(results[1],
+                       Document(fromjson("{_id : {min : 1.6, max : Infinity}, count : 1}")));
+}
+
+
 TEST_F(BucketAutoTests, ShouldFailOnNaNWhenGranularitySpecified) {
     auto bucketAutoSpec =
         fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, granularity : 'R5'}}");
@@ -853,5 +954,109 @@ TEST_F(BucketAutoTests, ShouldFailOnNegativeNumbersWhenGranularitySpecified) {
         AssertionException,
         40260);
 }
+
+TEST_F(BucketAutoTests, RedactionWithoutOutputField) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$_id',
+                buckets: 5,
+                granularity: "R5"
+            }
+        })");
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$HASH<_id>",
+                "buckets": "?number",
+                "granularity": "?string",
+                "output": {
+                    "HASH<count>": {
+                        "$sum": "?number"
+                    }
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(BucketAutoTests, RedactionWithOutputField) {
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$year',
+                buckets: 3,
+                output: {
+                    count: { $sum: 1 },
+                    years: { $push: '$year' }
+                }
+            }})");
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$HASH<year>",
+                "buckets": "?number",
+                "output": {
+                    "HASH<count>": {
+                        "$sum": "?number"
+                    },
+                    "HASH<years>": {
+                        "$push": "$HASH<year>"
+                    }
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(BucketAutoTests, QueryShapeReParseSerializedStage) {
+    auto expCtx = getExpCtx();
+    auto spec = fromjson(R"({
+            $bucketAuto: {
+                groupBy: '$year',
+                buckets: 3,
+                granularity: "E192",
+                output: {
+                    count: { $sum: 1 },
+                    years: { $push: '$year' }
+                }
+            }})");
+
+    auto docSource = DocumentSourceBucketAuto::createFromBson(spec.firstElement(), expCtx);
+    auto opts = SerializationOptions{LiteralSerializationPolicy::kToRepresentativeParseableValue};
+    std::vector<Value> serialized;
+    docSource->serializeToArray(serialized, opts);
+    auto serializedDocSource = serialized[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$bucketAuto": {
+                "groupBy": "$year",
+                "buckets": 1,
+                "granularity": "R5",
+                "output": {
+                    "count": {
+                        "$sum": {
+                            "$const":1
+                        }
+                    },
+                    "years": {
+                        "$push": "$year"
+                    }
+                }
+            }
+        })",
+        serializedDocSource);
+    auto docSourceFromQueryShape =
+        DocumentSourceBucketAuto::createFromBson(serializedDocSource.firstElement(), expCtx);
+
+    vector<Value> newSerialization;
+    docSourceFromQueryShape->serializeToArray(newSerialization, opts);
+    auto newSerializedDocSource = newSerialization[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedDocSource, newSerializedDocSource);
+}
+
+
 }  // namespace
 }  // namespace mongo

@@ -27,34 +27,52 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/query/collection_query_info.h"
 
-#include <memory>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/aggregated_index_usage_tracker.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/collection_index_usage_tracker.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/curop_metrics.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/index_path_projection.h"
 #include "mongo/db/exec/projection_executor.h"
-#include "mongo/db/exec/projection_executor_utils.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/transformer_interface.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
-#include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
 #include "mongo/db/query/planner_ixselect.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/clock_source.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
-
 namespace {
 
 CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
@@ -77,83 +95,141 @@ CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
             projExec};
 }
 
+void recordCollectionIndexUsage(const CollectionPtr& coll,
+                                long long collectionScans,
+                                long long collectionScansNonTailable,
+                                const std::set<std::string>& indexesUsed) {
+    const auto& collectionIndexUsageTracker =
+        CollectionIndexUsageTrackerDecoration::get(coll.get());
+
+    collectionIndexUsageTracker.recordCollectionScans(collectionScans);
+    collectionIndexUsageTracker.recordCollectionScansNonTailable(collectionScansNonTailable);
+
+    // Record indexes used to fulfill query.
+    for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
+        collectionIndexUsageTracker.recordIndexAccess(*it);
+    }
+}
+
 }  // namespace
 
+CollectionQueryInfo::PlanCacheState::PlanCacheState()
+    : classicPlanCache{static_cast<size_t>(internalQueryCacheMaxEntriesPerCollection.load())} {}
+
+CollectionQueryInfo::PlanCacheState::PlanCacheState(OperationContext* opCtx,
+                                                    const Collection* collection)
+    : classicPlanCache{static_cast<size_t>(internalQueryCacheMaxEntriesPerCollection.load())},
+      planCacheInvalidator{collection, opCtx->getServiceContext()} {
+    std::vector<CoreIndexInfo> indexCores;
+
+    // TODO We shouldn't need to include unfinished indexes, but we must here because the index
+    // catalog may be in an inconsistent state.  SERVER-18346.
+    auto ii = collection->getIndexCatalog()->getIndexIterator(
+        opCtx, IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
+    while (ii->more()) {
+        const IndexCatalogEntry* ice = ii->next();
+        if (ice->accessMethod()) {
+            indexCores.emplace_back(indexInfoFromIndexCatalogEntry(*ice));
+        }
+    }
+
+    planCacheIndexabilityState.updateDiscriminators(indexCores);
+}
+
+void CollectionQueryInfo::PlanCacheState::clearPlanCache() {
+    classicPlanCache.clear();
+    planCacheInvalidator.clearPlanCache();
+}
+
 CollectionQueryInfo::CollectionQueryInfo()
-    : _keysComputed(false), _planCache(std::make_shared<PlanCache>()) {}
+    : _keysComputed{false}, _planCacheState{std::make_shared<PlanCacheState>()} {}
 
 const UpdateIndexData& CollectionQueryInfo::getIndexKeys(OperationContext* opCtx) const {
     invariant(_keysComputed);
     return _indexedPaths;
 }
 
-void CollectionQueryInfo::computeIndexKeys(OperationContext* opCtx, const CollectionPtr& coll) {
-    _indexedPaths.clear();
-
-    std::unique_ptr<IndexCatalog::IndexIterator> it =
-        coll->getIndexCatalog()->getIndexIterator(opCtx, true);
-    while (it->more()) {
-        const IndexCatalogEntry* entry = it->next();
-        const IndexDescriptor* descriptor = entry->descriptor();
-        const IndexAccessMethod* iam = entry->accessMethod();
-
-        if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
-            // Obtain the projection used by the $** index's key generator.
-            const auto* pathProj =
-                static_cast<const WildcardAccessMethod*>(iam)->getWildcardProjection();
-            // If the projection is an exclusion, then we must check the new document's keys on all
-            // updates, since we do not exhaustively know the set of paths to be indexed.
-            if (pathProj->exec()->getType() ==
-                TransformerInterface::TransformerType::kExclusionProjection) {
-                _indexedPaths.allPathsIndexed();
-            } else {
-                // If a subtree was specified in the keyPattern, or if an inclusion projection is
-                // present, then we need only index the path(s) preserved by the projection.
-                const auto& exhaustivePaths = pathProj->exhaustivePaths();
-                invariant(exhaustivePaths);
-                for (const auto& path : *exhaustivePaths) {
-                    _indexedPaths.addPath(path);
-                }
-            }
-        } else if (descriptor->getAccessMethodName() == IndexNames::TEXT) {
-            fts::FTSSpec ftsSpec(descriptor->infoObj());
-
-            if (ftsSpec.wildcard()) {
-                _indexedPaths.allPathsIndexed();
-            } else {
-                for (size_t i = 0; i < ftsSpec.numExtraBefore(); ++i) {
-                    _indexedPaths.addPath(FieldRef(ftsSpec.extraBefore(i)));
-                }
-                for (fts::Weights::const_iterator it = ftsSpec.weights().begin();
-                     it != ftsSpec.weights().end();
-                     ++it) {
-                    _indexedPaths.addPath(FieldRef(it->first));
-                }
-                for (size_t i = 0; i < ftsSpec.numExtraAfter(); ++i) {
-                    _indexedPaths.addPath(FieldRef(ftsSpec.extraAfter(i)));
-                }
-                // Any update to a path containing "language" as a component could change the
-                // language of a subdocument.  Add the override field as a path component.
-                _indexedPaths.addPathComponent(ftsSpec.languageOverrideField());
-            }
+void CollectionQueryInfo::computeUpdateIndexData(const IndexCatalogEntry* entry,
+                                                 const IndexAccessMethod* accessMethod,
+                                                 UpdateIndexData* outData) {
+    const IndexDescriptor* descriptor = entry->descriptor();
+    if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
+        // Obtain the projection used by the $** index's key generator.
+        const auto* pathProj = static_cast<const IndexPathProjection*>(
+            static_cast<const WildcardAccessMethod*>(accessMethod)->getWildcardProjection());
+        // If the projection is an exclusion, then we must check the new document's keys on all
+        // updates, since we do not exhaustively know the set of paths to be indexed.
+        if (pathProj->exec()->getType() ==
+            TransformerInterface::TransformerType::kExclusionProjection) {
+            outData->allPathsIndexed();
         } else {
+            // If a subtree was specified in the keyPattern, or if an inclusion projection is
+            // present, then we need only index the path(s) preserved by the projection.
+            const auto& exhaustivePaths = pathProj->exhaustivePaths();
+            invariant(exhaustivePaths);
+            for (const auto& path : *exhaustivePaths) {
+                outData->addPath(path);
+            }
+
+            // Handle regular index fields of Compound Wildcard Index.
             BSONObj key = descriptor->keyPattern();
             BSONObjIterator j(key);
             while (j.more()) {
-                BSONElement e = j.next();
-                _indexedPaths.addPath(FieldRef(e.fieldName()));
+                StringData fieldName(j.next().fieldName());
+                if (!fieldName.endsWith("$**"_sd)) {
+                    outData->addPath(FieldRef{fieldName});
+                }
             }
         }
+    } else if (descriptor->getAccessMethodName() == IndexNames::TEXT) {
+        fts::FTSSpec ftsSpec(descriptor->infoObj());
 
-        // handle partial indexes
-        const MatchExpression* filter = entry->getFilterExpression();
-        if (filter) {
-            stdx::unordered_set<std::string> paths;
-            QueryPlannerIXSelect::getFields(filter, &paths);
-            for (auto it = paths.begin(); it != paths.end(); ++it) {
-                _indexedPaths.addPath(FieldRef(*it));
+        if (ftsSpec.wildcard()) {
+            outData->allPathsIndexed();
+        } else {
+            for (size_t i = 0; i < ftsSpec.numExtraBefore(); ++i) {
+                outData->addPath(FieldRef(ftsSpec.extraBefore(i)));
             }
+            for (fts::Weights::const_iterator it = ftsSpec.weights().begin();
+                 it != ftsSpec.weights().end();
+                 ++it) {
+                outData->addPath(FieldRef(it->first));
+            }
+            for (size_t i = 0; i < ftsSpec.numExtraAfter(); ++i) {
+                outData->addPath(FieldRef(ftsSpec.extraAfter(i)));
+            }
+            // Any update to a path containing "language" as a component could change the
+            // language of a subdocument.  Add the override field as a path component.
+            outData->addPathComponent(ftsSpec.languageOverrideField());
         }
+    } else {
+        BSONObj key = descriptor->keyPattern();
+        BSONObjIterator j(key);
+        while (j.more()) {
+            BSONElement e = j.next();
+            outData->addPath(FieldRef(e.fieldName()));
+        }
+    }
+
+    // handle partial indexes
+    const MatchExpression* filter = entry->getFilterExpression();
+    if (filter) {
+        RelevantFieldIndexMap paths;
+        QueryPlannerIXSelect::getFields(filter, &paths);
+        for (auto it = paths.begin(); it != paths.end(); ++it) {
+            outData->addPath(FieldRef(it->first));
+        }
+    }
+}
+
+void CollectionQueryInfo::computeUpdateIndexData(OperationContext* opCtx, const Collection* coll) {
+    _indexedPaths.clear();
+
+    auto it = coll->getIndexCatalog()->getIndexIterator(
+        opCtx, IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
+    while (it->more()) {
+        const IndexCatalogEntry* entry = it->next();
+        computeUpdateIndexData(entry, entry->accessMethod(), &_indexedPaths);
     }
 
     _keysComputed = true;
@@ -162,39 +238,35 @@ void CollectionQueryInfo::computeIndexKeys(OperationContext* opCtx, const Collec
 void CollectionQueryInfo::notifyOfQuery(OperationContext* opCtx,
                                         const CollectionPtr& coll,
                                         const PlanSummaryStats& summaryStats) const {
-    auto& collectionIndexUsageTracker =
-        CollectionIndexUsageTrackerDecoration::get(coll->getSharedDecorations());
+    recordCollectionIndexUsage(coll,
+                               summaryStats.collectionScans,
+                               summaryStats.collectionScansNonTailable,
+                               summaryStats.indexesUsed);
+}
 
-    collectionIndexUsageTracker.recordCollectionScans(summaryStats.collectionScans);
-    collectionIndexUsageTracker.recordCollectionScansNonTailable(
-        summaryStats.collectionScansNonTailable);
-
-    const auto& indexesUsed = summaryStats.indexesUsed;
-    // Record indexes used to fulfill query.
-    for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
-        collectionIndexUsageTracker.recordIndexAccess(*it);
-    }
+void CollectionQueryInfo::notifyOfQuery(const CollectionPtr& coll, const OpDebug& debug) const {
+    recordCollectionIndexUsage(
+        coll, debug.collectionScans, debug.collectionScansNonTailable, debug.indexesUsed);
 }
 
 void CollectionQueryInfo::clearQueryCache(OperationContext* opCtx, const CollectionPtr& coll) {
     // We are operating on a cloned collection, the use_count can only be 1 if we've created a new
     // PlanCache instance for this collection clone. Checking the refcount can't race as we can't
     // start readers on this collection while it is writable
-    if (_planCache.use_count() == 1) {
+    if (_planCacheState.use_count() == 1) {
         LOGV2_DEBUG(5014501,
                     1,
                     "Clearing plan cache - collection info cache cleared",
-                    "namespace"_attr = coll->ns());
+                    logAttrs(coll->ns()));
 
-        _planCache->clear();
+        _planCacheState->clearPlanCache();
     } else {
         LOGV2_DEBUG(5014502,
                     1,
                     "Clearing plan cache - collection info cache reinstantiated",
-                    "namespace"_attr = coll->ns());
+                    logAttrs(coll->ns()));
 
-        _planCache = std::make_shared<PlanCache>();
-        updatePlanCacheIndexEntries(opCtx, coll);
+        updatePlanCacheIndexEntries(opCtx, coll.get());
     }
 }
 
@@ -202,49 +274,40 @@ void CollectionQueryInfo::clearQueryCacheForSetMultikey(const CollectionPtr& col
     LOGV2_DEBUG(5014500,
                 1,
                 "Clearing plan cache for multikey - collection info cache cleared",
-                "namespace"_attr = coll->ns());
-    _planCache->clear();
-}
-
-PlanCache* CollectionQueryInfo::getPlanCache() const {
-    return _planCache.get();
+                logAttrs(coll->ns()));
+    _planCacheState->clearPlanCache();
 }
 
 void CollectionQueryInfo::updatePlanCacheIndexEntries(OperationContext* opCtx,
-                                                      const CollectionPtr& coll) {
-    std::vector<CoreIndexInfo> indexCores;
-
-    // TODO We shouldn't need to include unfinished indexes, but we must here because the index
-    // catalog may be in an inconsistent state.  SERVER-18346.
-    const bool includeUnfinishedIndexes = true;
-    std::unique_ptr<IndexCatalog::IndexIterator> ii =
-        coll->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-    while (ii->more()) {
-        const IndexCatalogEntry* ice = ii->next();
-        indexCores.emplace_back(indexInfoFromIndexCatalogEntry(*ice));
-    }
-
-    _planCache->notifyOfIndexUpdates(indexCores);
+                                                      const Collection* coll) {
+    _planCacheState = std::make_shared<PlanCacheState>(opCtx, coll);
 }
 
-void CollectionQueryInfo::init(OperationContext* opCtx, const CollectionPtr& coll) {
-    const bool includeUnfinishedIndexes = false;
-    std::unique_ptr<IndexCatalog::IndexIterator> ii =
-        coll->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
+void CollectionQueryInfo::init(OperationContext* opCtx, Collection* coll) {
+    // Skip registering the index in a --repair, as the server will terminate after
+    // the repair operation completes.
+    if (storageGlobalParams.repair) {
+        LOGV2_DEBUG(7610901, 1, "In a repair, skipping registering indexes");
+        return;
+    }
+
+    auto ii =
+        coll->getIndexCatalog()->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
+    auto& collectionIndexUsageTracker = CollectionIndexUsageTrackerDecoration::write(coll);
     while (ii->more()) {
         const IndexDescriptor* desc = ii->next()->descriptor();
-        CollectionIndexUsageTrackerDecoration::get(coll->getSharedDecorations())
-            .registerIndex(desc->indexName(), desc->keyPattern());
+        collectionIndexUsageTracker.registerIndex(
+            desc->indexName(),
+            desc->keyPattern(),
+            IndexFeatures::make(desc, coll->ns().isOnInternalDb()));
     }
 
     rebuildIndexData(opCtx, coll);
 }
 
-void CollectionQueryInfo::rebuildIndexData(OperationContext* opCtx, const CollectionPtr& coll) {
-    _planCache = std::make_shared<PlanCache>();
-
+void CollectionQueryInfo::rebuildIndexData(OperationContext* opCtx, const Collection* coll) {
     _keysComputed = false;
-    computeIndexKeys(opCtx, coll);
+    computeUpdateIndexData(opCtx, coll);
     updatePlanCacheIndexEntries(opCtx, coll);
 }
 

@@ -27,18 +27,48 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
+namespace mongo {
 namespace QueryStageIxscan {
 namespace {
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
@@ -47,8 +77,8 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 class IndexScanTest {
 public:
     IndexScanTest()
-        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
-          _ctx(&_opCtx, ns()),
+        : _dbLock(&_opCtx, nss().dbName(), MODE_X),
+          _ctx(&_opCtx, nss()),
           _coll(nullptr),
           _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss())) {}
 
@@ -59,10 +89,11 @@ public:
 
         _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
         _coll = _ctx.db()->createCollection(&_opCtx, nss());
-        _collPtr = _coll;
+        _collPtr = CollectionPtr(_coll);
 
         ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
             &_opCtx,
+            _coll,
             BSON("key" << BSON("x" << 1) << "name" << DBClientBase::genIndexName(BSON("x" << 1))
                        << "v" << static_cast<int>(kIndexVersion))));
 
@@ -72,7 +103,8 @@ public:
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_opCtx);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(_coll->insertDocument(&_opCtx, InsertStatement(doc), nullOpDebug, false));
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, CollectionPtr(_coll), InsertStatement(doc), nullOpDebug, false));
         wunit.commit();
     }
 
@@ -96,11 +128,12 @@ public:
     IndexScan* createIndexScanSimpleRange(BSONObj startKey, BSONObj endKey) {
         IndexCatalog* catalog = _coll->getIndexCatalog();
         std::vector<const IndexDescriptor*> indexes;
-        catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
+        catalog->findIndexesByKeyPattern(
+            &_opCtx, BSON("x" << 1), IndexCatalog::InclusionPolicy::kReady, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
         // We are not testing indexing here so use maximal bounds
-        IndexScanParams params(&_opCtx, indexes[0]);
+        IndexScanParams params(&_opCtx, _collPtr, indexes[0]);
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = startKey;
         params.bounds.endKey = endKey;
@@ -109,7 +142,7 @@ public:
 
         // This child stage gets owned and freed by the caller.
         MatchExpression* filter = nullptr;
-        return new IndexScan(_expCtx.get(), _collPtr, params, &_ws, filter);
+        return new IndexScan(_expCtx.get(), &_collPtr, params, &_ws, filter);
     }
 
     IndexScan* createIndexScan(BSONObj startKey,
@@ -119,10 +152,11 @@ public:
                                int direction = 1) {
         IndexCatalog* catalog = _coll->getIndexCatalog();
         std::vector<const IndexDescriptor*> indexes;
-        catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
+        catalog->findIndexesByKeyPattern(
+            &_opCtx, BSON("x" << 1), IndexCatalog::InclusionPolicy::kReady, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
-        IndexScanParams params(&_opCtx, indexes[0]);
+        IndexScanParams params(&_opCtx, _collPtr, indexes[0]);
         params.direction = direction;
 
         OrderedIntervalList oil("x");
@@ -133,14 +167,14 @@ public:
         params.bounds.fields.push_back(oil);
 
         MatchExpression* filter = nullptr;
-        return new IndexScan(_expCtx.get(), _coll, params, &_ws, filter);
+        return new IndexScan(_expCtx.get(), &_collPtr, params, &_ws, filter);
     }
 
     static const char* ns() {
         return "unittest.QueryStageIxscan";
     }
     static NamespaceString nss() {
-        return NamespaceString(ns());
+        return NamespaceString::createNamespaceString_forTest(ns());
     }
 
 protected:
@@ -316,11 +350,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_ixscan") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageIxscanInitializeStats>();
         add<QueryStageIxscanInsertDuringSave>();
         add<QueryStageIxscanInsertDuringSaveExclusive>();
@@ -329,6 +363,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> aueryStageIxscanAll;
+unittest::OldStyleSuiteInitializer<All> aueryStageIxscanAll;
 
 }  // namespace QueryStageIxscan
+}  // namespace mongo

@@ -29,14 +29,34 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
+#include <set>
+#include <string>
+#include <vector>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_interface.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -46,6 +66,7 @@ namespace repl {
 
 class OplogInterface;
 class ReplicationCoordinator;
+
 class ReplicationProcess;
 
 /**
@@ -247,7 +268,7 @@ public:
                  ReplicationProcess* replicationProcess,
                  ReplicationCoordinator* replicationCoordinator);
 
-    virtual ~RollbackImpl();
+    ~RollbackImpl() override;
 
     /**
      * Runs the rollback algorithm.
@@ -266,8 +287,9 @@ public:
     /**
      * Wrappers to expose private methods for testing.
      */
-    StatusWith<std::set<NamespaceString>> _namespacesForOp_forTest(const OplogEntry& oplogEntry) {
-        return _namespacesForOp(oplogEntry);
+    StatusWith<std::pair<std::set<NamespaceString>, std::set<UUID>>>
+    _namespacesAndUUIDsForOp_forTest(const OplogEntry& oplogEntry) {
+        return _namespacesAndUUIDsForOp(oplogEntry);
     }
 
     /**
@@ -367,6 +389,17 @@ private:
     void _stopAndWaitForIndexBuilds(OperationContext* opCtx);
 
     /**
+     * Performs a forward scan of the oplog starting at 'stableTimestamp', exclusive. For every
+     * retryable write oplog entry that has a 'prevOpTime' <= 'stableTimestamp', update the
+     * transactions table with the appropriate information to detail the last executed operation. We
+     * do this because derived updates to the transactions table can be coalesced into one
+     * operation, and so certain session entry updates may not exist when restoring to the
+     * 'stableTimestamp'.
+     */
+    void _restoreTxnsTableEntryFromRetryableWrites(OperationContext* opCtx,
+                                                   Timestamp stableTimestamp);
+
+    /**
      * Recovers to the stable timestamp while holding the global exclusive lock.
      * Returns the stable timestamp that the storage engine recovered to.
      */
@@ -423,7 +456,8 @@ private:
      * handle 'applyOps' oplog entries, since it assumes their sub operations have already been
      * extracted at a higher layer.
      */
-    StatusWith<std::set<NamespaceString>> _namespacesForOp(const OplogEntry& oplogEntry);
+    StatusWith<std::pair<std::set<NamespaceString>, std::set<UUID>>> _namespacesAndUUIDsForOp(
+        const OplogEntry& oplogEntry);
 
     /**
      * Persists rollback files to disk for each namespace that contains documents inserted or
@@ -448,7 +482,7 @@ private:
     void _resetDropPendingState(OperationContext* opCtx);
 
     // Guards access to member variables.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackImpl::_mutex");  // (S)
+    mutable stdx::mutex _mutex;  // (S)
 
     // Set to true when RollbackImpl should shut down.
     bool _inShutdown = false;  // (M)

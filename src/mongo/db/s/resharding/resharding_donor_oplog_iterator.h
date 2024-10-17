@@ -29,13 +29,18 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -69,7 +74,17 @@ public:
      *    final oplog entry hasn't been returned yet.
      */
     virtual ExecutorFuture<std::vector<repl::OplogEntry>> getNextBatch(
-        std::shared_ptr<executor::TaskExecutor> executor, CancellationToken cancelToken) = 0;
+        std::shared_ptr<executor::TaskExecutor> executor,
+        CancellationToken cancelToken,
+        CancelableOperationContextFactory factory) = 0;
+
+    /**
+     * Releases any resources held by this oplog iterator such as Pipelines, PlanExecutors, or
+     * in-memory structures.
+     *
+     * This function must be called before destroying the oplog iterator.
+     */
+    virtual void dispose(OperationContext* opCtx) {}
 };
 
 /**
@@ -86,24 +101,18 @@ public:
 
     /**
      * Returns a pipeline for iterating the buffered copy of the donor's oplog.
-     *
-     * The documents returned by the pipeline have the oplog entries linked together with their
-     * preImage/postImage entries.
      */
     std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface);
 
     ExecutorFuture<std::vector<repl::OplogEntry>> getNextBatch(
-        std::shared_ptr<executor::TaskExecutor> executor, CancellationToken cancelToken) override;
+        std::shared_ptr<executor::TaskExecutor> executor,
+        CancellationToken cancelToken,
+        CancelableOperationContextFactory factory) override;
 
-    static constexpr auto kActualOpFieldName = "actualOp"_sd;
-    static constexpr auto kPreImageOpFieldName = "preImageOp"_sd;
-    static constexpr auto kPostImageOpFieldName = "postImageOp"_sd;
+    void dispose(OperationContext* opCtx) override;
 
 private:
-    template <typename Callable>
-    auto _withTemporaryOperationContext(Callable&& callable);
-
     std::vector<repl::OplogEntry> _fillBatch(Pipeline& pipeline);
 
     const NamespaceString _oplogBufferNss;

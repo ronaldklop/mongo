@@ -1,10 +1,11 @@
 """Modules for find which files should be linted."""
+
 import os
 import sys
-from typing import Tuple, List, Dict, Callable
+from typing import Callable, List, Tuple
 
-from git import Repo
 import structlog
+from git import Repo
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -12,29 +13,32 @@ if __name__ == "__main__" and __package__ is None:
 
 # pylint: disable=wrong-import-position
 from buildscripts.linter import git
-from buildscripts.patch_builds.change_data import generate_revision_map, \
-    RevisionMap, find_changed_files_in_repos
+from buildscripts.patch_builds.change_data import (
+    RevisionMap,
+    find_changed_files_in_repos,
+    generate_revision_map,
+)
 
 # pylint: enable=wrong-import-position
 
 LOGGER = structlog.get_logger(__name__)
 MONGO_REVISION_ENV_VAR = "REVISION"
-ENTERPRISE_REVISION_ENV_VAR = "ENTERPRISE_REV"
 
 
 def _get_repos_and_revisions() -> Tuple[List[Repo], RevisionMap]:
     """Get the repo object and a map of revisions to compare against."""
-    modules = git.get_module_paths()
+    modules = [
+        path
+        for path in git.get_module_paths()
+        # Exclude enterprise module; it's in the "modules" folder but does not correspond to a repo
+        if "src/mongo/db/modules/enterprise" not in path
+    ]
     repos = [Repo(path) for path in modules]
-    revision_map = generate_revision_map(
-        repos, {
-            "mongo": os.environ.get(MONGO_REVISION_ENV_VAR),
-            "enterprise": os.environ.get(ENTERPRISE_REVISION_ENV_VAR)
-        })
+    revision_map = generate_revision_map(repos, {"mongo": os.environ.get(MONGO_REVISION_ENV_VAR)})
     return repos, revision_map
 
 
-def _filter_file(filename: str, is_interesting_file: Callable) -> bool:
+def _filter_file(filename: str, is_interesting_file: Callable[[str], bool]) -> bool:
     """
     Determine if file should be included based on existence and passed in method.
 
@@ -45,7 +49,7 @@ def _filter_file(filename: str, is_interesting_file: Callable) -> bool:
     return os.path.exists(filename) and is_interesting_file(filename)
 
 
-def gather_changed_files_for_lint(is_interesting_file: Callable) -> List[str]:
+def gather_changed_files_for_lint(is_interesting_file: Callable[[str], bool]) -> List[str]:
     """
     Get the files that have changes since the last git commit.
 

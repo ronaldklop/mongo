@@ -57,10 +57,6 @@ public:
             // Indicates that no oplog entry should be produced.
             kDoNotGenerateOplogEntry,
 
-            // Indicates that the update executor should produce an oplog entry. Only the $v: 1
-            // format or replacement-style format may be used, however.
-            kGenerateOnlyV1OplogEntry,
-
             // Indicates that the update executor should produce an oplog entry, and may use any
             // format.
             kGenerateOplogEntry
@@ -86,12 +82,13 @@ public:
         // replication.
         bool fromOplogApplication = false;
 
+        // If true, it is guaranteed that the document doesn't contain dots or dollars fields and
+        // should skip the check.
+        bool skipDotsDollarsCheck = false;
+
         // If true, UpdateNode::apply ensures that modified elements do not violate depth or DBRef
         // constraints.
         bool validateForStorage = true;
-
-        // Used to determine whether indexes are affected.
-        const UpdateIndexData* indexData = nullptr;
 
         // Indicates whether/what type of oplog entry should be produced by the update executor.
         // If 'logMode' indicates an oplog entry should be produced but the update turns out to be
@@ -108,13 +105,13 @@ public:
     struct ApplyResult {
         static ApplyResult noopResult() {
             ApplyResult applyResult;
-            applyResult.indexesAffected = false;
             applyResult.noop = true;
+            applyResult.containsDotsAndDollarsField = false;
             return applyResult;
         }
 
-        bool indexesAffected = true;
         bool noop = false;
+        bool containsDotsAndDollarsField = false;
 
         // The oplog entry to log. This is only populated if the operation is not considered a
         // noop and if the 'logMode' provided in ApplyParams indicates that an oplog entry should
@@ -129,6 +126,10 @@ public:
     virtual Value serialize() const = 0;
 
     virtual void setCollator(const CollatorInterface* collator){};
+
+    virtual bool getCheckExistenceForDiffInsertOperations() const {
+        return false;
+    }
 
     /**
      * Applies the update to 'applyParams.element'. Returns an ApplyResult specifying whether the

@@ -1,9 +1,8 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({name: "features1", shards: 2, mongos: 1});
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 
 // ---- can't shard system namespaces ----
 assert.commandFailed(s.s0.adminCommand({shardcollection: "test.system.blah", key: {num: 1}}),
@@ -128,4 +127,3 @@ assert.commandWorked(s.s0.adminCommand({flushRouterConfig: 'TestDB'}));
 assert.commandWorked(s.s0.adminCommand({flushRouterConfig: 'TestDB.TestColl'}));
 
 s.stop();
-})();

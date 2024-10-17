@@ -29,10 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -53,6 +60,9 @@ public:
     static const BSONField<std::string> what;
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> details;
+
+    // Name of the chunks collection in the config server.
+    static const NamespaceString ConfigNS;
 
     /**
      * Returns the BSON representation of the entry.
@@ -106,10 +116,10 @@ public:
     }
     void setWhat(const std::string& what);
 
-    const std::string& getNS() const {
+    const NamespaceString& getNS() const {
         return _ns.get();
     }
-    void setNS(const std::string& ns);
+    void setNS(const NamespaceString& ns);
 
     const BSONObj& getDetails() const {
         return _details.get();
@@ -132,7 +142,7 @@ private:
     // (M)  description of the change
     boost::optional<std::string> _what;
     // (O) database or collection this change applies to
-    boost::optional<std::string> _ns;
+    boost::optional<NamespaceString> _ns;
     // (M)  A BSONObj containing extra information about some operations
     boost::optional<BSONObj> _details;
 };

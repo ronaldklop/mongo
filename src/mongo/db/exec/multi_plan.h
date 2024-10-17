@@ -30,40 +30,69 @@
 #pragma once
 
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_enumerator_explain_info.h"
+#include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/plan_ranker_util.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_solution.h"
-#include "mongo/db/record_id.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
+extern FailPoint sleepWhileMultiplanning;
+
 /**
- * This stage outputs its mainChild, and possibly it's backup child
- * and also updates the cache.
+ * A PlanStage for performing runtime plan selection. The caller is expected to construct a
+ * 'MultiPlanStage', add candidate plans using the 'addPlan()' method, and then trigger runtime plan
+ * selection by calling the 'pickBestPlan()' method.
  *
- * Preconditions: Valid RecordId.
- *
- * Owns the query solutions and PlanStage roots for all candidate plans.
+ * Partial result sets for each candidate are maintained in separate buffers. Once plan selection is
+ * complete, the 'doWork()' method can be used to execute the winning plan. This will first unspool
+ * the buffered results associated with the winning plan and then will continue execution of the
+ * winning plan.
  */
 class MultiPlanStage final : public RequiresCollectionStage {
 public:
+    static const char* kStageType;
+
     /**
-     * Takes no ownership.
+     * Callback function which gets called from 'pickBestPlan()'. The 'PlanRankingDecision' and
+     * vector of candidate plans describe the outcome of multi-planning.
+     */
+    using OnPickBestPlan = std::function<void(const CanonicalQuery&,
+                                              MultiPlanStage& mps,
+                                              std::unique_ptr<plan_ranker::PlanRankingDecision>,
+                                              std::vector<plan_ranker::CandidatePlan>&)>;
+
+
+    /**
+     * Constructs a 'MultiPlanStage'.
      *
-     * If 'shouldCache' is true, writes a cache entry for the winning plan to the plan cache
-     * when possible. If 'shouldCache' is false, the plan cache will never be written.
+     * The 'onPickBestPlan()' callback is invoked once plan selection is complete, with parameters
+     * passed that describe the result of multi-planning. This ensures that the 'MultiPlanStage'
+     * does not interact with either the classic or SBE plan caches directly.
      */
     MultiPlanStage(ExpressionContext* expCtx,
-                   const CollectionPtr& collection,
+                   VariantCollectionPtrOrAcquisition collection,
                    CanonicalQuery* cq,
-                   PlanCachingMode cachingMode = PlanCachingMode::AlwaysCache);
+                   OnPickBestPlan onPickBestPlan,
+                   boost::optional<std::string> replanReason = boost::none);
 
     bool isEOF() final;
 
@@ -75,33 +104,38 @@ public:
 
     std::unique_ptr<PlanStageStats> getStats() final;
 
-
     const SpecificStats* getSpecificStats() const final;
 
+    const plan_ranker::CandidatePlan& getCandidate(size_t candidateIdx) const;
+    boost::optional<double> getCandidateScore(size_t candidateIdx) const;
+
     /**
-     * Adsd a new candidate plan to be considered for selection by the MultiPlanStage trial period.
+     * Adds a new candidate plan to be considered for selection by the MultiPlanStage trial period.
      */
     void addPlan(std::unique_ptr<QuerySolution> solution,
                  std::unique_ptr<PlanStage> root,
                  WorkingSet* sharedWs);
 
     /**
-     * Runs all plans added by addPlan, ranks them, and picks a best.
-     * All further calls to work(...) will return results from the best plan.
+     * Runs all plans added by addPlan(), ranks them, and picks a best plan. All further calls to
+     * doWork() will return results from the best plan.
      *
-     * If 'yieldPolicy' is non-NULL, then all locks may be yielded in between round-robin
-     * works of the candidate plans. By default, 'yieldPolicy' is NULL and no yielding will
-     * take place.
+     * If 'yieldPolicy' is non-null, then all locks may be yielded in between round-robin works of
+     * the candidate plans. By default, 'yieldPolicy' is null and no yielding will take place.
      *
      * Returns a non-OK status if query planning fails. In particular, this function returns
      * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield.
      */
     Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
 
-    /** Return true if a best plan has been chosen  */
+    /**
+     * Returns true if a best plan has been chosen.
+     */
     bool bestPlanChosen() const;
 
-    /** Return the index of the best plan chosen, or boost::none if there is no such plan. */
+    /**
+     * Returns the index of the best plan chosen, or boost::none if there is no such plan.
+     */
     boost::optional<size_t> bestPlanIdx() const;
 
     /**
@@ -118,7 +152,13 @@ public:
      * The MultiPlanStage does not retain ownership of the winning QuerySolution and returns
      * a unique pointer.
      */
-    std::unique_ptr<QuerySolution> bestSolution();
+    std::unique_ptr<QuerySolution> extractBestSolution();
+
+    /**
+     * Returns true if the winning plan reached EOF during its trial period and false otherwise.
+     * Illegal to call if the best plan has not yet been selected.
+     */
+    bool bestSolutionEof() const;
 
     /**
      * Returns true if a backup plan was picked.
@@ -126,12 +166,6 @@ public:
      * Exposed for testing.
      */
     bool hasBackupPlan() const;
-
-    //
-    // Used by explain.
-    //
-
-    static const char* kStageType;
 
 protected:
     void doSaveStateRequiresCollection() final {}
@@ -161,24 +195,44 @@ private:
      */
     void tryYield(PlanYieldPolicy* yieldPolicy);
 
-    static const int kNoSuchPlan = -1;
+    /**
+     * Deletes all children, except for best and backup plans.
+     *
+     * This is necessary to release any resources that rejected plans might have.
+     * For example, if multi-update can be done by scanning several indexes,
+     * it will be slowed down by rejected index scans because of index cursors
+     * that need to be reopeneed after every update.
+     */
+    void removeRejectedPlans();
+    void rejectPlan(size_t planIdx);
+    void switchToBackupPlan();
+    void removeBackupPlan();
 
-    // Describes the cases in which we should write an entry for the winning plan to the plan cache.
-    const PlanCachingMode _cachingMode;
+    static const int kNoSuchPlan = -1;
 
     // The query that we're trying to figure out the best solution to.
     // not owned here
     CanonicalQuery* _query;
 
+    // Callback provided by the caller to invoke, passing the results of the plan selection trial
+    // period.
+    OnPickBestPlan _onPickBestPlan;
+
     // Candidate plans. Each candidate includes a child PlanStage tree and QuerySolution. Ownership
-    // of all QuerySolutions is retained here, and will *not* be tranferred to the PlanExecutor that
-    // wraps this stage. Ownership of the PlanStages will be in PlanStage::_children which maps
+    // of all QuerySolutions is retained here, and will *not* be transferred to the PlanExecutor
+    // that wraps this stage. Ownership of the PlanStages will be in PlanStage::_children which maps
     // one-to-one with _candidates.
     std::vector<plan_ranker::CandidatePlan> _candidates;
+
+    // Rejected plans in saved and detached state.
+    std::vector<std::unique_ptr<PlanStage>> _rejected;
 
     // index into _candidates, of the winner of the plan competition
     // uses -1 / kNoSuchPlan when best plan is not (yet) known
     int _bestPlanIdx;
+
+    // Because best solution may be "extracted", we need to cache best plan score for explain.
+    boost::optional<double> _bestPlanScore;
 
     // index into _candidates, of the backup plan for sort
     // uses -1 / kNoSuchPlan when best plan is not (yet) known

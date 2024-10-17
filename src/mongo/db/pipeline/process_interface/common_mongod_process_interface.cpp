@@ -27,95 +27,101 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/process_interface/common_mongod_process_interface.h"
 
+#include <absl/container/flat_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <limits>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/catalog/list_indexes.h"
-#include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/fill_locker_info.h"
+#include "mongo/db/concurrency/flow_control_ticketholder.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/initialize_auto_get_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/pipeline/search/search_helper.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/sbe_plan_cache.h"
 #include "mongo/db/repl/primary_only_service.h"
-#include "mongo/db/repl/speculative_majority_read_info.h"
-#include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/s/transaction_coordinator_curop.h"
 #include "mongo/db/s/transaction_coordinator_worker_curop_repository.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/stats/storage_stats.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/transaction_history_iterator.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant_resource_yielder.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/query/document_source_merge_cursors.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/analyze_shard_key_role.h"
+#include "mongo/s/query_analysis_sample_tracker.h"
+#include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
-
 namespace {
-
-class MongoDResourceYielder : public ResourceYielder {
-public:
-    void yield(OperationContext* opCtx) override {
-        // We're about to block. Check back in the session so that it's available to other
-        // threads. Note that we may block on a request to _ourselves_, meaning that we may have to
-        // wait for another thread which will use the same session. This step is necessary
-        // to prevent deadlocks.
-
-        Session* const session = OperationContextSession::get(opCtx);
-        if (session) {
-            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-                txnParticipant.stashTransactionResources(opCtx);
-            }
-
-            MongoDOperationContextSession::checkIn(opCtx);
-        }
-        _yielded = (session != nullptr);
-    }
-
-    void unyield(OperationContext* opCtx) override {
-        if (_yielded) {
-            // This may block on a sub-operation on this node finishing. It's possible that while
-            // blocked on the network layer, another shard could have responded, theoretically
-            // unblocking this thread of execution. However, we must wait until the child operation
-            // on this shard finishes so we can get the session back. This may limit the throughput
-            // of the operation, but it's correct.
-            MongoDOperationContextSession::checkOut(opCtx);
-
-            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-                // Assumes this is only called from the 'aggregate' or 'getMore' commands.  The code
-                // which relies on this parameter does not distinguish/care about the difference so
-                // we simply always pass 'aggregate'.
-                txnParticipant.unstashTransactionResources(opCtx, "aggregate");
-            }
-        }
-    }
-
-private:
-    bool _yielded = false;
-};
 
 // Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
 // of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
@@ -135,12 +141,75 @@ bool keyPatternNamesExactPaths(const BSONObj& keyPattern,
     return nFieldsMatched == uniqueKeyPaths.size();
 }
 
-bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                       const IndexCatalogEntry* index,
-                       const std::set<FieldPath>& uniqueKeyPaths) {
-    return (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
-            keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
-            CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
+MongoProcessInterface::SupportingUniqueIndex supportsUniqueKey(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const IndexCatalogEntry* index,
+    const std::set<FieldPath>& uniqueKeyPaths) {
+    bool supports =
+        (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
+         keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
+         CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
+    if (!supports) {
+        return MongoProcessInterface::SupportingUniqueIndex::None;
+    }
+    return index->descriptor()->isSparse()
+        ? MongoProcessInterface::SupportingUniqueIndex::NotNullish
+        : MongoProcessInterface::SupportingUniqueIndex::Full;
+}
+
+// Proactively assert that this operation can safely write before hitting an assertion in the
+// storage engine. We can safely write if we are enforcing prepare conflicts by blocking or if we
+// are ignoring prepare conflicts and explicitly allowing writes. Ignoring prepare conflicts
+// without allowing writes will cause this operation to fail in the storage engine.
+void assertIgnorePrepareConflictsBehavior(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    tassert(5996900,
+            "Expected operation to either be blocking on prepare conflicts or ignoring prepare "
+            "conflicts and allowing writes",
+            shard_role_details::getRecoveryUnit(expCtx->opCtx)->getPrepareConflictBehavior() !=
+                PrepareConflictBehavior::kIgnoreConflicts);
+}
+
+/**
+ * Returns all documents from _mdb_catalog along with a sorted list of all
+ * <db>.system.views namespaces found.
+ */
+void listDurableCatalog(OperationContext* opCtx,
+                        StringData shardName,
+                        std::deque<BSONObj>* docs,
+                        std::vector<NamespaceStringOrUUID>* systemViewsNamespaces) {
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    auto rs = durableCatalog->getRecordStore();
+    if (!rs) {
+        return;
+    }
+
+    auto cursor = rs->getCursor(opCtx);
+    while (auto record = cursor->next()) {
+        BSONObj obj = record->data.releaseToBson();
+
+        // For backwards compatibility where older version have a written feature document.
+        // See SERVER-57125.
+        if (DurableCatalog::isFeatureDocument(obj)) {
+            continue;
+        }
+
+        NamespaceString ns(NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+            obj.getStringField("ns")));
+        if (ns.isSystemDotViews()) {
+            systemViewsNamespaces->push_back(ns);
+        }
+
+        BSONObjBuilder builder;
+        builder.append(
+            "db", DatabaseNameUtil::serialize(ns.dbName(), SerializationContext::stateDefault()));
+        builder.append("name", ns.coll());
+        builder.append("type", "collection");
+        if (!shardName.empty()) {
+            builder.append("shard", shardName);
+        }
+        builder.appendElements(obj);
+        docs->push_back(builder.obj());
+    }
 }
 
 }  // namespace
@@ -156,21 +225,19 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
                                                                   const NamespaceString& ns,
                                                                   StringData host,
                                                                   bool addShardName) {
-    AutoGetCollectionForReadCommandMaybeLockFree collection(opCtx, ns);
+    AutoGetCollectionForReadMaybeLockFree collection(opCtx, ns);
 
     std::vector<Document> indexStats;
     if (!collection) {
-        LOGV2_DEBUG(23881,
-                    2,
-                    "Collection not found on index stats retrieval: {ns_ns}",
-                    "ns_ns"_attr = ns.ns());
+        LOGV2_DEBUG(
+            23881, 2, "Collection not found on index stats retrieval: {ns_ns}", "ns_ns"_attr = ns);
         return indexStats;
     }
 
-    auto indexStatsMap =
-        CollectionIndexUsageTrackerDecoration::get(collection->getSharedDecorations())
+    const auto& indexStatsMap =
+        CollectionIndexUsageTrackerDecoration::get(collection.getCollection().get())
             .getUsageStats();
-    for (auto&& indexStatsMapIter : *indexStatsMap) {
+    for (auto&& indexStatsMapIter : indexStatsMap) {
         auto indexName = indexStatsMapIter.first;
         auto stats = indexStatsMapIter.second;
         MutableDocument doc;
@@ -187,21 +254,15 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
         auto idxCatalog = collection->getIndexCatalog();
         auto idx = idxCatalog->findIndexByName(opCtx,
                                                indexName,
-                                               /* includeUnfinishedIndexes */ true);
+                                               IndexCatalog::InclusionPolicy::kReady |
+                                                   IndexCatalog::InclusionPolicy::kUnfinished);
         uassert(ErrorCodes::IndexNotFound,
                 "Could not find entry in IndexCatalog for index " + indexName,
                 idx);
         auto entry = idxCatalog->getEntry(idx);
         doc["spec"] = Value(idx->infoObj());
 
-        // Not all indexes in the CollectionIndexUsageTracker may be visible or consistent with our
-        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
-        // asserts that the index's in-memory state is consistent with our snapshot.
-        if (!entry->isPresentInMySnapshot(opCtx)) {
-            continue;
-        }
-
-        if (!entry->isReadyInMySnapshot(opCtx)) {
+        if (!entry->isReady()) {
             doc["building"] = Value(true);
         }
 
@@ -210,18 +271,155 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
     return indexStats;
 }
 
+std::deque<BSONObj> CommonMongodProcessInterface::listCatalog(OperationContext* opCtx) const {
+    while (true) {
+        std::deque<BSONObj> docs;
+        std::vector<NamespaceStringOrUUID> systemViewsNamespaces;
+        {
+            Lock::GlobalLock globalLock(opCtx, MODE_IS);
+            listDurableCatalog(opCtx, getShardName(opCtx), &docs, &systemViewsNamespaces);
+        }
+
+        if (systemViewsNamespaces.empty()) {
+            return docs;
+        }
+
+        // Clear 'docs' because we will read _mdb_catalog again using a consistent snapshot for all
+        // the system.views collections.
+        docs.clear();
+
+        // We want to read all the system.views as well as _mdb_catalog (again) using a consistent
+        // snapshot.
+        AutoGetCollectionForReadCommandMaybeLockFree collLock(
+            opCtx,
+            systemViewsNamespaces.front(),
+            AutoGetCollection::Options{}.secondaryNssOrUUIDs(++systemViewsNamespaces.cbegin(),
+                                                             systemViewsNamespaces.cend()),
+            AutoStatsTracker::LogMode::kUpdateTopAndCurOp);
+
+        // If the primary collection is not available, it means the information from parsing
+        // _mdb_catalog is no longer valid. Therefore, we restart this process from the top.
+        if (!collLock.getCollection()) {
+            continue;
+        }
+
+        // Read _mdb_catalog again using the same snapshot set up by our collection(s) lock helper.
+        // If _mdb_catalog contains a different set of system.views namespaces from the first time
+        // we read it, we should discard this set of results and retry from the top (with the
+        // global read lock) of this loop.
+        std::vector<NamespaceStringOrUUID> systemViewsNamespacesFromSecondCatalogRead;
+        listDurableCatalog(
+            opCtx, getShardName(opCtx), &docs, &systemViewsNamespacesFromSecondCatalogRead);
+        if (!std::equal(systemViewsNamespaces.cbegin(),
+                        systemViewsNamespaces.cend(),
+                        systemViewsNamespacesFromSecondCatalogRead.cbegin(),
+                        [](const auto& lhs, const auto& rhs) { return lhs.nss() == rhs.nss(); })) {
+            continue;
+        }
+
+        for (const auto& svns : systemViewsNamespaces) {
+            // Hold reference to the catalog for collection lookup without locks to be safe.
+            auto catalog = CollectionCatalog::get(opCtx);
+            auto collection = catalog->lookupCollectionByNamespace(opCtx, svns.nss());
+            if (!collection) {
+                continue;
+            }
+
+            auto cursor = collection->getCursor(opCtx);
+            while (auto record = cursor->next()) {
+                BSONObj obj = record->data.releaseToBson();
+
+                NamespaceString ns(
+                    NamespaceStringUtil::deserialize(svns.nss().tenantId(),
+                                                     obj.getStringField("_id"),
+                                                     SerializationContext::stateDefault()));
+                NamespaceString viewOnNs(
+                    NamespaceStringUtil::deserialize(ns.dbName(), obj.getStringField("viewOn")));
+
+                BSONObjBuilder builder;
+                builder.append(
+                    "db",
+                    DatabaseNameUtil::serialize(ns.dbName(), SerializationContext::stateDefault()));
+                builder.append("name", ns.coll());
+                if (viewOnNs.isTimeseriesBucketsCollection()) {
+                    builder.append("type", "timeseries");
+                } else {
+                    builder.append("type", "view");
+                }
+                if (auto shardName = getShardName(opCtx); !shardName.empty()) {
+                    builder.append("shard", shardName);
+                }
+                builder.appendAs(obj["_id"], "ns");
+                builder.appendElements(obj);
+                docs.push_back(builder.obj());
+            }
+        }
+
+        return docs;
+    }
+}
+
+boost::optional<BSONObj> CommonMongodProcessInterface::getCatalogEntry(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    const boost::optional<UUID>& collUUID) const {
+
+    // Perform an aquisition. This will verify that the collection still exists at the given
+    // read concern. If it doesn't and the aggregation has specified a UUID then this acquisition
+    // will fail.
+    auto acquisition =
+        acquireCollectionMaybeLockFree(opCtx,
+                                       CollectionAcquisitionRequest::fromOpCtx(
+                                           opCtx, ns, AcquisitionPrerequisites::kRead, collUUID));
+
+    if (!acquisition.exists()) {
+        return boost::none;
+    }
+
+    auto obj = DurableCatalog::get(opCtx)->getCatalogEntry(
+        opCtx, acquisition.getCollectionPtr()->getCatalogId());
+
+    BSONObjBuilder builder;
+    builder.append("db",
+                   DatabaseNameUtil::serialize(ns.dbName(), SerializationContext::stateDefault()));
+    builder.append("name", ns.coll());
+    builder.append("type", "collection");
+    if (auto shardName = getShardName(opCtx); !shardName.empty()) {
+        builder.append("shard", shardName);
+    }
+    builder.appendElements(obj);
+
+    return builder.obj();
+}
+
 void CommonMongodProcessInterface::appendLatencyStats(OperationContext* opCtx,
                                                       const NamespaceString& nss,
                                                       bool includeHistograms,
                                                       BSONObjBuilder* builder) const {
-    Top::get(opCtx->getServiceContext()).appendLatencyStats(nss, includeHistograms, builder);
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto view = catalog->lookupView(opCtx, nss);
+    if (!view) {
+        AutoGetCollectionForRead collection(opCtx, nss);
+        bool redactForQE =
+            (collection && collection->getCollectionOptions().encryptedFieldConfig) ||
+            nss.isFLE2StateCollection();
+        if (!redactForQE) {
+            Top::get(opCtx->getServiceContext())
+                .appendLatencyStats(nss, includeHistograms, builder);
+        }
+    } else {
+        Top::get(opCtx->getServiceContext()).appendLatencyStats(nss, includeHistograms, builder);
+    }
 }
 
-Status CommonMongodProcessInterface::appendStorageStats(OperationContext* opCtx,
-                                                        const NamespaceString& nss,
-                                                        const StorageStatsSpec& spec,
-                                                        BSONObjBuilder* builder) const {
-    return appendCollectionStorageStats(opCtx, nss, spec, builder);
+Status CommonMongodProcessInterface::appendStorageStats(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    const StorageStatsSpec& spec,
+    BSONObjBuilder* builder,
+    const boost::optional<BSONObj>& filterObj) const {
+    return appendCollectionStorageStats(
+        expCtx->opCtx, nss, spec, expCtx->serializationCtxt, builder, filterObj);
 }
 
 Status CommonMongodProcessInterface::appendRecordCount(OperationContext* opCtx,
@@ -230,87 +428,202 @@ Status CommonMongodProcessInterface::appendRecordCount(OperationContext* opCtx,
     return appendCollectionRecordCount(opCtx, nss, builder);
 }
 
+void CommonMongodProcessInterface::appendOperationStats(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
+                                                        BSONObjBuilder* builder) const {
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto view = catalog->lookupView(opCtx, nss);
+    if (!view) {
+        AutoGetCollectionForRead collection(opCtx, nss);
+        bool redactForQE =
+            (collection && collection->getCollectionOptions().encryptedFieldConfig) ||
+            nss.isFLE2StateCollection();
+        if (!redactForQE) {
+            Top::get(opCtx->getServiceContext()).appendOperationStats(nss, builder);
+        }
+    } else {
+        Top::get(opCtx->getServiceContext()).appendOperationStats(nss, builder);
+    }
+}
+
 Status CommonMongodProcessInterface::appendQueryExecStats(OperationContext* opCtx,
                                                           const NamespaceString& nss,
                                                           BSONObjBuilder* builder) const {
     AutoGetCollectionForReadCommand collection(opCtx, nss);
-
-    if (!collection.getDb()) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Database [" << nss.db().toString() << "] not found."};
-    }
-
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection [" << nss.toString() << "] not found."};
+                str::stream() << "Collection [" << nss.toStringForErrorMsg() << "] not found."};
     }
 
-    auto collectionScanStats =
-        CollectionIndexUsageTrackerDecoration::get(collection->getSharedDecorations())
-            .getCollectionScanStats();
+    bool redactForQE =
+        collection->getCollectionOptions().encryptedFieldConfig || nss.isFLE2StateCollection();
+    if (!redactForQE) {
+        auto collectionScanStats =
+            CollectionIndexUsageTrackerDecoration::get(collection.getCollection().get())
+                .getCollectionScanStats();
 
-    dassert(collectionScanStats.collectionScans <=
-            static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
-    dassert(collectionScanStats.collectionScansNonTailable <=
-            static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
-    builder->append("queryExecStats",
-                    BSON("collectionScans" << BSON(
-                             "total" << static_cast<long long>(collectionScanStats.collectionScans)
-                                     << "nonTailable"
-                                     << static_cast<long long>(
-                                            collectionScanStats.collectionScansNonTailable))));
-
+        dassert(collectionScanStats.collectionScans <=
+                static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
+        dassert(collectionScanStats.collectionScansNonTailable <=
+                static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
+        builder->append(
+            "queryExecStats",
+            BSON("collectionScans"
+                 << BSON("total" << static_cast<long long>(collectionScanStats.collectionScans)
+                                 << "nonTailable"
+                                 << static_cast<long long>(
+                                        collectionScanStats.collectionScansNonTailable))));
+    }
     return Status::OK();
+}
+
+BSONObj CommonMongodProcessInterface::getCollectionOptionsLocally(OperationContext* opCtx,
+                                                                  const NamespaceString& nss) {
+    auto acquisition =
+        acquireCollectionOrViewMaybeLockFree(opCtx,
+                                             CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                                 opCtx,
+                                                 nss,
+                                                 AcquisitionPrerequisites::OperationType::kRead,
+                                                 AcquisitionPrerequisites::ViewMode::kCanBeView));
+
+    if (auto& collectionPtr = acquisition.getCollectionPtr(); collectionPtr) {
+        return collectionPtr->getCollectionOptions().toBSON();
+    }
+
+    if (acquisition.isView()) {
+        const auto view = acquisition.getView().getViewDefinition();
+        if (view.timeseries()) {
+            return getCollectionOptionsLocally(opCtx, nss.makeTimeseriesBucketsNamespace());
+        }
+        BSONObjBuilder bob;
+        bob.append("viewOn", view.viewOn().coll());
+        bob.append("pipeline", view.pipeline());
+        if (view.defaultCollator()) {
+            bob.append("collation", view.defaultCollator()->getSpec().toBSON());
+        }
+        return bob.obj();
+    }
+
+    return {};
 }
 
 BSONObj CommonMongodProcessInterface::getCollectionOptions(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand collection(opCtx, nss);
-    BSONObj collectionOptions = {};
-    if (!collection.getDb()) {
-        return collectionOptions;
-    }
-    if (!collection) {
-        return collectionOptions;
-    }
+    return getCollectionOptionsLocally(opCtx, nss);
+}
 
-    collectionOptions = DurableCatalog::get(opCtx)
-                            ->getCollectionOptions(opCtx, collection->getCatalogId())
-                            .toBSON();
-    return collectionOptions;
+query_shape::CollectionType CommonMongodProcessInterface::getCollectionTypeLocally(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollectionOrViewMaybeLockFree(opCtx,
+                                                CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                                    opCtx,
+                                                    nss,
+                                                    AcquisitionPrerequisites::OperationType::kRead,
+                                                    AcquisitionPrerequisites::ViewMode::kCanBeView))
+        .getCollectionType();
+}
+
+query_shape::CollectionType CommonMongodProcessInterface::getCollectionType(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    return getCollectionTypeLocally(opCtx, nss);
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(Pipeline* ownedPipeline) {
+CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(
+    Pipeline* ownedPipeline, boost::optional<const AggregateCommandRequest&> aggRequest) {
     auto expCtx = ownedPipeline->getContext();
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                         PipelineDeleter(expCtx->opCtx));
 
-    invariant(pipeline->getSources().empty() ||
-              !dynamic_cast<DocumentSourceCursor*>(pipeline->getSources().front().get()));
+    Pipeline::SourceContainer& sources = pipeline->getSources();
+    boost::optional<DocumentSource*> firstStage =
+        sources.empty() ? boost::optional<DocumentSource*>{} : sources.front().get();
+    invariant(!firstStage || !dynamic_cast<DocumentSourceCursor*>(*firstStage));
 
-    boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> autoColl;
-    const NamespaceStringOrUUID nsOrUUID = expCtx->uuid
-        ? NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid}
-        : expCtx->ns;
-    autoColl.emplace(expCtx->opCtx,
-                     nsOrUUID,
-                     AutoGetCollectionViewMode::kViewsForbidden,
-                     Date_t::max(),
-                     AutoStatsTracker::LogMode::kUpdateTop);
+    bool skipRequiresInputDocSourceCheck =
+        PipelineD::isSearchPresentAndEligibleForSbe(pipeline.get());
 
+    if (!skipRequiresInputDocSourceCheck && firstStage &&
+        !(*firstStage)->constraints().requiresInputDocSource) {
+        // There's no need to attach a cursor here.
+        search_helpers::prepareSearchForNestedPipelineLegacyExecutor(pipeline.get());
+        return pipeline;
+    }
+
+    if (expCtx->eligibleForSampling()) {
+        if (auto sampleId = analyze_shard_key::tryGenerateSampleId(
+                expCtx->opCtx, expCtx->ns, analyze_shard_key::SampledCommandNameEnum::kAggregate)) {
+            auto [_, letParameters] =
+                expCtx->variablesParseState.transitionalCompatibilitySerialize(expCtx->variables);
+            analyze_shard_key::QueryAnalysisWriter::get(expCtx->opCtx)
+                ->addAggregateQuery(*sampleId,
+                                    expCtx->ns,
+                                    pipeline->getInitialQuery(),
+                                    expCtx->getCollatorBSON(),
+                                    letParameters)
+                .getAsync([](auto) {});
+        }
+    }
+
+    // Reparse 'pipeline' to discover whether there are secondary namespaces that we need to lock
+    // when constructing our query executor.
+    auto lpp = LiteParsedPipeline(expCtx->ns, pipeline->serializeToBson());
+    std::vector<NamespaceStringOrUUID> secondaryNamespaces = lpp.getForeignExecutionNamespaces();
+    auto* opCtx = expCtx->opCtx;
+
+    boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> autoColl = boost::none;
+    auto initAutoGetCallback = [&]() {
+        autoColl.emplace(opCtx,
+                         expCtx->ns,
+                         AutoGetCollection::Options{}.secondaryNssOrUUIDs(
+                             secondaryNamespaces.cbegin(), secondaryNamespaces.cend()),
+                         AutoStatsTracker::LogMode::kUpdateTop);
+    };
+
+    bool isAnySecondaryCollectionNotLocal =
+        intializeAutoGet(opCtx, expCtx->ns, secondaryNamespaces, initAutoGetCallback);
+
+    tassert(8322002,
+            "Should have initialized AutoGet* after calling 'initializeAutoGet'",
+            autoColl.has_value());
+    uassert(ErrorCodes::NamespaceNotFound,
+            fmt::format("collection '{}' does not match the expected uuid",
+                        expCtx->ns.toStringForErrorMsg()),
+            !expCtx->uuid ||
+                (autoColl->getCollection() && autoColl->getCollection()->uuid() == expCtx->uuid));
+
+    MultipleCollectionAccessor holder{expCtx->opCtx,
+                                      &autoColl->getCollection(),
+                                      autoColl->getNss(),
+                                      autoColl->isAnySecondaryNamespaceAView() ||
+                                          isAnySecondaryCollectionNotLocal,
+                                      secondaryNamespaces};
+    auto resolvedAggRequest = aggRequest ? &aggRequest.get() : nullptr;
     PipelineD::buildAndAttachInnerQueryExecutorToPipeline(
-        autoColl->getCollection(), expCtx->ns, nullptr, pipeline.get());
+        holder, expCtx->ns, resolvedAggRequest, pipeline.get());
 
     return pipeline;
 }
 
 std::string CommonMongodProcessInterface::getShardName(OperationContext* opCtx) const {
-    if (ShardingState::get(opCtx)->enabled()) {
-        return ShardingState::get(opCtx)->shardId().toString();
+    if (auto shardId = getShardId(opCtx)) {
+        return shardId->toString();
     }
 
     return std::string();
+}
+
+boost::optional<ShardId> CommonMongodProcessInterface::getShardId(OperationContext* opCtx) const {
+    if (ShardingState::get(opCtx)->enabled()) {
+        return ShardingState::get(opCtx)->shardId();
+    }
+
+    return {};
+}
+
+bool CommonMongodProcessInterface::inShardedEnvironment(OperationContext* opCtx) const {
+    return ShardingState::get(opCtx)->enabled();
 }
 
 std::vector<GenericCursor> CommonMongodProcessInterface::getIdleCursors(
@@ -318,33 +631,27 @@ std::vector<GenericCursor> CommonMongodProcessInterface::getIdleCursors(
     return CursorManager::get(expCtx->opCtx)->getIdleCursors(expCtx->opCtx, userMode);
 }
 
-boost::optional<Document> CommonMongodProcessInterface::lookupSingleDocument(
+boost::optional<Document> CommonMongodProcessInterface::doLookupSingleDocument(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
     UUID collectionUUID,
     const Document& documentKey,
-    boost::optional<BSONObj> readConcern,
-    bool allowSpeculativeMajorityRead) {
-    invariant(!readConcern);  // We don't currently support a read concern on mongod - it's only
-                              // expected to be necessary on mongos.
-    invariant(!allowSpeculativeMajorityRead);  // We don't expect 'allowSpeculativeMajorityRead' on
-                                               // mongod - it's only expected to be necessary on
-                                               // mongos.
-
+    MakePipelineOptions opts) {
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     try {
         // Be sure to do the lookup using the collection default collation
         auto foreignExpCtx = expCtx->copyWith(
             nss,
             collectionUUID,
-            _getCollectionDefaultCollator(expCtx->opCtx, nss.db(), collectionUUID));
-        // When looking up on a mongoD, we only ever want to read from the local collection. By
-        // default, makePipeline will attach a cursor source which may read from remote if the
-        // collection is sharded, so we configure it to not allow that here.
-        MakePipelineOptions opts;
-        opts.allowTargetingShards = false;
+            _getCollectionDefaultCollator(expCtx->opCtx, nss.dbName(), collectionUUID));
+
+        // If we are here, we are either executing the pipeline normally or running in one of the
+        // execution stat explain verbosities. In either case, we disable explain on the foreign
+        // context so that we actually retrieve the document.
+        foreignExpCtx->explain = boost::none;
         pipeline = Pipeline::makePipeline({BSON("$match" << documentKey)}, foreignExpCtx, opts);
-    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+        LOGV2_DEBUG(6726700, 1, "Namespace not found while looking up document", "error"_attr = ex);
         return boost::none;
     }
 
@@ -354,22 +661,6 @@ boost::optional<Document> CommonMongodProcessInterface::lookupSingleDocument(
                   str::stream() << "found more than one document with document key "
                                 << documentKey.toString() << " [" << lookedUpDocument->toString()
                                 << ", " << next->toString() << "]");
-    }
-
-    // Set the speculative read timestamp appropriately after we do a document lookup locally. We
-    // set the speculative read timestamp based on the timestamp used by the transaction.
-    repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
-        repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
-    if (speculativeMajorityReadInfo.isSpeculativeRead()) {
-        // Speculative majority reads are required to use the 'kNoOverlap' read source.
-        // Storage engine operations require at least Global IS.
-        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
-        invariant(expCtx->opCtx->recoveryUnit()->getTimestampReadSource() ==
-                  RecoveryUnit::ReadSource::kNoOverlap);
-        boost::optional<Timestamp> readTs =
-            expCtx->opCtx->recoveryUnit()->getPointInTimeReadTimestamp(expCtx->opCtx);
-        invariant(readTs);
-        speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(*readTs);
     }
 
     return lookedUpDocument;
@@ -407,85 +698,117 @@ BackupCursorExtendState CommonMongodProcessInterface::extendBackupCursor(
 
 std::vector<BSONObj> CommonMongodProcessInterface::getMatchingPlanCacheEntryStats(
     OperationContext* opCtx, const NamespaceString& nss, const MatchExpression* matchExp) const {
-    const auto serializer = [](const PlanCacheEntry& entry) {
+    const auto serializer = [](const auto& key, const auto& entry) {
         BSONObjBuilder out;
         Explain::planCacheEntryToBSON(entry, &out);
+        if (auto querySettings = key.querySettings().toBSON(); !querySettings.isEmpty()) {
+            out.append("querySettings"_sd, querySettings);
+        }
         return out.obj();
     };
 
     const auto predicate = [&matchExp](const BSONObj& obj) {
+        if (obj.hasField("securityLevel")) {
+            return false;
+        }
         return !matchExp ? true : matchExp->matchesBSON(obj);
     };
 
     AutoGetCollection collection(opCtx, nss, MODE_IS);
-    uassert(
-        50933, str::stream() << "collection '" << nss.toString() << "' does not exist", collection);
+    uassert(50933,
+            str::stream() << "collection '" << nss.toStringForErrorMsg() << "' does not exist",
+            collection);
 
-    const auto planCache = CollectionQueryInfo::get(collection.getCollection()).getPlanCache();
+    const auto& collQueryInfo = CollectionQueryInfo::get(collection.getCollection());
+    const auto planCache = collQueryInfo.getPlanCache();
     invariant(planCache);
 
-    return planCache->getMatchingStats(serializer, predicate);
+    auto planCacheEntries =
+        planCache->getMatchingStats({} /* cacheKeyFilterFunc */, serializer, predicate);
+
+    // Retrieve plan cache entries from the SBE plan cache.
+    const auto cacheKeyFilter = [uuid = collection->uuid(),
+                                 collVersion = collQueryInfo.getPlanCacheInvalidatorVersion()](
+                                    const sbe::PlanCacheKey& key) {
+        // Only fetch plan cache entries with keys matching given UUID and collectionVersion.
+        return uuid == key.getMainCollectionState().uuid &&
+            collVersion == key.getMainCollectionState().version;
+    };
+
+    auto planCacheEntriesSBE =
+        sbe::getPlanCache(opCtx).getMatchingStats(cacheKeyFilter, serializer, predicate);
+
+    planCacheEntries.insert(
+        planCacheEntries.end(), planCacheEntriesSBE.begin(), planCacheEntriesSBE.end());
+
+
+    return planCacheEntries;
 }
 
-bool CommonMongodProcessInterface::fieldsHaveSupportingUniqueIndex(
+MongoProcessInterface::SupportingUniqueIndex
+CommonMongodProcessInterface::fieldsHaveSupportingUniqueIndex(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
     const std::set<FieldPath>& fieldPaths) const {
     auto* opCtx = expCtx->opCtx;
-    // We purposefully avoid a helper like AutoGetCollection here because we don't want to check the
-    // db version or do anything else. We simply want to protect against concurrent modifications to
-    // the catalog.
-    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-    Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto db = databaseHolder->getDb(opCtx, nss.db());
-    auto collection =
-        db ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) : nullptr;
-    if (!collection) {
-        return fieldPaths == std::set<FieldPath>{"_id"};
-    }
 
-    auto indexIterator = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
+    // This method just checks metadata of the collection, which should be consistent across all
+    // shards therefore it's safe to ignore placement concern when locking the collection for read
+    // and acquiring a reference to it.
+    const auto collection = acquireCollectionMaybeLockFree(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     AcquisitionPrerequisites::kPretendUnsharded,
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead));
+    if (!collection.exists()) {
+        return fieldPaths == std::set<FieldPath>{"_id"} ? SupportingUniqueIndex::Full
+                                                        : SupportingUniqueIndex::None;
+    }
+    auto indexIterator = collection.getCollectionPtr()->getIndexCatalog()->getIndexIterator(
+        opCtx, IndexCatalog::InclusionPolicy::kReady);
+    auto result = SupportingUniqueIndex::None;
     while (indexIterator->more()) {
         const IndexCatalogEntry* entry = indexIterator->next();
-        if (supportsUniqueKey(expCtx, entry, fieldPaths)) {
-            return true;
+        result = std::max(result, supportsUniqueKey(expCtx, entry, fieldPaths));
+        if (result == SupportingUniqueIndex::Full) {
+            break;
         }
     }
-    return false;
+    return result;
 }
 
 BSONObj CommonMongodProcessInterface::_reportCurrentOpForClient(
-    OperationContext* opCtx,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Client* client,
-    CurrentOpTruncateMode truncateOps,
-    CurrentOpBacktraceMode backtraceMode) const {
+    CurrentOpTruncateMode truncateOps) const {
     BSONObjBuilder builder;
 
-    CurOp::reportCurrentOpForClient(opCtx,
-                                    client,
-                                    (truncateOps == CurrentOpTruncateMode::kTruncateOps),
-                                    (backtraceMode == CurrentOpBacktraceMode::kIncludeBacktrace),
-                                    &builder);
+    CurOp::reportCurrentOpForClient(
+        expCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
 
     OperationContext* clientOpCtx = client->getOperationContext();
 
     if (clientOpCtx) {
+        if (CurOp::get(clientOpCtx)->getShouldOmitDiagnosticInformation()) {
+            return builder.obj();
+        }
+
         if (auto txnParticipant = TransactionParticipant::get(clientOpCtx)) {
             txnParticipant.reportUnstashedState(clientOpCtx, &builder);
         }
 
         // Append lock stats before returning.
-        if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo(
-                CurOp::get(*clientOpCtx)->getLockStatsBase())) {
-            fillLockerInfo(*lockerInfo, builder);
-        }
+        auto lockerInfo = shard_role_details::getLocker(clientOpCtx)
+                              ->getLockerInfo(CurOp::get(*clientOpCtx)->getLockStatsBase());
+        fillLockerInfo(lockerInfo, builder);
+
 
         if (auto tcWorkerRepo = getTransactionCoordinatorWorkerCurOpRepository()) {
             tcWorkerRepo->reportState(clientOpCtx, &builder);
         }
 
-        auto flowControlStats = clientOpCtx->lockState()->getFlowControlStats();
+        auto flowControlStats = shard_role_details::getLocker(clientOpCtx)->getFlowControlStats();
         flowControlStats.writeToBuilder(builder);
     }
 
@@ -512,8 +835,7 @@ void CommonMongodProcessInterface::_reportCurrentOpsForIdleSessions(
     OperationContext* opCtx, CurrentOpUserMode userMode, std::vector<BSONObj>* ops) const {
     auto sessionCatalog = SessionCatalog::get(opCtx);
 
-    const bool authEnabled =
-        AuthorizationSession::get(opCtx->getClient())->getAuthorizationManager().isAuthEnabled();
+    const bool authEnabled = AuthorizationManager::get(opCtx->getService())->isAuthEnabled();
 
     // If the user is listing only their own ops, we use makeSessionFilterForAuthenticatedUsers to
     // create a pattern that will match against all authenticated usernames for the current client.
@@ -531,12 +853,19 @@ void CommonMongodProcessInterface::_reportCurrentOpsForIdleSessions(
     });
 }
 
+void CommonMongodProcessInterface::_reportCurrentOpsForQueryAnalysis(
+    OperationContext* opCtx, std::vector<BSONObj>* ops) const {
+    if (analyze_shard_key::supportsPersistingSampledQueries(opCtx)) {
+        analyze_shard_key::QueryAnalysisSampleTracker::get(opCtx).reportForCurrentOp(ops);
+    }
+}
+
 std::unique_ptr<CollatorInterface> CommonMongodProcessInterface::_getCollectionDefaultCollator(
-    OperationContext* opCtx, StringData dbName, UUID collectionUUID) {
+    OperationContext* opCtx, const DatabaseName& dbName, UUID collectionUUID) {
     auto it = _collatorCache.find(collectionUUID);
     if (it == _collatorCache.end()) {
         auto collator = [&]() -> std::unique_ptr<CollatorInterface> {
-            AutoGetCollection autoColl(opCtx, {dbName.toString(), collectionUUID}, MODE_IS);
+            AutoGetCollection autoColl(opCtx, {dbName, collectionUUID}, MODE_IS);
             if (!autoColl.getCollection()) {
                 // This collection doesn't exist, so assume a nullptr default collation
                 return nullptr;
@@ -555,102 +884,47 @@ std::unique_ptr<CollatorInterface> CommonMongodProcessInterface::_getCollectionD
     return collator ? collator->clone() : nullptr;
 }
 
-std::unique_ptr<ResourceYielder> CommonMongodProcessInterface::getResourceYielder() const {
-    return std::make_unique<MongoDResourceYielder>();
-}
-
-
-std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+CommonMongodProcessInterface::DocumentKeyResolutionMetadata
 CommonMongodProcessInterface::ensureFieldsUniqueOrResolveDocumentKey(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     boost::optional<std::set<FieldPath>> fieldPaths,
-    boost::optional<ChunkVersion> targetCollectionVersion,
+    boost::optional<ChunkVersion> targetCollectionPlacementVersion,
     const NamespaceString& outputNs) const {
-    if (targetCollectionVersion) {
-        uassert(51123, "Unexpected target chunk version specified", expCtx->fromMongos);
-        // If mongos has sent us a target shard version, we need to be sure we are prepared to
-        // act as a router which is at least as recent as that mongos.
-        checkRoutingInfoEpochOrThrow(expCtx, outputNs, *targetCollectionVersion);
-    }
+    uassert(51123,
+            "Unexpected target chunk version specified",
+            !targetCollectionPlacementVersion || expCtx->fromRouter);
 
     if (!fieldPaths) {
-        uassert(51124, "Expected fields to be provided from mongos", !expCtx->fromMongos);
-        return {std::set<FieldPath>{"_id"}, targetCollectionVersion};
+        uassert(51124, "Expected fields to be provided from router", !expCtx->fromRouter);
+        return {std::set<FieldPath>{"_id"},
+                targetCollectionPlacementVersion,
+                SupportingUniqueIndex::Full};
     }
 
     // Make sure the 'fields' array has a supporting index. Skip this check if the command is sent
-    // from mongos since the 'fields' check would've happened already.
-    if (!expCtx->fromMongos) {
+    // from router since the 'fields' check would've happened already.
+    auto supportingUniqueIndex = fieldsHaveSupportingUniqueIndex(expCtx, outputNs, *fieldPaths);
+    if (!expCtx->fromRouter) {
         uassert(51183,
                 "Cannot find index to verify that join fields will be unique",
-                fieldsHaveSupportingUniqueIndex(expCtx, outputNs, *fieldPaths));
+                supportingUniqueIndex != SupportingUniqueIndex::None);
     }
-    return {*fieldPaths, targetCollectionVersion};
-}
-
-write_ops::InsertCommandRequest CommonMongodProcessInterface::buildInsertOp(
-    const NamespaceString& nss, std::vector<BSONObj>&& objs, bool bypassDocValidation) {
-    write_ops::InsertCommandRequest insertOp(nss);
-    insertOp.setDocuments(std::move(objs));
-    insertOp.setWriteCommandRequestBase([&] {
-        write_ops::WriteCommandRequestBase wcb;
-        wcb.setOrdered(false);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return insertOp;
-}
-
-write_ops::UpdateCommandRequest CommonMongodProcessInterface::buildUpdateOp(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const NamespaceString& nss,
-    BatchedObjects&& batch,
-    UpsertType upsert,
-    bool multi) {
-    write_ops::UpdateCommandRequest updateOp(nss);
-    updateOp.setUpdates([&] {
-        std::vector<write_ops::UpdateOpEntry> updateEntries;
-        for (auto&& obj : batch) {
-            updateEntries.push_back([&] {
-                write_ops::UpdateOpEntry entry;
-                auto&& [q, u, c] = obj;
-                entry.setQ(std::move(q));
-                entry.setU(std::move(u));
-                entry.setC(std::move(c));
-                entry.setUpsert(upsert != UpsertType::kNone);
-                entry.setUpsertSupplied(
-                    {{entry.getUpsert(), upsert == UpsertType::kInsertSuppliedDoc}});
-                entry.setMulti(multi);
-                return entry;
-            }());
-        }
-        return updateEntries;
-    }());
-    updateOp.setWriteCommandRequestBase([&] {
-        write_ops::WriteCommandRequestBase wcb;
-        wcb.setOrdered(false);
-        wcb.setBypassDocumentValidation(expCtx->bypassDocumentValidation);
-        return wcb;
-    }());
-    auto [constants, letParams] =
-        expCtx->variablesParseState.transitionalCompatibilitySerialize(expCtx->variables);
-    updateOp.setLegacyRuntimeConstants(std::move(constants));
-    if (!letParams.isEmpty()) {
-        updateOp.setLet(std::move(letParams));
-    }
-    return updateOp;
+    return {*fieldPaths, targetCollectionPlacementVersion, supportingUniqueIndex};
 }
 
 BSONObj CommonMongodProcessInterface::_convertRenameToInternalRename(
     OperationContext* opCtx,
-    const BSONObj& renameCommandObj,
+    const NamespaceString& sourceNs,
+    const NamespaceString& targetNs,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
 
     BSONObjBuilder newCmd;
     newCmd.append("internalRenameIfOptionsAndIndexesMatch", 1);
-    newCmd.append("from", renameCommandObj["renameCollection"].String());
-    newCmd.append("to", renameCommandObj["to"].String());
+    newCmd.append("from",
+                  NamespaceStringUtil::serialize(sourceNs, SerializationContext::stateDefault()));
+    newCmd.append("to",
+                  NamespaceStringUtil::serialize(targetNs, SerializationContext::stateDefault()));
     newCmd.append("collectionOptions", originalCollectionOptions);
     BSONArrayBuilder indexArrayBuilder(newCmd.subarrayStart("indexes"));
     for (auto&& index : originalIndexes) {
@@ -658,6 +932,105 @@ BSONObj CommonMongodProcessInterface::_convertRenameToInternalRename(
     }
     indexArrayBuilder.done();
     return newCmd.obj();
+}
+
+void CommonMongodProcessInterface::_handleTimeseriesCreateError(const DBException& ex,
+                                                                OperationContext* opCtx,
+                                                                const NamespaceString& ns,
+                                                                TimeseriesOptions userOpts) {
+    // If we receive a NamespaceExists error for a time-series view that has the same
+    // specification as the time-series view we wanted to create, we should not throw an
+    // error. The user is allowed to overwrite an existing time-series collection when
+    // entering this function.
+
+    // Confirming the error is NamespaceExists
+    if (ex.code() != ErrorCodes::NamespaceExists) {
+        throw;
+    }
+    auto timeseriesOpts = _getTimeseriesOptions(opCtx, ns);
+    // Confirming there is a time-series view in that namespace and the time-series options of the
+    // existing view are the same as expected.
+    if (!timeseriesOpts || !mongo::timeseries::optionsAreEqual(timeseriesOpts.value(), userOpts)) {
+        throw;
+    }
+}
+
+boost::optional<TimeseriesOptions> CommonMongodProcessInterface::_getTimeseriesOptions(
+    OperationContext* opCtx, const NamespaceString& ns) {
+    auto view = CollectionCatalog::get(opCtx)->lookupView(opCtx, ns);
+    if (!view || !view->timeseries()) {
+        return boost::none;
+    }
+    return mongo::timeseries::getTimeseriesOptions(opCtx, ns, true /*convertToBucketsNamespace*/);
+}
+
+void CommonMongodProcessInterface::writeRecordsToRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    RecordStore* rs,
+    std::vector<Record>* records,
+    const std::vector<Timestamp>& ts) const {
+    tassert(5643012, "Attempted to write to record store with nullptr", records);
+    assertIgnorePrepareConflictsBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::writeRecordsToRecordStore", expCtx->ns, [&] {
+        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        auto writeResult = rs->insertRecords(expCtx->opCtx, records, ts);
+        tassert(5643002,
+                str::stream() << "Failed to write to disk because " << writeResult.reason(),
+                writeResult.isOK());
+        wuow.commit();
+    });
+}
+
+std::unique_ptr<TemporaryRecordStore> CommonMongodProcessInterface::createTemporaryRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, KeyFormat keyFormat) const {
+    assertIgnorePrepareConflictsBehavior(expCtx);
+    return expCtx->opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(
+        expCtx->opCtx, keyFormat);
+}
+
+Document CommonMongodProcessInterface::readRecordFromRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs, RecordId rID) const {
+    RecordData possibleRecord;
+    Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
+    auto foundDoc = rs->findRecord(expCtx->opCtx, RecordId(rID), &possibleRecord);
+    tassert(775101, str::stream() << "Could not find document id " << rID, foundDoc);
+    return Document(possibleRecord.toBson());
+}
+
+void CommonMongodProcessInterface::deleteRecordFromRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs, RecordId rID) const {
+    assertIgnorePrepareConflictsBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::deleteFromRecordStore", expCtx->ns, [&] {
+        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        rs->deleteRecord(expCtx->opCtx, rID);
+        wuow.commit();
+    });
+}
+
+void CommonMongodProcessInterface::truncateRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs) const {
+    assertIgnorePrepareConflictsBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::truncateRecordStore", expCtx->ns, [&] {
+        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        auto status = rs->truncate(expCtx->opCtx);
+        tassert(5643000, "Unable to clear record store", status.isOK());
+        wuow.commit();
+    });
+}
+
+boost::optional<Document> CommonMongodProcessInterface::lookupSingleDocumentLocally(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    const Document& documentKey) {
+    AutoGetCollectionForReadMaybeLockFree autoColl(expCtx->opCtx, nss);
+    BSONObj document;
+    if (!Helpers::findById(expCtx->opCtx, nss, documentKey.toBson(), document)) {
+        return boost::none;
+    }
+    return Document(document).getOwned();
 }
 
 }  // namespace mongo

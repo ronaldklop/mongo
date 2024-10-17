@@ -3,9 +3,10 @@
  *
  * https://docs.mongodb.com/v3.0/tutorial/configure-replica-set-tag-sets/
  */
-var TagsTest = function(options) {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
+export var TagsTest = function(options) {
     // Skip db hash check since this test leaves replset partitioned.
     TestData.skipCheckDBHashes = true;
 
@@ -23,9 +24,6 @@ var TagsTest = function(options) {
      */
     this.run = function() {
         var options = this.options;
-
-        load('jstests/replsets/rslib.js');
-
         let nodes = options.nodes;
         var host = getHostName();
         var name = 'tags';
@@ -39,8 +37,10 @@ var TagsTest = function(options) {
         // upgrading some of our nodes to the latest version while performing write operations under
         // different network partition scenarios.
         if (options.setFeatureCompatibilityVersion) {
-            assert.commandWorked(replTest.getPrimary().adminCommand(
-                {setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion}));
+            assert.commandWorked(replTest.getPrimary().adminCommand({
+                setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion,
+                confirm: true
+            }));
         }
 
         for (let i = 1; i < nodes.length; ++i) {
@@ -138,6 +138,7 @@ var TagsTest = function(options) {
         assert.soonNoExcept(() => replTest.nodes[2].adminCommand({replSetStepUp: 1}).ok);
         replTest.waitForState(replTest.nodes[2], ReplSetTest.State.PRIMARY);
         replTest.awaitReplication();
+        replTest.waitForAllNewlyAddedRemovals();
 
         // Create collection to guard against timeouts due to file allocation.
         assert.commandWorked(replTest.getPrimary().getDB('foo').createCollection('bar'));
@@ -168,9 +169,6 @@ var TagsTest = function(options) {
                       ' agree that ' + nodeId + ' (' + replTest.nodes[nodeId].host +
                       ') should be primary.');
 
-            if (options.forceWriteMode) {
-                primary.forceWriteMode(options.forceWriteMode);
-            }
             var writeConcern = {
                 writeConcern: {w: expectedWritableNodesCount, wtimeout: replTest.kDefaultTimeoutMS}
             };
@@ -305,6 +303,15 @@ var TagsTest = function(options) {
         result = assert.writeError(primary.getDB('foo').bar.insert(doc, options));
         assert.neq(null, result.getWriteConcernError());
         assert(result.getWriteConcernError().errInfo.wtimeout);
+
+        jsTestLog('Setting custom write concern via a cluster-wide write concern');
+        assert.commandWorked(primary.adminCommand({
+            setDefaultRWConcern: 1,
+            defaultWriteConcern: {w: "3 and 4", wtimeout: ReplSetTest.kDefaultTimeoutMS}
+        }));
+
+        jsTestLog('Custom write concern "3 and 4" should work');
+        assert.commandWorked(primary.getDB('foo').bar.insert(doc));
 
         replTest.stopSet();
     };

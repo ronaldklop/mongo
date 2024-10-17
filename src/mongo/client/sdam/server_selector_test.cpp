@@ -28,13 +28,30 @@
  */
 #include "mongo/client/sdam/server_selector.h"
 
-#include <boost/optional/optional_io.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <map>
+#include <ratio>
+#include <string>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/client/sdam/server_description_builder.h"
 #include "mongo/client/sdam/topology_description.h"
-#include "mongo/client/sdam/topology_manager.h"
+#include "mongo/client/sdam/topology_state_machine.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo::sdam {
@@ -42,10 +59,15 @@ namespace mongo::sdam {
 class ServerSelectorTestFixture : public SdamTestFixture {
 public:
     static inline const auto clockSource = SystemClockSource::get();
-    static inline const auto sdamConfiguration = SdamConfiguration({{HostAndPort("s0")}});
+
+    const SdamConfiguration sdamConfiguration;
+
+    ServerSelectorTestFixture() : sdamConfiguration(SdamConfiguration({{HostAndPort("s0")}})) {}
 
     static constexpr auto SET_NAME = "set";
     static constexpr int NUM_ITERATIONS = 1000;
+
+    static inline const OID kOidOne{"000000000000000000000001"};
 
     struct TagSets {
         static inline const auto eastProduction = BSON("dc"
@@ -177,6 +199,38 @@ TEST_F(ServerSelectorTestFixture, ShouldThrowOnWireError) {
                        ErrorCodes::IncompatibleServerVersion);
 }
 
+TEST_F(ServerSelectorTestFixture, ShouldNotThrowWireErrorIfOnlyOneServerUnknown) {
+    TopologyStateMachine stateMachine(sdamConfiguration);
+    auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
+    auto primary = ServerDescriptionBuilder()
+                       .withAddress(HostAndPort("s0"))
+                       .withType(ServerType::kRSPrimary)
+                       .withLastUpdateTime(Date_t::now())
+                       .withLastWriteDate(Date_t::now())
+                       .withRtt(Milliseconds{1})
+                       .withSetName("set")
+                       .withHost(HostAndPort("s0"))
+                       .withHost(HostAndPort("s1"))
+                       .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                       .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                       .withElectionId(kOidOne)
+                       .withSetVersion(100)
+                       .instance();
+    stateMachine.onServerDescription(*topologyDescription, primary);
+
+    auto downedServer = ServerDescriptionBuilder().withAddress(HostAndPort("s1")).instance();
+    stateMachine.onServerDescription(*topologyDescription, downedServer);
+
+    ASSERT(topologyDescription->isWireVersionCompatible());
+
+    const auto ninetySeconds = Seconds(90);
+    const auto readPref =
+        ReadPreferenceSetting(ReadPreference::Nearest, TagSets::emptySet, ninetySeconds);
+    auto result = selector.selectServers(topologyDescription, readPref);
+    ASSERT(result);
+    ASSERT_EQ(primary->getAddress(), (*result)[0]->getAddress());
+}
+
 TEST_F(ServerSelectorTestFixture, ShouldReturnNoneIfTopologyUnknown) {
     auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
     ASSERT_EQ(TopologyType::kUnknown, topologyDescription->getType());
@@ -197,9 +251,11 @@ TEST_F(ServerSelectorTestFixture, ShouldBeAbleToSelectWithMaxStalenessFromCloned
                        .withHost(HostAndPort("s0"))
                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                       .withElectionId(kOidOne)
+                       .withSetVersion(100)
                        .instance();
     stateMachine.onServerDescription(*topologyDescription, primary);
-    topologyDescription = TopologyDescription::clone(topologyDescription);
+    topologyDescription = TopologyDescription::clone(*topologyDescription);
 
     const auto ninetySeconds = Seconds(90);
     const auto readPref =
@@ -227,6 +283,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectRandomlyWhenMultipleOptionsAreAvai
                        .withHost(HostAndPort("s3"))
                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                       .withElectionId(kOidOne)
+                       .withSetVersion(100)
                        .instance();
     stateMachine.onServerDescription(*topologyDescription, primary);
 
@@ -282,6 +340,8 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectExcludedHostsNearest) {
                         .withHost(HostAndPort("s3"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s0);
 
@@ -306,6 +366,8 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectExcludedHostsNearest) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(Date_t::now())
                         .withLastWriteDate(Date_t::now())
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s2);
 
@@ -318,6 +380,8 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectExcludedHostsNearest) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(Date_t::now())
                         .withLastWriteDate(Date_t::now())
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s3);
 
@@ -358,6 +422,8 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectWhenPrimaryExcludedAndPrimaryOn
                         .withHost(HostAndPort("s1"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s0);
 
@@ -370,6 +436,8 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectWhenPrimaryExcludedAndPrimaryOn
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(Date_t::now())
                         .withLastWriteDate(Date_t::now())
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s1);
 
@@ -389,6 +457,50 @@ TEST_F(ServerSelectorTestFixture, ShouldNotSelectWhenPrimaryExcludedAndPrimaryOn
     // select either of the nodes.
     ASSERT_FALSE(frequencyInfo[HostAndPort("s0")]);
     ASSERT_FALSE(frequencyInfo[HostAndPort("s1")]);
+}
+
+TEST_F(ServerSelectorTestFixture, ShouldOnlyChooseSecondaryWithHighLatencyPrimary) {
+    TopologyStateMachine stateMachine(sdamConfiguration);
+    auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
+
+    const auto s0 = ServerDescriptionBuilder()
+                        .withAddress(HostAndPort("s0"))
+                        .withType(ServerType::kRSPrimary)
+                        .withLastUpdateTime(Date_t::now())
+                        .withLastWriteDate(Date_t::now())
+                        .withRtt(Milliseconds{1000000})
+                        .withSetName("set")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
+                        .instance();
+    stateMachine.onServerDescription(*topologyDescription, s0);
+
+    const auto s1 = ServerDescriptionBuilder()
+                        .withAddress(HostAndPort("s1"))
+                        .withType(ServerType::kRSSecondary)
+                        .withRtt(Milliseconds{10})
+                        .withSetName("set")
+                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withLastUpdateTime(Date_t::now())
+                        .withLastWriteDate(Date_t::now())
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
+                        .instance();
+    stateMachine.onServerDescription(*topologyDescription, s1);
+
+    auto excludedHosts = std::vector<HostAndPort>();
+    auto server = selector.selectServers(
+        topologyDescription, ReadPreferenceSetting(ReadPreference::Nearest), excludedHosts);
+
+    // Should only select secondary since primary had too much network lag.
+    ASSERT_TRUE(server && !(*server).empty());
+    ASSERT_EQ((*server).size(), 1);
+    ASSERT_EQ((*server)[0]->getType(), ServerType::kRSSecondary);
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
@@ -413,6 +525,8 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(now)
                         .withLastWriteDate(d0)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s0);
 
@@ -426,6 +540,8 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(now)
                         .withLastWriteDate(d1)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s1);
 
@@ -480,6 +596,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
                         .withTag("tag", "primary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s0);
 
@@ -494,6 +612,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
                         .withTag("tag", "secondary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s1);
 
@@ -535,6 +655,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
                         .withTag("tag", "primary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s0);
 
@@ -558,6 +680,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
                         .withTag("tag", "secondary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s1);
 
@@ -572,6 +696,8 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
                         .instance();
     stateMachine.onServerDescription(*topologyDescription, s2);
 
@@ -591,7 +717,9 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByTags) {
     tags = TagSets::eastOrWestProductionSet;
     servers = makeServerDescriptionList();
     selector.filterTags(&servers, tags);
-    ASSERT_EQ(2, servers.size());
+    ASSERT_EQ(1, servers.size());
+    ASSERT_EQ((std::map<std::string, std::string>{{"dc", "east"}, {"usage", "production"}}),
+              servers[0]->getTags());
 
     tags = TagSets::testSet;
     servers = makeServerDescriptionList();
@@ -617,5 +745,77 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByTags) {
     servers = makeServerDescriptionList();
     selector.filterTags(&servers, tags);
     ASSERT_EQ(makeServerDescriptionList().size(), servers.size());
+}
+
+TEST_F(ServerSelectorTestFixture, ShouldIgnoreMinClusterTimeIfNotSatisfiable) {
+    TopologyStateMachine stateMachine(sdamConfiguration);
+    auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
+
+    const auto now = Date_t::now();
+
+    const auto s0 = ServerDescriptionBuilder()
+                        .withAddress(HostAndPort("s0"))
+                        .withType(ServerType::kRSPrimary)
+                        .withRtt(sdamConfiguration.getLocalThreshold())
+                        .withSetName("set")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withLastUpdateTime(now)
+                        .withLastWriteDate(now)
+                        .withTag("tag", "primary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
+                        .withOpTime(repl::OpTime())  // server has smallest possible op time
+                        .instance();
+    stateMachine.onServerDescription(*topologyDescription, s0);
+
+    const auto s1 = ServerDescriptionBuilder()
+                        .withAddress(HostAndPort("s1"))
+                        .withType(ServerType::kRSSecondary)
+                        .withRtt(sdamConfiguration.getLocalThreshold())
+                        .withSetName("set")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                        .withLastUpdateTime(now)
+                        .withLastWriteDate(now - Milliseconds(910000000))
+                        .withTag("tag", "secondary")
+                        .withElectionId(kOidOne)
+                        .withSetVersion(100)
+                        .withOpTime(repl::OpTime())  // server has smallest possible op time
+                        .instance();
+    stateMachine.onServerDescription(*topologyDescription, s1);
+
+    topologyDescription = TopologyDescription::clone(*topologyDescription);
+
+    // Ensure that minClusterTime is ignored if no server can satisfy it
+    auto readPref = ReadPreferenceSetting(ReadPreference::Nearest);
+    readPref.minClusterTime = repl::OpTime::max().getTimestamp();
+    auto result = selector.selectServers(topologyDescription, readPref);
+
+    ASSERT(result);
+    ASSERT_EQ(result->size(), 2);
+
+    // Ensure that tags are still respected if minClusterTime is ignored
+    readPref = ReadPreferenceSetting(ReadPreference::Nearest, TagSets::secondarySet);
+    readPref.minClusterTime = repl::OpTime::max().getTimestamp();
+    result = selector.selectServers(topologyDescription, readPref);
+
+    ASSERT(result);
+    ASSERT_EQ(result->size(), 1);
+    ASSERT_EQ((*result)[0]->getAddress(), s1->getAddress());
+
+    // Ensure that maxStaleness is still respected if minClusterTime is ignored
+    const auto maxStalenessSeconds = Seconds(90);
+    readPref =
+        ReadPreferenceSetting(ReadPreference::Nearest, TagSets::emptySet, maxStalenessSeconds);
+    readPref.minClusterTime = repl::OpTime::max().getTimestamp();
+    result = selector.selectServers(topologyDescription, readPref);
+
+    ASSERT_EQ(result->size(), 1);
+    ASSERT_EQ((*result)[0]->getAddress(), s0->getAddress());
 }
 }  // namespace mongo::sdam

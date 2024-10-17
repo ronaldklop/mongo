@@ -1,7 +1,10 @@
 // This test was designed to reproduce SERVER-31475. It issues sharded aggregations with an error
 // returned from one shard, and a delayed response from another shard.
-(function() {
-"use strict";
+// @tags: [
+//   # TODO (SERVER-88129): Re-enable this test or add an explanation why it is incompatible.
+//   embedded_router_incompatible,
+// ]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2, useBridge: true});
 
@@ -11,8 +14,8 @@ const mongosColl = mongosDB[jsTestName()];
 assert.commandWorked(mongosDB.dropDatabase());
 
 // Enable sharding on the test DB and ensure its primary is st.shard0.shardName.
-assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
-st.ensurePrimaryShard(mongosDB.getName(), st.shard0.shardName);
+assert.commandWorked(
+    mongosDB.adminCommand({enableSharding: mongosDB.getName(), primaryShard: st.shard0.shardName}));
 
 // Shard the test collection on _id.
 assert.commandWorked(
@@ -48,4 +51,3 @@ for (let i = 1; i < 10; ++i) {
 }
 
 st.stop();
-}());

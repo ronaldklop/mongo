@@ -3,17 +3,12 @@
  * or insert state documents for resharding.
  *
  * @tags: [
- *   requires_fcv_49,
- *   requires_find_command,
- *   uses_atclustertime,
+ *   uses_atclustertime
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/discover_topology.js");
-load("jstests/libs/fail_point_util.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest();
 
@@ -57,4 +52,3 @@ reshardingTest.withReshardingInBackground(  //
     });
 
 reshardingTest.teardown();
-})();

@@ -29,7 +29,21 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/index_build_interceptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/resumable_index_builds_gen.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -50,13 +64,9 @@ public:
     ~IndexBuildBlock();
 
     /**
-     * Must be called before the object is destructed if init() has been called.
-     * Cleans up or keeps the temporary tables that are created for an index build.
-     *
-     * Being called in a 'WriteUnitOfWork' has no effect.
+     * Prevent any temporary tables from being dropped when this IndexBuildBlock is destructed.
      */
-    void finalizeTemporaryTables(OperationContext* opCtx,
-                                 TemporaryRecordStore::FinalizationAction action);
+    void keepTemporaryTables();
 
     /**
      * Initializes a new entry for the index in the IndexCatalog.
@@ -66,7 +76,7 @@ public:
      *
      * Must be called from within a `WriteUnitOfWork`
      */
-    Status init(OperationContext* opCtx, Collection* collection);
+    Status init(OperationContext* opCtx, Collection* collection, bool forRecovery);
 
     /**
      * Makes sure that an entry for the index was created at startup in the IndexCatalog. Returns
@@ -99,7 +109,7 @@ public:
      */
     const IndexCatalogEntry* getEntry(OperationContext* opCtx,
                                       const CollectionPtr& collection) const;
-    IndexCatalogEntry* getEntry(OperationContext* opCtx, Collection* collection);
+    IndexCatalogEntry* getWritableEntry(OperationContext* opCtx, Collection* collection);
 
     /**
      * Returns the name of the index managed by this index builder.

@@ -27,17 +27,37 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <string>
+#include <system_error>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/sharding_util.h"
-#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
@@ -57,7 +77,7 @@ const Status kRetryableError{ErrorCodes::HostUnreachable, "RetryableError for te
 
 class ShardingRefresherTest : public ConfigServerTestFixture {
 protected:
-    void setUp() {
+    void setUp() override {
         ConfigServerTestFixture::setUp();
 
         for (const auto& shard : kShards) {
@@ -76,7 +96,7 @@ protected:
 
 TEST_F(ShardingRefresherTest, refresherTwoShardsSucceed) {
     auto opCtx = operationContext();
-    auto nss = NamespaceString("mydb", "mycoll");
+    auto nss = NamespaceString::createNamespaceString_forTest("mydb", "mycoll");
     auto future = launchAsync([&] {
         sharding_util::tellShardsToRefreshCollection(opCtx, kShardIdList, nss, executor());
     });
@@ -89,7 +109,7 @@ TEST_F(ShardingRefresherTest, refresherTwoShardsSucceed) {
 
 TEST_F(ShardingRefresherTest, refresherTwoShardsFirstErrors) {
     auto opCtx = operationContext();
-    auto nss = NamespaceString("mydb", "mycoll");
+    auto nss = NamespaceString::createNamespaceString_forTest("mydb", "mycoll");
     auto future = launchAsync([&] {
         sharding_util::tellShardsToRefreshCollection(opCtx, kShardIdList, nss, executor());
     });
@@ -101,7 +121,7 @@ TEST_F(ShardingRefresherTest, refresherTwoShardsFirstErrors) {
 
 TEST_F(ShardingRefresherTest, refresherTwoShardsSecondErrors) {
     auto opCtx = operationContext();
-    auto nss = NamespaceString("mydb", "mycoll");
+    auto nss = NamespaceString::createNamespaceString_forTest("mydb", "mycoll");
     auto future = launchAsync([&] {
         sharding_util::tellShardsToRefreshCollection(opCtx, kShardIdList, nss, executor());
     });
@@ -114,7 +134,7 @@ TEST_F(ShardingRefresherTest, refresherTwoShardsSecondErrors) {
 
 TEST_F(ShardingRefresherTest, refresherTwoShardsWriteConcernFailed) {
     auto opCtx = operationContext();
-    auto nss = NamespaceString("mydb", "mycoll");
+    auto nss = NamespaceString::createNamespaceString_forTest("mydb", "mycoll");
     auto future = launchAsync([&] {
         sharding_util::tellShardsToRefreshCollection(opCtx, kShardIdList, nss, executor());
     });

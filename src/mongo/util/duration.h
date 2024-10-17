@@ -29,15 +29,20 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <fmt/format.h>
 #include <iosfwd>
 #include <limits>
 #include <ratio>
+#include <string>
 #include <type_traits>
 
-#include <fmt/format.h>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/type_traits.h"
@@ -47,7 +52,6 @@
 namespace mongo {
 
 class BSONObj;
-
 template <typename Allocator>
 class StringBuilderImpl;
 
@@ -266,8 +270,11 @@ public:
      * It is a compilation error to convert from higher precision to lower, or if the conversion
      * would cause an integer overflow.
      */
+    /** Implicitly convertible if `FromPeriod` is a multiple of `period`. */
     template <typename FromPeriod>
-    constexpr Duration(const Duration<FromPeriod>& from) : Duration(duration_cast<Duration>(from)) {
+    requires(std::ratio_divide<FromPeriod, period>::den ==
+             1) constexpr Duration(const Duration<FromPeriod>& from)
+        : Duration(duration_cast<Duration>(from)) {
         MONGO_STATIC_ASSERT_MSG(
             !isLowerPrecisionThan<Duration<FromPeriod>>(),
             "Use duration_cast to convert from higher precision Duration types to lower "

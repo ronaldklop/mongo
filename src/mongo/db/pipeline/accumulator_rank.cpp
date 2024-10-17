@@ -27,51 +27,71 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
-#include <cmath>
-#include <limits>
-
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
-#include "mongo/util/summation.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
 // These don't make sense as accumulators, so only register them as window functions.
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     rank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorRank>::parse);
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     denseRank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDenseRank>::parse);
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     documentNumber,
     mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDocumentNumber>::parse);
 
-const char* AccumulatorRank::getOpName() const {
-    return "$rank";
+const char* kTempSortKeyField = "sortKey";
+
+// Define sort-order compliant comparison function which uses fast pass logic for null and missing
+// and full sort key logic for arrays.
+bool isSameValue(const ValueComparator& valueComparator,
+                 SortKeyGenerator& sortKeyGen,
+                 const Value& a,
+                 const Value& b) {
+    if (a.nullish() && b.nullish()) {
+        return true;
+    }
+    if (a.isArray() || b.isArray()) {
+        auto getSortKey = [&](const Value& v) {
+            BSONObjBuilder builder;
+            v.addToBsonObj(&builder, kTempSortKeyField);
+            return sortKeyGen.computeSortKeyString(builder.obj());
+        };
+        auto aKey = getSortKey(a);
+        auto bKey = getSortKey(b);
+        return aKey.compare(bKey) == 0;
+    }
+    return valueComparator.compare(a, b) == 0;
 }
 
 void AccumulatorRank::processInternal(const Value& input, bool merging) {
     tassert(5417001, "$rank can't be merged", !merging);
     if (!_lastInput ||
-        getExpressionContext()->getValueComparator().compare(_lastInput.get(), input) != 0) {
+        !isSameValue(
+            getExpressionContext()->getValueComparator(), _sortKeyGen, _lastInput.value(), input)) {
         _lastRank += _numSameRank;
         _numSameRank = 1;
         _lastInput = input;
-        _memUsageBytes = sizeof(*this) + _lastInput->getApproximateSize() - sizeof(Value);
+        _memUsageTracker.set(sizeof(*this) + _lastInput->getApproximateSize() - sizeof(Value));
     } else {
         ++_numSameRank;
     }
-}
-
-const char* AccumulatorDocumentNumber::getOpName() const {
-    return "$documentNumber";
 }
 
 void AccumulatorDocumentNumber::processInternal(const Value& input, bool merging) {
@@ -80,45 +100,50 @@ void AccumulatorDocumentNumber::processInternal(const Value& input, bool merging
     ++_lastRank;
 }
 
-const char* AccumulatorDenseRank::getOpName() const {
-    return "$denseRank";
-}
-
 void AccumulatorDenseRank::processInternal(const Value& input, bool merging) {
     tassert(5417003, "$denseRank can't be merged", !merging);
     if (!_lastInput ||
-        getExpressionContext()->getValueComparator().compare(_lastInput.get(), input) != 0) {
+        !isSameValue(
+            getExpressionContext()->getValueComparator(), _sortKeyGen, _lastInput.value(), input)) {
         ++_lastRank;
         _lastInput = input;
-        _memUsageBytes = sizeof(*this) + _lastInput->getApproximateSize() - sizeof(Value);
+        _memUsageTracker.set(sizeof(*this) + _lastInput->getApproximateSize() - sizeof(Value));
     }
 }
 
-intrusive_ptr<AccumulatorState> AccumulatorRank::create(ExpressionContext* const expCtx) {
-    return new AccumulatorRank(expCtx);
+intrusive_ptr<AccumulatorState> AccumulatorRank::create(ExpressionContext* const expCtx,
+                                                        bool isAscending) {
+    return new AccumulatorRank(expCtx, isAscending);
 }
 
-intrusive_ptr<AccumulatorState> AccumulatorDenseRank::create(ExpressionContext* const expCtx) {
-    return new AccumulatorDenseRank(expCtx);
+intrusive_ptr<AccumulatorState> AccumulatorDenseRank::create(ExpressionContext* const expCtx,
+                                                             bool isAscending) {
+    return new AccumulatorDenseRank(expCtx, isAscending);
 }
 
-intrusive_ptr<AccumulatorState> AccumulatorDocumentNumber::create(ExpressionContext* const expCtx) {
-    return new AccumulatorDocumentNumber(expCtx);
+intrusive_ptr<AccumulatorState> AccumulatorDocumentNumber::create(ExpressionContext* const expCtx,
+                                                                  bool isAscending) {
+    return new AccumulatorDocumentNumber(expCtx, isAscending);
 }
 
-AccumulatorRankBase::AccumulatorRankBase(ExpressionContext* const expCtx)
-    : AccumulatorState(expCtx) {
-    _memUsageBytes = sizeof(*this);
+AccumulatorRankBase::AccumulatorRankBase(ExpressionContext* const expCtx, bool isAscending)
+    : AccumulatorForWindowFunctions(expCtx),
+      _sortKeyGen(
+          SortPattern({SortPattern::SortPatternPart{isAscending, FieldPath{kTempSortKeyField}}}),
+          expCtx->getCollator()) {
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorRankBase::reset() {
     _lastInput = boost::none;
     _lastRank = 0;
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorRank::reset() {
     _lastInput = boost::none;
     _numSameRank = 1;
     _lastRank = 0;
+    _memUsageTracker.set(sizeof(*this));
 }
 }  // namespace mongo

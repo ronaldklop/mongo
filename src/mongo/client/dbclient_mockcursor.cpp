@@ -27,12 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <string>
+#include <vector>
 
-#include "mongo/client/dbclient_mockcursor.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/dbclient_mockcursor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,7 +54,7 @@ DBClientMockCursor::DBClientMockCursor(mongo::DBClientBase* client,
                                        const BSONArray& mockCollection,
                                        const bool provideResumeToken,
                                        unsigned long batchSize)
-    : mongo::DBClientCursor(client, NamespaceString(), 0, 0, 0),
+    : mongo::DBClientCursor(client, NamespaceString::kEmpty, 0 /*cursorId*/, false /*isExhaust*/),
       _collectionArray(mockCollection),
       _iter(_collectionArray),
       _provideResumeToken(provideResumeToken),
@@ -53,7 +65,13 @@ DBClientMockCursor::DBClientMockCursor(mongo::DBClientBase* client,
 }
 
 bool DBClientMockCursor::more() {
+    if (_batchSize && _batch.pos == _batchSize) {
+        _fillNextBatch();
+    }
+    return _batch.pos < _batch.objs.size();
+}
 
+void DBClientMockCursor::_fillNextBatch() {
     // Throw if requested via failpoint.
     mockCursorThrowErrorOnGetMore.execute([&](const BSONObj& data) {
         auto errorString = data["errorType"].valueStringDataSafe();
@@ -64,23 +82,16 @@ bool DBClientMockCursor::more() {
         uasserted(errorCode, message);
     });
 
-    if (_batchSize && batch.pos == _batchSize) {
-        _fillNextBatch();
-    }
-    return batch.pos < batch.objs.size();
-}
-
-void DBClientMockCursor::_fillNextBatch() {
     int leftInBatch = _batchSize;
-    batch.objs.clear();
+    _batch.objs.clear();
     while (_iter.more() && (!_batchSize || leftInBatch--)) {
-        batch.objs.emplace_back(_iter.next().Obj().getOwned());
+        _batch.objs.emplace_back(_iter.next().Obj().getOwned());
     }
-    batch.pos = 0;
+    _batch.pos = 0;
 
     // Store a mock resume token, if applicable.
-    if (!batch.objs.empty()) {
-        auto lastId = batch.objs.back()["_id"].numberInt();
+    if (!_batch.objs.empty()) {
+        auto lastId = _batch.objs.back()["_id"].numberInt();
         _postBatchResumeToken = BSON("n" << lastId);
     }
 }

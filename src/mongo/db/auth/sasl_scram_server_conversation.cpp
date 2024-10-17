@@ -27,27 +27,50 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/auth/sasl_scram_server_conversation.h"
-
-#include <boost/algorithm/string/join.hpp>
+#include <algorithm>
 #include <boost/algorithm/string/replace.hpp>
+#include <boost/iterator/iterator_traits.hpp>
+#include <boost/none.hpp>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <set>
 
-#include "mongo/base/init.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/crypto/mechanism_scram.h"
-#include "mongo/crypto/sha1_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/auth/sasl_scram_server_conversation.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/random.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/read_through_cache.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/str.h"
-#include "mongo/util/text.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
 
@@ -56,7 +79,8 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::step
     OperationContext* opCtx, StringData inputData) {
     _step++;
 
-    const int numSteps = (_skipEmptyExchange ? 2 : 3);
+    const unsigned int numSteps = _totalSteps();
+
     if (_step > numSteps || _step <= 0) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Invalid SCRAM authentication step: " << _step);
@@ -177,20 +201,45 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     UserName user(ServerMechanismBase::ServerMechanismBase::_principalName,
                   ServerMechanismBase::getAuthenticationDatabase());
 
+    const auto isInternalUser = (user == (*internalSecurity.getUser())->getName());
+    const auto clusterAuthMode = ClusterAuthMode::get(opCtx->getServiceContext());
+
     // SERVER-16534, some mechanisms must be enabled for authenticating the internal user, so that
     // cluster members may communicate with each other. Hence ignore disabled auth mechanism
     // for the internal user.
-    if (Policy::isInternalAuthMech() &&
-        !sequenceContains(saslGlobalParams.authenticationMechanisms, Policy::getName()) &&
-        user != internalSecurity.user->getName()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << Policy::getName() << " authentication is disabled");
+    if (Policy::isInternalAuthMech()) {
+        if (isInternalUser) {
+            if (!clusterAuthMode.allowsKeyFile()) {
+                // We can no longer accept keyfiles.
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << Policy::getName()
+                                            << " is disallowed for cluster authentication");
+            }
+        } else {
+            if (!sequenceContains(saslGlobalParams.authenticationMechanisms, Policy::getName())) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << Policy::getName() << " authentication is disabled");
+            }
+        }
     }
 
     // The authentication database is also the source database for the user.
-    auto authManager = AuthorizationManager::get(opCtx->getServiceContext());
+    auto authManager = AuthorizationManager::get(opCtx->getService());
 
-    auto swUser = authManager->acquireUser(opCtx, user);
+    auto swUser = [&]() {
+        if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
+            ScopedCallbackTimer timer([&](Microseconds elapsed) {
+                LOGV2(6788604,
+                      "Auth metrics report",
+                      "metric"_attr = "acquireUser",
+                      "micros"_attr = elapsed.count());
+            });
+        }
+
+        return authManager->acquireUser(opCtx,
+                                        std::make_unique<UserRequestGeneral>(user, boost::none));
+    }();
+
     if (!swUser.isOK()) {
         return swUser.getStatus();
     }
@@ -204,7 +253,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     if (!scramCredentials.isValid()) {
         // Check for authentication attempts of the __system user on
         // systems started without a keyfile.
-        if (userName == internalSecurity.user->getName()) {
+        if (isInternalUser) {
             return Status(ErrorCodes::AuthenticationFailed,
                           "It is not possible to authenticate as the __system user "
                           "on servers started without a --keyFile parameter");
@@ -225,7 +274,8 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
         base64::decode(scramCredentials.storedKey),
         base64::decode(scramCredentials.serverKey)));
 
-    if (userName == internalSecurity.user->getName() && internalSecurity.alternateCredentials) {
+    if (userName == (*internalSecurity.getUser())->getName() &&
+        internalSecurity.alternateCredentials) {
         auto altCredentials = internalSecurity.alternateCredentials->scram<HashBlock>();
         _secrets.push_back(scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>(
             "",
@@ -237,7 +287,6 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
     const int nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
-
     SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
     _nonce = clientNonce +

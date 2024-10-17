@@ -29,15 +29,26 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
-class FTSAccessMethod : public AbstractIndexAccessMethod {
+class FTSAccessMethod : public SortedDataIndexAccessMethod {
 public:
     FTSAccessMethod(IndexCatalogEntry* btreeState, std::unique_ptr<SortedDataInterface> btree);
 
@@ -52,13 +63,16 @@ private:
      * This function ignores the 'multikeyPaths' and 'multikeyMetadataKeys' pointers because text
      * indexes don't support tracking path-level multikey information.
      */
-    void doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+    void doGetKeys(OperationContext* opCtx,
+                   const CollectionPtr& collection,
+                   const IndexCatalogEntry* entry,
+                   SharedBufferFragmentBuilder& pooledBufferBuilder,
                    const BSONObj& obj,
                    GetKeysContext context,
                    KeyStringSet* keys,
                    KeyStringSet* multikeyMetadataKeys,
                    MultikeyPaths* multikeyPaths,
-                   boost::optional<RecordId> id) const final;
+                   const boost::optional<RecordId>& id) const final;
 
     fts::FTSSpec _ftsSpec;
 };

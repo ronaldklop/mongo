@@ -8,7 +8,8 @@ var keyfile = "jstests/libs/key1";
 var username = "foo";
 var password = "bar";
 
-load("jstests/libs/host_ipaddr.js");
+import {get_ipaddr} from "jstests/libs/host_ipaddr.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var createUser = function(mongo) {
     print("============ adding a user.");
@@ -107,7 +108,7 @@ var authenticate = function(mongo) {
 };
 
 var start = function(useHostName) {
-    var rs = new ReplSetTest(
+    const rs = new ReplSetTest(
         {name: replSetName, nodes: 3, keyFile: keyfile, auth: "", useHostName: useHostName});
 
     rs.startSet();
@@ -126,7 +127,7 @@ var runTest = function(useHostName) {
     print("=====================");
     print("starting replica set: useHostName=" + useHostName);
     print("=====================");
-    var rs = start(useHostName);
+    const rs = start(useHostName);
     var port = rs.getPort(rs.getPrimary());
     var host = "localhost:" + port;
     var secHosts = [];
@@ -190,7 +191,7 @@ var runNonlocalTest = function(ipAddr) {
     print("starting mongod: non-local host access " + ipAddr);
     print("==========================");
 
-    var rs = start(false);
+    const rs = start(false);
     var port = rs.getPort(rs.getPrimary());
     var host = ipAddr + ":" + port;
     var secHosts = [];

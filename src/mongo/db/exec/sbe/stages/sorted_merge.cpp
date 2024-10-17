@@ -27,21 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/sorted_merge.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace sbe {
-SortedMergeStage::SortedMergeStage(std::vector<std::unique_ptr<PlanStage>> inputStages,
+SortedMergeStage::SortedMergeStage(PlanStage::Vector inputStages,
                                    std::vector<value::SlotVector> inputKeys,
                                    std::vector<value::SortDirection> dirs,
                                    std::vector<value::SlotVector> inputVals,
                                    value::SlotVector outputVals,
-                                   PlanNodeId planNodeId)
-    : PlanStage("smerge"_sd, planNodeId),
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage("smerge"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inputKeys(std::move(inputKeys)),
       _dirs(std::move(dirs)),
       _inputVals(std::move(inputVals)),
@@ -63,18 +74,22 @@ SortedMergeStage::SortedMergeStage(std::vector<std::unique_ptr<PlanStage>> input
 }
 
 std::unique_ptr<PlanStage> SortedMergeStage::clone() const {
-    std::vector<std::unique_ptr<PlanStage>> inputStages;
+    Vector inputStages;
     inputStages.reserve(_children.size());
     for (auto& child : _children) {
         inputStages.emplace_back(child->clone());
     }
-    return std::make_unique<SortedMergeStage>(
-        std::move(inputStages), _inputKeys, _dirs, _inputVals, _outputVals, _commonStats.nodeId);
+    return std::make_unique<SortedMergeStage>(std::move(inputStages),
+                                              _inputKeys,
+                                              _dirs,
+                                              _inputVals,
+                                              _outputVals,
+                                              _commonStats.nodeId,
+                                              participateInTrialRunTracking());
 }
 
 void SortedMergeStage::prepare(CompileCtx& ctx) {
     std::vector<std::vector<value::SlotAccessor*>> inputKeyAccessors;
-    std::vector<std::vector<value::SlotAccessor*>> inputValAccessors;
     std::vector<PlanStage*> streams;
 
     for (size_t childNum = 0; childNum < _children.size(); childNum++) {
@@ -84,30 +99,26 @@ void SortedMergeStage::prepare(CompileCtx& ctx) {
         streams.emplace_back(child.get());
 
         inputKeyAccessors.emplace_back();
-        inputValAccessors.emplace_back();
 
         for (auto slot : _inputKeys[childNum]) {
             inputKeyAccessors.back().push_back(child->getAccessor(ctx, slot));
         }
-        for (auto slot : _inputVals[childNum]) {
-            inputValAccessors.back().push_back(child->getAccessor(ctx, slot));
+    }
+
+    for (size_t idx = 0; idx < _outputVals.size(); ++idx) {
+        std::vector<value::SlotAccessor*> accessors;
+        accessors.reserve(_children.size());
+
+        for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+            auto slot = _inputVals[childNum][idx];
+
+            accessors.emplace_back(_children[childNum]->getAccessor(ctx, slot));
         }
+
+        _outAccessors.emplace_back(value::SwitchAccessor{std::move(accessors)});
     }
 
-    for (size_t i = 0; i < _outputVals.size(); ++i) {
-        _outAccessors.emplace_back(value::ViewOfValueAccessor{});
-    }
-
-    std::vector<value::ViewOfValueAccessor*> outAccessorPtrs;
-    for (auto&& outAccessor : _outAccessors) {
-        outAccessorPtrs.push_back(&outAccessor);
-    }
-
-    _merger.emplace(std::move(inputKeyAccessors),
-                    std::move(inputValAccessors),
-                    std::move(streams),
-                    _dirs,
-                    std::move(outAccessorPtrs));
+    _merger.emplace(std::move(inputKeyAccessors), std::move(streams), _dirs, _outAccessors);
 }
 
 value::SlotAccessor* SortedMergeStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -131,11 +142,11 @@ void SortedMergeStage::open(bool reOpen) {
 }
 
 PlanState SortedMergeStage::getNext() {
-    return _merger->getNext();
+    return trackPlanState(_merger->getNext());
 }
 
 void SortedMergeStage::close() {
-    ++_commonStats.closes;
+    trackClose();
     for (auto& child : _children) {
         child->close();
     }
@@ -164,11 +175,11 @@ std::unique_ptr<PlanStageStats> SortedMergeStage::getStats(bool includeDebugInfo
         {
             BSONArrayBuilder valsArrBob(bob.subarrayStart("inputValSlots"));
             for (auto&& slots : _inputVals) {
-                valsArrBob.append(slots);
+                valsArrBob.append(slots.begin(), slots.end());
             }
         }
 
-        bob.append("outputSlots", _outputVals);
+        bob.append("outputSlots", _outputVals.begin(), _outputVals.end());
         ret->debugInfo = bob.obj();
     }
 
@@ -236,6 +247,16 @@ std::vector<DebugPrinter::Block> SortedMergeStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     return ret;
+}
+
+size_t SortedMergeStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_inputKeys);
+    size += size_estimator::estimate(_dirs);
+    size += size_estimator::estimate(_inputVals);
+    size += size_estimator::estimate(_outputVals);
+    return size;
 }
 }  // namespace sbe
 }  // namespace mongo

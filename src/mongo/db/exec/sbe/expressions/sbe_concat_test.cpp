@@ -27,8 +27,26 @@
  *    it in the license file.
  */
 
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo::sbe {
 class SBEConcatTest : public EExpressionTestFixture {
@@ -147,7 +165,7 @@ TEST_F(SBEConcatTest, ComputesManyMoreStringsConcat) {
                        smallArityLimit - 1,
                        smallArityLimit + 1,
                        smallArityLimit * 10}) {
-        std::vector<std::unique_ptr<EExpression>> args;
+        EExpression::Vector args;
         args.reserve(arity);
         for (size_t idx = 0; idx < arity; ++idx) {
             args.push_back(makeE<EConstant>("x"));

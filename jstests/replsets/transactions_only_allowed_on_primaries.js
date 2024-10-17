@@ -1,10 +1,14 @@
 /**
  * Test that transactions are only allowed on primaries, and prohibited from running on secondaries.
  *
- * @tags: [uses_transactions]
+ * TODO (SERVER-80568): Re-enable this test in multiversion suites once it has been fixed.
+ * @tags: [
+ *   disables_test_commands,
+ *   uses_transactions,
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+ * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // In 4.0, we allow read-only transactions on secondaries when test commands are enabled, so we
 // disable them in this test, to test that transactions on secondaries will be disallowed
@@ -124,4 +128,3 @@ assert.commandWorked(primarySession.commitTransaction_forTesting());
 primarySession.endSession();
 
 replTest.stopSet();
-}());

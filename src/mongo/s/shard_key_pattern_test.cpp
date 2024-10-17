@@ -27,30 +27,54 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/hasher.h"
-#include "mongo/db/json.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
 class ShardKeyPatternTest : public ServiceContextTest {
 protected:
-    BSONObj queryKey(const ShardKeyPattern& pattern, const BSONObj& query) {
-        const NamespaceString nss("foo");
+    ShardKeyPatternTest() {
+        _opCtxHolder = makeOperationContext();
+        _opCtx = _opCtxHolder.get();
+    }
 
-        StatusWith<BSONObj> status = pattern.extractShardKeyFromQuery(_opCtx, nss, query);
+    BSONObj queryKey(const ShardKeyPattern& pattern, const BSONObj& query) {
+        const NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo");
+
+        StatusWith<BSONObj> status = extractShardKeyFromBasicQuery(_opCtx, nss, pattern, query);
         if (!status.isOK())
             return BSONObj();
         return status.getValue();
     }
 
-    ServiceContext::UniqueOperationContext _opCtxHolder{makeOperationContext()};
-    OperationContext* const _opCtx{_opCtxHolder.get()};
+    ServiceContext::UniqueOperationContext _opCtxHolder;
+    OperationContext* _opCtx;
 };
 
 TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
@@ -59,6 +83,7 @@ TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
     ShardKeyPattern s3(BSON("a" << (long long)1L));
     ShardKeyPattern s4(BSON("a"
                             << "hashed"));
+    ShardKeyPattern s5(BSON("a$" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSONObj()), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << -1)), DBException);
@@ -71,12 +96,21 @@ TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
                   DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("." << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$a" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$**" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$id" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$db" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$ref" << 1)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, CompositeShardKeyPatternsValidityCheck) {
     ShardKeyPattern s1(BSON("a" << 1 << "b" << 1));
     ShardKeyPattern s2(BSON("a" << 1.0f << "b" << 1.0));
     ShardKeyPattern s3(BSON("a" << 1 << "b" << 1.0 << "c" << 1.0f));
+    ShardKeyPattern s4(BSON("a.$id" << 1));
+    ShardKeyPattern s5(BSON("a.$db" << 1));
+    ShardKeyPattern s6(BSON("a.$ref" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b"
@@ -84,6 +118,9 @@ TEST_F(ShardKeyPatternTest, CompositeShardKeyPatternsValidityCheck) {
                   DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b." << 1.0)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$b" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$**" << 1.0)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
@@ -91,6 +128,7 @@ TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
     ShardKeyPattern s2(BSON("a.b.c.d" << 1.0));
     ShardKeyPattern s3(BSON("a" << 1 << "c.d" << 1.0 << "e.f.g" << 1.0f));
     ShardKeyPattern s4(BSON("a" << 1 << "a.b" << 1.0 << "a.b.c" << 1.0f));
+    ShardKeyPattern s6(BSON("a.b$" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a.b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << BSON("b" << 1))), DBException);
@@ -99,6 +137,9 @@ TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
     ASSERT_THROWS(ShardKeyPattern(BSON("a..b" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "a.b." << 1.0)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << BSON("b" << 1) << "c.d" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$b" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$**" << 1)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, IsShardKey) {
@@ -324,9 +365,10 @@ TEST_F(ShardKeyPatternTest, ExtractQueryShardKeySingle) {
     ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$and:[{a:{$eq:10}},{b:'20'}]}")),
                       fromjson("{a:10}"));
     ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{a:{$all:[10]}}")), fromjson("{a:10}"));
-    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$or:[{a:{$eq:10}},{a:10}]}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$and:[{a:10},{a:10}]}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{a:{$all:[10,10]}}")), BSONObj());
+    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$or:[{a:{$eq:10}},{a:10}]}")),
+                      fromjson("{a:10}"));
+    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$and:[{a:10},{a:11}]}")), BSONObj());
+    ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{a:{$all:[10,11]}}")), BSONObj());
     ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{$or:[{a:{$eq:10}},{b:'20'}]}")), BSONObj());
 
     // Regex can't be extracted from query
@@ -494,7 +536,7 @@ TEST_F(ShardKeyPatternTest, ExtractQueryShardKeyHashed) {
 }
 
 static bool indexComp(const ShardKeyPattern& pattern, const BSONObj& indexPattern) {
-    return pattern.isUniqueIndexCompatible(indexPattern);
+    return pattern.isIndexUniquenessCompatible(indexPattern);
 }
 
 TEST_F(ShardKeyPatternTest, UniqueIndexCompatibleSingle) {
@@ -782,6 +824,202 @@ TEST_F(ShardKeyPatternTest, ExtractShardKeyFromIndexKeyData_FromMultipleIndexesP
                            << "a.secondIndex"
                            << "a_sec_val"
                            << "a.thirdIndex" << hashedValue << "null" << BSONNULL));
+}
+
+BSONObj getDocumentKey(const BSONObj& obj, const ShardKeyPattern& shardKeyPattern) {
+    return dotted_path_support::extractElementsBasedOnTemplate(obj, shardKeyPattern.toBSON());
+}
+
+TEST_F(ShardKeyPatternTest, ExtractShardKeyFromDocumentKey_Single) {
+    ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("_id" << 10), shardKeyPattern)),
+                      BSON("_id" << 10));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("_id" << 10 << "a" << 20), shardKeyPattern)),
+                      BSON("_id" << 10));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("b" << 30), shardKeyPattern)),
+                      BSON("_id" << BSONNULL));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("_id" << BSON_ARRAY(10)), shardKeyPattern)),
+                      BSONObj());
+}
+
+TEST_F(ShardKeyPatternTest, ExtractShardKeyFromDocumentKey_Compound) {
+    ShardKeyPattern shardKeyPattern(BSON("a" << 1 << "b" << 1));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("a" << 10 << "b" << 20), shardKeyPattern)),
+                      BSON("a" << 10 << "b" << 20));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          BSON("a" << 10 << "b" << 20 << "c" << 30), shardKeyPattern)),
+                      BSON("a" << 10 << "b" << 20));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("b" << 20), shardKeyPattern)),
+                      BSON("a" << BSONNULL << "b" << 20));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("c" << 30), shardKeyPattern)),
+                      BSON("a" << BSONNULL << "b" << BSONNULL));
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          BSON("a" << BSON_ARRAY(10) << "b" << 20), shardKeyPattern)),
+                      BSONObj());
+}
+
+TEST_F(ShardKeyPatternTest, ExtractShardKeyFromDocumentKey_Nested) {
+    ShardKeyPattern shardKeyPattern(BSON("a.b" << 1 << "c" << 1));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:{b:10}, c:20}"), shardKeyPattern)),
+                      fromjson("{'a.b':10, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{d:30}"), shardKeyPattern)),
+                      fromjson("{'a.b':null, c:null}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:{b:10}}"), shardKeyPattern)),
+                      fromjson("{'a.b':10, c:null}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{c:20}"), shardKeyPattern)),
+                      fromjson("{'a.b':null, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:10, c:20}"), shardKeyPattern)),
+                      fromjson("{'a.b':null, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:{d:10}, c:20}"), shardKeyPattern)),
+                      fromjson("{'a.b':null, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:{b:10, d:30}, c:20}"), shardKeyPattern)),
+                      fromjson("{'a.b':10, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          fromjson("{a:{b:{y:10,z:11}}, c:20, d:30}"), shardKeyPattern)),
+                      fromjson("{'a.b':{y:10,z:11}, c:20}"));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(fromjson("{a:{b:[10,11]}, c:20, d:30}"), shardKeyPattern)),
+                      BSONObj());
+}
+
+TEST_F(ShardKeyPatternTest, ExtractShardKeyFromDocumentKey_Hashed) {
+    const std::string value = "12345";
+    const BSONObj bsonValue = BSON("" << value);
+    const long long hashValue =
+        BSONElementHasher::hash64(bsonValue.firstElement(), BSONElementHasher::DEFAULT_HASH_SEED);
+
+    const BSONObj nullBsonValue = BSON("" << BSONNULL);
+    const long long nullHashValue = BSONElementHasher::hash64(nullBsonValue.firstElement(),
+                                                              BSONElementHasher::DEFAULT_HASH_SEED);
+
+    ShardKeyPattern shardKeyPattern(BSON("a.b"
+                                         << "hashed"
+                                         << "c" << 1));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          BSON("a" << BSON("b" << value) << "c" << 20), shardKeyPattern)),
+                      BSON("a.b" << hashValue << "c" << 20));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          BSON("a" << BSON("b" << value << "z" << 11) << "c" << 20 << "d" << 30),
+                          shardKeyPattern)),
+                      BSON("a.b" << hashValue << "c" << 20));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(
+                          getDocumentKey(BSON("c" << 20), shardKeyPattern)),
+                      BSON("a.b" << nullHashValue << "c" << 20));
+
+    ASSERT_BSONOBJ_EQ(shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+                          BSON("a" << BSON("z" << value) << "c" << 20), shardKeyPattern)),
+                      BSON("a.b" << nullHashValue << "c" << 20));
+
+    ASSERT_BSONOBJ_EQ(
+        shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
+            BSON("a" << BSON("b" << BSON_ARRAY(value)) << "c" << 20), shardKeyPattern)),
+        BSONObj());
+}
+
+TEST_F(ShardKeyPatternTest, IsExtendedBy) {
+
+    // NumberOfFields
+    ShardKeyPattern shardKeyPattern1(BSON("a" << 1));
+    ShardKeyPattern shardKeyPattern2(BSON("a" << 1 << "b" << 1));
+    ShardKeyPattern shardKeyPattern3(BSON("a" << 1 << "b" << 1 << "c" << 1));
+
+    // NumberOfFields_PositionOfHash
+    ShardKeyPattern shardKeyPatternHashed1_0(BSON("a"
+                                                  << "hashed"));
+    ShardKeyPattern shardKeyPatternHashed2_0(BSON("a"
+                                                  << "hashed"
+                                                  << "b" << 1));
+    ShardKeyPattern shardKeyPatternHashed2_1(BSON("a" << 1 << "b"
+                                                      << "hashed"));
+    ShardKeyPattern shardKeyPatternHashed3_0(BSON("a"
+                                                  << "hashed"
+                                                  << "b" << 1 << "c" << 1));
+    ShardKeyPattern shardKeyPatternHashed3_1(BSON("a" << 1 << "b"
+                                                      << "hashed"
+                                                      << "c" << 1));
+    ShardKeyPattern shardKeyPatternHashed3_2(BSON("a" << 1 << "b" << 1 << "c"
+                                                      << "hashed"));
+
+    // same pattern, always true
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern1));
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPattern2));
+    ASSERT_TRUE(shardKeyPattern3.isExtendedBy(shardKeyPattern3));
+    ASSERT_TRUE(shardKeyPatternHashed1_0.isExtendedBy(shardKeyPatternHashed1_0));
+    ASSERT_TRUE(shardKeyPatternHashed2_0.isExtendedBy(shardKeyPatternHashed2_0));
+    ASSERT_TRUE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_TRUE(shardKeyPatternHashed3_0.isExtendedBy(shardKeyPatternHashed3_0));
+    ASSERT_TRUE(shardKeyPatternHashed3_1.isExtendedBy(shardKeyPatternHashed3_1));
+    ASSERT_TRUE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPatternHashed3_2));
+
+    // different number of fields, same values
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern2));
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPattern3));
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern3));
+
+    ASSERT_FALSE(shardKeyPattern2.isExtendedBy(shardKeyPattern1));
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPattern2));
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPattern1));
+
+    // different number of fields, different values
+    // { a : 1 } is not extended by { a : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern1.isExtendedBy(shardKeyPatternHashed1_0));
+    ASSERT_FALSE(shardKeyPatternHashed1_0.isExtendedBy(shardKeyPattern1));
+
+    // { a : 1, b : 1 } is not extended by { a : 1, b : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern2.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPattern2));
+
+    // { a : 1 } is extended by { a : 1, b : "hashed" } but not viceversa
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPattern1));
+
+    // { a : 1, b : 1 } is extended by { a : 1, b : 1, c : "hashed" } but not viceversa
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPattern2));
+
+    // { a : 1, b : 1, c : 1 } is not extended by { a : 1, b : 1, c : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPattern3));
+
+    // { a: "hashed", b : 1 } is not extended by { a : 1, b : 1, c : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPatternHashed2_1));
+
+    // { a : "hashed", b : 1 } is extended by { a : "hashed", b : 1, c : "1" } but not viceversa
+    ASSERT_TRUE(shardKeyPatternHashed2_0.isExtendedBy(shardKeyPatternHashed3_0));
+    ASSERT_FALSE(shardKeyPatternHashed3_0.isExtendedBy(shardKeyPatternHashed2_0));
+
+    // { a : 1, b : "hashed " } is extended by { a : 1, b : "hashed", c : "1" } but not viceversa
+    ASSERT_TRUE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed3_1));
+    ASSERT_FALSE(shardKeyPatternHashed3_1.isExtendedBy(shardKeyPatternHashed2_1));
 }
 
 }  // namespace

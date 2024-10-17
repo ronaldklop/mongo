@@ -29,15 +29,24 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <queue>
+#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_all_indices_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
@@ -57,10 +66,9 @@ class PlanYieldPolicy;
 class CachedPlanStage final : public RequiresAllIndicesStage {
 public:
     CachedPlanStage(ExpressionContext* expCtx,
-                    const CollectionPtr& collection,
+                    VariantCollectionPtrOrAcquisition collection,
                     WorkingSet* ws,
                     CanonicalQuery* cq,
-                    const QueryPlannerParams& params,
                     size_t decisionWorks,
                     std::unique_ptr<PlanStage> root);
 
@@ -86,7 +94,11 @@ public:
      * than expected, the old plan is evicted and a new plan is selected from scratch (again
      * yielding according to 'yieldPolicy'). Otherwise, the cached plan is run.
      */
-    Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
+    Status pickBestPlan(const QueryPlannerParams& plannerParams, PlanYieldPolicy* yieldPolicy);
+
+    bool bestPlanChosen() const {
+        return _bestPlanChosen;
+    }
 
 private:
     /**
@@ -98,7 +110,10 @@ private:
      *
      * We only modify the plan cache if 'shouldCache' is true.
      */
-    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, std::string reason);
+    Status replan(const QueryPlannerParams& plannerParams,
+                  PlanYieldPolicy* yieldPolicy,
+                  bool shouldCache,
+                  std::string reason);
 
     /**
      * May yield during the cached plan stage's trial period or replanning phases.
@@ -115,8 +130,6 @@ private:
     // Not owned.
     CanonicalQuery* _canonicalQuery;
 
-    QueryPlannerParams _plannerParams;
-
     // The number of work cycles taken to decide on a winning plan when the plan was first
     // cached.
     size_t _decisionWorks;
@@ -130,6 +143,9 @@ private:
 
     // Stats
     CachedPlanStats _specificStats;
+
+    // Picked best plan
+    bool _bestPlanChosen = false;
 };
 
 }  // namespace mongo

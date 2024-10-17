@@ -27,29 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
-
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
+
+
 namespace mongo {
 namespace repl {
-
-// After the release of MongoDB 3.8, these fail point declarations can
-// be moved into the rs_rollback.cpp file, as we no longer need to maintain
-// functionality for rs_rollback_no_uuid.cpp. See SERVER-29766.
-
-// Failpoint which causes rollback to hang before finishing.
-MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeFinish);
-
-// Failpoint which causes rollback to hang and then fail after minValid is written.
-MONGO_FAIL_POINT_DEFINE(rollbackHangThenFailAfterWritingMinValid);
-
 
 namespace {
 
@@ -116,7 +116,6 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
         _scanned++;
         LOGV2_DEBUG(21656,
                     2,
-                    "Local oplog entry to roll back: {oplogEntry}",
                     "Local oplog entry to roll back",
                     "oplogEntry"_attr = redact(_localOplogValue.first));
         auto status = _rollbackOperation(_localOplogValue.first);

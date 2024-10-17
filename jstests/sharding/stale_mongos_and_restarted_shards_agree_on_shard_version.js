@@ -4,17 +4,16 @@
  * have it's data after a restart.
  *
  * @tags: [
- *  requires_fcv_47,
- *  requires_persistence,
+ *   requires_persistence,
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
  * ]
  *
- * TODO (SERVER-47265): Remove the requires_fcv_47 flag
  */
-(function() {
-'use strict';
-
-load('jstests/libs/parallel_shell_helpers.js');
-load('jstests/libs/fail_point_util.js');
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Disable checking for index consistency to ensure that the config server doesn't trigger a
 // StaleShardVersion exception on the shards and cause them to refresh theirsharding metadata.
@@ -37,16 +36,16 @@ st.enableSharding(kDatabaseName, st.shard1.shardName);
 function setupCollectionForTest(collName) {
     const ns = kDatabaseName + '.' + collName;
     assert.commandFailedWithCode(st.s0.adminCommand({getShardVersion: ns}),
-                                 ErrorCodes.NamespaceNotSharded);
+                                 [ErrorCodes.NamespaceNotSharded, ErrorCodes.NamespaceNotFound]);
     assert.commandFailedWithCode(st.s1.adminCommand({getShardVersion: ns}),
-                                 ErrorCodes.NamespaceNotSharded);
+                                 [ErrorCodes.NamespaceNotSharded, ErrorCodes.NamespaceNotFound]);
     st.shardCollection(ns, {Key: 1});
 
     st.s0.adminCommand({split: ns, middle: {Key: 0}});
     st.s0.adminCommand({moveChunk: ns, find: {Key: -1}, to: shard0Name});
     st.s0.adminCommand({moveChunk: ns, find: {Key: 0}, to: shard1Name});
     assert.commandFailedWithCode(st.s1.adminCommand({getShardVersion: ns}),
-                                 ErrorCodes.NamespaceNotSharded);
+                                 [ErrorCodes.NamespaceNotSharded, ErrorCodes.NamespaceNotFound]);
 
     // This document will go to shard 0
     assert.commandWorked(
@@ -123,27 +122,40 @@ const staleMongoS = st.s1;
         staleMongoS.getDB(kDatabaseName).TestAggregateColl.aggregate([{$count: 'total'}]).toArray();
     assert.eq(2, count[0].total);
 }
-{
-    jsTest.log('Testing: Transactions with unsharded collection, which is unknown on the shard');
-    st.restartShardRS(0);
-    st.restartShardRS(1);
+var session = null;
+withRetryOnTransientTxnError(
+    () => {
+        jsTest.log(
+            'Testing: Transactions with unsharded collection, which is unknown on the shard');
+        st.restartShardRS(0);
+        st.restartShardRS(1);
 
-    var session = staleMongoS.startSession();
-    session.startTransaction();
-    session.getDatabase(kDatabaseName).TestTransactionColl.insert({Key: 1});
-    session.commitTransaction();
-}
-{
-    jsTest.log('Testing: Create collection as first op inside transaction works');
-    st.restartShardRS(0);
-    st.restartShardRS(1);
+        session = staleMongoS.startSession();
+        session.startTransaction();
+        session.getDatabase(kDatabaseName).TestTransactionColl.insert({Key: 1});
+        session.commitTransaction();
+    },
+    () => {
+        session.abortTransaction();
+        session.getDatabase(kDatabaseName).TestTransactionColl.drop();
+    });
 
-    var session = staleMongoS.startSession();
-    session.startTransaction();
-    session.getDatabase(kDatabaseName).createCollection('TestTransactionCollCreation');
-    session.getDatabase(kDatabaseName).TestTransactionCollCreation.insertOne({Key: 0});
-    session.commitTransaction();
-}
+withRetryOnTransientTxnError(
+    () => {
+        jsTest.log('Testing: Create collection as first op inside transaction works');
+        st.restartShardRS(0);
+        st.restartShardRS(1);
+
+        session = staleMongoS.startSession();
+        session.startTransaction();
+        session.getDatabase(kDatabaseName).createCollection('TestTransactionCollCreation');
+        session.getDatabase(kDatabaseName).TestTransactionCollCreation.insertOne({Key: 0});
+        session.commitTransaction();
+    },
+    () => {
+        session.abortTransaction();
+        session.getDatabase(kDatabaseName).TestTransactionCollCreation.drop();
+    });
 
 {
     const kNumThreadsForConvoyTest = 20;
@@ -161,6 +173,12 @@ const staleMongoS = st.s1;
 
     // Restart the shard to have UNKNOWN shard version.
     st.restartShardRS(0);
+
+    // Anticipate a refresh of the logical session cache to avoid the risk of it happening later by
+    // affecting the actual number of refreshing threads and sharding statistics. In sharded
+    // clusters, the logical session collection is sharded and any operations on it require the
+    // cached metadata to be updated, causing a refresh if necessary.
+    st.shard0.adminCommand({_flushRoutingTableCacheUpdates: 'config.system.sessions'});
 
     let failPoint = configureFailPoint(st.shard0, 'hangInRecoverRefreshThread');
 
@@ -212,14 +230,13 @@ const staleMongoS = st.s1;
     assert.eq(kNumThreadsForConvoyTest,
               freshMongoS.getDB(kDatabaseName).TestConvoyColl.countDocuments({a: 1}));
 
-    // Check for the expected number of refreshes.
+    // There must be two refreshes: one for convoy and another for the logical session.
     const catalogCacheStatistics =
         st.shard0.adminCommand({serverStatus: 1}).shardingStatistics.catalogCache;
-    assert.eq(kNumThreadsForConvoyTest,
-              catalogCacheStatistics.countFullRefreshesStarted -
+    assert.eq(2,
+              catalogCacheStatistics.countFullRefreshesStarted +
+                  catalogCacheStatistics.countIncrementalRefreshesStarted -
                   catalogCacheStatistics.countFailedRefreshes);
-    assert.eq(0, catalogCacheStatistics.countIncrementalRefreshesStarted);
 }
 
 st.stop();
-})();

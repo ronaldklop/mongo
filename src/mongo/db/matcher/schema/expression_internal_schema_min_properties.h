@@ -29,6 +29,18 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/matcher/matchable.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_num_properties.h"
 
 namespace mongo {
@@ -60,7 +72,7 @@ public:
         return (elem.embeddedObject().nFields() >= numProperties());
     }
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         auto minProperties = std::make_unique<InternalSchemaMinPropertiesMatchExpression>(
             numProperties(), _errorAnnotation);
         if (getTag()) {

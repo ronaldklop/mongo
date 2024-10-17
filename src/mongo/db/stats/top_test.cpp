@@ -27,17 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/string_data.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
 using namespace mongo;
 
 TEST(TopTest, CollectionDropped) {
-    Top().collectionDropped(NamespaceString("test.coll"));
+    Top().collectionDropped(NamespaceString::createNamespaceString_forTest("test.coll"));
 }
 
 }  // namespace

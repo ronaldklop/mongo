@@ -3,8 +3,7 @@
  * primary. Mongos does this as an optimization.
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({name: "invalidate_sessions_on_stepdown", nodes: 2});
 rst.startSet();
@@ -30,8 +29,7 @@ assert.commandWorked(node0SessionDB.runCommand({
 }));
 
 jsTestLog("Step up the secondary. The primary will abort the transaction when it steps down.");
-assert.commandWorked(node1.adminCommand({replSetStepUp: 1}));
-assert.eq(node1, rst.getPrimary());
+rst.stepUp(node1);
 
 const node1DB = node1.getDB(dbName);
 
@@ -59,9 +57,9 @@ assert.commandWorked(node1DB.adminCommand({
     autocommit: false,
     writeConcern: {w: "majority"}
 }));
+rst.awaitReplication();
 assert.eq(2, node0SessionDB.coll.find().itcount());
 assert.eq(0, node0SessionDB.coll.find({b: 1}).itcount());
 assert.eq(1, node0SessionDB.coll.find({c: 1}).itcount());
 
 rst.stopSet();
-})();

@@ -2,10 +2,14 @@
  * Test that unfinishedMigrationFromPreviousPrimary field in shardingStatistics reports the
  * expected number.
  */
-(function() {
-"use strict";
-
-load('./jstests/libs/chunk_manipulation_util.js');
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Test calls step down on primaries.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
@@ -14,8 +18,8 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 var staticMongod = MongoRunner.runMongod({});
 
 let st = new ShardingTest({shards: 2, rs: {nodes: 2}});
-assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
 
 let priConn = st.rs0.getPrimary();
@@ -59,4 +63,3 @@ try {
 st.stop();
 
 MongoRunner.stopMongod(staticMongod);
-})();

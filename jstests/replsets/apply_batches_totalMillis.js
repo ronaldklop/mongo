@@ -6,8 +6,7 @@
  * machines and test runs.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Gets the value of metrics.repl.apply.batches.totalMillis.
 function getTotalMillis(node) {
@@ -60,4 +59,3 @@ jsTestLog(`Time recorded after larger batch: ${timeAfterLarge}ms`);
 assert.gte(timeAfterLarge, timeAfterSmall);
 
 rst.stopSet();
-})();

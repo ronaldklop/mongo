@@ -27,19 +27,48 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/db/auth/action_set.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -64,55 +93,64 @@ public:
         return " example: { getShardVersion : 'alleyinsider.foo'  } ";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::getShardVersion)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::getShardVersion)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
         BSONElement first = cmdObj.firstElement();
         uassert(ErrorCodes::BadValue,
                 str::stream() << "namespace has invalid type " << typeName(first.type()),
                 first.canonicalType() == canonicalizeBSONType(mongo::String));
-        const NamespaceString nss(first.valueStringData());
-        return nss.ns();
+        return NamespaceStringUtil::deserialize(
+            dbName.tenantId(), first.valueStringData(), SerializationContext::stateDefault());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-
+        const NamespaceString nss(parseNs(dbName, cmdObj));
         const auto catalogCache = Grid::get(opCtx)->catalogCache();
 
         if (nss.coll().empty()) {
             // Return the database's information.
-            auto cachedDbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss.ns()));
-            result.append("primaryShard", cachedDbInfo.primaryId().toString());
-            result.append("shardingEnabled", cachedDbInfo.shardingEnabled());
-            result.append("version", cachedDbInfo.databaseVersion().toBSON());
+            auto cachedDbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss.dbName()));
+            result.append("primaryShard", cachedDbInfo->getPrimary().toString());
+            result.append("version", cachedDbInfo->getVersion().toBSON());
         } else {
             // Return the collection's information.
-            const auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
-            uassert(ErrorCodes::NamespaceNotSharded,
-                    str::stream() << "Collection " << nss.ns() << " is not sharded.",
-                    cm.isSharded());
-            cm.getVersion().appendLegacyWithField(&result, "version");
+            const auto [cm, sii] =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "Collection " << nss.toStringForErrorMsg()
+                                  << " does not have a routing table.",
+                    cm.hasRoutingTable());
+
+            result.appendTimestamp("version", cm.getVersion().toLong());
+            result.append("versionEpoch", cm.getVersion().epoch());
+            result.append("versionTimestamp", cm.getVersion().getTimestamp());
+            // Added to the result bson if the max bson size is exceeded
+            BSONObjBuilder exceededSizeElt(BSON("exceededSize" << true));
+
+            if (sii) {
+                result.append("indexVersion", sii->getCollectionIndexes().indexVersion());
+            }
 
             if (cmdObj["fullMetadata"].trueValue()) {
                 BSONArrayBuilder chunksArrBuilder;
                 bool exceedsSizeLimit = false;
 
                 LOGV2(22753,
-                      "Routing info requested by getShardVersion: {routingInfo}",
                       "Routing info requested by getShardVersion",
                       "routingInfo"_attr = redact(cm.toString()));
 
@@ -122,7 +160,8 @@ public:
                         chunkBB.append(chunk.getMin());
                         chunkBB.append(chunk.getMax());
                         chunkBB.done();
-                        if (chunksArrBuilder.len() + result.len() > BSONObjMaxUserSize) {
+                        if (chunksArrBuilder.len() + result.len() + exceededSizeElt.len() >
+                            BSONObjMaxUserSize) {
                             exceedsSizeLimit = true;
                         }
                     }
@@ -132,14 +171,36 @@ public:
 
                 if (!exceedsSizeLimit) {
                     result.append("chunks", chunksArrBuilder.arr());
+
+                    if (sii) {
+                        BSONArrayBuilder indexesArrBuilder;
+                        sii->forEachIndex([&](const auto& index) {
+                            BSONObjBuilder indexB(index.toBSON());
+                            if (result.len() + exceededSizeElt.len() + indexesArrBuilder.len() +
+                                    indexB.len() >
+                                BSONObjMaxUserSize) {
+                                exceedsSizeLimit = true;
+                            } else {
+                                indexesArrBuilder.append(indexB.done());
+                            }
+
+                            return !exceedsSizeLimit;
+                        });
+
+                        result.append("indexes", indexesArrBuilder.arr());
+                    }
+                }
+
+                if (exceedsSizeLimit) {
+                    result.appendElements(exceededSizeElt.done());
                 }
             }
         }
 
         return true;
     }
-
-} getShardVersionCmd;
+};
+MONGO_REGISTER_COMMAND(GetShardVersion).forRouter();
 
 }  // namespace
 }  // namespace mongo

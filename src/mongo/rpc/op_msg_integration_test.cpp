@@ -27,23 +27,70 @@
  *    it in the license file.
  */
 
+
+#include <cstddef>
+#include <cstdint>
+#include <fmt/format.h>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/dbclient_rs.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/getmore_command_gen.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/integration_test.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include <fmt/format.h>
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/dbclient_connection.h"
-#include "mongo/client/dbclient_rs.h"
-#include "mongo/db/ops/write_ops.h"
-#include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/getmore_request.h"
-#include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/op_msg.h"
-#include "mongo/unittest/integration_test.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -78,31 +125,37 @@ std::string getThreadNameByAppName(DBClientBase* conn, StringData appName) {
         BSON("aggregate" << 1 << "cursor" << BSONObj() << "pipeline"
                          << BSON_ARRAY(BSON("$currentOp" << BSON("localOps" << true))
                                        << BSON("$match" << BSON("appName" << appName))));
-    const auto curOpReply = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", curOpCmd));
+    const auto curOpReply = conn->runCommand(OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, curOpCmd));
     const auto cursorResponse = CursorResponse::parseFromBSON(curOpReply->getCommandReply());
     ASSERT_OK(cursorResponse.getStatus());
     const auto batch = cursorResponse.getValue().getBatch();
-    return batch.empty() ? "" : batch[0].getStringField("desc");
+    return batch.empty() ? "" : batch[0].getStringField("desc").toString();
 }
 
 TEST(OpMsg, UnknownRequiredFlagClosesConnection) {
     auto conn = getIntegrationTestConnection();
 
-    auto request = OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1)).serialize();
+    auto request = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                               DatabaseName::kAdmin,
+                                               BSON("ping" << 1))
+                       .serialize();
     OpMsg::setFlag(&request, 1u << 15);  // This should be the last required flag to be assigned.
 
     Message reply;
-    ASSERT(!conn->call(request, reply, /*assertOK*/ false));
+    ASSERT_THROWS_CODE(conn->call(request), DBException, ErrorCodes::HostUnreachable);
 }
 
 TEST(OpMsg, UnknownOptionalFlagIsIgnored) {
     auto conn = getIntegrationTestConnection();
 
-    auto request = OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1)).serialize();
+    auto request = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                               DatabaseName::kAdmin,
+                                               BSON("ping" << 1))
+                       .serialize();
     OpMsg::setFlag(&request, 1u << 31);  // This should be the last optional flag to be assigned.
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     uassertStatusOK(getStatusFromCommandResult(
         conn->parseCommandReplyMessage(conn->getServerAddress(), reply)->getCommandReply()));
 }
@@ -110,9 +163,12 @@ TEST(OpMsg, UnknownOptionalFlagIsIgnored) {
 TEST(OpMsg, FireAndForgetInsertWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 
-    conn->runFireAndForgetCommand(OpMsgRequest::fromDBAndBody("test", fromjson(R"({
+    conn->runFireAndForgetCommand(
+        OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                    DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                                    fromjson(R"({
         insert: "collection",
         writeConcern: {w: 0},
         documents: [
@@ -120,13 +176,13 @@ TEST(OpMsg, FireAndForgetInsertWorks) {
         ]
     })")));
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 1u);
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")), 1u);
 }
 
 TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 
     OpMsgBuilder msgBuilder;
 
@@ -147,17 +203,16 @@ TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
     })"));
 
     Message request = msgBuilder.finishWithoutSizeChecking();
-    Message reply;
-    ASSERT_TRUE(conn->call(request, reply, false));
+    Message reply = conn->call(request);
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 3u);
-    conn->dropCollection("test.collection");
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")), 3u);
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 }
 
 TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 
     OpMsgBuilder msgBuilder;
 
@@ -180,11 +235,11 @@ TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     msgBuilder.setBody(std::move(body));
 
     Message request = msgBuilder.finishWithoutSizeChecking();
-    Message reply;
-    ASSERT_TRUE(conn->call(request, reply, false));
+    Message reply = conn->call(request);
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), write_ops::kMaxWriteBatchSize);
-    conn->dropCollection("test.collection");
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")),
+              write_ops::kMaxWriteBatchSize);
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 }
 
 TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
@@ -198,14 +253,17 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
     bool foundSecondary = false;
     for (auto host : connStr.getServers()) {
         DBClientConnection conn;
-        uassertStatusOK(conn.connect(host, "integration_test", boost::none));
+        conn.connect(host, "integration_test", boost::none);
         bool isPrimary;
         ASSERT(conn.isPrimary(isPrimary));
         if (isPrimary)
             continue;
         foundSecondary = true;
 
-        auto request = OpMsgRequest::fromDBAndBody("test", fromjson(R"({
+        auto request = OpMsgRequestBuilder::create(
+                           auth::ValidatedTenancyScope::kNotRequired,
+                           DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                           fromjson(R"({
             insert: "collection",
             writeConcern: {w: 0},
             documents: [
@@ -216,8 +274,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
 
         // Round-trip command fails with NotWritablePrimary error. Note that this failure is in
         // command dispatch which ignores w:0.
-        Message reply;
-        ASSERT(conn.call(request, reply, /*assertOK*/ true, nullptr));
+        Message reply = conn.call(request);
         ASSERT_EQ(
             getStatusFromCommandResult(
                 conn.parseCommandReplyMessage(conn.getServerAddress(), reply)->getCommandReply()),
@@ -230,14 +287,14 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
         // conn.call() calculated the request checksum, but setFlag() makes it invalid. Clear the
         // checksum so the next conn.call() recalculates it.
         OpMsg::removeChecksum(&request);
-        ASSERT(!conn.call(request, reply, /*assertOK*/ false, nullptr));
+        ASSERT_THROWS(conn.call(request), ExceptionForCat<ErrorCategory::NetworkError>);
 
-        uassertStatusOK(conn.connect(host, "integration_test", boost::none));  // Reconnect.
+        conn.connect(host, "integration_test", boost::none);  // Reconnect.
 
         // Disable eager checking of primary to simulate a stepdown occurring after the check. This
         // should respect w:0.
         BSONObj output;
-        ASSERT(conn.runCommand("admin",
+        ASSERT(conn.runCommand(DatabaseName::kAdmin,
                                fromjson(R"({
                                    configureFailPoint: 'skipCheckingForNotPrimaryInCommandDispatch',
                                    mode: 'alwaysOn'
@@ -245,8 +302,8 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
                                output))
             << output;
         ON_BLOCK_EXIT([&] {
-            uassertStatusOK(conn.connect(host, "integration_test-cleanup", boost::none));
-            ASSERT(conn.runCommand("admin",
+            conn.connect(host, "integration_test-cleanup", boost::none);
+            ASSERT(conn.runCommand(DatabaseName::kAdmin,
                                    fromjson(R"({
                                           configureFailPoint:
                                               'skipCheckingForNotPrimaryInCommandDispatch',
@@ -260,14 +317,14 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
         // Round-trip command claims to succeed due to w:0.
         OpMsg::removeChecksum(&request);
         OpMsg::replaceFlags(&request, 0);
-        ASSERT(conn.call(request, reply, /*assertOK*/ true, nullptr));
+        reply = conn.call(request);
         ASSERT_OK(getStatusFromCommandResult(
             conn.parseCommandReplyMessage(conn.getServerAddress(), reply)->getCommandReply()));
 
         // Fire-and-forget should still close connection.
         OpMsg::setFlag(&request, OpMsg::kMoreToCome);
         OpMsg::removeChecksum(&request);
-        ASSERT(!conn.call(request, reply, /*assertOK*/ false, nullptr));
+        ASSERT_THROWS(conn.call(request), ExceptionForCat<ErrorCategory::NetworkError>);
 
         break;
     }
@@ -277,12 +334,12 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
 TEST(OpMsg, DocumentSequenceReturnsWork) {
     auto conn = getIntegrationTestConnection();
 
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", BSON("echo" << 1));
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, BSON("echo" << 1));
     opMsgRequest.sequences.push_back({"example", {BSON("a" << 1), BSON("b" << 2)}});
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
 
     auto opMsgReply = OpMsg::parse(reply);
     ASSERT_EQ(opMsgReply.sequences.size(), 1u);
@@ -303,7 +360,7 @@ TEST(OpMsg, DocumentSequenceReturnsWork) {
                                   << "admin"));
 }
 
-constexpr auto kDisableChecksum = "dbClientConnectionDisableChecksum";
+constexpr auto kDisableChecksum = "dbClientSessionDisableChecksum";
 
 void disableClientChecksum() {
     auto failPoint = globalFailPointRegistry().find(kDisableChecksum);
@@ -318,8 +375,8 @@ void enableClientChecksum() {
 void exhaustGetMoreTest(bool enableChecksum) {
     auto conn = getIntegrationTestConnection();
 
-    // Only test exhaust against a standalone.
-    if (conn->isReplicaSetMember() || conn->isMongos()) {
+    // Only test exhaust against a standalone and mongos.
+    if (conn->isReplicaSetMember()) {
         return;
     }
 
@@ -329,23 +386,23 @@ void exhaustGetMoreTest(bool enableChecksum) {
 
     ON_BLOCK_EXIT([&] { enableClientChecksum(); });
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request to open a cursor but return 0 documents. Specify a sort in order to
     // guarantee their return order.
     auto findCmd = BSON("find" << nss.coll() << "batchSize" << 0 << "sort" << BSON("_id" << 1));
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), findCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), findCmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     const long long cursorId = res["cursor"]["id"].numberLong();
     ASSERT(res["cursor"]["firstBatch"].Array().empty());
@@ -356,13 +413,15 @@ void exhaustGetMoreTest(bool enableChecksum) {
     // Construct getMore request with exhaust flag. Set batch size so we will need multiple batches
     // to exhaust the cursor.
     int batchSize = 2;
-    GetMoreRequest gmr(nss, cursorId, batchSize, boost::none, boost::none, boost::none);
-    opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), gmr.toBSON());
+    GetMoreCommandRequest getMoreRequest(cursorId, nss.coll().toString());
+    getMoreRequest.setBatchSize(batchSize);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), getMoreRequest.toBSON());
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run getMore to initiate the exhaust stream.
-    ASSERT(conn->call(request, reply));
+    reply = conn->call(request);
     auto lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
@@ -375,7 +434,7 @@ void exhaustGetMoreTest(bool enableChecksum) {
     ASSERT_BSONOBJ_EQ(nextBatch[1].embeddedObject(), BSON("_id" << 1));
 
     // Receive next exhaust batch.
-    ASSERT_OK(conn->recv(reply, lastRequestId));
+    reply = conn->recv(lastRequestId);
     lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
@@ -388,7 +447,7 @@ void exhaustGetMoreTest(bool enableChecksum) {
     ASSERT_BSONOBJ_EQ(nextBatch[1].embeddedObject(), BSON("_id" << 3));
 
     // Receive terminal batch.
-    ASSERT_OK(conn->recv(reply, lastRequestId));
+    reply = conn->recv(lastRequestId);
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
     res = OpMsg::parse(reply).body;
@@ -410,28 +469,28 @@ TEST(OpMsg, ServerHandlesExhaustGetMoreCorrectlyWithChecksum) {
 TEST(OpMsg, FindIgnoresExhaust) {
     auto conn = getIntegrationTestConnection();
 
-    // Only test exhaust against a standalone.
-    if (conn->isReplicaSetMember() || conn->isMongos()) {
+    // Only test exhaust against a standalone and mongos.
+    if (conn->isReplicaSetMember()) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request with exhaust flag. Returns 0 documents.
     auto findCmd = BSON("find" << nss.coll() << "batchSize" << 0);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), findCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), findCmd);
     auto request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT(res["cursor"]["firstBatch"].Array().empty());
     // The response should not have set moreToCome. We only expect getMore response to set
@@ -442,97 +501,125 @@ TEST(OpMsg, FindIgnoresExhaust) {
 TEST(OpMsg, ServerDoesNotSetMoreToComeOnErrorInGetMore) {
     auto conn = getIntegrationTestConnection();
 
-    // Only test exhaust against a standalone.
-    if (conn->isReplicaSetMember() || conn->isMongos()) {
+    // Only test exhaust against a standalone and mongos.
+    if (conn->isReplicaSetMember()) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request to open a cursor but return 0 documents.
     auto findCmd = BSON("find" << nss.coll() << "batchSize" << 0);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), findCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), findCmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     const long long cursorId = res["cursor"]["id"].numberLong();
     ASSERT(res["cursor"]["firstBatch"].Array().empty());
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     // Drop the collection, so that the next getMore will error.
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Construct getMore request with exhaust flag.
     int batchSize = 2;
-    GetMoreRequest gmr(nss, cursorId, batchSize, boost::none, boost::none, boost::none);
-    opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), gmr.toBSON());
+    GetMoreCommandRequest getMoreRequest(cursorId, nss.coll().toString());
+    getMoreRequest.setBatchSize(batchSize);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), getMoreRequest.toBSON());
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run getMore. This should not start an exhaust stream.
-    ASSERT(conn->call(request, reply));
+    reply = conn->call(request);
     // The response should not have set moreToCome.
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
     ASSERT_NOT_OK(getStatusFromCommandResult(res));
 }
 
-TEST(OpMsg, MongosIgnoresExhaustForGetMore) {
+TEST(OpMsg, ExhaustWorksForAggCursor) {
     auto conn = getIntegrationTestConnection();
 
-    if (!conn->isMongos()) {
+    // Only test exhaust against a standalone and mongos.
+    if (conn->isReplicaSetMember()) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
-    // Insert a few documents.
+    // Insert 5 documents so that a cursor using a batchSize of 2 requires three batches to get all
+    // the results.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
-    // Issue a find request to open a cursor but return 0 documents. Specify a sort in order to
+    // Issue an agg request to open a cursor but return 0 documents. Specify a sort in order to
     // guarantee their return order.
-    auto findCmd = BSON("find" << nss.coll() << "batchSize" << 0 << "sort" << BSON("_id" << 1));
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), findCmd);
+    auto aggCmd = BSON("aggregate" << nss.coll() << "cursor" << BSON("batchSize" << 0) << "pipeline"
+                                   << BSON_ARRAY(BSON("$sort" << BSON("_id" << 1))));
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), aggCmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     const long long cursorId = res["cursor"]["id"].numberLong();
     ASSERT(res["cursor"]["firstBatch"].Array().empty());
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
-    // Construct getMore request with exhaust flag.
+    // Construct getMore request with exhaust flag. Set batch size so we will need multiple batches
+    // to exhaust the cursor.
     int batchSize = 2;
-    GetMoreRequest gmr(nss, cursorId, batchSize, boost::none, boost::none, boost::none);
-    opMsgRequest = OpMsgRequest::fromDBAndBody(nss.db(), gmr.toBSON());
+    GetMoreCommandRequest getMoreRequest(cursorId, nss.coll().toString());
+    getMoreRequest.setBatchSize(batchSize);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), getMoreRequest.toBSON());
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
-    // Run getMore. This should not start an exhaust stream.
-    ASSERT(conn->call(request, reply));
-    // The response should not have set moreToCome.
+    auto assertNextBatch =
+        [](const Message& msg, CursorId expectedCursorId, std::vector<BSONObj> expectedBatch) {
+            auto cmdReply = OpMsg::parse(msg).body;
+            ASSERT_OK(getStatusFromCommandResult(cmdReply));
+            ASSERT_EQ(cmdReply["cursor"]["id"].numberLong(), expectedCursorId);
+            std::vector<BSONElement> nextBatch = cmdReply["cursor"]["nextBatch"].Array();
+            ASSERT_EQ(nextBatch.size(), expectedBatch.size());
+            auto it = expectedBatch.begin();
+            for (auto&& batchElt : nextBatch) {
+                ASSERT(it != expectedBatch.end());
+                ASSERT_BSONOBJ_EQ(batchElt.embeddedObject(), *it);
+                ++it;
+            }
+        };
+
+    // Run getMore to initiate the exhaust stream.
+    reply = conn->call(request);
+    auto lastRequestId = reply.header().getId();
+    ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    assertNextBatch(reply, cursorId, {BSON("_id" << 0), BSON("_id" << 1)});
+
+    // Receive next exhaust batch.
+    reply = conn->recv(lastRequestId);
+    lastRequestId = reply.header().getId();
+    ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    assertNextBatch(reply, cursorId, {BSON("_id" << 2), BSON("_id" << 3)});
+
+    // Receive terminal batch.
+    reply = conn->recv(lastRequestId);
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
-    res = OpMsg::parse(reply).body;
-    ASSERT_OK(getStatusFromCommandResult(res));
-    ASSERT_EQ(res["cursor"]["id"].numberLong(), cursorId);
-    std::vector<BSONElement> nextBatch = res["cursor"]["nextBatch"].Array();
-    ASSERT_EQ(nextBatch.size(), 2U);
-    ASSERT_BSONOBJ_EQ(nextBatch[0].embeddedObject(), BSON("_id" << 0));
-    ASSERT_BSONOBJ_EQ(nextBatch[1].embeddedObject(), BSON("_id" << 1));
+    assertNextBatch(reply, 0, {BSON("_id" << 4)});
 }
 
 TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
@@ -551,11 +638,11 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
 
     // Issue an isMaster command without a topology version.
     auto isMasterCmd = BSON("isMaster" << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", isMasterCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, isMasterCmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
@@ -564,13 +651,14 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
     // Construct isMaster command with topologyVersion, maxAwaitTimeMS, and exhaust.
     isMasterCmd =
         BSON("isMaster" << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", isMasterCmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, isMasterCmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run isMaster command to initiate the exhaust stream.
     auto beforeExhaustCommand = clockSource->now();
-    ASSERT(conn->call(request, reply));
+    reply = conn->call(request);
     auto afterFirstResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
     ASSERT_GT(duration_cast<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
@@ -583,7 +671,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
 
     // Receive next exhaust message.
     auto lastRequestId = reply.header().getId();
-    ASSERT_OK(conn->recv(reply, lastRequestId));
+    reply = conn->recv(lastRequestId);
     auto afterSecondResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
     ASSERT_GT(duration_cast<Milliseconds>(afterSecondResponse - afterFirstResponse),
@@ -613,11 +701,11 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
 
     // Issue an isMaster command without a topology version.
     auto isMasterCmd = BSON("isMaster" << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", isMasterCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, isMasterCmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
@@ -628,14 +716,15 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
     isMasterCmd = BSON("isMaster" << 1 << "topologyVersion"
                                   << BSON("processId" << OID::gen() << "counter" << 0LL)
                                   << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", isMasterCmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, isMasterCmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run isMaster command to initiate the exhaust stream. The first response should be received
     // immediately.
     auto beforeExhaustCommand = clockSource->now();
-    ASSERT(conn->call(request, reply));
+    reply = conn->call(request);
     auto afterFirstResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
     ASSERT_LT(duration_cast<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
@@ -648,7 +737,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
 
     // Receive next exhaust message. The second response waits for 'maxAwaitTimeMS'.
     auto lastRequestId = reply.header().getId();
-    ASSERT_OK(conn->recv(reply, lastRequestId));
+    reply = conn->recv(lastRequestId);
     auto afterSecondResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
     ASSERT_GT(duration_cast<Milliseconds>(afterSecondResponse - afterFirstResponse),
@@ -676,12 +765,12 @@ TEST(OpMsg, ServerRejectsExhaustIsMasterWithoutMaxAwaitTimeMS) {
 
     // Issue an isMaster command with exhaust but no maxAwaitTimeMS.
     auto isMasterCmd = BSON("isMaster" << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", isMasterCmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, isMasterCmd);
     auto request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_NOT_OK(getStatusFromCommandResult(res));
 }
@@ -700,30 +789,31 @@ void serverStatusCorrectlyShowsExhaustMetrics(std::string commandName) {
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
 
     // Issue a hello or isMaster command without a topology version.
     auto cmd = BSON(commandName << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     cmd = BSON(commandName << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run hello or isMaster command to initiate the exhaust stream.
-    ASSERT(conn->call(request, reply));
+    reply = conn->call(request);
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
@@ -735,7 +825,7 @@ void serverStatusCorrectlyShowsExhaustMetrics(std::string commandName) {
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -774,7 +864,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -786,23 +876,24 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
     }
     // Issue a hello or isMaster command without a topology version.
     auto cmd = BSON(cmdName << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn1->call(request, reply));
+    Message reply = conn1->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     cmd = BSON(cmdName << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run hello or isMaster command to initiate the exhaust stream.
-    ASSERT(conn1->call(request, reply));
+    reply = conn1->call(request);
     auto lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -821,7 +912,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -836,19 +927,20 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
                                    << BSON("threadName" << threadName << "errorCode"
                                                         << ErrorCodes::NotWritablePrimary
                                                         << "failCommands" << BSON_ARRAY(cmdName)));
-    auto response = conn2->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
+    auto response = conn2->runCommand(OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, failPointObj));
     ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
 
     // Wait for the exhaust stream to close from the error returned by hello or isMaster.
     ASSERT(waitForCondition([&] {
-        const auto status = conn1->recv(reply, lastRequestId);
+        reply = conn1->recv(lastRequestId);
         lastRequestId = reply.header().getId();
         res = OpMsg::parse(reply).body;
         return !getStatusFromCommandResult(res).isOK();
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -865,18 +957,19 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
     std::cout << newCmdName;
     auto newCmd =
         BSON(newCmdName << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", newCmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, newCmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
-    ASSERT(conn1->call(request, reply));
+    reply = conn1->call(request);
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
 
     // exhaust metric should decrease for the exhaust type that was closed, and increase for the
     // exhaust type that was just opened.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -911,7 +1004,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -922,23 +1015,24 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
         cmdName = "isMaster";
     }
     auto cmd = BSON(cmdName << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn1->call(request, reply));
+    Message reply = conn1->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     cmd = BSON(cmdName << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run hello or isMaster command to initiate the exhaust stream.
-    ASSERT(conn1->call(request, reply));
+    reply = conn1->call(request);
     auto lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -957,7 +1051,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -972,19 +1066,20 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
                                    << BSON("threadName" << threadName << "errorCode"
                                                         << ErrorCodes::NotWritablePrimary
                                                         << "failCommands" << BSON_ARRAY(cmdName)));
-    auto response = conn2->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
+    auto response = conn2->runCommand(OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, failPointObj));
     ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
 
     // Wait for the exhaust stream to close from the error returned by hello or isMaster.
     ASSERT(waitForCondition([&] {
-        const auto status = conn1->recv(reply, lastRequestId);
+        reply = conn1->recv(lastRequestId);
         lastRequestId = reply.header().getId();
         res = OpMsg::parse(reply).body;
         return !getStatusFromCommandResult(res).isOK();
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -995,7 +1090,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
 
     // exhaust metric should now decrement after calling serverStatus on the connection that used
     // to have the exhaust stream.
-    ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn1->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
     ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
 }
@@ -1024,7 +1119,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -1035,23 +1130,24 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
         cmdName = "isMaster";
     }
     auto cmd = BSON(cmdName << 1);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn1->call(request, reply));
+    Message reply = conn1->call(request);
     auto res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     auto topologyVersion = res["topologyVersion"].Obj().getOwned();
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     cmd = BSON(cmdName << 1 << "topologyVersion" << topologyVersion << "maxAwaitTimeMS" << 100);
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run hello or isMaster command to initiate the exhaust stream.
-    ASSERT(conn1->call(request, reply));
+    reply = conn1->call(request);
     auto lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -1070,7 +1166,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1085,19 +1181,20 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
                                    << BSON("threadName" << threadName << "errorCode"
                                                         << ErrorCodes::NotWritablePrimary
                                                         << "failCommands" << BSON_ARRAY(cmdName)));
-    auto response = conn2->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
+    auto response = conn2->runCommand(OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, failPointObj));
     ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
 
     // Wait for the exhaust stream to close from the error returned by hello or isMaster.
     ASSERT(waitForCondition([&] {
-        const auto status = conn1->recv(reply, lastRequestId);
+        reply = conn1->recv(lastRequestId);
         lastRequestId = reply.header().getId();
         res = OpMsg::parse(reply).body;
         return !getStatusFromCommandResult(res).isOK();
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1106,18 +1203,19 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustHello"].numberInt());
     }
 
-    opMsgRequest = OpMsgRequest::fromDBAndBody("admin", cmd);
+    opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     request = opMsgRequest.serialize();
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run hello or isMaster command on conn1 to initiate a new exhaust stream.
-    ASSERT(conn1->call(request, reply));
+    reply = conn1->call(request);
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
 
     // exhaust metric should not increment or decrement after initiating a new exhaust stream.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand(DatabaseName::kAdmin, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1142,28 +1240,29 @@ TEST(OpMsg, ExhaustWithDBClientCursorBehavesCorrectly) {
     // don't measure that here.
     auto conn = getIntegrationTestConnection();
 
-    // Only test exhaust against a standalone.
-    if (conn->isReplicaSetMember() || conn->isMongos()) {
+    // Only test exhaust against a standalone and mongos.
+    if (conn->isReplicaSetMember()) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
-    conn->dropCollection(nss.toString());
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    conn->dropCollection(nss);
 
     const int nDocs = 5;
     LOGV2(22634, "Inserting {nDocs} documents.", "nDocs"_attr = nDocs);
     for (int i = 0; i < nDocs; i++) {
         auto doc = BSON("_id" << i);
-        conn->insert(nss.toString(), doc);
+        conn->insert(nss, doc);
     }
 
     ASSERT_EQ(conn->count(nss), size_t(nDocs));
     LOGV2(22635, "Finished document insertion.");
 
     // Open an exhaust cursor.
-    int batchSize = 2;
-    auto cursor =
-        conn->query(nss, Query().sort("_id", 1), 0, 0, nullptr, QueryOption_Exhaust, batchSize);
+    FindCommandRequest findCmd{nss};
+    findCmd.setSort(BSON("_id" << 1));
+    findCmd.setBatchSize(2);
+    auto cursor = conn->find(std::move(findCmd), ReadPreferenceSetting{}, ExhaustMode::kOn);
 
     // Verify that the documents are returned properly. Exhaust cursors should still receive results
     // in batches, so we check that these batches correspond to the given specified batch size.
@@ -1198,11 +1297,11 @@ void checksumTest(bool enableChecksum) {
 
     ON_BLOCK_EXIT([&] { enableClientChecksum(); });
 
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1));
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, BSON("ping" << 1));
     auto request = opMsgRequest.serialize();
 
-    Message reply;
-    ASSERT(conn->call(request, reply));
+    Message reply = conn->call(request);
 
     auto opMsgReply = OpMsg::parse(reply);
     ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
@@ -1219,8 +1318,11 @@ TEST(OpMsg, ServerRepliesWithChecksumToRequestWithChecksum) {
 TEST(OpMsg, ServerHandlesReallyLargeMessagesGracefully) {
     auto conn = getIntegrationTestConnection();
 
-    auto buildInfo = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON("buildInfo" << 1)))
-                         ->getCommandReply();
+    auto buildInfo =
+        conn->runCommand(OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                                     DatabaseName::kAdmin,
+                                                     BSON("buildInfo" << 1)))
+            ->getCommandReply();
     ASSERT_OK(getStatusFromCommandResult(buildInfo));
     const auto maxBSONObjSizeFromServer =
         static_cast<size_t>(buildInfo["maxBsonObjectSize"].Number());
@@ -1234,8 +1336,7 @@ TEST(OpMsg, ServerHandlesReallyLargeMessagesGracefully) {
     ASSERT_GT(request.body.objsize(), BSONObjMaxInternalSize);
     auto requestMsg = request.serializeWithoutSizeChecking();
 
-    Message replyMsg;
-    ASSERT(conn->call(requestMsg, replyMsg));
+    Message replyMsg = conn->call(requestMsg);
 
     auto reply = OpMsg::parse(replyMsg);
     auto replyStatus = getStatusFromCommandResult(reply.body);
@@ -1253,7 +1354,7 @@ public:
 
         auto uri = swURI.getValue();
         if (helloOk.has_value()) {
-            uri.setHelloOk(helloOk.get());
+            uri.setHelloOk(helloOk.value());
         }
 
         auto swConn = connStr.connect(_appName, 0, &uri);
@@ -1261,16 +1362,18 @@ public:
         auto conn = std::move(swConn.getValue());
         uassert(ErrorCodes::SocketException, "connection failed", conn);
 
-        _configureFailPoint(conn.get());
+        _configureFailPoint(conn.get(), conn->isMongos());
         return conn;
     }
 
     auto checkIfClientSupportsHello(DBClientBase* conn) const {
         auto checkHelloSupport = [conn](const std::string& helloCommand) {
-            auto response =
-                conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON(helloCommand << 1)))
-                    ->getCommandReply()
-                    .getOwned();
+            auto response = conn->runCommand(OpMsgRequestBuilder::create(
+                                                 auth::ValidatedTenancyScope::kNotRequired,
+                                                 DatabaseName::kAdmin,
+                                                 BSON(helloCommand << 1)))
+                                ->getCommandReply()
+                                .getOwned();
             auto helloOk = response.getField("clientSupportsHello");
             ASSERT(!helloOk.eoo());
             return helloOk.Bool();
@@ -1283,14 +1386,17 @@ public:
     }
 
 private:
-    void _configureFailPoint(DBClientBase* conn) const {
+    void _configureFailPoint(DBClientBase* conn, bool isRouter) const {
         const auto threadName = getThreadNameByAppName(conn, _appName);
-        const auto failPointObj = BSON("configureFailPoint"
-                                       << "appendHelloOkToHelloResponse"
-                                       << "mode"
-                                       << "alwaysOn"
-                                       << "data" << BSON("threadName" << threadName));
-        auto response = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
+        // failpoint has a different name on the router
+        StringData failPointName =
+            isRouter ? "routerAppendHelloOkToHelloResponse" : "appendHelloOkToHelloResponse";
+        const auto failPointObj =
+            BSON("configureFailPoint" << failPointName << "mode"
+                                      << "alwaysOn"
+                                      << "data" << BSON("threadName" << threadName));
+        auto response = conn->runCommand(OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, failPointObj));
         ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
     }
 

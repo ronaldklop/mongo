@@ -2,10 +2,7 @@
  * Tests that stages which modify or remove the _id field are not permitted to run in a
  * $changeStream pipeline.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
 
 const coll = assertDropAndRecreateCollection(db, jsTestName());
 
@@ -114,7 +111,7 @@ const idPreservingTransformations = [
 
 let docId = 0;
 
-// Verify that each of the whitelisted transformations above succeeds.
+// Verify that each of the allowlisted transformations above succeeds.
 for (let transform of idPreservingTransformations) {
     const cmdRes = assert.commandWorked(
         db.runCommand(
@@ -128,7 +125,7 @@ for (let transform of idPreservingTransformations) {
     }, transform);
 }
 
-// Verify that each of the blacklisted transformations above are rejected.
+// Verify that each of the denylisted transformations above are rejected.
 for (let transform of idModifyingTransformations) {
     const cmdRes = assert.commandWorked(
         db.runCommand(
@@ -144,4 +141,3 @@ for (let transform of idModifyingTransformations) {
                 transform);
     }, transform);
 }
-}());

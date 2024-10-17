@@ -27,31 +27,53 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/op_msg_fuzzer_fixture.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/auth/authorization_session_for_test.h"
-#include "mongo/db/auth/authz_manager_external_state_local.h"
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
+#include "mongo/db/auth/authorization_router_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/database_holder_impl.h"
-#include "mongo/db/client.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/op_msg_fuzzer_fixture.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
-#include "mongo/db/service_entry_point_common.h"
-#include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_entry_point_shard_role.h"
+#include "mongo/db/session_manager_mongod.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/vector_clock_mutable.h"
-#include "mongo/transport/service_entry_point_impl.h"
+#include "mongo/rpc/message.h"
+#include "mongo/s/service_entry_point_router_role.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/periodic_runner_factory.h"
+#include "mongo/util/shared_buffer.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 
@@ -59,63 +81,89 @@ namespace {
 constexpr auto kTempDirStem = "op_msg_fuzzer_fixture"_sd;
 }
 
+// This must be called before creating any new threads that may access `AuthorizationManager` to
+// avoid a data-race.
+void OpMsgFuzzerFixture::_setAuthorizationManager() {
+    auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+    AuthorizationManager::set(
+        _serviceContext->getService(),
+        globalAuthzManagerFactory->createShard(_serviceContext->getService()));
+    AuthorizationManager::get(_serviceContext->getService())->setAuthEnabled(true);
+}
+
 OpMsgFuzzerFixture::OpMsgFuzzerFixture(bool skipGlobalInitializers)
     : _dir(kTempDirStem.toString()) {
     if (!skipGlobalInitializers) {
         auto ret = runGlobalInitializers(std::vector<std::string>{});
-        invariant(ret.isOK());
+        invariant(ret);
     }
+
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
 
     setGlobalServiceContext(ServiceContext::make());
     _session = _transportLayer.createSession();
 
     _serviceContext = getGlobalServiceContext();
-    _serviceContext->setServiceEntryPoint(
-        std::make_unique<ServiceEntryPointMongod>(_serviceContext));
+    _setAuthorizationManager();
+    _serviceContext->getService(ClusterRole::ShardServer)
+        ->setServiceEntryPoint(std::make_unique<ServiceEntryPointShardRole>());
+    _serviceContext->getService(ClusterRole::RouterServer)
+        ->setServiceEntryPoint(std::make_unique<ServiceEntryPointRouterRole>());
 
     auto observerRegistry = std::make_unique<OpObserverRegistry>();
     _serviceContext->setOpObserver(std::move(observerRegistry));
 
-    _clientStrand = ClientStrand::make(_serviceContext->makeClient("test", _session));
+    _serviceContext->setPeriodicRunner(makePeriodicRunner(_serviceContext));
+
+    _clientStrand = ClientStrand::make(_serviceContext->getService()->makeClient("test", _session));
     auto clientGuard = _clientStrand->bind();
-    auto opCtx = _serviceContext->makeOperationContext(clientGuard.get());
 
     storageGlobalParams.dbpath = _dir.path();
-    storageGlobalParams.engine = "ephemeralForTest";
+    storageGlobalParams.engine = "wiredTiger";
     storageGlobalParams.engineSetByUser = true;
     storageGlobalParams.repair = false;
-    serverGlobalParams.enableMajorityReadConcern = false;
+    // (Generic FCV reference): Initialize FCV.
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
 
-    initializeStorageEngine(opCtx.get(),
-                            StorageEngineInitFlags::kAllowNoLockFile |
-                                StorageEngineInitFlags::kSkipMetadataFile);
-    StorageControl::startStorageControls(_serviceContext, true /*forTestOnly*/);
+    {
+        auto initializeStorageEngineOpCtx =
+            _serviceContext->makeOperationContext(clientGuard.get());
+        shard_role_details::setRecoveryUnit(initializeStorageEngineOpCtx.get(),
+                                            std::make_unique<RecoveryUnitNoop>(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
+        initializeStorageEngine(initializeStorageEngineOpCtx.get(),
+                                StorageEngineInitFlags::kAllowNoLockFile |
+                                    StorageEngineInitFlags::kSkipMetadataFile);
+        StorageControl::startStorageControls(_serviceContext, true /*forTestOnly*/);
+    }
+
+    ShardingState::create(_serviceContext);
     CollectionShardingStateFactory::set(
-        _serviceContext,
-        std::make_unique<CollectionShardingStateFactoryStandalone>(_serviceContext));
+        _serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(_serviceContext));
     DatabaseHolder::set(_serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(_serviceContext,
-                                  std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(_serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
-
-    auto localExternalState = std::make_unique<AuthzManagerExternalStateMock>();
-    _externalState = localExternalState.get();
-
-    auto localAuthzManager =
-        std::make_unique<AuthorizationManagerImpl>(_serviceContext, std::move(localExternalState));
-    _authzManager = localAuthzManager.get();
-    _externalState->setAuthorizationManager(_authzManager);
-    _authzManager->setAuthEnabled(true);
-
-    AuthorizationManager::set(_serviceContext, std::move(localAuthzManager));
 
     // Setup the repl coordinator in standalone mode so we don't need an oplog etc.
     repl::ReplicationCoordinator::set(
         _serviceContext,
         std::make_unique<repl::ReplicationCoordinatorMock>(_serviceContext, repl::ReplSettings()));
 
-    _serviceContext->getStorageEngine()->notifyStartupComplete();
+    _serviceContext->getStorageEngine()->notifyStorageStartupRecoveryComplete();
+}
+
+OpMsgFuzzerFixture::~OpMsgFuzzerFixture() {
+    CollectionShardingStateFactory::clear(_serviceContext);
+
+    {
+        auto clientGuard = _clientStrand->bind();
+        auto opCtx = _serviceContext->makeOperationContext(clientGuard.get());
+        Lock::GlobalLock glk(opCtx.get(), MODE_X);
+        auto databaseHolder = DatabaseHolder::get(opCtx.get());
+        databaseHolder->closeAll(opCtx.get());
+    }
+
+    shutdownGlobalStorageEngineCleanly(_serviceContext);
 }
 
 int OpMsgFuzzerFixture::testOneInput(const char* Data, size_t Size) {
@@ -123,22 +171,28 @@ int OpMsgFuzzerFixture::testOneInput(const char* Data, size_t Size) {
         return 0;
     }
 
-    auto clientGuard = _clientStrand->bind();
-    auto opCtx = _serviceContext->makeOperationContext(clientGuard.get());
-    VectorClockMutable::get(_serviceContext)->tickClusterTimeTo(kInMemoryLogicalTime);
+    auto testHandleRequest = [&](const ClusterRole& role) {
+        auto clientGuard = _clientStrand->bind();
+        auto opCtx = _serviceContext->makeOperationContext(clientGuard.get());
+        VectorClockMutable::get(_serviceContext)->tickClusterTimeTo(kInMemoryLogicalTime);
 
-    int new_size = Size + sizeof(int);
-    auto sb = SharedBuffer::allocate(new_size);
-    memcpy(sb.get(), &new_size, sizeof(int));
-    memcpy(sb.get() + sizeof(int), Data, Size);
-    Message msg(std::move(sb));
+        int new_size = Size + sizeof(int);
+        auto sb = SharedBuffer::allocate(new_size);
+        memcpy(sb.get(), &new_size, sizeof(int));
+        memcpy(sb.get() + sizeof(int), Data, Size);
+        Message msg(std::move(sb));
 
-    try {
-        _serviceContext->getServiceEntryPoint()->handleRequest(opCtx.get(), msg).get();
-    } catch (const AssertionException&) {
-        // We need to catch exceptions caused by invalid inputs
-    }
-
+        try {
+            _serviceContext->getService(role)
+                ->getServiceEntryPoint()
+                ->handleRequest(opCtx.get(), msg)
+                .get();
+        } catch (const AssertionException&) {
+            // We need to catch exceptions caused by invalid inputs
+        }
+    };
+    testHandleRequest(ClusterRole::ShardServer);
+    testHandleRequest(ClusterRole::RouterServer);
     return 0;
 }
 

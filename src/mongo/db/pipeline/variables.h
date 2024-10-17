@@ -29,15 +29,32 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <map>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
+class Expression;
 class ExpressionContext;
 class VariablesParseState;
 
@@ -77,6 +94,17 @@ public:
         return id >= 0;
     }
 
+    /**
+     * Returns 'true' if any of the 'vars' appear in the passed 'ids' set.
+     */
+    static bool hasVariableReferenceTo(const std::set<Variables::Id>& vars,
+                                       const std::set<Variables::Id>& ids) {
+        std::vector<Variables::Id> match;
+        std::set_intersection(
+            vars.begin(), vars.end(), ids.begin(), ids.end(), std::back_inserter(match));
+        return !match.empty();
+    }
+
     // Ids for builtin variables.
     static constexpr auto kRootId = Id(-1);
     static constexpr auto kRemoveId = Id(-2);
@@ -84,6 +112,8 @@ public:
     static constexpr auto kClusterTimeId = Id(-4);
     static constexpr auto kJsScopeId = Id(-5);
     static constexpr auto kIsMapReduceId = Id(-6);
+    static constexpr auto kSearchMetaId = Id(-7);
+    static constexpr auto kUserRolesId = Id(-8);
 
     // Map from builtin var name to reserved id number.
     static const StringMap<Id> kBuiltinVarNameToId;
@@ -101,6 +131,12 @@ public:
      * has been marked constant.
      */
     void setConstantValue(Variables::Id id, const Value& value);
+
+    /**
+     * Same as 'setValue' but is only allowed on reserved, builtin, variables. Should not be used
+     * when setting from user input.
+     */
+    void setReservedValue(Variables::Id id, const Value& value, bool isConstant);
 
     /**
      * Gets the value of a user-defined or system variable. If the 'id' provided represents the
@@ -153,8 +189,13 @@ public:
     /**
      * Seed let parameters with the given BSONObj.
      */
-    void seedVariablesWithLetParameters(ExpressionContext* const expCtx,
-                                        const BSONObj letParameters);
+    void seedVariablesWithLetParameters(ExpressionContext* expCtx, BSONObj letParameters);
+
+    /**
+     * Serializes this Variables object to a BSONObj, according to the top level field names of
+     * 'varsToSerialize'.
+     */
+    BSONObj toBSON(const VariablesParseState& vps, const BSONObj& varsToSerialize) const;
 
     bool hasValue(Variables::Id id) const {
         return _definitions.find(id) != _definitions.end();
@@ -175,6 +216,38 @@ public:
 
     LegacyRuntimeConstants transitionalExtractRuntimeConstants() const;
 
+    static auto getBuiltinVariableName(Variables::Id variable) {
+        for (auto& [name, id] : kBuiltinVarNameToId) {
+            if (variable == id) {
+                return name;
+            }
+        }
+        MONGO_UNREACHABLE_TASSERT(5858104);
+    }
+
+    /**
+     * Return true if the passed-in variable ID belongs to a builtin variable.
+     */
+    static auto isBuiltin(Variables::Id variable) {
+        return kIdToBuiltinVarName.find(variable) != kIdToBuiltinVarName.end();
+    }
+
+    /**
+     * Define the value of the $$USER_ROLES variable.
+     */
+    void defineUserRoles(OperationContext* opCtx);
+
+    /**
+     * Define the value of the $$NOW variable by reading the current time.
+     */
+    void defineLocalNow();
+
+    /**
+     * Define the value of the $$CLUSTER_TIME variable by consulting the VectorClock (may be
+     * expensive due to mutex).
+     */
+    void defineClusterTime(OperationContext* opCtx);
+
 private:
     struct ValueAndState {
         ValueAndState() = default;
@@ -187,17 +260,23 @@ private:
 
     void setValue(Id id, const Value& value, bool isConstant);
 
-    static auto getBuiltinVariableName(Variables::Id variable) {
-        for (auto& [name, id] : kBuiltinVarNameToId) {
-            if (variable == id) {
-                return name;
-            }
-        }
-        return std::string();
-    }
-
     IdGenerator _idGenerator;
     stdx::unordered_map<Id, ValueAndState> _definitions;
+};
+
+/**
+ * This class represents the let variable that is defined under 'let' attribute in aggregation
+ * stages such as $lookup and $merge.
+ *
+ * 'let' attribute may store multiple let variables and these variables have to be stored in an
+ * order preserving container in order to guarantee the stability in the query shape serialization..
+ */
+struct LetVariable {
+    LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id);
+
+    std::string name;
+    boost::intrusive_ptr<Expression> expression;
+    Variables::Id id;
 };
 
 /**

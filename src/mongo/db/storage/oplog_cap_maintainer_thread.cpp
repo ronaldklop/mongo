@@ -27,84 +27,173 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "oplog_cap_maintainer_thread.h"
 
+#include <exception>
+#include <mutex>
+#include <utility>
+
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/collection_truncate_markers.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
 namespace {
 
+const auto getMaintainerThread = ServiceContext::declareDecoration<OplogCapMaintainerThread>();
+
 MONGO_FAIL_POINT_DEFINE(hangOplogCapMaintainerThread);
 
 }  // namespace
 
-bool OplogCapMaintainerThread::_deleteExcessDocuments() {
-    if (!getGlobalServiceContext()->getStorageEngine()) {
-        LOGV2_DEBUG(22240, 2, "OplogCapMaintainerThread: no global storage engine yet");
-        return false;
-    }
+OplogCapMaintainerThread* OplogCapMaintainerThread::get(ServiceContext* serviceCtx) {
+    return &getMaintainerThread(serviceCtx);
+}
 
-    const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
+bool OplogCapMaintainerThread::_deleteExcessDocuments(OperationContext* opCtx) {
+    // Maintaining the Oplog cap is crucial to the stability of the server so that we don't let the
+    // oplog grow unbounded. We mark the operation as having immediate priority to skip ticket
+    // acquisition and flow control.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
 
-    // Non-replicated writes will not contribute to replication lag and can be safely excluded from
-    // Flow Control.
-    opCtx->setShouldParticipateInFlowControl(false);
 
-    try {
-        // A Global IX lock should be good enough to protect the oplog truncation from
-        // interruptions such as restartCatalog. PBWM, database lock or collection lock is not
-        // needed. This improves concurrency if oplog truncation takes long time.
-        AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
-        const auto& oplog = oplogWrite.getCollection();
-        if (!oplog) {
+    // A Global IX lock should be good enough to protect the oplog truncation from
+    // interruptions such as replication rollback. Database lock or collection lock is not
+    // needed. This improves concurrency if oplog truncation takes long time.
+    std::shared_ptr<CollectionTruncateMarkers> oplogTruncateMarkers;
+    {
+        Lock::GlobalLock globalLk(opCtx, MODE_IX);
+        auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+        if (!rs) {
             LOGV2_DEBUG(4562600, 2, "oplog collection does not exist");
             return false;
         }
-        auto rs = oplog->getRecordStore();
-        if (!rs->yieldAndAwaitOplogDeletionRequest(opCtx.get())) {
-            return false;  // Oplog went away.
-        }
-        rs->reclaimOplog(opCtx.get());
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        return false;
-    } catch (const std::exception& e) {
-        LOGV2_FATAL_NOTRACE(22243,
-                            "error in OplogCapMaintainerThread: {error}",
-                            "Error in OplogCapMaintainerThread",
-                            "error"_attr = e.what());
-    } catch (...) {
-        fassertFailedNoTrace(!"unknown error in OplogCapMaintainerThread");
+
+        // Create another reference to the oplog truncate markers while holding a lock on
+        // the collection to prevent it from being destructed.
+        oplogTruncateMarkers = rs->getCollectionTruncateMarkers();
+        invariant(oplogTruncateMarkers);
     }
+
+    if (!oplogTruncateMarkers->awaitHasExcessMarkersOrDead(opCtx)) {
+        // Oplog went away or we timed out waiting for oplog space to reclaim.
+        return false;
+    }
+
+    {
+        // Oplog state could have changed while yielding. Reacquire global lock
+        // and refresh oplog state to ensure we have a valid pointer.
+        Lock::GlobalLock globalLk(opCtx, MODE_IX);
+        auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+        if (!rs) {
+            LOGV2_DEBUG(9064300, 2, "oplog collection does not exist");
+            return false;
+        }
+        rs->reclaimOplog(opCtx);
+    }
+
     return true;
 }
 
-void OplogCapMaintainerThread::run() {
-    LOGV2_DEBUG(5295000, 1, "Oplog cap maintainer thread started", "threadName"_attr = _name);
-    ThreadClient tc(_name, getGlobalServiceContext());
+void OplogCapMaintainerThread::start() {
+    massert(4204300, "OplogCapMaintainerThread already started", !_thread.joinable());
+    _thread = stdx::thread(&OplogCapMaintainerThread::_run, this);
+}
 
-    while (!globalInShutdownDeprecated()) {
-        if (MONGO_unlikely(hangOplogCapMaintainerThread.shouldFail())) {
-            LOGV2(5095500, "Hanging the oplog cap maintainer thread due to fail point");
-            hangOplogCapMaintainerThread.pauseWhileSet();
-        }
+void OplogCapMaintainerThread::_run() {
+    std::string name = std::string("OplogCapMaintainerThread-") +
+        toStringForLogging(NamespaceString::kRsOplogNamespace);
+    setThreadName(name);
 
-        if (!_deleteExcessDocuments()) {
-            sleepmillis(1000);  // Back off in case there were problems deleting.
+    LOGV2_DEBUG(5295000, 1, "Oplog cap maintainer thread started", "threadName"_attr = name);
+    ThreadClient tc(name, getGlobalServiceContext()->getService(ClusterRole::ShardServer));
+
+    {
+        stdx::lock_guard<Client> lk(*tc.get());
+        tc.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
+    ServiceContext::UniqueOperationContext opCtx;
+    while (true) {
+        // It's illegal to create a new opCtx while a thread already has one, so we reset the opCtx.
+        // Otherwise, it could lead to deadlocks in the production setup.
+        //
+        // For example, FCBIS requires switching storage engines. Before switching storage engines,
+        // we block the system from creating new opCtxs, kill all existing opCtxs, and wait for
+        // their destruction. If makeOperationContext() was called during this process, it could be
+        // blocked, which would in turn block the destruction of previous killed opCtx and block the
+        // FCBIS.
+        ON_BLOCK_EXIT([&] { opCtx.reset(); });
+        try {
+            opCtx = tc->makeOperationContext();
+
+            if (MONGO_unlikely(hangOplogCapMaintainerThread.shouldFail())) {
+                LOGV2(5095500, "Hanging the oplog cap maintainer thread due to fail point");
+                hangOplogCapMaintainerThread.pauseWhileSet(opCtx.get());
+            }
+
+            if (_deleteExcessDocuments(opCtx.get())) {
+                continue;
+            }
+
+            opCtx->sleepFor(Seconds(1));  // Back off in case there were problems deleting.
+        } catch (const ExceptionForCat<ErrorCategory::ShutdownError>& e) {
+            LOGV2_DEBUG(9259900,
+                        1,
+                        "Interrupted due to shutdown. OplogCapMaintainerThread Exiting",
+                        "error"_attr = e);
+            return;
+        } catch (...) {
+            const auto& err = mongo::exceptionToStatus();
+            if (opCtx->checkForInterruptNoAssert().isOK()) {
+                LOGV2_FATAL_NOTRACE(
+                    6761100, "Error in OplogCapMaintainerThread", "error"_attr = err);
+            }
+            // Since we set setSystemOperationUnkillableByStepdown(), the opCtx can't be interrupted
+            // by repl state transitions - stepdown, stepup, and rollback.
+            // It can only be interrupted by shutdown, killOp, or storage change
+            // (causes ErrorCodes::InterruptedDueToStorageChange) due to FCBIS. The shutdown case is
+            // handled above. We reach here for the last two cases, and it's safe to continue.
+            LOGV2_DEBUG(9064301,
+                        1,
+                        "Oplog cap maintainer thread was interrupted, but can safely continue",
+                        "error"_attr = err);
         }
     }
+
+    MONGO_UNREACHABLE;
 }
+
+void OplogCapMaintainerThread::shutdown() {
+    if (_thread.joinable()) {
+        LOGV2_INFO(7474902, "Shutting down oplog cap maintainer thread");
+        _thread.join();
+        LOGV2(7474901, "Finished shutting down oplog cap maintainer thread");
+    }
+}
+
 }  // namespace mongo

@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util_core.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -50,11 +52,18 @@ ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(Operati
     _enqueueLock();
 }
 
+ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(
+    ReplicationStateTransitionLockGuard&& other)
+    : _opCtx(other._opCtx), _mode(other._mode), _result(other._result) {
+    other._result = LockResult::LOCK_INVALID;
+}
+
 ReplicationStateTransitionLockGuard::~ReplicationStateTransitionLockGuard() {
     _unlock();
 }
 
-void ReplicationStateTransitionLockGuard::waitForLockUntil(mongo::Date_t deadline) {
+void ReplicationStateTransitionLockGuard::waitForLockUntil(
+    mongo::Date_t deadline, const Locker::LockTimeoutCallback& onTimeout) {
     // We can return early if the lock request was already satisfied.
     if (_result == LOCK_OK) {
         return;
@@ -62,7 +71,7 @@ void ReplicationStateTransitionLockGuard::waitForLockUntil(mongo::Date_t deadlin
 
     _result = LOCK_INVALID;
     // Wait for the completion of the lock request for the RSTL.
-    _opCtx->lockState()->lockRSTLComplete(_opCtx, _mode, deadline);
+    shard_role_details::getLocker(_opCtx)->lockRSTLComplete(_opCtx, _mode, deadline, onTimeout);
     _result = LOCK_OK;
 }
 
@@ -77,15 +86,20 @@ void ReplicationStateTransitionLockGuard::reacquire() {
 
 void ReplicationStateTransitionLockGuard::_enqueueLock() {
     // Enqueue a lock request for the RSTL.
-    _result = _opCtx->lockState()->lockRSTLBegin(_opCtx, _mode);
+    _result = shard_role_details::getLocker(_opCtx)->lockRSTLBegin(_opCtx, _mode);
 }
 
 void ReplicationStateTransitionLockGuard::_unlock() {
+    if (_result == LockResult::LOCK_INVALID) {
+        return;
+    }
+
     // If ReplicationStateTransitionLockGuard is called in a WriteUnitOfWork, we won't accept
     // any exceptions to be thrown between _enqueueLock and waitForLockUntil because that would
     // delay cleaning up any failed RSTL lock attempt state from lock manager.
-    invariant(!(_result == LOCK_WAITING && _opCtx->lockState()->inAWriteUnitOfWork()));
-    _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
+    invariant(
+        !(_result == LOCK_WAITING && shard_role_details::getLocker(_opCtx)->inAWriteUnitOfWork()));
+    shard_role_details::getLocker(_opCtx)->unlock(resourceIdReplicationStateTransitionLock);
     _result = LOCK_INVALID;
 }
 

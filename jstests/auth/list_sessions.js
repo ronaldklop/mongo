@@ -1,11 +1,10 @@
 /**
  * Auth tests for the $listSessions aggregation pipeline.
- * @tags: [requires_sharding]
+ * @tags: [requires_sharding, requires_auth]
  */
 
-(function() {
-'use strict';
-load('jstests/aggregation/extras/utils.js');
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
@@ -56,6 +55,7 @@ function runListSessionsTest(mongod) {
     assertErrorCode(admin.system.collections, pipeline, ErrorCodes.InvalidNamespace);
 
     // Ensure that changing users hides the session everwhere.
+    admin.logout();
     assert(admin.auth('user2', 'pass'));
     assert.eq(listSessions().toArray().length, 0);
 
@@ -76,4 +76,3 @@ const st =
     new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
 runListSessionsTest(st.s0);
 st.stop();
-})();

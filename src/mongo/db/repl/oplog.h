@@ -29,19 +29,34 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <functional>
+#include <iosfwd>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_constraint_violation_logger.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 class Collection;
@@ -50,6 +65,7 @@ class Database;
 class NamespaceString;
 class OperationContext;
 class OperationSessionInfo;
+class CollectionAcquisition;
 class Session;
 
 using OplogSlot = repl::OpTime;
@@ -72,8 +88,22 @@ public:
     InsertStatement(BSONObj toInsert, Timestamp ts, long long term)
         : oplogSlot(repl::OpTime(ts, term)), doc(std::move(toInsert)) {}
 
+    InsertStatement(BSONObj toInsert, RecordId rid)
+        : recordId(std::move(rid)), doc(std::move(toInsert)) {}
+
     std::vector<StmtId> stmtIds = {kUninitializedStmtId};
     OplogSlot oplogSlot;
+
+    // TODO SERVER-86241: Clarify whether this is just used for testing and whether it is necessary
+    // at all. When a collection has replicated record ids enabled, defer to the
+    // 'replicatedRecordId' as the source of truth.
+    //
+    // Caution: this may be an artifact of code movement, and its current purpose is unclear.
+    RecordId recordId;
+
+    // Holds the replicated recordId during secondary oplog application.
+    RecordId replicatedRecordId;
+
     BSONObj doc;
 };
 
@@ -84,20 +114,15 @@ struct OplogLink {
     OplogLink() = default;
 
     OpTime prevOpTime;
-    OpTime preImageOpTime;
-    OpTime postImageOpTime;
+    MultiOplogEntryType multiOpType = MultiOplogEntryType::kLegacyMultiOpType;
 };
 
 /**
- * Set the "lsid", "txnNumber", "stmtId", "prevOpTime", "preImageOpTime" and "postImageOpTime"
- * fields of the oplogEntry based on the given oplogLink for retryable writes (i.e. when
- * stmtIds.front() != kUninitializedStmtId).
+ * Set the "lsid", "txnNumber", "stmtId", "prevOpTime" fields of the oplogEntry based on the given
+ * oplogLink for retryable writes (i.e. when stmtIds.front() != kUninitializedStmtId).
  *
  * If the given oplogLink.prevOpTime is a null OpTime, both the oplogLink.prevOpTime and the
  * "prevOpTime" field of the oplogEntry will be set to the TransactionParticipant's lastWriteOpTime.
- * The "preImageOpTime" field will only be set if the given oplogLink.preImageOpTime is not null.
- * Similarly, the "postImageOpTime" field will only be set if the given oplogLink.postImageOpTime is
- * not null.
  */
 void appendOplogEntryChainInfo(OperationContext* opCtx,
                                MutableOplogEntry* oplogEntry,
@@ -119,30 +144,34 @@ void createOplog(OperationContext* opCtx,
 void createOplog(OperationContext* opCtx);
 
 /**
- * Log insert(s) to the local oplog.
- * Returns the OpTime of every insert.
- * @param oplogEntryTemplate: a template used to generate insert oplog entries. Callers must set the
- * "ns", "ui", "fromMigrate" and "wall" fields before calling this function. This function will then
- * augment the template with the "op" (which is set to kInsert), "lsid" and "txnNumber" fields if
- * necessary.
- * @param begin/end: first/last InsertStatement to be inserted. This function iterates from begin to
- * end and generates insert oplog entries based on the augmented oplogEntryTemplate with the "ts",
- * "t", "o", "prevOpTime" and "stmtId" fields replaced by the content of each InsertStatement
- * defined by the begin-end range.
- *
- */
-std::vector<OpTime> logInsertOps(
-    OperationContext* opCtx,
-    MutableOplogEntry* oplogEntryTemplate,
-    std::vector<InsertStatement>::const_iterator begin,
-    std::vector<InsertStatement>::const_iterator end,
-    std::function<boost::optional<ShardId>(const BSONObj& doc)> getDestinedRecipientFn);
-
-/**
  * Returns the optime of the oplog entry written to the oplog.
  * Returns a null optime if oplog was not modified.
  */
 OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry);
+
+/**
+ * Low level oplog function used by logOp() and similar functions to append
+ * storage engine records to the oplog collection.
+ *
+ * This function has to be called within the scope of a WriteUnitOfWork with
+ * a valid CollectionPtr reference to the oplog.
+ *
+ * @param records a vector of oplog records to be written. Records hold references
+ * to unowned BSONObj data.
+ * @param timestamps a vector of respective Timestamp objects for each oplog record.
+ * @param oplogCollection collection to be written to.
+ * @param finalOpTime the OpTime of the last oplog record.
+ * @param wallTime the wall clock time of the last oplog record.
+ * @param isAbortIndexBuild for tenant migration use only.
+ */
+void logOplogRecords(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     std::vector<Record>* records,
+                     const std::vector<Timestamp>& timestamps,
+                     const CollectionPtr& oplogCollection,
+                     OpTime finalOpTime,
+                     Date_t wallTime,
+                     bool isAbortIndexBuild);
 
 // Flush out the cached pointer to the oplog.
 void clearLocalOplogPtr(ServiceContext* service);
@@ -158,7 +187,7 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
  * Called by catalog::openCatalog() to re-establish the oplog collection pointer while holding onto
  * the global lock in exclusive mode.
  */
-void establishOplogCollectionForLogging(OperationContext* opCtx, const CollectionPtr& oplog);
+void establishOplogRecordStoreForLogging(OperationContext* opCtx, RecordStore* oplog);
 
 using IncrementOpsAppliedStatsFn = std::function<void()>;
 
@@ -171,7 +200,10 @@ using IncrementOpsAppliedStatsFn = std::function<void()>;
 class OplogApplication {
 public:
     static constexpr StringData kInitialSyncOplogApplicationMode = "InitialSync"_sd;
+    // This only being used in 'applyOps' command when sent by client.
     static constexpr StringData kRecoveringOplogApplicationMode = "Recovering"_sd;
+    static constexpr StringData kStableRecoveringOplogApplicationMode = "StableRecovering"_sd;
+    static constexpr StringData kUnstableRecoveringOplogApplicationMode = "UnstableRecovering"_sd;
     static constexpr StringData kSecondaryOplogApplicationMode = "Secondary"_sd;
     static constexpr StringData kApplyOpsCmdOplogApplicationMode = "ApplyOps"_sd;
 
@@ -180,9 +212,12 @@ public:
         kInitialSync,
 
         // Used when we are applying oplog operations to recover the database state following an
-        // unclean shutdown, or when we are recovering from the oplog after we rollback to a
+        // clean/unclean shutdown, or when we are recovering from the oplog after we rollback to a
         // checkpoint.
-        kRecovering,
+        // If recovering from a unstable stable checkpoint.
+        kUnstableRecovering,
+        // If recovering from a stable checkpoint.~
+        kStableRecovering,
 
         // Used when a secondary node is applying oplog operations from the primary during steady
         // state replication.
@@ -193,14 +228,35 @@ public:
         kApplyOpsCmd
     };
 
+    static bool inRecovering(Mode mode) {
+        return mode == Mode::kUnstableRecovering || mode == Mode::kStableRecovering;
+    }
+
     static StringData modeToString(Mode mode);
 
     static StatusWith<Mode> parseMode(const std::string& mode);
+
+    // Server will crash on oplog application failure during recovery from stable checkpoint in the
+    // test environment.
+    static void checkOnOplogFailureForRecovery(OperationContext* opCtx,
+                                               const mongo::NamespaceString& nss,
+                                               const mongo::BSONObj& oplogEntry,
+                                               const std::string& errorMsg);
 };
 
 inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
     return (s << OplogApplication::modeToString(mode));
 }
+
+/**
+ * Logs an oplog constraint violation and writes an entry into the health log.
+ */
+void logOplogConstraintViolation(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 OplogConstraintViolationEnum type,
+                                 const std::string& operation,
+                                 const BSONObj& opObj,
+                                 boost::optional<Status> status);
 
 /**
  * Used for applying from an oplog entry or grouped inserts.
@@ -211,10 +267,11 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
  * Returns failure status if the op was an update that could not be applied.
  */
 Status applyOperation_inlock(OperationContext* opCtx,
-                             Database* db,
+                             CollectionAcquisition& collectionAcquisition,
                              const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
+                             bool isDataConsistent,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats = {});
 
 /**
@@ -223,7 +280,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
  * Returns failure status if the op that could not be applied.
  */
 Status applyCommand_inlock(OperationContext* opCtx,
-                           const OplogEntry& entry,
+                           const ApplierOperation& op,
                            OplogApplication::Mode mode);
 
 /**
@@ -251,7 +308,7 @@ void createIndexForApplyOps(OperationContext* opCtx,
 
 /**
  * Allocates optimes for new entries in the oplog.  Returns a vector of OplogSlots, which
- * contain the new optimes along with their terms and newly calculated hash fields.
+ * contain the new optimes along with their terms.
  */
 std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
@@ -272,6 +329,14 @@ using ApplyImportCollectionFn = std::function<void(OperationContext*,
                                                    OplogApplication::Mode)>;
 
 void registerApplyImportCollectionFn(ApplyImportCollectionFn func);
+
+template <typename F>
+auto writeConflictRetryWithLimit(OperationContext* opCtx,
+                                 StringData opStr,
+                                 const NamespaceStringOrUUID& nssOrUUID,
+                                 F&& f) {
+    return writeConflictRetry(opCtx, opStr, nssOrUUID, f, repl::writeConflictRetryLimit);
+}
 
 }  // namespace repl
 }  // namespace mongo

@@ -1,7 +1,7 @@
 /*
  * Utilities for dealing with chunk bounds.
  */
-var chunkBoundsUtil = (function() {
+export var chunkBoundsUtil = (function() {
     let eq = function(shardKeyA, shardKeyB) {
         return bsonWoCompare(shardKeyA, shardKeyB) == 0;
     };
@@ -80,8 +80,9 @@ var chunkBoundsUtil = (function() {
      */
     let _getShard = function(st, shardName) {
         for (let i = 0; i < st._connections.length; i++) {
-            if (st["rs" + i].name == shardName) {
-                return st._connections[i];
+            const conn = st._connections[i];
+            if (conn.shardName === shardName) {
+                return conn;
             }
         }
     };

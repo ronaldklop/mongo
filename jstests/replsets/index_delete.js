@@ -5,6 +5,8 @@
  * @tags: [multiversion_incompatible]
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 function indexBuildInProgress(checkDB) {
     var inprog = checkDB.currentOp().inprog;
     var indexOps = inprog.filter(function(op) {
@@ -36,6 +38,10 @@ var primaryDB = primary.getDB(dbName);
 var secondDB = second.getDB(dbName);
 
 var size = 100;
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Make sure that the index build does not terminate on the secondary.
 assert.commandWorked(

@@ -27,30 +27,49 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include <set>
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
 
 class ConfigSvrCreateDatabaseCommand final : public TypedCommand<ConfigSvrCreateDatabaseCommand> {
 public:
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors forwarded with this internal
+     * command.
+     */
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
     using Request = ConfigsvrCreateDatabase;
     using Response = ConfigsvrCreateDatabaseResponse;
 
@@ -61,11 +80,10 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCreateDatabase can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream()
-                        << "_configsvrCreateDatabase must be called with majority writeConcern",
-                    opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -74,21 +92,14 @@ public:
 
             auto dbname = request().getCommandParameter();
 
-            if (request().getEnableSharding()) {
-                uassert(ErrorCodes::BadValue,
-                        str::stream() << "Enable sharding can only be set to `true`",
-                        *request().getEnableSharding());
-
-                audit::logEnableSharding(opCtx->getClient(), dbname);
-            }
+            audit::logEnableSharding(opCtx->getClient(), dbname);
 
             auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
                 opCtx,
-                dbname,
-                request().getPrimaryShardId()
-                    ? boost::optional<ShardId>(request().getPrimaryShardId()->toString())
-                    : boost::optional<ShardId>(),
-                request().getEnableSharding().value_or(false));
+                DatabaseNameUtil::deserialize(
+                    boost::none, dbname, request().getSerializationContext()),
+                request().getPrimaryShardId(),
+                request().getSerializationContext());
 
             return {dbt.getVersion()};
         }
@@ -106,8 +117,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -124,7 +136,8 @@ private:
     bool adminOnly() const override {
         return true;
     }
-} configsvrCreateDatabaseCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrCreateDatabaseCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

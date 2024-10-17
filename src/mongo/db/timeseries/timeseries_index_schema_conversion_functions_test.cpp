@@ -27,14 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <string>
 
-#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/timeseries/timeseries_field_names.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -48,8 +56,10 @@ const std::string kControlMinTimeFieldName(timeseries::kControlMinFieldNamePrefi
 const std::string kControlMaxTimeFieldName(timeseries::kControlMaxFieldNamePrefix +
                                            kTimeseriesTimeFieldName);
 const std::string kTimeseriesSomeDataFieldName("somedatafield");
-const std::string kBucketsSomeDataFieldName(timeseries::kBucketDataFieldName + "." +
-                                            kTimeseriesSomeDataFieldName);
+const std::string kControlMinSomeDataFieldName(timeseries::kControlMinFieldNamePrefix +
+                                               kTimeseriesSomeDataFieldName);
+const std::string kControlMaxSomeDataFieldName(timeseries::kControlMaxFieldNamePrefix +
+                                               kTimeseriesSomeDataFieldName);
 
 /**
  * Constructs a TimeseriesOptions object for testing.
@@ -83,12 +93,13 @@ void testBothWaysIndexSpecConversion(const TimeseriesOptions& timeseriesOptions,
 
     // Test buckets => time-series schema conversion.
 
-    auto timeseriesIndexSpecResult = timeseries::createTimeseriesIndexSpecFromBucketsIndexSpec(
-        timeseriesOptions, bucketsIndexSpec);
+    auto timeseriesIndexSpecResult = timeseries::createTimeseriesIndexFromBucketsIndex(
+        timeseriesOptions, BSON(timeseries::kKeyFieldName << bucketsIndexSpec));
 
     if (testShouldSucceed) {
         ASSERT(timeseriesIndexSpecResult);
-        ASSERT_BSONOBJ_EQ(timeseriesIndexSpec, timeseriesIndexSpecResult.get());
+        ASSERT_BSONOBJ_EQ(timeseriesIndexSpec,
+                          timeseriesIndexSpecResult->getObjectField(timeseries::kKeyFieldName));
     } else {
         // A buckets collection index spec that does not conform to the supported time-series index
         // spec schema should be converted to an empty time-series index spec result.
@@ -96,12 +107,45 @@ void testBothWaysIndexSpecConversion(const TimeseriesOptions& timeseriesOptions,
     }
 }
 
-// {} <=> {}
-TEST(TimeseriesIndexSchemaConversionTest, EmptyTimeseriesIndexSpecDoesNothing) {
+TEST(TimeseriesIndexSchemaConversionTest, OriginalSpecFieldName) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
-    BSONObj emptyIndexSpec = {};
 
-    testBothWaysIndexSpecConversion(timeseriesOptions, emptyIndexSpec, emptyIndexSpec);
+    BSONObj bucketsIndexSpec =
+        BSON(timeseries::kKeyFieldName << BSON("control.min.a" << 1 << "control.max.a" << 1)
+                                       << timeseries::kOriginalSpecFieldName << BSON("abc" << 123));
+
+    auto timeseriesIndexSpecResult =
+        timeseries::createTimeseriesIndexFromBucketsIndex(timeseriesOptions, bucketsIndexSpec);
+    ASSERT(timeseriesIndexSpecResult);
+    ASSERT_BSONOBJ_EQ(*timeseriesIndexSpecResult, BSON("abc" << 123));
+}
+
+// {} is invalid.
+TEST(TimeseriesIndexSchemaConversionTest, EmptyTimeseriesIndexSpecInvalid) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = {};
+
+    ASSERT_NOT_OK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(timeseriesOptions,
+                                                                            timeseriesIndexSpec));
+}
+
+// {$hint: 'abc'} is invalid.
+TEST(TimeseriesIndexSchemaConversionTest, HintTimeseriesIndexSpecInvalid) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("$hint"
+                                       << "abc");
+
+    ASSERT_NOT_OK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(timeseriesOptions,
+                                                                            timeseriesIndexSpec));
+}
+
+// {$natural: 1} is invalid.
+TEST(TimeseriesIndexSchemaConversionTest, NaturalTimeseriesIndexSpecInvalid) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("$natural" << 1);
+
+    ASSERT_NOT_OK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(timeseriesOptions,
+                                                                            timeseriesIndexSpec));
 }
 
 // {tm: 1} <=> {control.min.tm: 1, control.max.tm: 1}
@@ -123,14 +167,16 @@ TEST(TimeseriesIndexSchemaConversionTest, DescendingTimeIndexSpecConversion) {
     testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {tm.subfield1: 1} <=> {tm.subfield1: 1}
-TEST(TimeseriesIndexSchemaConversionTest, TimeSubFieldIndexSpecConversionFails) {
+// {tm.subfield1: 1} <=> {control.min.tm.subfield1: 1, control.max.tm.subfield1: 1}
+// This case is probably not useful, because 'tm' is always a Date, which can't have subfields.
+// Presumably it works because we treat 'tm' similarly to other non-metadata fields.
+TEST(TimeseriesIndexSchemaConversionTest, TimeSubFieldIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec = BSON(kTimeseriesTimeFieldName + kSubField1Name << 1);
-    BSONObj bucketsIndexSpec = BSON(kTimeseriesTimeFieldName + kSubField1Name << 1);
+    BSONObj bucketsIndexSpec = BSON(kControlMinTimeFieldName + kSubField1Name
+                                    << 1 << kControlMaxTimeFieldName + kSubField1Name << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
 // {mm: 1} <=> {meta: 1}
@@ -186,62 +232,69 @@ TEST(TimeseriesIndexSchemaConversionTest, MetadataAndTimeCompoundIndexSpecConver
     testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {somedatafield: 1} <=> {data.somedatafield: 1}
-TEST(TimeseriesIndexSchemaConversionTest, DataIndexSpecConversionFails) {
+// {somedatafield: 1} <=> {control.min.somedatafield: 1, control.max.somedatafield: 1}
+TEST(TimeseriesIndexSchemaConversionTest, DataIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec = BSON(kTimeseriesSomeDataFieldName << 1);
-    BSONObj bucketsIndexSpec = BSON(kBucketsSomeDataFieldName << 1);
+    BSONObj bucketsIndexSpec =
+        BSON(kControlMinSomeDataFieldName << 1 << kControlMaxSomeDataFieldName << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {tm: 1, somedatafield: 1} <=> {control.min.tm: 1, control.max.tm: 1, data.somedatafield: 1}
-TEST(TimeseriesIndexSchemaConversionTest, TimeAndDataCompoundIndexSpecConversionFails) {
+// {tm: 1, somedatafield: 1} <=>
+// {control.min.tm: 1, control.max.tm: 1,
+//  control.min.somedatafield: 1, control.max.somedatafield: 1}
+TEST(TimeseriesIndexSchemaConversionTest, TimeAndDataCompoundIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec =
         BSON(kTimeseriesTimeFieldName << 1 << kTimeseriesSomeDataFieldName << 1);
     BSONObj bucketsIndexSpec = BSON(kControlMinTimeFieldName << 1 << kControlMaxTimeFieldName << 1
-                                                             << kBucketsSomeDataFieldName << 1);
+                                                             << kControlMinSomeDataFieldName << 1
+                                                             << kControlMaxSomeDataFieldName << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {somedatafield: 1, tm: 1} <=> {data.somedatafield: 1, control.min.tm: 1, control.max.tm: 1}
-TEST(TimeseriesIndexSchemaConversionTest, DataAndTimeCompoundIndexSpecConversionFails) {
+// {somedatafield: 1, tm: 1} <=>
+// {control.min.somedatafield: 1, control.max.somedatafield: 1,
+//  control.min.tm: 1, control.max.tm: 1}
+TEST(TimeseriesIndexSchemaConversionTest, DataAndTimeCompoundIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec =
         BSON(kTimeseriesSomeDataFieldName << 1 << kTimeseriesTimeFieldName << 1);
-    BSONObj bucketsIndexSpec = BSON(kBucketsSomeDataFieldName << 1 << kControlMinTimeFieldName << 1
-                                                              << kControlMaxTimeFieldName << 1);
+    BSONObj bucketsIndexSpec =
+        BSON(kControlMinSomeDataFieldName << 1 << kControlMaxSomeDataFieldName << 1
+                                          << kControlMinTimeFieldName << 1
+                                          << kControlMaxTimeFieldName << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {mm: 1, somedatafield: 1} <=> {meta: 1, data.somedatafield: 1}
-TEST(TimeseriesIndexSchemaConversionTest, MetadataAndDataCompoundIndexSpecConversionFails) {
+// {mm: 1, somedatafield: 1} <=> {meta: 1, control.min.somedatafield: 1, control.max.somedatafield:
+// 1}
+TEST(TimeseriesIndexSchemaConversionTest, MetadataAndDataCompoundIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec =
         BSON(kTimeseriesMetaFieldName << 1 << kTimeseriesSomeDataFieldName << 1);
     BSONObj bucketsIndexSpec =
-        BSON(timeseries::kBucketMetaFieldName << 1 << kBucketsSomeDataFieldName << 1);
+        BSON(timeseries::kBucketMetaFieldName << 1 << kControlMinSomeDataFieldName << 1
+                                              << kControlMaxSomeDataFieldName << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
-// {somedatafield: 1, mm: 1} <=> {data.somedatafield: 1, meta: 1}
-TEST(TimeseriesIndexSchemaConversionTest, DataAndMetadataCompoundIndexSpecConversionFails) {
+// {somedatafield: 1, mm: 1} <=>
+// {control.min.somedatafield: 1, control.max.somedatafield: 1, meta: 1}
+TEST(TimeseriesIndexSchemaConversionTest, DataAndMetadataCompoundIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec =
         BSON(kTimeseriesSomeDataFieldName << 1 << kTimeseriesMetaFieldName << 1);
     BSONObj bucketsIndexSpec =
-        BSON(kBucketsSomeDataFieldName << 1 << timeseries::kBucketMetaFieldName << 1);
+        BSON(kControlMinSomeDataFieldName << 1 << kControlMaxSomeDataFieldName << 1
+                                          << timeseries::kBucketMetaFieldName << 1);
 
-    testBothWaysIndexSpecConversion(
-        timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec, false /* testShouldSucceed */);
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }
 
 // {mm.subfield1: 1, mm.subfield2: 1, mm.foo:1, mm.bar: 1, mm.baz: 1, tm: 1} <=>
@@ -316,6 +369,51 @@ TEST(TimeseriesIndexSchemaConversionTest, 2dsphereMetadataIndexSpecConversion) {
     TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
     BSONObj timeseriesIndexSpec = BSON(kTimeseriesMetaFieldName << "2dsphere");
     BSONObj bucketsIndexSpec = BSON(timeseries::kBucketMetaFieldName << "2dsphere");
+
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
+}
+
+// {a: 1} <=> {control.min.a: 1, control.max.a: 1}
+TEST(TimeseriesIndexSchemaConversionTest, AscendingMeasurementIndexSpecConversion) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("a" << 1);
+    BSONObj bucketsIndexSpec = BSON("control.min.a" << 1 << "control.max.a" << 1);
+
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
+}
+
+// {a: -1} <=> {control.max.a: -1, control.min.a: -1}
+TEST(TimeseriesIndexSchemaConversionTest, DescendingMeasurementIndexSpecConversion) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("a" << -1);
+    BSONObj bucketsIndexSpec = BSON("control.max.a" << -1 << "control.min.a" << -1);
+
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
+}
+
+// {a: 1, b: -1, c: 1, d: "2dsphere"} <=> {control.min.a: 1, control.max.a: 1,
+//                                         control.max.b: -1, control.min.b: -1,
+//                                         control.min.c: 1, control.max.c: 1,
+//                                         data.d: "2dsphere_bucket"}
+TEST(TimeseriesIndexSchemaConversionTest, MixedCompoundMeasurementIndexSpecConversion) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("a" << 1 << "b" << -1 << "c" << 1 << "d"
+                                           << "2dsphere");
+    BSONObj bucketsIndexSpec = BSON(
+        "control.min.a" << 1 << "control.max.a" << 1 << "control.max.b" << -1 << "control.min.b"
+                        << -1 << "control.min.c" << 1 << "control.max.c" << 1 << "data.d"
+                        << "2dsphere_bucket");
+
+    testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
+}
+
+// {a: "2sphere"} <=> {data.a: "2dsphere_bucket"}
+TEST(TimeseriesIndexSchemaConversionTest, 2dsphereMeasurementIndexSpecConversion) {
+    TimeseriesOptions timeseriesOptions = makeTimeseriesOptions();
+    BSONObj timeseriesIndexSpec = BSON("a"
+                                       << "2dsphere");
+    BSONObj bucketsIndexSpec = BSON("data.a"
+                                    << "2dsphere_bucket");
 
     testBothWaysIndexSpecConversion(timeseriesOptions, timeseriesIndexSpec, bucketsIndexSpec);
 }

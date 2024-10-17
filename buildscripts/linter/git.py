@@ -1,14 +1,15 @@
 """Git Utility functions."""
+
 from __future__ import annotations
 
 import itertools
 import os
 import re
+from pathlib import Path
 from typing import Callable, List
 
-from buildscripts.linter import git_base as _git
 from buildscripts import moduleconfig
-from buildscripts.resmokelib.utils import globstar
+from buildscripts.linter import git_base as _git
 
 # Path to the modules in the mongodb source tree
 # Has to match the string in SConstruct
@@ -36,7 +37,8 @@ def get_module_paths() -> List[str]:
 
     # Get a list of modules
     mongo_modules = moduleconfig.discover_module_directories(
-        os.path.join(base_dir, MODULE_DIR), None)
+        os.path.join(base_dir, MODULE_DIR), None
+    )
 
     paths = [os.path.join(base_dir, MODULE_DIR, m) for m in mongo_modules]
     paths.append(base_dir)
@@ -71,10 +73,11 @@ class Repo(_git.Repository):
 
         Returns the full path to the file for clang-format to consume.
         """
-        if candidates is not None and len(candidates) > 0:  # pylint: disable=len-as-condition
+        if candidates is not None and len(candidates) > 0:
             candidates = [self._get_local_dir(f) for f in candidates]
             valid_files = list(
-                set(candidates).intersection(self.get_candidate_files(filter_function)))
+                set(candidates).intersection(self.get_candidate_files(filter_function))
+            )
         else:
             valid_files = list(self.get_candidate_files(filter_function))
 
@@ -115,14 +118,14 @@ class Repo(_git.Repository):
 
         file_set = {
             os.path.normpath(os.path.join(self.directory, line.rstrip()))
-            for line in diff_files.splitlines() if filter_function(line.rstrip())
+            for line in diff_files.splitlines()
+            if filter_function(line.rstrip())
         }
 
         return list(file_set)
 
     def get_working_tree_candidate_files(self, filter_function):
         # type: (Callable[[str], bool]) -> List[str]
-        # pylint: disable=invalid-name
         """Query git to get a list of all files in the working tree to consider for analysis."""
         return self._git_ls_files(["--cached", "--others"], filter_function)
 
@@ -147,7 +150,9 @@ class Repo(_git.Repository):
 def expand_file_string(glob_pattern):
     # type: (str) -> List[str]
     """Expand a string that represents a set of files."""
-    return [os.path.abspath(f) for f in globstar.iglob(glob_pattern)]
+    current_path = Path(".")
+    glob_pattern = os.path.relpath(glob_pattern)
+    return [str(glob_match.resolve()) for glob_match in current_path.glob(glob_pattern)]
 
 
 def get_files_to_check_working_tree(filter_function):
@@ -161,7 +166,9 @@ def get_files_to_check_working_tree(filter_function):
 
     valid_files = list(
         itertools.chain.from_iterable(
-            [r.get_working_tree_candidates(filter_function) for r in repos]))
+            [r.get_working_tree_candidates(filter_function) for r in repos]
+        )
+    )
 
     return valid_files
 
@@ -177,7 +184,8 @@ def get_valid_files_from_candidates(candidates, filter_fn: Callable[[str], bool]
     repos = get_repos()
 
     valid_files = list(
-        itertools.chain.from_iterable([r.get_candidates(candidates, filter_fn) for r in repos]))
+        itertools.chain.from_iterable([r.get_candidates(candidates, filter_fn) for r in repos])
+    )
 
     return valid_files
 
@@ -227,6 +235,8 @@ def get_my_files_to_check(filter_function, origin_branch):
 
     valid_files = list(
         itertools.chain.from_iterable(
-            [r.get_my_candidate_files(filter_function, origin_branch) for r in repos]))
+            [r.get_my_candidate_files(filter_function, origin_branch) for r in repos]
+        )
+    )
 
     return valid_files

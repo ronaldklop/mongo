@@ -29,43 +29,54 @@
 
 #pragma once
 
-#include "mongo/s/database_version_gen.h"
+#include <iosfwd>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/database_version_base_gen.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 /**
  * This class is used to represent a specific version of a Database.
  *
- * Currently it is implemented as a (uuid, [timestamp,] lastMod) triplet, where the
+ * Currently it is implemented as a (uuid, timestamp, lastMod) triplet, where the
  * timestamp is optional in versions prior 4.9. The uuid is going to be removed soon,
- * since they are not comparable (that's the reason why there is a ComparableDatabaseVersion class).
- *
- * Once uuids are gone, relational operators should be implemented in this class.
+ * since they are not comparable.
  *
  */
 class DatabaseVersion : public DatabaseVersionBase {
 public:
+    /**
+     * The name for the database version information field, which shard-aware commands should
+     * include if they want to convey database version.
+     */
+    static constexpr StringData kDatabaseVersionField = "databaseVersion"_sd;
+
+    using DatabaseVersionBase::getTimestamp;
+
     DatabaseVersion() = default;
 
     explicit DatabaseVersion(const BSONObj& obj) {
-        DatabaseVersionBase::parseProtected(IDLParserErrorContext("DatabaseVersion"), obj);
+        DatabaseVersionBase::parseProtected(IDLParserContext("DatabaseVersion"), obj);
     }
 
     explicit DatabaseVersion(const DatabaseVersionBase& dbv) : DatabaseVersionBase(dbv) {}
 
     /**
-     * Constructor of a DatabaseVersion based on epochs
-     */
-    explicit DatabaseVersion(mongo::UUID uuid)
-        : DatabaseVersion(uuid, boost::none /* timestamp */) {}
-
-    /**
      * Constructor of a DatabaseVersion based on epochs and timestamps
      */
-    DatabaseVersion(mongo::UUID uuid, boost::optional<mongo::Timestamp> timestamp)
-        : DatabaseVersionBase(1 /* lastMod */) {
+    DatabaseVersion(mongo::UUID uuid, mongo::Timestamp timestamp)
+        : DatabaseVersionBase(timestamp, 1 /* lastMod */) {
         setUuid(uuid);
-        setTimestamp(timestamp);
     }
 
     // Returns a new hardcoded DatabaseVersion value, which is used to distinguish databases that do
@@ -77,14 +88,28 @@ public:
     DatabaseVersion makeUpdated() const;
 
     /**
-     * It returns true if the uuid and lastmod of both versions are the same.
+     * It returns true if the Timestamp and lastmod of both versions are the same.
      */
     bool operator==(const DatabaseVersion& other) const {
-        return getUuid() == other.getUuid() && getLastMod() == other.getLastMod();
+        return getTimestamp() == other.getTimestamp() && getLastMod() == other.getLastMod();
     }
 
     bool operator!=(const DatabaseVersion& other) const {
         return !(*this == other);
+    }
+
+    bool operator<(const DatabaseVersion& other) const;
+
+    bool operator>(const DatabaseVersion& other) const {
+        return other < *this;
+    }
+
+    bool operator<=(const DatabaseVersion& other) const {
+        return !(*this > other);
+    }
+
+    bool operator>=(const DatabaseVersion& other) const {
+        return !(*this < other);
     }
 
     bool isFixed() const {
@@ -94,99 +119,16 @@ public:
     UUID getUuid() const {
         return *DatabaseVersionBase::getUuid();
     }
+
+    std::string toString() const;
 };
 
+inline std::ostream& operator<<(std::ostream& s, const DatabaseVersion& v) {
+    return s << v.toString();
+}
 
-/**
- * The DatabaseVersion class contains a UUID that is not comparable,
- * in fact is impossible to compare two different DatabaseVersion that have different UUIDs.
- *
- * This class wrap a DatabaseVersion object to make it always comparable by timestamping it with a
- * node-local sequence number (_uuidDisambiguatingSequenceNum).
- *
- * This class class should go away once a cluster-wide comparable DatabaseVersion will be
- * implemented.
- */
-class ComparableDatabaseVersion {
-public:
-    /**
-     * Creates a ComparableDatabaseVersion that wraps the given DatabaseVersion.
-     * Each object created through this method will have a local sequence number greater than the
-     * previously created ones.
-     */
-    static ComparableDatabaseVersion makeComparableDatabaseVersion(const DatabaseVersion& version);
-
-    /**
-     * Creates a new instance which will artificially be greater than any
-     * previously created ComparableDatabaseVersion and smaller than any instance
-     * created afterwards. Used as means to cause the collections cache to
-     * attempt a refresh in situations where causal consistency cannot be
-     * inferred.
-     */
-    static ComparableDatabaseVersion makeComparableDatabaseVersionForForcedRefresh();
-
-    /**
-     * Creates a new instance which will artificially be greater than any
-     * previously created ComparableDatabaseVersion. Instances created afterwards
-     * will be compared as-if this object was a normal (i.e. non-forced) ComparableDatabaseVersion.
-     */
-    static ComparableDatabaseVersion makeComparableDatabaseVersionForForcedRefresh(
-        const DatabaseVersion& version);
-
-    /**
-     * Empty constructor needed by the ReadThroughCache.
-     *
-     * Instances created through this constructor will be always less then the ones created through
-     * the static constructor.
-     */
-    ComparableDatabaseVersion() = default;
-
-    BSONObj toBSONForLogging() const;
-
-    bool operator==(const ComparableDatabaseVersion& other) const;
-
-    bool operator!=(const ComparableDatabaseVersion& other) const {
-        return !(*this == other);
-    }
-
-    /**
-     * In case the two compared instances have different UUIDs, the most recently created one will
-     * be greater, otherwise the comparison will be driven by the lastMod field of the underlying
-     * DatabaseVersion.
-     */
-    bool operator<(const ComparableDatabaseVersion& other) const;
-
-    bool operator>(const ComparableDatabaseVersion& other) const {
-        return other < *this;
-    }
-
-    bool operator<=(const ComparableDatabaseVersion& other) const {
-        return !(*this > other);
-    }
-
-    bool operator>=(const ComparableDatabaseVersion& other) const {
-        return !(*this < other);
-    }
-
-private:
-    static AtomicWord<uint64_t> _uuidDisambiguatingSequenceNumSource;
-    static AtomicWord<uint64_t> _forcedRefreshSequenceNumSource;
-
-    ComparableDatabaseVersion(boost::optional<DatabaseVersion> version,
-                              uint64_t uuidDisambiguatingSequenceNum,
-                              uint64_t forcedRefreshSequenceNum)
-        : _dbVersion(std::move(version)),
-          _uuidDisambiguatingSequenceNum(uuidDisambiguatingSequenceNum),
-          _forcedRefreshSequenceNum(forcedRefreshSequenceNum) {}
-
-    boost::optional<DatabaseVersion> _dbVersion;
-
-    // Locally incremented sequence number that allows to compare two database versions with
-    // different UUIDs. Each new comparableDatabaseVersion will have a greater sequence number then
-    // the ones created before.
-    uint64_t _uuidDisambiguatingSequenceNum{0};
-    uint64_t _forcedRefreshSequenceNum{0};
-};
-
+inline StringBuilder& operator<<(StringBuilder& s, const DatabaseVersion& v) {
+    return s << v.toString();
+}
 
 }  // namespace mongo

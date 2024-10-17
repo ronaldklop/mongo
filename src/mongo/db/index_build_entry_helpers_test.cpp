@@ -27,22 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
-#include "mongo/db/client.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/index_build_entry_helpers.h"
-#include "mongo/db/service_context.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/uuid.h"
 
@@ -51,7 +61,7 @@ namespace mongo {
 namespace {
 using namespace indexbuildentryhelpers;
 
-const std::vector<std::string> generateIndexes(size_t numIndexes) {
+std::vector<std::string> generateIndexes(size_t numIndexes) {
     std::vector<std::string> indexes;
     for (size_t i = 0; i < numIndexes; i++) {
         indexes.push_back("index_" + std::to_string(i));
@@ -59,7 +69,7 @@ const std::vector<std::string> generateIndexes(size_t numIndexes) {
     return indexes;
 }
 
-const std::vector<HostAndPort> generateCommitReadyMembers(size_t numMembers) {
+std::vector<HostAndPort> generateCommitReadyMembers(size_t numMembers) {
     std::vector<HostAndPort> members;
     for (size_t i = 0; i < numMembers; i++) {
         members.push_back(HostAndPort("localhost:27017"));
@@ -80,8 +90,8 @@ void checkIfEqual(IndexBuildEntry lhs, IndexBuildEntry rhs) {
     ASSERT_TRUE(std::equal(lhsIndexNames.begin(), lhsIndexNames.end(), rhsIndexNames.begin()));
 
     if (lhs.getCommitReadyMembers() && rhs.getCommitReadyMembers()) {
-        auto lhsMembers = lhs.getCommitReadyMembers().get();
-        auto rhsMembers = rhs.getCommitReadyMembers().get();
+        auto lhsMembers = lhs.getCommitReadyMembers().value();
+        auto rhsMembers = rhs.getCommitReadyMembers().value();
         ASSERT_TRUE(std::equal(lhsMembers.begin(), lhsMembers.end(), rhsMembers.begin()));
     } else {
         ASSERT_FALSE(lhs.getCommitReadyMembers());
@@ -89,11 +99,15 @@ void checkIfEqual(IndexBuildEntry lhs, IndexBuildEntry rhs) {
     }
 }
 
+Status removeIndexBuildEntry(OperationContext* opCtx, UUID indexBuildUUID) {
+    AutoGetCollection autoColl(opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
+    return indexbuildentryhelpers::removeIndexBuildEntry(opCtx, *autoColl, indexBuildUUID);
+}
+
 class IndexBuildEntryHelpersTest : public CatalogTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         CatalogTestFixture::setUp();
-        operationContext()->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
         const UUID collectionUUID = UUID::gen();
         const CommitQuorumOptions commitQuorum(CommitQuorumOptions::kMajority);

@@ -27,100 +27,378 @@
  *    it in the license file.
  */
 
+
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
-#include "mongo/db/repl/tenant_migration_access_blocker.h"
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <mutex>
+#include <string>
+#include <type_traits>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 namespace mongo {
+
+namespace {
+
+/**
+ * kGlobalAccessBlockerKey must be unique across all possible tenant IDs.
+ * Since the first four bytes of an OID are a unix epoch timestamp,
+ * we can simply select a value prior to the inception of MongoDB,
+ * and be guaranteed to never have a collision with a value
+ * produced by OID::gen().
+ */
+const TenantId kGlobalAccessBlockerKey(
+    OID("15650123"   /* unique timestamp */
+        "0000000000" /* process id */
+        "000000" /* counter */));
+}  // namespace
+
+using MtabType = TenantMigrationAccessBlocker::BlockerType;
+using MtabPair = TenantMigrationAccessBlockerRegistry::DonorRecipientAccessBlockerPair;
 
 const ServiceContext::Decoration<TenantMigrationAccessBlockerRegistry>
     TenantMigrationAccessBlockerRegistry::get =
         ServiceContext::declareDecoration<TenantMigrationAccessBlockerRegistry>();
 
-void TenantMigrationAccessBlockerRegistry::add(StringData tenantId,
-                                               std::shared_ptr<TenantMigrationAccessBlocker> mtab) {
-    stdx::lock_guard<Latch> lg(_mutex);
+TenantMigrationAccessBlockerRegistry::TenantMigrationAccessBlockerRegistry() {
+    // Executor to asynchronously schedule blocking operations while the tenant migration access
+    // blockers are in action. This provides migrated tenants isolation from the non-migrated
+    // users. The executor is shared by all access blockers and the thread count goes to 0 when
+    // there is no migration.
+    ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.maxThreads = 4;
+    // When there is no migration, reduce thread count to 0.
+    threadPoolOptions.minThreads = 0;
+    threadPoolOptions.threadNamePrefix = "TenantMigrationBlockerAsync-";
+    threadPoolOptions.poolName = "TenantMigrationBlockerAsyncThreadPool";
+    threadPoolOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str(),
+                           getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
-    // Assume that all tenant ids (i.e. 'tenantId') have equal length.
-    auto it = _tenantMigrationAccessBlockers.find(tenantId);
-
-    if (it != _tenantMigrationAccessBlockers.end()) {
-        uasserted(ErrorCodes::ConflictingOperationInProgress,
-                  str::stream() << "Found active migration for tenantId \"" << tenantId << "\"");
-    }
-
-    _tenantMigrationAccessBlockers.emplace(tenantId, mtab);
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    };
+    _asyncBlockingOperationsExecutor = executor::ThreadPoolTaskExecutor::create(
+        std::make_unique<ThreadPool>(threadPoolOptions),
+        executor::makeNetworkInterface("TenantMigrationBlockerNet"));
 }
 
-void TenantMigrationAccessBlockerRegistry::remove(StringData tenantId) {
-    stdx::lock_guard<Latch> lg(_mutex);
+void TenantMigrationAccessBlockerRegistry::add(const TenantId& tenantId,
+                                               std::shared_ptr<TenantMigrationAccessBlocker> mtab) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    auto mtabType = mtab->getType();
 
-    auto it = _tenantMigrationAccessBlockers.find(tenantId);
-    invariant(it != _tenantMigrationAccessBlockers.end());
+    const auto& it = _tenantMigrationAccessBlockers.find(tenantId);
+    if (it != _tenantMigrationAccessBlockers.end()) {
+        auto existingMtab = it->second.getAccessBlocker(mtabType);
+        if (existingMtab) {
+            uasserted(ErrorCodes::ConflictingServerlessOperation,
+                      str::stream() << "This node is already a "
+                                    << (mtabType == MtabType::kDonor ? "donor" : "recipient")
+                                    << " for tenantId \"" << tenantId << "\" with migrationId \""
+                                    << existingMtab->getMigrationId().toString() << "\"");
+        }
+        // The migration protocol guarantees that the original donor node must be garbage collected
+        // before it can be chosen as a recipient under the same tenant. Therefore, we only expect
+        // to have both recipient and donor access blockers in the case of back-to-back migrations
+        // where the node participates first as a recipient then a donor.
+        invariant(mtabType == MtabType::kDonor);
+        it->second.setAccessBlocker(std::move(mtab));
+        return;
+    }
+    MtabPair mtabPair;
+    mtabPair.setAccessBlocker(std::move(mtab));
+    _tenantMigrationAccessBlockers.emplace(tenantId, mtabPair);
+}
 
-    _tenantMigrationAccessBlockers.erase(it);
+void TenantMigrationAccessBlockerRegistry::add(const std::vector<TenantId>& tenantIds,
+                                               std::shared_ptr<TenantMigrationAccessBlocker> mtab) {
+    for (auto&& tenantId : tenantIds) {
+        add(tenantId, mtab);
+    }
+}
+
+void TenantMigrationAccessBlockerRegistry::addGlobalDonorAccessBlocker(
+    std::shared_ptr<TenantMigrationDonorAccessBlocker> mtab) {
+    LOGV2_DEBUG(6114102, 1, "Adding global donor access blocker for all tenants");
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    const auto donorAccessBlocker = _getGlobalTenantDonorAccessBlocker(lg);
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            str::stream() << "This node is already a donor with migrationId "
+                          << donorAccessBlocker->getMigrationId().toString(),
+            !donorAccessBlocker);
+
+    MtabPair mtabPair;
+    mtabPair.setAccessBlocker(std::move(mtab));
+    _tenantMigrationAccessBlockers.emplace(kGlobalAccessBlockerKey, mtabPair);
+}
+
+void TenantMigrationAccessBlockerRegistry::_remove(WithLock,
+                                                   const TenantId& tenantId,
+                                                   MtabType type) {
+    const auto& it = _tenantMigrationAccessBlockers.find(tenantId);
+
+    if (it == _tenantMigrationAccessBlockers.end()) {
+        return;
+    }
+
+    // Use a reference to the DonorRecipientAccessBlockerPair so that we manipulate the actual
+    // value as opposed to a copy.
+    auto& mtabPair = it->second;
+    mtabPair.clearAccessBlocker(type);
+    if (!mtabPair.getDonorAccessBlocker() && !mtabPair.getRecipientAccessBlocker()) {
+        _tenantMigrationAccessBlockers.erase(it);
+    }
+}
+
+void TenantMigrationAccessBlockerRegistry::removeAccessBlockersForMigration(
+    const UUID& migrationId, TenantMigrationAccessBlocker::BlockerType type) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    for (auto it = _tenantMigrationAccessBlockers.begin();
+         it != _tenantMigrationAccessBlockers.end();) {
+        auto& mtabPair = it->second;
+        if (const auto blocker = mtabPair.getAccessBlocker(type);
+            blocker && blocker->getMigrationId() == migrationId) {
+            mtabPair.clearAccessBlocker(type);
+
+            if (!mtabPair.getDonorAccessBlocker() && !mtabPair.getRecipientAccessBlocker()) {
+                _tenantMigrationAccessBlockers.erase(it++);
+                continue;
+            }
+        }
+        it++;
+    }
+}
+
+void TenantMigrationAccessBlockerRegistry::removeAll(MtabType type) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    for (auto it = _tenantMigrationAccessBlockers.begin();
+         it != _tenantMigrationAccessBlockers.end();) {
+        _remove(lg, (it++)->first, type);
+    }
+}
+
+boost::optional<MtabPair> TenantMigrationAccessBlockerRegistry::getAccessBlockersForDbName(
+    const DatabaseName& dbName) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    if (_tenantMigrationAccessBlockers.empty()) {
+        return boost::none;
+    }
+
+    const auto tenantId = tenant_migration_access_blocker::extractTenantFromDatabaseName(dbName);
+
+    if (!tenantId) {
+        // Only global system internal collections, empty database name (generated by no-ops) or
+        // virtual DB (such as $external for authenticate) won't contain tenantId. Operations on
+        // those namespace shouldn't be controlled by access blocker.
+        return boost::none;
+    }
+
+    const auto tid = TenantId::parseFromString(*tenantId);
+    const auto& it = _tenantMigrationAccessBlockers.find(tid);
+    auto globalDonorAccessBlocker = _getGlobalTenantDonorAccessBlocker(lg, dbName);
+
+    if (it != _tenantMigrationAccessBlockers.end() && it->second.getDonorAccessBlocker()) {
+        // Return a copy of the DonorRecipientAccessBlockerPair to the caller so that it
+        // can be inspected and/or manipulated without changing the value in the registry.
+        return it->second;
+    } else if (it != _tenantMigrationAccessBlockers.end()) {
+        // Return the recipient access blocker for the tenant and the global donor access blocker
+        // (which might be empty).
+        return MtabPair{globalDonorAccessBlocker, it->second.getRecipientAccessBlocker()};
+    }
+
+    if (globalDonorAccessBlocker) {
+        return MtabPair{globalDonorAccessBlocker, nullptr};
+    }
+
+    return boost::none;
 }
 
 std::shared_ptr<TenantMigrationAccessBlocker>
-TenantMigrationAccessBlockerRegistry::getTenantMigrationAccessBlockerForDbName(StringData dbName) {
-    stdx::lock_guard<Latch> lg(_mutex);
+TenantMigrationAccessBlockerRegistry::getTenantMigrationAccessBlockerForDbName(
+    const DatabaseName& dbName, MtabType type) {
+    auto mtabPair = getAccessBlockersForDbName(dbName);
+    if (!mtabPair) {
+        return nullptr;
+    }
 
-    auto it = std::find_if(
-        _tenantMigrationAccessBlockers.begin(),
-        _tenantMigrationAccessBlockers.end(),
-        [dbName](
-            const std::pair<std::string, std::shared_ptr<TenantMigrationAccessBlocker>>& blocker) {
-            StringData tenantId = blocker.first;
-            return dbName.startsWith(tenantId + "_");
-        });
+    return mtabPair->getAccessBlocker(type);
+}
 
+std::shared_ptr<TenantMigrationDonorAccessBlocker>
+TenantMigrationAccessBlockerRegistry::_getGlobalTenantDonorAccessBlocker(WithLock) const {
+    const auto& it = _tenantMigrationAccessBlockers.find(kGlobalAccessBlockerKey);
     if (it == _tenantMigrationAccessBlockers.end()) {
         return nullptr;
-    } else {
-        return it->second;
     }
+
+    return checked_pointer_cast<TenantMigrationDonorAccessBlocker>(
+        it->second.getDonorAccessBlocker());
+}
+
+std::shared_ptr<TenantMigrationDonorAccessBlocker>
+TenantMigrationAccessBlockerRegistry::_getGlobalTenantDonorAccessBlocker(
+    WithLock lk, const DatabaseName& dbName) const {
+    // No-op oplog entries, e.g. for linearizable reads, use namespace "".
+    bool isInternal = (dbName.size() == 0 || NamespaceString(dbName).isOnInternalDb());
+    if (isInternal) {
+        return nullptr;
+    }
+
+    return _getGlobalTenantDonorAccessBlocker(lk);
 }
 
 std::shared_ptr<TenantMigrationAccessBlocker>
 TenantMigrationAccessBlockerRegistry::getTenantMigrationAccessBlockerForTenantId(
-    StringData tenantId) {
-    stdx::lock_guard<Latch> lg(_mutex);
+    const TenantId& tenantId, MtabType type) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    auto it = _tenantMigrationAccessBlockers.find(tenantId);
-    if (it != _tenantMigrationAccessBlockers.end()) {
-        return it->second;
-    } else {
-        return nullptr;
+    const auto it = _tenantMigrationAccessBlockers.find(tenantId);
+    if (it != _tenantMigrationAccessBlockers.end() && it->second.getAccessBlocker(type)) {
+        return it->second.getAccessBlocker(type);
+    }
+
+    if (auto donorAccessBlocker = _getGlobalTenantDonorAccessBlocker(lg);
+        type == MtabType::kDonor && donorAccessBlocker) {
+        return donorAccessBlocker;
+    }
+
+    return nullptr;
+}
+
+std::vector<std::shared_ptr<TenantMigrationDonorAccessBlocker>>
+TenantMigrationAccessBlockerRegistry::getDonorAccessBlockersForMigration(const UUID& migrationId) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    std::vector<std::shared_ptr<TenantMigrationDonorAccessBlocker>> blockers;
+    for (const auto& pair : _tenantMigrationAccessBlockers) {
+        if (auto donorMtab = pair.second.getDonorAccessBlocker();
+            donorMtab && donorMtab->getMigrationId() == migrationId) {
+            blockers.push_back(donorMtab);
+        }
+    }
+
+    return blockers;
+}
+
+std::vector<std::shared_ptr<TenantMigrationRecipientAccessBlocker>>
+TenantMigrationAccessBlockerRegistry::getRecipientAccessBlockersForMigration(
+    const UUID& migrationId) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    std::vector<std::shared_ptr<TenantMigrationRecipientAccessBlocker>> blockers;
+    for (const auto& pair : _tenantMigrationAccessBlockers) {
+        if (auto recipientMtab = pair.second.getRecipientAccessBlocker();
+            recipientMtab && recipientMtab->getMigrationId() == migrationId) {
+            blockers.push_back(recipientMtab);
+        }
+    }
+
+    return blockers;
+}
+
+void TenantMigrationAccessBlockerRegistry::applyAll(TenantMigrationAccessBlocker::BlockerType type,
+                                                    applyAllCallback&& callback) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    for (auto& [tenantId, mtabPair] : _tenantMigrationAccessBlockers) {
+        if (auto mtab = mtabPair.getAccessBlocker(type)) {
+            callback(tenantId, mtab);
+        }
     }
 }
 
-void TenantMigrationAccessBlockerRegistry::shutDown() {
-    stdx::lock_guard<Latch> lg(_mutex);
+void TenantMigrationAccessBlockerRegistry::startup() {
+    _asyncBlockingOperationsExecutor->startup();
+}
+
+void TenantMigrationAccessBlockerRegistry::clear() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    _clear(lg);
+}
+
+void TenantMigrationAccessBlockerRegistry::_clear(WithLock) {
     _tenantMigrationAccessBlockers.clear();
+}
+
+void TenantMigrationAccessBlockerRegistry::shutDown() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    _clear(lg);
+    _asyncBlockingOperationsExecutor.reset();
 }
 
 void TenantMigrationAccessBlockerRegistry::appendInfoForServerStatus(
     BSONObjBuilder* builder) const {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    std::for_each(
-        _tenantMigrationAccessBlockers.begin(),
-        _tenantMigrationAccessBlockers.end(),
-        [builder](
-            const std::pair<std::string, std::shared_ptr<TenantMigrationAccessBlocker>>& blocker) {
-            blocker.second->appendInfoForServerStatus(builder);
-        });
+    const auto globalDonorAccessBlocker = _getGlobalTenantDonorAccessBlocker(lg);
+    if (globalDonorAccessBlocker) {
+        BSONObjBuilder donorMtabInfoBuilder;
+        globalDonorAccessBlocker->appendInfoForServerStatus(&donorMtabInfoBuilder);
+        builder->append("donor", donorMtabInfoBuilder.obj());
+    }
+
+    for (auto& [tenantId, mtabPair] : _tenantMigrationAccessBlockers) {
+        BSONObjBuilder mtabInfoBuilder;
+
+        auto donorMtab = mtabPair.getDonorAccessBlocker() ? mtabPair.getDonorAccessBlocker()
+                                                          : globalDonorAccessBlocker;
+        if (donorMtab) {
+            BSONObjBuilder donorMtabInfoBuilder;
+            donorMtab->appendInfoForServerStatus(&donorMtabInfoBuilder);
+            mtabInfoBuilder.append("donor", donorMtabInfoBuilder.obj());
+        }
+
+        if (auto recipientMtab = mtabPair.getRecipientAccessBlocker()) {
+            BSONObjBuilder recipientMtabInfoBuilder;
+            recipientMtab->appendInfoForServerStatus(&recipientMtabInfoBuilder);
+            mtabInfoBuilder.append("recipient", recipientMtabInfoBuilder.obj());
+        }
+
+        if (mtabInfoBuilder.len()) {
+            builder->append(tenantId.toString(), mtabInfoBuilder.obj());
+        }
+    }
 }
 
 void TenantMigrationAccessBlockerRegistry::onMajorityCommitPointUpdate(repl::OpTime opTime) {
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    std::for_each(
-        _tenantMigrationAccessBlockers.begin(),
-        _tenantMigrationAccessBlockers.end(),
-        [opTime](
-            const std::pair<std::string, std::shared_ptr<TenantMigrationAccessBlocker>>& blocker) {
-            blocker.second->onMajorityCommitPointUpdate(opTime);
-        });
+    for (auto& [_, mtabPair] : _tenantMigrationAccessBlockers) {
+        if (auto recipientMtab = mtabPair.getRecipientAccessBlocker()) {
+            recipientMtab->onMajorityCommitPointUpdate(opTime);
+        }
+        if (auto donorMtab = mtabPair.getDonorAccessBlocker()) {
+            donorMtab->onMajorityCommitPointUpdate(opTime);
+        }
+    }
+}
+
+std::shared_ptr<executor::TaskExecutor>
+TenantMigrationAccessBlockerRegistry::getAsyncBlockingOperationsExecutor() const {
+    return _asyncBlockingOperationsExecutor;
 }
 
 }  // namespace mongo

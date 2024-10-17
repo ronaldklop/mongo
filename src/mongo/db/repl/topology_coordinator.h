@@ -29,23 +29,46 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <iosfwd>
+#include <map>
+#include <memory>
 #include <queue>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/last_vote.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_data.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
+#include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_metrics_gen.h"
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/topology_version_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -102,6 +125,12 @@ public:
          * Return the underlying queue. Used for testing purposes only.
          */
         std::queue<Date_t> getChanges_forTest();
+
+        /**
+         * Tracks the last time there was a log saying a node is an ineligible sync source during
+         * shouldChangeSyncSourceDueToPingTime.
+         */
+        Date_t lastLoggedIneligibleSrc = Date_t::fromMillisSinceEpoch(0);
 
     private:
         std::queue<Date_t> _recentChanges;
@@ -212,6 +241,8 @@ public:
      */
     bool isElectableNodeInSingleNodeReplicaSet() const;
 
+    // Returns _electionIdTerm.
+    long long getElectionIdTerm() const;
 
     ////////////////////////////////////////////////////////////
     //
@@ -242,18 +273,18 @@ public:
     /**
      * Suppresses selecting "host" as sync source until "until".
      */
-    void blacklistSyncSource(const HostAndPort& host, Date_t until);
+    void denylistSyncSource(const HostAndPort& host, Date_t until);
 
     /**
      * Removes a single entry "host" from the list of potential sync sources which we
-     * have blacklisted, if it is supposed to be unblacklisted by "now".
+     * have denylisted, if it is supposed to be undenylisted by "now".
      */
-    void unblacklistSyncSource(const HostAndPort& host, Date_t now);
+    void undenylistSyncSource(const HostAndPort& host, Date_t now);
 
     /**
-     * Clears the list of potential sync sources we have blacklisted.
+     * Clears the list of potential sync sources we have denylisted.
      */
-    void clearSyncSourceBlacklist();
+    void clearSyncSourceDenylist();
 
     /**
      * Determines if a new sync source should be chosen, if a better candidate sync source is
@@ -263,14 +294,27 @@ public:
      * running in ProtocolVersion 1, our current sync source is not primary, has no sync source
      * ("syncSourceHasSyncSource" is false), and only has data up to "myLastOpTime", returns true.
      *
-     * "now" is used to skip over currently blacklisted sync sources.
+     * "now" is used to skip over currently denylisted sync sources.
      */
     bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                 const rpc::ReplSetMetadata& replMetadata,
                                 const rpc::OplogQueryMetadata& oqMetadata,
                                 const OpTime& lastOpTimeFetched,
-                                Date_t now) const;
+                                Date_t now);
 
+    /*
+     * Clear this node's sync source.
+     */
+    void clearSyncSource();
+
+    /**
+     * Determines if a new sync source should be chosen when an error occurs. In this case
+     * we do not have current metadata from the sync source and so can only do a subset of
+     * the checks we do when we get a response.
+     */
+    bool shouldChangeSyncSourceOnError(const HostAndPort& currentSource,
+                                       const OpTime& lastOpTimeFetched,
+                                       Date_t now);
     /**
      * Returns true if we find an eligible sync source that is significantly closer than our current
      * sync source.
@@ -279,7 +323,7 @@ public:
                                              const MemberState& memberState,
                                              const OpTime& previousOpTimeFetched,
                                              Date_t now,
-                                             const ReadPreference readPreference);
+                                             ReadPreference readPreference);
 
     /**
      * Sets the reported mode of this node to one of RS_SECONDARY, RS_STARTUP2, RS_ROLLBACK or
@@ -291,10 +335,10 @@ public:
     void setFollowerMode(MemberState::MS newMode);
 
     /**
-     * Scan the memberData and determine the highest last applied or last
+     * Scan the memberData and determine the highest last written or last
      * durable optime present on a majority of servers; set _lastCommittedOpTime to this
      * new entry.
-     * Whether the last applied or last durable op time is used depends on whether
+     * Whether the last written or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      * Returns true if the _lastCommittedOpTime was changed.
      */
@@ -303,12 +347,15 @@ public:
     /**
      * Updates _lastCommittedOpTime to be 'committedOpTime' if it is more recent than the current
      * last committed OpTime.  Returns true if _lastCommittedOpTime is changed. We ignore
-     * 'committedOpTime' if it has a different term than our lastApplied, unless
+     * 'committedOpTime' if it has a different term than our lastWritten, unless
      * 'fromSyncSource'=true, which guarantees we are on the same branch of history as
-     * 'committedOpTime', so we update our commit point to min(committedOpTime, lastApplied).
+     * 'committedOpTime', so we update our commit point to min(committedOpTime, lastWritten).
+     * The 'forInitiate' flag is to force-advance our committedOpTime during the execution of
+     * the replSetInitiate command.
      */
     bool advanceLastCommittedOpTimeAndWallTime(OpTimeAndWallTime committedOpTimeAndWallTime,
-                                               bool fromSyncSource);
+                                               bool fromSyncSource,
+                                               bool forInitiate = false);
 
     /**
      * Returns the OpTime of the latest majority-committed op known to this server.
@@ -339,6 +386,11 @@ public:
      */
     void adjustMaintenanceCountBy(int inc);
 
+    /**
+     * Sets the value of the maintenance mode counter to 0.
+     */
+    void resetMaintenanceCount();
+
     ////////////////////////////////////////////////////////////
     //
     // Methods that prepare responses to command requests.
@@ -350,11 +402,11 @@ public:
                                  BSONObjBuilder* response,
                                  Status* result);
 
-    // produce a reply to a V1 heartbeat
-    Status prepareHeartbeatResponseV1(Date_t now,
-                                      const ReplSetHeartbeatArgsV1& args,
-                                      StringData ourSetName,
-                                      ReplSetHeartbeatResponse* response);
+    // produce a reply to a V1 heartbeat, and return whether the remote node's config has changed.
+    StatusWith<bool> prepareHeartbeatResponseV1(Date_t now,
+                                                const ReplSetHeartbeatArgsV1& args,
+                                                StringData ourSetName,
+                                                ReplSetHeartbeatResponse* response);
 
     struct ReplSetStatusArgs {
         const Date_t now;
@@ -364,7 +416,8 @@ public:
         const BSONObj electionCandidateMetrics;
         const BSONObj electionParticipantMetrics;
 
-        // boost::none if the storage engine does not support recovery to a timestamp.
+        // boost::none if the storage engine does not support recovery to a timestamp, or if the
+        // storage engine is not available.
         // Timestamp::min() if a stable recovery timestamp is yet to be taken.
         //
         // On the replication layer, a non-min() timestamp ensures recoverable rollback is possible,
@@ -387,7 +440,7 @@ public:
     // replset.  Drivers interpret the hello fields according to the Server Discovery and
     // Monitoring Spec, see the "Parsing an isMaster response" section.
     void fillHelloForReplSet(std::shared_ptr<HelloResponse> response,
-                             const StringData& horizonString) const;
+                             StringData horizonString) const;
 
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
@@ -464,14 +517,14 @@ public:
 
     /**
      *  Returns whether or not at least 'numNodes' have reached the given opTime with the same term.
-     * "durablyWritten" indicates whether the operation has to be durably applied.
+     * "durablyWritten" indicates whether the operation has to be durably written.
      */
     bool haveNumNodesReachedOpTime(const OpTime& opTime, int numNodes, bool durablyWritten);
 
     /**
      * Returns whether or not at least one node matching the tagPattern has reached the given opTime
      * with the same term.
-     * "durablyWritten" indicates whether the operation has to be durably applied.
+     * "durablyWritten" indicates whether the operation has to be durably written.
      */
     bool haveTaggedNodesReachedOpTime(const OpTime& opTime,
                                       const ReplSetTagPattern& tagPattern,
@@ -507,7 +560,7 @@ public:
      * Marks a member as down from our perspective and returns a bool which indicates if we can no
      * longer see a majority of the nodes and thus should step down.
      */
-    bool setMemberAsDown(Date_t now, const int memberIndex);
+    bool setMemberAsDown(Date_t now, int memberIndex);
 
     /**
      * Goes through the memberData and determines which member that is currently live
@@ -529,6 +582,23 @@ public:
      */
     void resetMemberTimeouts(Date_t now, const stdx::unordered_set<HostAndPort>& member_set);
 
+
+    /*
+     * Returns the last optime that this node has written oplog entry into memory.
+     */
+    OpTime getMyLastWrittenOpTime() const;
+    OpTimeAndWallTime getMyLastWrittenOpTimeAndWallTime() const;
+
+    /*
+     * Sets the last optime that this node has written oplog entry into memory. Fails with an
+     * invariant if 'isRollbackAllowed' is false and we're attempting to set the optime backwards.
+     * The Date_t 'now' is used to track liveness; setting a node's written optime updates its
+     * liveness information.
+     */
+    void setMyLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                           Date_t now,
+                                           bool isRollbackAllowed);
+
     /*
      * Returns the last optime that this node has applied, whether or not it has been journaled.
      */
@@ -546,13 +616,13 @@ public:
                                            bool isRollbackAllowed);
 
     /*
-     * Returns the last optime that this node has applied and journaled.
+     * Returns the last optime that this node has written and journaled.
      */
     OpTime getMyLastDurableOpTime() const;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const;
 
     /*
-     * Sets the last optime that this node has applied and journaled. Fails with an invariant if
+     * Sets the last optime that this node has written and journaled. Fails with an invariant if
      * 'isRollbackAllowed' is false and we're attempting to set the optime backwards. The Date_t
      * 'now' is used to track liveness; setting a node's durable optime updates its liveness
      * information.
@@ -566,9 +636,10 @@ public:
      * replSetUpdatePosition command.
      *
      * Returns a Status if the position could not be set, false if the last optimes for the node
-     * did not change, or true if either the last applied or last durable optime did change.
+     * did not change, or true if either the last written, last applied or last durable optime did
+     * change.
      */
-    StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
+    StatusWith<bool> setLastOptimeForMember(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
 
     /**
      * Sets the latest optime committed in the previous config to the current lastCommitted optime.
@@ -592,11 +663,6 @@ public:
     void voteForMyselfV1();
 
     /**
-     * Sets election id and election optime.
-     */
-    void setElectionInfo(OID electionId, Timestamp electionOpTime);
-
-    /**
      * Performs state updates associated with winning an election.
      *
      * It is an error to call this if the topology coordinator is not in candidate mode.
@@ -604,7 +670,7 @@ public:
      * Exactly one of either processWinElection or processLoseElection must be called if
      * processHeartbeatResponse returns StartElection, to exit candidate mode.
      */
-    void processWinElection(OID electionId, Timestamp electionOpTime);
+    void processWinElection(Timestamp electionOpTime);
 
     /**
      * Performs state updates associated with losing an election.
@@ -638,7 +704,7 @@ public:
      *      C1. 'force' is true and now > waitUntil
      *
      *      C2. A majority set of nodes, M, in the replica set have optimes greater than or
-     *      equal to the last applied optime of the primary.
+     *      equal to the last written optime of the primary.
      *
      *      C3. There exists at least one electable secondary node in the majority set M.
      *
@@ -698,7 +764,7 @@ public:
     /**
      * Set the outgoing heartbeat message from self
      */
-    void setMyHeartbeatMessage(const Date_t now, const std::string& s);
+    void setMyHeartbeatMessage(Date_t now, const std::string& s);
 
     /**
      * Prepares a ReplSetMetadata object describing the current term, primary, and lastOp
@@ -738,7 +804,7 @@ public:
     /**
      * Transitions to the candidate role if the node is electable.
      */
-    Status becomeCandidateIfElectable(const Date_t now, StartElectionReasonEnum reason);
+    Status becomeCandidateIfElectable(Date_t now, StartElectionReasonEnum reason);
 
     /**
      * Updates the storage engine read committed support in the TopologyCoordinator options after
@@ -749,15 +815,18 @@ public:
     /**
      * Reset the booleans to record the last heartbeat restart for the target node.
      */
-    void restartHeartbeat(const Date_t now, const HostAndPort& target);
+    void restartHeartbeat(Date_t now, const HostAndPort& target);
 
     /**
      * Increments the counter field of the current TopologyVersion.
      */
     void incrementTopologyVersion();
 
-    // Scans through all members that are 'up' and returns the latest known optime.
-    OpTime latestKnownOpTime() const;
+    // Scans through all members that are 'up' and returns the latest known written optime.
+    OpTime latestKnownWrittenOpTime() const;
+
+    // Scans through all members that are 'up' and returns the latest known applied optime.
+    OpTime latestKnownAppliedOpTime() const;
 
     /**
      * Scans through all members that are 'up' and return the latest known optime, if we have
@@ -823,13 +892,10 @@ public:
     /**
      * Records the ping for the given host. For use only in testing.
      */
-    void setPing_forTest(const HostAndPort& host, const Milliseconds ping);
+    void setPing_forTest(const HostAndPort& host, Milliseconds ping);
 
     // Returns _electionTime.  Only used in unittests.
     Timestamp getElectionTime() const;
-
-    // Returns _electionId.  Only used in unittests.
-    OID getElectionId() const;
 
     // Returns the name for a role.  Only used in unittests.
     static std::string roleToString(TopologyCoordinator::Role role);
@@ -889,6 +955,9 @@ private:
     // Returns a HostAndPort if one is forced via the 'replSetSyncFrom' command.
     boost::optional<HostAndPort> _chooseSyncSourceReplSetSyncFrom(Date_t now);
 
+    // Returns a HostAndPort if one is forced via the 'unsupportedSyncSource' startup parameter.
+    boost::optional<HostAndPort> _chooseSyncSourceUnsupportedSyncSourceParameter(Date_t now);
+
     // Does preliminary checks involved in choosing sync source
     // * Do we have a valid configuration?
     // * Is the 'forceSyncSourceCandidate' failpoint enabled?
@@ -908,10 +977,54 @@ private:
                                         const OpTime& lastOpTimeFetched,
                                         ReadPreference readPreference);
 
-    /*
-     * Clear this node's sync source.
-     */
-    void _clearSyncSource();
+    // Does preliminary checkes to see if a new sync source should be chosen
+    // * Do we have a valid configuration -- if so, we do not change sync source.
+    // * Are we in initial sync -- if so, we do not change sync source.
+    // * Do we have a new forced sync source -- if so, we do change sync source.
+    // Returns decision and current sync source candidate if decision is kMaybe.
+    // (kMaybe indicates to continue with further checks).
+    enum class ChangeSyncSourceDecision { kNo, kYes, kMaybe };
+    std::pair<ChangeSyncSourceDecision, int> _shouldChangeSyncSourceInitialChecks(
+        const HostAndPort& currentSource) const;
+
+    // Returns true if we should choose a new sync source because chaining is disabled
+    // and there is a new primary.
+    bool _shouldChangeSyncSourceDueToNewPrimary(const HostAndPort& currentSource,
+                                                int currentSourceIndex) const;
+
+    // Change sync source if they are not ahead of us, and don't have a sync source.
+    // Note 'syncSourceIndex' is the index of our sync source's sync source. The 'currentSource'
+    // is our sync source.
+    bool _shouldChangeSyncSourceDueToSourceNotAhead(const HostAndPort& currentSource,
+                                                    int syncSourceIndex,
+                                                    bool syncSourceIsPrimary,
+                                                    const OpTime& currentSourceOpTime,
+                                                    const OpTime& lastOpTimeFetched) const;
+
+    // Change sync source if our sync source is also syncing from us when we are in primary
+    // catchup mode, forming a sync source selection cycle, and the sync source is not ahead
+    // of us.
+    // Note 'syncSourceHost' and 'syncSourceIndex' are the host and index of ourb sync source's
+    // sync source. The 'currentSource' is our sync source.
+    bool _shouldChangeSyncSourceToBreakCycle(const HostAndPort& currentSource,
+                                             const std::string& syncSourceHost,
+                                             int syncSourceIndex,
+                                             const OpTime& currentSourceOpTime,
+                                             const OpTime& lastOpTimeFetched) const;
+
+    // Returns true if we should choose a new sync source due to our current sync source being
+    // greater than maxSyncSourceLagSeconds and a better source being available.
+    bool _shouldChangeSyncSourceDueToLag(const HostAndPort& currentSource,
+                                         const OpTime& currentSourceOpTime,
+                                         const OpTime& lastOpTimeFetched,
+                                         Date_t now);
+
+    // Returns true if we should choose a new sync source because our current sync source does
+    // not match our strict criteria for sync source candidates, but another member does.
+    bool _shouldChangeSyncSourceDueToBetterEligibleSource(const HostAndPort& currentSource,
+                                                          int currentSourceIndex,
+                                                          const OpTime& lastOpTimeFetched,
+                                                          Date_t now);
 
     /**
      * Sets this node's sync source. It will also update whether the sync source was forced and add
@@ -921,14 +1034,16 @@ private:
 
     // Returns the oldest acceptable OpTime that a node must have for us to choose it as our sync
     // source.
-    const OpTime _getOldestSyncOpTime() const;
+    OpTime _getOldestSyncOpTime() const;
 
     // Returns true if the candidate node is viable as our sync source.
     bool _isEligibleSyncSource(int candidateIndex,
                                Date_t now,
                                const OpTime& lastOpTimeFetched,
                                ReadPreference readPreference,
-                               bool firstAttempt) const;
+                               bool firstAttempt,
+                               bool shouldCheckStaleness,
+                               bool limitLogFrequency);
 
     // Returns the current "ping" value for the given member by their address.
     Milliseconds _getPing(const HostAndPort& host);
@@ -941,7 +1056,7 @@ private:
 
     // Checks if the node can see a healthy primary of equal or greater priority to the
     // candidate. If so, returns the index of that node. Otherwise returns -1.
-    int _findHealthyPrimaryOfEqualOrGreaterPriority(const int candidateIndex) const;
+    int _findHealthyPrimaryOfEqualOrGreaterPriority(int candidateIndex) const;
 
     // Is our optime close enough to the latest known optime to call for a priority takeover.
     bool _amIFreshEnoughForPriorityTakeover() const;
@@ -951,8 +1066,7 @@ private:
     bool _amIFreshEnoughForCatchupTakeover() const;
 
     // Returns reason why "self" member is unelectable
-    UnelectableReasonMask _getMyUnelectableReason(const Date_t now,
-                                                  StartElectionReasonEnum reason) const;
+    UnelectableReasonMask _getMyUnelectableReason(Date_t now, StartElectionReasonEnum reason) const;
 
     // Returns reason why memberIndex is unelectable
     UnelectableReasonMask _getUnelectableReason(int memberIndex) const;
@@ -973,13 +1087,13 @@ private:
     MemberData& _selfMemberData();
 
     // Index of self member in member data.
-    const int _selfMemberDataIndex() const;
+    int _selfMemberDataIndex() const;
 
     /*
      * Returns information we have on the state of the node identified by memberId.  Returns
      * nullptr if memberId is not found in the configuration.
      */
-    MemberData* _findMemberDataByMemberId(const int memberId);
+    MemberData* _findMemberDataByMemberId(int memberId);
 
     /**
      * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse().
@@ -1013,15 +1127,18 @@ private:
     void _stepDownSelfAndReplaceWith(int newPrimary);
 
     /**
-     * Looks up the provided member in the blacklist and returns true if the member's blacklist
+     * Looks up the provided member in the denylist and returns true if the member's denylist
      * expire time is after 'now'.  If the member is found but the expire time is before 'now',
-     * the function returns false.  If the member is not found in the blacklist, the function
+     * the function returns false.  If the member is not found in the denylist, the function
      * returns false.
      **/
-    bool _memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now) const;
+    bool _memberIsDenylisted(const MemberConfig& memberConfig, Date_t now) const;
 
     // Returns a string representation of the current replica set status for logging purposes.
     std::string _getReplSetStatusString();
+
+    // Returns the member's corresponding opTime for recency check
+    OpTime _getMemberOpTimeForRecencyCheck(const MemberData& memberData, bool durablyWritten);
 
     // This node's role in the replication protocol.
     Role _role;
@@ -1029,9 +1146,10 @@ private:
     // This node's topology version. This is updated upon a significant topology change.
     TopologyVersion _topologyVersion;
 
-    // This is a unique id that is generated and set each time we transition to PRIMARY, as the
-    // result of an election.
-    OID _electionId;
+    // The term in which this node was elected primary.  Used to generate the election ID
+    // for 'hello' responses.
+    long long _electionIdTerm = repl::OpTime::kUninitializedTerm;
+
     // The time at which the current PRIMARY was elected.
     Timestamp _electionTime;
 
@@ -1047,7 +1165,7 @@ private:
     HostAndPort _syncSource;
     // These members are not chosen as sync sources for a period of time, due to connection
     // issues with them
-    std::map<HostAndPort, Date_t> _syncSourceBlacklist;
+    std::map<HostAndPort, Date_t> _syncSourceDenylist;
     // The next sync source to be chosen, requested via a replSetSyncFrom command
     int _forceSyncSourceIndex;
     // Whether the current sync source has been set via a replSetSyncFrom command
@@ -1068,8 +1186,8 @@ private:
 
     ReplSetConfig _rsConfig;  // The current config, including a vector of MemberConfigs
 
-    // Heartbeat, current applied/durable optime, and other state data for each member.  It is
-    // guaranteed that this vector will be maintained in the same order as the MemberConfigs in
+    // Heartbeat, current written/applied/durable optime, and other state data for each member.  It
+    // is guaranteed that this vector will be maintained in the same order as the MemberConfigs in
     // _currentConfig, therefore the member config index can be used to index into this vector as
     // well.
     std::vector<MemberData> _memberData;

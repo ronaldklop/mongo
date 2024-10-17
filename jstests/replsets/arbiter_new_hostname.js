@@ -8,8 +8,8 @@
  *     multiversion_incompatible,
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 const replTest = new ReplSetTest({name: 'test', nodes: 3});
 replTest.startSet();
 const nodes = replTest.nodeList();
@@ -45,4 +45,3 @@ assert.commandWorked(primary.getDB("admin").runCommand({replSetReconfig: config}
 replTest.awaitReplication();
 replTest.awaitNodesAgreeOnConfigVersion();
 replTest.stopSet();
-}());

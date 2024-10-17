@@ -32,9 +32,14 @@
 #include <vector>
 
 #include "mongo/db/baton.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/waitable.h"
 
 namespace mongo {
 
@@ -47,11 +52,11 @@ class DefaultBaton : public Baton {
 public:
     explicit DefaultBaton(OperationContext* opCtx);
 
-    ~DefaultBaton();
-
-    void markKillOnClientDisconnect() noexcept override;
+    ~DefaultBaton() override;
 
     void schedule(Task func) noexcept override;
+
+    Future<void> waitUntil(Date_t expiration, const CancellationToken& token) override;
 
     void notify() noexcept override;
 
@@ -60,16 +65,40 @@ public:
     void run(ClockSource* clkSource) noexcept override;
 
 private:
+    struct Timer {
+        size_t id;
+        Promise<void> promise;
+    };
     void detachImpl() noexcept override;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("DefaultBaton::_mutex");
+    using Job = unique_function<void(stdx::unique_lock<stdx::mutex>)>;
+
+    /**
+     * Invokes a job with exclusive access to the baton's internals.
+     *
+     * If the baton is currently sleeping (i.e., `_sleeping` is `true`), the sleeping thread owns
+     * the baton, so we schedule the job and notify the sleeping thread to wake up and run the job.
+     *
+     * Otherwise, take exclusive access and run the job on the current thread.
+     *
+     * Note that `_safeExecute()` will throw if the baton has been detached.
+     *
+     * Also note that the job may not run inline, and may get scheduled to run by the baton, so it
+     * should never throw.
+     */
+    void _safeExecute(stdx::unique_lock<stdx::mutex> lk, Job job);
+
+    stdx::mutex _mutex;
     stdx::condition_variable _cv;
     bool _notified = false;
     bool _sleeping = false;
 
     OperationContext* _opCtx;
 
-    bool _hasIngressSocket = false;
+    AtomicWord<size_t> _nextTimerId;
+    // Sorted in order of nearest -> furthest in future.
+    std::multimap<Date_t, Timer> _timers;
+    stdx::unordered_map<size_t, std::multimap<Date_t, Timer>::iterator> _timersById;
 
     std::vector<Task> _scheduled;
 };

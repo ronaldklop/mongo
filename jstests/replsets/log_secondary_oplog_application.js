@@ -4,15 +4,12 @@
  * We intentionally target CRUD ops in this test, since we know we should be the only ones
  * issuing them. See below for details on how we simulate quickness and slowness.
  */
-
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 let name = "log_secondary_oplog_application";
-let rst = ReplSetTest({name: name, nodes: 2});
+let rst = new ReplSetTest({name: name, nodes: 2});
 rst.startSet();
 
 let nodes = rst.nodeList();
@@ -23,6 +20,10 @@ rst.initiate({
 
 let primary = rst.getPrimary();
 let secondary = rst.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 /**
  * Part 1: Issue a fast op and make sure that we do *not* log it.
@@ -134,4 +135,3 @@ rst.awaitReplication();
 checkLog.contains(secondary, "snail");
 
 rst.stopSet();
-})();

@@ -27,19 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/document_source_mock.h"
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/expression_context_for_test.h"
 
 namespace mongo {
 
+boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return make_intrusive<DocumentSourceMock>(std::deque<GetNextResult>{}, expCtx);
+}
+
 DocumentSourceMock::DocumentSourceMock(std::deque<GetNextResult> results,
                                        const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSourceQueue(std::move(results), expCtx),
+    : DocumentSource(kStageName, expCtx),
       mockConstraints(StreamType::kStreaming,
                       PositionRequirement::kNone,
                       HostTypeRequirement::kNone,
@@ -48,11 +53,14 @@ DocumentSourceMock::DocumentSourceMock(std::deque<GetNextResult> results,
                       TransactionRequirement::kAllowed,
                       LookupRequirement::kAllowed,
                       UnionRequirement::kAllowed) {
+    for (auto& res : results) {
+        _queue.push_back(QueueItem{std::move(res), /*count*/ 1});
+    }
     mockConstraints.requiresInputDocSource = false;
 }
 
 const char* DocumentSourceMock::getSourceName() const {
-    return "mock";
+    return kStageName.rawData();
 }
 
 size_t DocumentSourceMock::size() const {
@@ -94,4 +102,25 @@ boost::intrusive_ptr<DocumentSourceMock> DocumentSourceMock::createForTest(
     }
     return new DocumentSourceMock(std::move(results), expCtx);
 }
+
+DocumentSource::GetNextResult DocumentSourceMock::doGetNext() {
+    invariant(!isDisposed);
+    invariant(!isDetachedFromOpCtx);
+
+    if (_queue.empty()) {
+        return GetNextResult::makeEOF();
+    }
+
+    boost::optional<DocumentSource::GetNextResult> next;
+    auto& nextQueueItem = _queue.front();
+    --nextQueueItem.count;
+    if (nextQueueItem.count == 0) {
+        next = std::move(nextQueueItem.next);
+        _queue.pop_front();
+    } else {
+        next = nextQueueItem.next;
+    }
+    return std::move(*next);
+}
+
 }  // namespace mongo

@@ -19,16 +19,22 @@
  * 14. Assert that original primary is now a secondary
  *
  */
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");  // for stopReplicationOnSecondaries,
-                                             // restartServerReplication,
-                                             // restartReplSetReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplSetReplication,
+    restartServerReplication,
+    stopReplicationOnSecondaries,
+} from "jstests/libs/write_concern_util.js";
 
 var name = 'stepdown_needs_electable_secondary';
 
-var replTest = new ReplSetTest({name: name, nodes: 5});
+var replTest = new ReplSetTest({
+    name: name,
+    nodes: 5,
+    nodeOptions: {
+        setParameter: {logComponentVerbosity: tojson({replication: 2}), numInitialSyncAttempts: 25},
+    }
+});
 var nodes = replTest.nodeList();
 
 replTest.startSet();
@@ -137,4 +143,3 @@ replTest.waitForState(primary, ReplSetTest.State.SECONDARY);
 // Disable all fail points for clean shutdown
 restartReplSetReplication(replTest);
 replTest.stopSet();
-}());

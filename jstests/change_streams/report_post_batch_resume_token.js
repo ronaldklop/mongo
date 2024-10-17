@@ -3,11 +3,8 @@
  * test verifies postBatchResumeToken semantics that are common to sharded and unsharded streams.
  * @tags: [uses_transactions]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For isMongos.
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // Drop and recreate collections to assure a clean run.
 const collName = "report_post_batch_resume_token";
@@ -157,7 +154,7 @@ const rcCmdRes = testCollection.runCommand("find", {readConcern: {level: "majori
 if (FixtureHelpers.isSharded(testCollection) &&
     rcCmdRes.code === ErrorCodes.ReadConcernMajorityNotEnabled) {
     jsTestLog("Skipping transaction tests since majority read concern is disabled.");
-    return;
+    quit();
 }
 
 // Test that the PBRT is correctly updated when reading events from within a transaction.
@@ -224,4 +221,14 @@ assert.gt(bsonWoCompare(txnEvent3._id, previousGetMorePBRT), 0);
 // appear in the batch. Confirm that the postBatchResumeToken has been set correctly.
 getMorePBRT = csCursor.getResumeToken();
 assert.gte(bsonWoCompare(getMorePBRT, txnEvent3._id), 0);
-})();
+
+// Test that a batch does not exceed the limit (and throw BSONObjectTooLarge) with a large
+// post-batch resume token.
+csCursor = testCollection.watch();
+const kSecondDocSize = 80 * 1024;
+// Here, 4.5 is some "unlucky" (non-unique) weight to provoke an error.
+const kFirstDocSize = (16 * 1024 * 1024) - (4.5 * kSecondDocSize);
+testCollection.insertMany([{a: "x".repeat(kFirstDocSize)}, {_id: "x".repeat(kSecondDocSize)}]);
+assert.doesNotThrow(() => {
+    csCursor.hasNext();
+}, [], "Unexpected exception on 'csCursor.hasNext()'.");

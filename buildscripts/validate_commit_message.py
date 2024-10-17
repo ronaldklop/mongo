@@ -27,124 +27,108 @@
 # it in the license file.
 #
 """Validate that the commit message is ok."""
-import argparse
-import os
+
+import pathlib
 import re
 import subprocess
-import sys
-import logging
 
-LOGGER = logging.getLogger(__name__)
+import structlog
+import typer
+from git import Commit, Repo
+from typing_extensions import Annotated
 
-COMMON_PUBLIC_PATTERN = r'''
-    ((?P<revert>Revert)\s+[\"\']?)?                         # Revert (optional)
-    ((?P<ticket>(?:EVG|SERVER|WT)-[0-9]+)[\"\']?\s*)               # ticket identifier
-    (?P<body>(?:(?!\(cherry\spicked\sfrom).)*)?             # To also capture the body
-    (?P<backport>\(cherry\spicked\sfrom.*)?                 # back port (optional)
-    '''
-"""Common Public pattern format."""
-
-COMMON_LINT_PATTERN = r'(?P<lint>Fix\slint)'
-"""Common Lint pattern format."""
-
-COMMON_IMPORT_PATTERN = r'(?P<imported>Import\s(wiredtiger|tools):\s.*)'
-"""Common Import pattern format."""
-
-COMMON_PRIVATE_PATTERN = r'''
-    ((?P<revert>Revert)\s+[\"\']?)?                                     # Revert (optional)
-    ((?P<ticket>[A-Z]+-[0-9]+)[\"\']?\s*)                               # ticket identifier
-    (?P<body>(?:(?!('\s(into\s'(([^/]+))/(([^:]+)):(([^']+))'))).)*)?   # To also capture the body
-'''
-"""Common Private pattern format."""
+LOGGER = structlog.get_logger(__name__)
 
 STATUS_OK = 0
 STATUS_ERROR = 1
 
-GIT_SHOW_COMMAND = ["git", "show", "-1", "-s", "--format=%s"]
+repo_root = pathlib.Path(
+    subprocess.run(
+        "git rev-parse --show-toplevel", shell=True, text=True, capture_output=True
+    ).stdout.strip()
+)
+
+pr_template = ""
+with open(repo_root / ".github" / "pull_request_template.md", "r") as r:
+    pr_template = r.read().strip()
+
+BANNED_STRINGS = ["https://spruce.mongodb.com", "https://evergreen.mongodb.com", pr_template]
+
+VALID_SUMMARY = re.compile(r'(Revert ")?(SERVER-[0-9]+|Import wiredtiger)')
 
 
-def new_patch_description(pattern: str) -> str:
-    """
-    Wrap the pattern to conform to the new commit queue patch description format.
+def is_valid_commit(commit: Commit) -> bool:
+    # Valid values look like:
+    # 1. SERVER-\d+
+    # 2. Revert "SERVER-\d+
+    # 3. Import wiredtiger
+    # 4. Revert "Import wiredtiger
+    if not VALID_SUMMARY.match(commit.summary):
+        LOGGER.error(
+            "Commit did not contain a valid summary",
+            commit_hexsha=commit.hexsha,
+            commit_summary=commit.summary,
+        )
+        return False
 
-    Add the commit queue prefix and suffix to the pattern. The format looks like:
-
-    Commit Queue Merge: '<commit message>' into '<owner>/<repo>:<branch>'
-
-    :param pattern: The pattern to wrap.
-    :return: A pattern to match the new format for the patch description.
-    """
-    return (r"""^((?P<commitqueue>Commit\sQueue\sMerge:)\s')"""
-            f'{pattern}'
-            # r"""('\s(?P<into>into\s'((?P<owner>[^/]+))/((?P<repo>[^:]+)):((?P<branch>[^']+))'))"""
+    # Remove all whitespace from comparisons. GitHub line-wraps commit messages, which adds
+    # newline characters that otherwise would not match verbatim such banned strings.
+    stripped_message = "".join(commit.message.split())
+    for banned_string in BANNED_STRINGS:
+        if "".join(banned_string.split()) in stripped_message:
+            LOGGER.error(
+                "Commit contains banned string (ignoring whitespace)",
+                banned_string=banned_string,
+                commit_hexsha=commit.hexsha,
+                commit_message=commit.message,
             )
+            return False
+
+    return True
 
 
-def old_patch_description(pattern: str) -> str:
+def main(
+    branch_name: Annotated[
+        str,
+        typer.Option(envvar="BRANCH_NAME", help="Name of the branch to compare against HEAD"),
+    ],
+    is_commit_queue: Annotated[
+        str,
+        typer.Option(
+            envvar="IS_COMMIT_QUEUE",
+            help="If this is being run in the commit/merge queue. Set to anything to be considered part of the commit/merge queue.",
+        ),
+    ] = "",
+):
     """
-    Wrap the pattern to conform to the new commit queue patch description format.
+    Validate the commit message.
 
-    Just add a start anchor. The format looks like:
-
-    <commit message>
-
-    :param pattern: The pattern to wrap.
-    :return: A pattern to match the old format for the patch description.
+    It validates the latest message when no arguments are provided.
     """
-    return r'^' f'{pattern}'
 
+    if not is_commit_queue:
+        LOGGER.info("Exiting early since this is not running in the commit/merge queue")
+        raise typer.Exit(code=STATUS_OK)
 
-# NOTE: re.VERBOSE is for visibility / debugging. As such significant white space must be
-# escaped (e.g ' ' to \s).
-VALID_PATTERNS = [
-    re.compile(new_patch_description(COMMON_PUBLIC_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(old_patch_description(COMMON_PUBLIC_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(new_patch_description(COMMON_LINT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(old_patch_description(COMMON_LINT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(new_patch_description(COMMON_IMPORT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(old_patch_description(COMMON_IMPORT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-]
-"""valid public patterns."""
-
-PRIVATE_PATTERNS = [
-    re.compile(
-        new_patch_description(COMMON_PRIVATE_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-    re.compile(
-        old_patch_description(COMMON_PRIVATE_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
-]
-"""private patterns."""
-
-
-def main(argv=None):
-    """Execute Main function to validate commit messages."""
-    parser = argparse.ArgumentParser(
-        usage="Validate the commit message. "
-        "It validates the latest message when no arguments are provided.")
-    parser.add_argument(
-        "message",
-        metavar="commit message",
-        nargs="*",
-        help="The commit message to validate",
+    diff_commits = subprocess.run(
+        ["git", "log", '--pretty=format:"%H"', f"{branch_name}...HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    args = parser.parse_args(argv)
+    # Comes back like "hash1"\n"hash2"\n...
+    commit_hashs: list[str] = diff_commits.stdout.replace('"', "").splitlines()
+    LOGGER.info("Diff commit hashes", commit_hashs=commit_hashs)
+    repo = Repo(repo_root)
 
-    if not args.message:
-        print('Validating last git commit message')
-        result = subprocess.check_output(GIT_SHOW_COMMAND)
-        message = result.decode('utf-8')
-    else:
-        message = " ".join(args.message)
+    for commit_hash in commit_hashs:
+        commit = repo.commit(commit_hash)
+        if not is_valid_commit(commit):
+            LOGGER.error("Found an invalid commit", commit=commit)
+            raise typer.Exit(code=STATUS_ERROR)
 
-    if any(valid_pattern.match(message) for valid_pattern in VALID_PATTERNS):
-        return STATUS_OK
-    else:
-        if any(private_pattern.match(message) for private_pattern in PRIVATE_PATTERNS):
-            error_type = "Found a reference to a private project"
-        else:
-            error_type = "Found a commit without a ticket"
-        LOGGER.error(f"{error_type}\n{message}")  # pylint: disable=logging-fstring-interpolation
-        return STATUS_ERROR
+    return
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    typer.run(main)

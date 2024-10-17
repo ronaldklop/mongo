@@ -1,13 +1,16 @@
-// This test causes node 2 to enter rollback and then fail with a SocketException before updating
-// MinValid or altering durable state in any way. It will then choose a sync source from which it
-// is able to stitch the oplog and therefore doesn't need to roll back. Prior to SERVER-27282, the
-// node would be "stuck" with state=ROLLBACK while it was doing steady-state replication, with no
-// way to reach SECONDARY without restarting the process.
-(function() {
-'use strict';
+/**
+ * This test causes node 2 to enter rollback and then fail with a SocketException before updating
+ * MinValid or altering durable state in any way. It will then choose a sync source from which it
+ * is able to stitch the oplog and therefore doesn't need to roll back. Prior to SERVER-27282, the
+ * node would be "stuck" with state=ROLLBACK while it was doing steady-state replication, with no
+ * way to reach SECONDARY without restarting the process.
+ *
+ * @tags: [requires_fcv_53]
+ */
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 var collName = "test.coll";
 var counter = 0;
@@ -26,8 +29,14 @@ var rst = new ReplSetTest({
     ],
     useBridge: true
 });
-var nodes = rst.startSet();
+var nodes = rst.startSet({setParameter: {allowMultipleArbiters: true}});
 rst.initiate();
+
+// The default WC is majority and stopServerReplication could prevent satisfying any majority
+// writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 
 function stepUp(rst, node) {
     var primary = rst.getPrimary();
@@ -131,4 +140,3 @@ rst.awaitSecondaryNodes();
 rst.checkReplicatedDataHashes();
 rst.checkOplogs();
 rst.stopSet();
-}());

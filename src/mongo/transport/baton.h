@@ -32,6 +32,7 @@
 #include <memory>
 
 #include "mongo/db/baton.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
@@ -69,6 +70,7 @@ public:
     };
     virtual Future<void> addSession(Session& session, Type type) noexcept = 0;
 
+    using Baton::waitUntil;
     /**
      * Adds a timer, returning a future which activates after a deadline.
      */
@@ -88,11 +90,20 @@ public:
      */
     virtual bool cancelTimer(const ReactorTimer& timer) noexcept = 0;
 
+    /**
+     * Marks the baton to wake up on client session disconnect and mark the associated operation as
+     * killed.
+     */
+    virtual void markKillOnClientDisconnect() noexcept = 0;
+
+
     NetworkingBaton* networking() noexcept final {
         return this;
     }
 
     virtual bool canWait() noexcept = 0;
+
+    virtual const TransportLayer* getTransportLayer() const = 0;
 };
 
 }  // namespace transport

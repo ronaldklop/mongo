@@ -1,7 +1,10 @@
 // Cannot implicitly shard accessed collections because the coll.stats() output from a mongod when
 // run against a sharded collection is wrapped in a "shards" object with keys for each shard.
-// @tags: [assumes_unsharded_collection]
-
+// @tags: [
+//   assumes_unsharded_collection,
+//   not_allowed_with_signed_security_token,
+// ]
+//
 // This test is designed to stress $sample, and any optimizations a storage engine might provide.
 //
 // A $sample stage as the first stage in a pipeline should ideally have a uniform distribution, so
@@ -10,10 +13,7 @@
 //      documents after sampling N times.
 //   2. We should not see any duplicate documents in any one $sample (this is only guaranteed if
 //      there are no ongoing write operations).
-(function() {
-"use strict";
-
-load('jstests/libs/fixture_helpers.js');  // For isReplSet() and awaitReplication().
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 var coll = db.server21632;
 coll.drop();
@@ -41,7 +41,7 @@ if (FixtureHelpers.isReplSet(db)) {
 var storageEngine = jsTest.options().storageEngine || "wiredTiger";
 
 if (storageEngine === "wiredTiger" && coll.stats().wiredTiger.type === 'lsm') {
-    return;
+    quit();
 }
 
 assert.eq([], coll.aggregate([{$sample: {size: 1}}]).toArray());
@@ -92,4 +92,3 @@ assert.gte(Object.keys(cumulativeSeenIds).length, nDocs / 4);
 
 // Make sure we can return all documents in the collection.
 assert.eq(coll.aggregate([{$sample: {size: nDocs}}]).toArray().length, nDocs);
-})();

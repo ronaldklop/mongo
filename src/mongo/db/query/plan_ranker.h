@@ -29,14 +29,28 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <deque>
+#include <functional>
+#include <memory>
 #include <queue>
+#include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_ranking_decision.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/container_size_helper.h"
 
 namespace mongo::plan_ranker {
@@ -65,7 +79,14 @@ void logScoringPlan(std::function<std::string()> solution,
 void logScore(double score);
 void logEOFBonus(double eofBonus);
 void logFailedPlan(std::function<std::string()> planSummary);
+void logTieBreaking(double score,
+                    double docsFetchedBonus,
+                    double indexPrefixBonus,
+                    bool isPlanTied);
 }  // namespace log_detail
+
+// Constant used for tie breakers.
+const double kBonusEpsilon = 1e-4;
 
 /**
  * Assigns the stats tree a 'goodness' score. The higher the score, the better the plan. The exact
@@ -89,7 +110,7 @@ public:
         const auto productivity = calculateProductivity(stats);
         const auto advances = getNumberOfAdvances(stats);
         const double epsilon =
-            std::min(1.0 / static_cast<double>(10 * (advances > 0 ? advances : 1)), 1e-4);
+            std::min(1.0 / static_cast<double>(10 * (advances > 0 ? advances : 1)), kBonusEpsilon);
 
 
         // We prefer queries that don't require a fetch stage.
@@ -189,9 +210,25 @@ struct BaseCandidatePlan {
     // If the candidate plan has failed in a recoverable fashion during the trial run, contains a
     // non-OK status.
     Status status{Status::OK()};
+    // Indicates whether this candidate plan was retrieved from the cache. During explain, we do not
+    // fetch plans from the cache, so it may be the case that a plan matches a cache entry even when
+    // it is not fetched from the cache.
+    bool fromPlanCache{false};
     // Any results produced during the plan's execution prior to scoring are retained here.
-    std::queue<ResultType> results;
+    std::deque<ResultType> results;
+    // This is used to track the original plan with clean PlanStage tree and the auxiliary data.
+    // The 'root' and 'data' in this struct could be used to execute trials in multi-planner before
+    // caching the winning plan, which requires necessary values bound to 'data'. These values
+    // should not be stored in the plan cache.
+    boost::optional<std::pair<PlanStageType, Data>> clonedPlan;
 };
 
 using CandidatePlan = BaseCandidatePlan<PlanStage*, WorkingSetID, WorkingSet*>;
+
+/**
+ * Apply index prefix heuristic (see comment to 'getIndexBoundsScore' function in the cpp file) for
+ * the given list of solutions, if the solutions are compatible (have the same plan shape), the
+ * vector of winner indexes are returned, otherwise an empty vector is returned.
+ */
+std::vector<size_t> applyIndexPrefixHeuristic(const std::vector<const QuerySolution*>& solutions);
 }  // namespace mongo::plan_ranker

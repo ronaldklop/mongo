@@ -79,13 +79,13 @@ class ExceptionForAPI : public std::exception {
 public:
     explicit ExceptionForAPI(const ErrorEnum code, std::string m)
         : _mesg(std::move(m)), _code(code) {}
-    virtual ~ExceptionForAPI() {}
+    ~ExceptionForAPI() override {}
 
     ErrorEnum statusCode() const noexcept {
         return this->_code;
     }
 
-    const char* what() const noexcept {
+    const char* what() const noexcept override {
         return this->_mesg.c_str();
     }
 
@@ -165,9 +165,8 @@ struct enterCXXImpl<Status, Function, void> {
 template <typename Status, typename Function, typename Pointer>
 struct enterCXXImpl<Status, Function, Pointer*> {
     template <typename Callable>
-    static Pointer* call(Callable&& function,
-                         Status& status,
-                         const ReentrancyGuard&& = {}) noexcept try {
+    static Pointer* call(Callable&& function, Status& status, const ReentrancyGuard&& = {}) noexcept
+        try {
         return function();
     } catch (...) {
         return handleException(status);

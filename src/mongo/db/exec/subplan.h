@@ -29,21 +29,32 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_all_indices_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -70,13 +81,31 @@ class OperationContext;
  */
 class SubplanStage final : public RequiresAllIndicesStage {
 public:
+    struct PlanSelectionCallbacks {
+        /**
+         * Called after plan selection is performed for an individual $or branch.
+         */
+        MultiPlanStage::OnPickBestPlan onPickPlanForBranch;
+
+        /**
+         * In some cases, the 'SubplanStage' may fall back to performing regular multi-planning for
+         * the entire query. In this case, it will call this callback rather than
+         * 'onPickPlanForBranch'.
+         */
+        MultiPlanStage::OnPickBestPlan onPickPlanWholeQuery;
+    };
+
     SubplanStage(ExpressionContext* expCtx,
-                 const CollectionPtr& collection,
+                 VariantCollectionPtrOrAcquisition collection,
                  WorkingSet* ws,
-                 const QueryPlannerParams& params,
-                 CanonicalQuery* cq);
+                 CanonicalQuery* cq,
+                 PlanSelectionCallbacks PlanSelectionCallbacks);
 
     static bool canUseSubplanning(const CanonicalQuery& query);
+    static bool needsSubplanning(const CanonicalQuery& query) {
+        return internalQueryPlanOrChildrenIndependently.load() &&
+            SubplanStage::canUseSubplanning(query);
+    }
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -85,7 +114,7 @@ public:
         return STAGE_SUBPLAN;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -98,6 +127,11 @@ public:
      * If this effort fails, then falls back on planning the whole query normally rather
      * then planning $or branches independently.
      *
+     * If 'shouldConstructClassicExecutableTree' is true, builds a classic executable tree and
+     * appends it to the stage's children. If 'shouldConstructClassicExecutableTree' is false, it
+     * means we are using the sub planner for SBE queries, and do not need to build a classic
+     * executable tree. 'shouldConstructClassicExecutableTree' is true by default.
+     *
      * If 'yieldPolicy' is non-NULL, then all locks may be yielded in between round-robin
      * works of the candidate plans. By default, 'yieldPolicy' is NULL and no yielding will
      * take place.
@@ -106,7 +140,9 @@ public:
      * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield, or
      * ErrorCodes::MaxTimeMSExpired if the operation has exceeded its time limit.
      */
-    Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
+    Status pickBestPlan(const QueryPlannerParams& plannerParams,
+                        PlanYieldPolicy* yieldPolicy,
+                        bool shouldConstructClassicExecutableTree = true);
 
     //
     // For testing.
@@ -129,16 +165,45 @@ public:
         return _compositeSolution.get();
     }
 
+    /**
+     * Extracts the best query solution. If the sub planner falls back to the multi planner,
+     * extracts the best solution from the multi planner, otherwise extracts the composite solution.
+     */
+    std::unique_ptr<QuerySolution> extractBestWholeQuerySolution() {
+        if (usesMultiplanning()) {
+            return multiPlannerStage()->extractBestSolution();
+        }
+        return std::move(_compositeSolution);
+    }
+
+    /**
+     * Returns true if the sub planner fell back to multiplanning.
+     */
+    bool usesMultiplanning() const {
+        return _usesMultiplanning;
+    }
+
+    /**
+     * Returns the MultiPlan stage.
+     */
+    MultiPlanStage* multiPlannerStage() {
+        tassert(8524100,
+                "The sub planner stage should fall back to the multi planner.",
+                _usesMultiplanning);
+        return static_cast<MultiPlanStage*>(child().get());
+    }
+
+
 private:
     /**
      * Used as a fallback if subplanning fails. Helper for pickBestPlan().
      */
-    Status choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy);
+    Status choosePlanWholeQuery(const QueryPlannerParams& plannerParams,
+                                PlanYieldPolicy* yieldPolicy,
+                                bool shouldConstructClassicExecutableTree);
 
     // Not owned here.
     WorkingSet* _ws;
-
-    QueryPlannerParams _plannerParams;
 
     // Not owned here.
     CanonicalQuery* _query;
@@ -149,5 +214,11 @@ private:
 
     // Indicates whether i-th branch of the rooted $or query was planned from a cached solution.
     std::vector<bool> _branchPlannedFromCache;
+
+    // Callbacks to pass through to 'MultiPlanStage'.
+    PlanSelectionCallbacks _planSelectionCallbacks;
+
+    // Indicates whether the sub planner has fallen back to multi planning.
+    bool _usesMultiplanning = false;
 };
 }  // namespace mongo

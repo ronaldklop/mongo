@@ -27,29 +27,61 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/list_indexes_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/collection_routing_info_targeter.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/query/exec/store_possible_cursor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
 
 ListIndexesReply cursorCommandPassthroughShardWithMinKeyChunk(OperationContext* opCtx,
                                                               const NamespaceString& nss,
-                                                              const ChunkManager& cm,
+                                                              const CollectionRoutingInfo& cri,
                                                               const BSONObj& cmdObj,
                                                               const PrivilegeVector& privileges) {
     auto response = executeCommandAgainstShardWithMinKeyChunk(
         opCtx,
         nss,
-        cm,
+        cri,
         CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
         ReadPreferenceSetting::get(opCtx),
         Shard::RetryPolicy::kIdempotent);
@@ -70,7 +102,7 @@ ListIndexesReply cursorCommandPassthroughShardWithMinKeyChunk(OperationContext* 
     const auto& resultObj = out.obj();
     uassertStatusOK(getStatusFromCommandResult(resultObj));
     // The reply syntax must conform to its IDL definition.
-    return ListIndexesReply::parse({"listIndexes"}, resultObj);
+    return ListIndexesReply::parse(IDLParserContext{"listIndexes"}, resultObj);
 }
 
 class CmdListIndexes final : public ListIndexesCmdVersion1Gen<CmdListIndexes> {
@@ -94,37 +126,49 @@ public:
         }
 
         NamespaceString ns() const final {
-            const auto& nss = request().getNamespaceOrUUID().nss();
-            uassert(
-                ErrorCodes::BadValue, "Mongos requires a namespace for listIndexes command", nss);
-            return nss.get();
+            uassert(ErrorCodes::BadValue,
+                    "Mongos requires a namespace for listIndexes command",
+                    request().getNamespaceOrUUID().isNamespaceString());
+            return request().getNamespaceOrUUID().nss();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
             AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
             uassert(ErrorCodes::Unauthorized,
                     str::stream() << "Not authorized to list indexes on collection:"
-                                  << ns().toString(),
+                                  << ns().toStringForErrorMsg(),
                     authzSession->isAuthorizedForActionsOnResource(
                         ResourcePattern::forExactNamespace(ns()), ActionType::listIndexes));
         }
 
         ListIndexesReply typedRun(OperationContext* opCtx) final {
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
             // The command's IDL definition permits namespace or UUID, but mongos requires a
             // namespace.
-            const auto cm = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, ns()));
+            auto targeter = CollectionRoutingInfoTargeter(opCtx, ns());
+            auto cri = targeter.getRoutingInfo();
+            auto& cmd = request();
+            setReadWriteConcern(opCtx, cmd, this);
+            auto cmdToBeSent = cmd.toBSON();
+            if (targeter.timeseriesNamespaceNeedsRewrite(ns())) {
+                cmdToBeSent =
+                    timeseries::makeTimeseriesCommand(cmdToBeSent,
+                                                      ns(),
+                                                      ListIndexes::kCommandName,
+                                                      ListIndexes::kIsTimeseriesNamespaceFieldName);
+            }
 
             return cursorCommandPassthroughShardWithMinKeyChunk(
                 opCtx,
-                ns(),
-                cm,
-                applyReadWriteConcern(opCtx, this, request().toBSON({})),
+                targeter.getNS(),
+                cri,
+                cmdToBeSent,
                 {Privilege(ResourcePattern::forExactNamespace(ns()), ActionType::listIndexes)});
         }
     };
-} cmdListIndexes;
+};
+MONGO_REGISTER_COMMAND(CmdListIndexes).forRouter();
 
 }  // namespace
 }  // namespace mongo

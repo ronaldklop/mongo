@@ -27,14 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -42,26 +61,48 @@ namespace {
 class ImplicitCollectionCreationTest : public ShardServerTestFixture {};
 
 TEST_F(ImplicitCollectionCreationTest, ImplicitCreateDisallowedByDefault) {
-    NamespaceString nss("ImplicitCreateDisallowedByDefaultDB.TestColl");
-    AutoGetOrCreateDb db(operationContext(), nss.db(), MODE_IX);
-    Lock::CollectionLock collLock(operationContext(), nss, MODE_IX);
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "ImplicitCreateDisallowedByDefaultDB.TestColl");
+    AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
+    auto db = autoColl.ensureDbExists(operationContext());
     WriteUnitOfWork wuow(operationContext());
     ASSERT_THROWS_CODE(
-        uassertStatusOK(db.getDb()->userCreateNS(operationContext(), nss, CollectionOptions{})),
+        uassertStatusOK(db->userCreateNS(operationContext(), nss, CollectionOptions{})),
         DBException,
         ErrorCodes::CannotImplicitlyCreateCollection);
     wuow.commit();
 }
 
 TEST_F(ImplicitCollectionCreationTest, AllowImplicitCollectionCreate) {
-    NamespaceString nss("AllowImplicitCollectionCreateDB.TestColl");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("AllowImplicitCollectionCreateDB.TestColl");
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
         operationContext());
-    AutoGetOrCreateDb db(operationContext(), nss.db(), MODE_IX);
-    Lock::CollectionLock collLock(operationContext(), nss, MODE_IX);
+    AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
+    auto db = autoColl.ensureDbExists(operationContext());
     WriteUnitOfWork wuow(operationContext());
-    ASSERT_OK(db.getDb()->userCreateNS(operationContext(), nss, CollectionOptions{}));
+    ASSERT_OK(db->userCreateNS(operationContext(), nss, CollectionOptions{}));
     wuow.commit();
+
+    const auto scopedCsr =
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(operationContext(), nss);
+    ASSERT_TRUE(scopedCsr->getCurrentMetadataIfKnown());
+}
+
+TEST_F(ImplicitCollectionCreationTest, AllowImplicitCollectionCreateWithSetCSRAsUnknown) {
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("AllowImplicitCollectionCreateDB.TestColl");
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+        operationContext(), /* forceCSRAsUnknownAfterCollectionCreation */ true);
+    AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
+    auto db = autoColl.ensureDbExists(operationContext());
+    WriteUnitOfWork wuow(operationContext());
+    ASSERT_OK(db->userCreateNS(operationContext(), nss, CollectionOptions{}));
+    wuow.commit();
+
+    const auto scopedCsr =
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(operationContext(), nss);
+    ASSERT_FALSE(scopedCsr->getCurrentMetadataIfKnown());
 }
 
 }  // namespace

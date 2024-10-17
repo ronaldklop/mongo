@@ -27,25 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/split_horizon.h"
 
+#include <algorithm>
+#include <iterator>
+#include <mutex>
 #include <utility>
+#include <vector>
 
-#include "mongo/bson/util/bson_extract.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/client.h"
+#include "mongo/util/decorable.h"
 
-using namespace std::literals::string_literals;
-
-using std::begin;
-using std::end;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 namespace mongo {
 namespace repl {
 namespace {
+
+using namespace std::literals::string_literals;
+
 const auto getSplitHorizonParameters = Client::declareDecoration<SplitHorizon::Parameters>();
 
 using AllMappings = SplitHorizon::AllMappings;
@@ -123,8 +128,10 @@ SplitHorizon::ForwardMapping computeForwardMappings(
 
         const auto horizonEntries = [&] {
             std::vector<MapMember> rv;
-            std::transform(
-                begin(*horizonsObject), end(*horizonsObject), inserter(rv, end(rv)), convert);
+            std::transform(std::begin(*horizonsObject),
+                           std::end(*horizonsObject),
+                           inserter(rv, end(rv)),
+                           convert);
             return rv;
         }();
 
@@ -181,7 +188,8 @@ auto SplitHorizon::getParameters(const Client* const client) -> Parameters {
     return getSplitHorizonParameters(*client);
 }
 
-StringData SplitHorizon::determineHorizon(const SplitHorizon::Parameters& horizonParameters) const {
+std::string SplitHorizon::determineHorizon(
+    const SplitHorizon::Parameters& horizonParameters) const {
     if (horizonParameters.sniName) {
         const auto sniName = *horizonParameters.sniName;
         const auto found = _reverseHostMapping.find(sniName);
@@ -189,7 +197,7 @@ StringData SplitHorizon::determineHorizon(const SplitHorizon::Parameters& horizo
             return found->second;
         }
     }
-    return kDefaultHorizon;
+    return kDefaultHorizon.toString();
 }
 
 void SplitHorizon::toBSON(BSONObjBuilder& configBuilder) const {
@@ -202,12 +210,18 @@ void SplitHorizon::toBSON(BSONObjBuilder& configBuilder) const {
     if (_forwardMapping.size() == 1)
         return;
 
-    BSONObjBuilder horizonsBson(configBuilder.subobjStart("horizons"));
+    // StringMaps are iterated in arbitrary order, so we sort before returning the horizons.
+    std::vector<std::pair<StringData, std::string>> sortedHorizons;
     for (const auto& horizon : _forwardMapping) {
         // The "__default" horizon should never be emitted in the horizon table.
         if (horizon.first == SplitHorizon::kDefaultHorizon)
             continue;
-        horizonsBson.append(horizon.first, horizon.second.toString());
+        sortedHorizons.emplace_back(horizon.first, horizon.second.toString());
+    }
+    std::sort(sortedHorizons.begin(), sortedHorizons.end());
+    BSONObjBuilder horizonsBson(configBuilder.subobjStart("horizons"));
+    for (const auto& horizon : sortedHorizons) {
+        horizonsBson.append(horizon.first, horizon.second);
     }
 }
 

@@ -40,35 +40,30 @@ class OperationContext;
 
 class RecoveryUnitNoop : public RecoveryUnit {
 public:
-    void beginUnitOfWork(OperationContext* opCtx) final {}
+    RecoveryUnitNoop();
+    ~RecoveryUnitNoop() override;
 
-    bool waitUntilDurable(OperationContext* opCtx) override {
+    bool isNoop() const final {
         return true;
     }
 
-    void setOrderedCommit(bool orderedCommit) override {}
+    void setOrderedCommit(bool orderedCommit) final {}
 
-    void validateInUnitOfWork() const override {}
+    void validateInUnitOfWork() const final {}
 
-    bool inActiveTxn() const {
-        return false;
-    }
+    void doBeginUnitOfWork() override {}
 
-    bool isNoop() const override {
-        return true;
-    }
+    void doAbandonSnapshot() override {}
 
-private:
-    void doCommitUnitOfWork() final {
+    void doCommitUnitOfWork() override {
         _executeCommitHandlers(boost::none);
     }
 
-    void doAbortUnitOfWork() final {
+    void doAbortUnitOfWork() override {
         _executeRollbackHandlers();
     }
 
-    virtual void doAbandonSnapshot() {}
-
+private:
     std::vector<std::unique_ptr<Change>> _changes;
 };
 

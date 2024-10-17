@@ -1,10 +1,11 @@
 /**
  * Tests for invalid usages of $unionWith, or invalid stages within the $unionWith sub-pipeline.
+ * @tags: [
+ *  # Some stages we're checking are only supported with a single read concern.
+ *  assumes_read_concern_unchanged
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For isReplSet() and isSharded().
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const baseColl = db["base"];
 baseColl.drop();
@@ -15,8 +16,9 @@ unionColl.drop();
 assert.commandWorked(baseColl.insert({a: 1}));
 
 // Disallowed within an update pipeline.
-assert.commandFailedWithCode(baseColl.update({a: 1}, [{$unionWith: unionColl.getName()}]),
-                             ErrorCodes.InvalidOptions);
+assert.commandFailedWithCode(
+    baseColl.update({a: 1}, [{$unionWith: unionColl.getName()}]),
+    [ErrorCodes.InvalidOptions, ErrorCodes.OperationNotSupportedInTransaction]);
 
 function assertFailsWithCode(pipeline, errCode) {
     assert.commandFailedWithCode(db.runCommand({
@@ -72,4 +74,3 @@ if (FixtureHelpers.isSharded(baseColl)) {
     assertFailsWithCode([{$unionWith: {coll: unionColl.getName(), pipeline: subPipe}}],
                         ErrorCodes.InvalidNamespace);
 }
-})();

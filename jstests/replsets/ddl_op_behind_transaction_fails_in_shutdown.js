@@ -15,12 +15,9 @@
  * @tags: [requires_persistence, uses_prepare_transaction, uses_transactions]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/parallel_shell_helpers.js");
-load('jstests/libs/test_background_ops.js');
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -30,13 +27,25 @@ const dbName = "test";
 const collName = "ddl_op_behind_prepared_transaction_fails_in_shutdown";
 let primary = rst.getPrimary();
 const testDB = primary.getDB(dbName);
+
+const buildInfo = assert.commandWorked(testDB.runCommand({"buildInfo": 1}));
+const isCodeCoverageEnabled = buildInfo.buildEnvironment.ccflags.includes('-ftest-coverage');
+const isSanitizerEnabled = buildInfo.buildEnvironment.ccflags.includes('-fsanitize');
+const slowTestVariant = isCodeCoverageEnabled || isSanitizerEnabled;
+
+if (slowTestVariant) {
+    jsTestLog("Skipping test on slow test variant");
+    rst.stopSet(true /*use default exit signal*/, false /*forRestart*/, {skipValidation: true});
+    quit();
+}
+
 const testColl = testDB.getCollection(collName);
 const txnDoc = {
     _id: 100
 };
 
 jsTest.log("Creating a collection '" + collName + "' with data in it...");
-assert.commandWorked(testDB.createCollection(collName));
+assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
 let bulk = testColl.initializeUnorderedBulkOp();
 for (let i = 0; i < 2; ++i) {
     bulk.insert({_id: i});
@@ -115,4 +124,3 @@ assert.commandFailedWithCode(primary.getDB(dbName).runCommand({
 
 // Skip validation because it requires a lock that the prepared transaction is blocking.
 rst.stopSet(true /*use default exit signal*/, false /*forRestart*/, {skipValidation: true});
-})();

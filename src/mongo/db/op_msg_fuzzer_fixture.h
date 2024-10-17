@@ -27,9 +27,11 @@
  *    it in the license file.
  */
 
+#include <cstddef>
+#include <memory>
+
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/client_strand.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/service_context.h"
@@ -47,12 +49,16 @@ class OpMsgFuzzerFixture {
 public:
     OpMsgFuzzerFixture(bool skipGlobalInitializers = false);
 
+    ~OpMsgFuzzerFixture();
+
     /**
      * Run a single operation as if it came from the network.
      */
     int testOneInput(const char* Data, size_t Size);
 
 private:
+    void _setAuthorizationManager();
+
     const LogicalTime kInMemoryLogicalTime = LogicalTime(Timestamp(3, 1));
 
     // This member is responsible for both creating and deleting the base directory. Think of it as
@@ -62,8 +68,6 @@ private:
     ServiceContext* _serviceContext;
     ClientStrandPtr _clientStrand;
     transport::TransportLayerMock _transportLayer;
-    transport::SessionHandle _session;
-    AuthzManagerExternalStateMock* _externalState;
-    AuthorizationManagerImpl* _authzManager;
+    std::shared_ptr<transport::Session> _session;
 };
 }  // namespace mongo

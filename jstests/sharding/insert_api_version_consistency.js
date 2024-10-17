@@ -1,7 +1,9 @@
 // Test that we support all the same BSON types throughout API Version 1.
 // @tags: [
-//       requires_fcv_49,
 // ]
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const OID = new ObjectId();
 const DATE = new Date();
@@ -14,9 +16,9 @@ const DOC = {
     x05: {
         x00: BinData(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
         x01: BinData(1, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-        x02: BinData(2, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-        x03: BinData(3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-        x04: BinData(4, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        x02: BinData(2, "KwAAAFRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2c="),
+        x03: BinData(3, "OEJTfmD8twzaj/LPKLIVkA=="),
+        x04: BinData(4, "OEJTfmD8twzaj/LPKLIVkA=="),
         x05: BinData(5, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
         x06: BinData(6, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     },
@@ -38,9 +40,6 @@ const DOC = {
     x7F: MaxKey(),
 };
 
-(function() {
-"use strict";
-
 let test = function(db) {
     // We have to create a collection until _configsvrCreateDatabase is in API Version 1.
     assert.commandWorked(db.createCollection("collection"));
@@ -55,9 +54,10 @@ let test = function(db) {
 
     assert.eq(val.x05.x00, BinData(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     assert.eq(val.x05.x01, BinData(1, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-    assert.eq(val.x05.x02, BinData(2, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-    assert.eq(val.x05.x03, BinData(3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-    assert.eq(val.x05.x04, BinData(4, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    assert.eq(val.x05.x02,
+              BinData(2, "KwAAAFRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2c="));
+    assert.eq(val.x05.x03, BinData(3, "OEJTfmD8twzaj/LPKLIVkA=="));
+    assert.eq(val.x05.x04, BinData(4, "OEJTfmD8twzaj/LPKLIVkA=="));
     assert.eq(val.x05.x05, BinData(5, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     assert.eq(val.x05.x06, BinData(6, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
 
@@ -81,7 +81,7 @@ let test = function(db) {
 
 // Testing against a sharded cluster.
 {
-    const st = new ShardingTest({shards: 1, config: 1});
+    const st = new ShardingTest({shards: 1});
     const db = st.s.getDB("test");
     test(db);
     st.stop();
@@ -96,4 +96,3 @@ let test = function(db) {
     test(db);
     rst.stopSet();
 }
-})();

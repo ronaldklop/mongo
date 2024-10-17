@@ -27,38 +27,69 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/process_interface/non_shardsvr_process_interface.h"
 
+#include <typeinfo>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/query/write_ops/single_write_result_gen.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_exec.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-NonShardServerProcessInterface::attachCursorSourceToPipeline(Pipeline* ownedPipeline,
-                                                             bool allowTargetingShards) {
+NonShardServerProcessInterface::preparePipelineForExecution(
+    Pipeline* ownedPipeline,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern) {
     return attachCursorSourceToPipelineForLocalRead(ownedPipeline);
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter>
+NonShardServerProcessInterface::preparePipelineForExecution(
+    const AggregateCommandRequest& aggRequest,
+    Pipeline* pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern) {
+    return attachCursorSourceToPipelineForLocalRead(pipeline, aggRequest);
 }
 
 std::list<BSONObj> NonShardServerProcessInterface::getIndexSpecs(OperationContext* opCtx,
                                                                  const NamespaceString& ns,
                                                                  bool includeBuildUUIDs) {
-    return listIndexesEmptyListIfMissing(opCtx, ns, includeBuildUUIDs);
-}
-
-std::pair<std::vector<FieldPath>, bool>
-NonShardServerProcessInterface::collectDocumentKeyFieldsForHostedCollection(
-    OperationContext* opCtx, const NamespaceString& nss, UUID uuid) const {
-    return {{"_id"}, false};  // Nothing is sharded.
+    return listIndexesEmptyListIfMissing(
+        opCtx, ns, includeBuildUUIDs ? ListIndexesInclude::BuildUUID : ListIndexesInclude::Nothing);
 }
 
 std::vector<FieldPath> NonShardServerProcessInterface::collectDocumentKeyFieldsActingAsRouter(
@@ -66,13 +97,45 @@ std::vector<FieldPath> NonShardServerProcessInterface::collectDocumentKeyFieldsA
     return {"_id"};  // Nothing is sharded.
 }
 
-Status NonShardServerProcessInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              const NamespaceString& ns,
-                                              std::vector<BSONObj>&& objs,
-                                              const WriteConcernOptions& wc,
-                                              boost::optional<OID> targetEpoch) {
-    auto writeResults = write_ops_exec::performInserts(
-        expCtx->opCtx, buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+boost::optional<Document> NonShardServerProcessInterface::lookupSingleDocument(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    UUID collectionUUID,
+    const Document& documentKey,
+    boost::optional<BSONObj> readConcern) {
+    MakePipelineOptions opts;
+    opts.shardTargetingPolicy = ShardTargetingPolicy::kNotAllowed;
+    opts.readConcern = std::move(readConcern);
+
+    auto lookedUpDocument =
+        doLookupSingleDocument(expCtx, nss, collectionUUID, documentKey, std::move(opts));
+
+    // Set the speculative read timestamp appropriately after we do a document lookup locally. We
+    // set the speculative read timestamp based on the timestamp used by the transaction.
+    repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
+        repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
+    if (speculativeMajorityReadInfo.isSpeculativeRead()) {
+        // Speculative majority reads are required to use the 'kNoOverlap' read source.
+        // Storage engine operations require at least Global IS.
+        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
+        invariant(shard_role_details::getRecoveryUnit(expCtx->opCtx)->getTimestampReadSource() ==
+                  RecoveryUnit::ReadSource::kNoOverlap);
+        boost::optional<Timestamp> readTs =
+            shard_role_details::getRecoveryUnit(expCtx->opCtx)->getPointInTimeReadTimestamp();
+        invariant(readTs);
+        speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(*readTs);
+    }
+
+    return lookedUpDocument;
+}
+
+Status NonShardServerProcessInterface::insert(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    auto writeResults = write_ops_exec::performInserts(expCtx->opCtx, *insertCommand);
 
     // Need to check each result in the batch since the writes are unordered.
     for (const auto& result : writeResults.results) {
@@ -83,16 +146,32 @@ Status NonShardServerProcessInterface::insert(const boost::intrusive_ptr<Express
     return Status::OK();
 }
 
+Status NonShardServerProcessInterface::insertTimeseries(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    try {
+        auto insertReply = write_ops_exec::performTimeseriesWrites(expCtx->opCtx, *insertCommand);
+
+        checkWriteErrors(insertReply.getWriteCommandReplyBase());
+    } catch (DBException& ex) {
+        ex.addContext(str::stream() << "time-series insert failed: " << ns.toStringForErrorMsg());
+        throw;
+    }
+    return Status::OK();
+}
+
 StatusWith<MongoProcessInterface::UpdateResult> NonShardServerProcessInterface::update(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& ns,
-    BatchedObjects&& batch,
+    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
     const WriteConcernOptions& wc,
     UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
-    auto writeResults = write_ops_exec::performUpdates(
-        expCtx->opCtx, buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
+    auto writeResults = write_ops_exec::performUpdates(expCtx->opCtx, *updateCommand);
 
     // Need to check each result in the batch since the writes are unordered.
     UpdateResult updateResult;
@@ -110,21 +189,24 @@ StatusWith<MongoProcessInterface::UpdateResult> NonShardServerProcessInterface::
 void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
     OperationContext* opCtx, const NamespaceString& ns, const std::vector<BSONObj>& indexSpecs) {
     AutoGetCollection autoColl(opCtx, ns, MODE_X);
-    CollectionWriter collection(autoColl);
+    CollectionWriter collection(opCtx, autoColl);
     writeConflictRetry(
-        opCtx, "CommonMongodProcessInterface::createIndexesOnEmptyCollection", ns.ns(), [&] {
+        opCtx, "CommonMongodProcessInterface::createIndexesOnEmptyCollection", ns, [&] {
             uassert(ErrorCodes::DatabaseDropPending,
-                    str::stream() << "The database is in the process of being dropped " << ns.db(),
-                    autoColl.getDb() && !autoColl.getDb()->isDropPending(opCtx));
+                    str::stream() << "The database is in the process of being dropped "
+                                  << ns.dbName().toStringForErrorMsg(),
+                    autoColl.getDb() && !CollectionCatalog::get(opCtx)->isDropPending(ns.dbName()));
 
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "Failed to create indexes for aggregation because collection "
                                      "does not exist: "
-                                  << ns << ": " << BSON("indexes" << indexSpecs),
+                                  << ns.toStringForErrorMsg() << ": "
+                                  << BSON("indexes" << indexSpecs),
                     collection.get());
 
-            invariant(0U == collection->numRecords(opCtx),
-                      str::stream() << "Expected empty collection for index creation: " << ns
+            invariant(collection->isEmpty(opCtx),
+                      str::stream() << "Expected empty collection for index creation: "
+                                    << ns.toStringForErrorMsg()
                                     << ": numRecords: " << collection->numRecords(opCtx) << ": "
                                     << BSON("indexes" << indexSpecs));
 
@@ -132,7 +214,7 @@ void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
             // primary.
             auto removeIndexBuildsToo = false;
             auto filteredIndexes = collection->getIndexCatalog()->removeExistingIndexes(
-                opCtx, indexSpecs, removeIndexBuildsToo);
+                opCtx, collection.get(), indexSpecs, removeIndexBuildsToo);
             if (filteredIndexes.empty()) {
                 return;
             }
@@ -146,35 +228,68 @@ void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
 }
 void NonShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     OperationContext* opCtx,
-    const BSONObj& renameCommandObj,
+    const NamespaceString& sourceNs,
     const NamespaceString& targetNs,
+    bool dropTarget,
+    bool stayTemp,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
-    NamespaceString sourceNs = NamespaceString(renameCommandObj["renameCollection"].String());
     RenameCollectionOptions options;
-    options.dropTarget = renameCommandObj["dropTarget"].trueValue();
-    options.stayTemp = renameCommandObj["stayTemp"].trueValue();
+    options.dropTarget = dropTarget;
+    options.stayTemp = stayTemp;
+    options.originalCollectionOptions = originalCollectionOptions;
+    options.originalIndexes = originalIndexes;
     // skip sharding validation on non sharded servers
-    doLocalRenameIfOptionsAndIndexesHaveNotChanged(
-        opCtx, sourceNs, targetNs, options, originalIndexes, originalCollectionOptions);
+    doLocalRenameIfOptionsAndIndexesHaveNotChanged(opCtx, sourceNs, targetNs, options);
+}
+
+void NonShardServerProcessInterface::createTimeseriesView(OperationContext* opCtx,
+                                                          const NamespaceString& ns,
+                                                          const BSONObj& cmdObj,
+                                                          const TimeseriesOptions& userOpts) {
+    try {
+        uassertStatusOK(mongo::createCollection(opCtx, ns.dbName(), cmdObj));
+    } catch (DBException& ex) {
+        _handleTimeseriesCreateError(ex, opCtx, ns, userOpts);
+    }
 }
 
 void NonShardServerProcessInterface::createCollection(OperationContext* opCtx,
-                                                      const std::string& dbName,
+                                                      const DatabaseName& dbName,
                                                       const BSONObj& cmdObj) {
     uassertStatusOK(mongo::createCollection(opCtx, dbName, cmdObj));
 }
 
+void NonShardServerProcessInterface::createTempCollection(OperationContext* opCtx,
+                                                          const NamespaceString& nss,
+                                                          const BSONObj& collectionOptions,
+                                                          boost::optional<ShardId> dataShard) {
+    tassert(
+        7971800, "Should not specify 'dataShard' in a non-sharded context", !dataShard.has_value());
+    BSONObjBuilder cmd;
+    cmd << "create" << nss.coll();
+    cmd << "temp" << true;
+    cmd.appendElementsUnique(collectionOptions);
+    createCollection(opCtx, nss.dbName(), cmd.done());
+}
+
 void NonShardServerProcessInterface::dropCollection(OperationContext* opCtx,
                                                     const NamespaceString& ns) {
-    uassertStatusOK(mongo::dropCollectionForApplyOps(
-        opCtx, ns, {}, DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+    DropReply dropReply;
+    uassertStatusOK(mongo::dropCollection(
+        opCtx, ns, &dropReply, DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+}
+
+void NonShardServerProcessInterface::dropTempCollection(OperationContext* opCtx,
+                                                        const NamespaceString& nss) {
+    dropCollection(opCtx, nss);
 }
 
 BSONObj NonShardServerProcessInterface::preparePipelineAndExplain(
     Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity) {
     std::vector<Value> pipelineVec;
     auto firstStage = ownedPipeline->peekFront();
+    auto opts = SerializationOptions{.verbosity = verbosity};
     // If the pipeline already has a cursor explain with that one, otherwise attach a new one like
     // we would for a normal execution and explain that.
     if (firstStage && typeid(*firstStage) == typeid(DocumentSourceCursor)) {
@@ -182,7 +297,7 @@ BSONObj NonShardServerProcessInterface::preparePipelineAndExplain(
         // extracted the necessary information and won't need it again.
         std::unique_ptr<Pipeline, PipelineDeleter> managedPipeline(
             ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
-        pipelineVec = managedPipeline->writeExplainOps(verbosity);
+        pipelineVec = managedPipeline->writeExplainOps(opts);
         ownedPipeline = nullptr;
     } else {
         auto pipelineWithCursor = attachCursorSourceToPipelineForLocalRead(ownedPipeline);
@@ -191,7 +306,7 @@ BSONObj NonShardServerProcessInterface::preparePipelineAndExplain(
             while (pipelineWithCursor->getNext()) {
             }
         }
-        pipelineVec = pipelineWithCursor->writeExplainOps(verbosity);
+        pipelineVec = pipelineWithCursor->writeExplainOps(opts);
     }
     BSONArrayBuilder bab;
     for (auto&& stage : pipelineVec) {

@@ -29,9 +29,22 @@
 
 #include "mongo/db/pipeline/expression_function.h"
 
+#include <memory>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/pipeline/javascript_execution.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 namespace mongo {
 
-REGISTER_EXPRESSION(function, ExpressionFunction::parse);
+REGISTER_STABLE_EXPRESSION(function, ExpressionFunction::parse);
 
 ExpressionFunction::ExpressionFunction(ExpressionContext* const expCtx,
                                        boost::intrusive_ptr<Expression> passedArgs,
@@ -43,28 +56,27 @@ ExpressionFunction::ExpressionFunction(ExpressionContext* const expCtx,
       _assignFirstArgToThis(assignFirstArgToThis),
       _funcSource(std::move(funcSource)),
       _lang(std::move(lang)) {
-    expCtx->sbeCompatible = false;
+    expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
 }
 
-Value ExpressionFunction::serialize(bool explain) const {
-    MutableDocument d;
-    d["body"] = Value(_funcSource);
-    d["args"] = Value(_passedArgs->serialize(explain));
-    d["lang"] = Value(_lang);
+Value ExpressionFunction::serialize(const SerializationOptions& options) const {
+    MutableDocument innerOpts(Document{{"body"_sd, options.serializeLiteral(_funcSource)},
+                                       {"args"_sd, _passedArgs->serialize(options)},
+                                       // "lang" is purposefully not treated as a literal since it
+                                       // is more of a selection of an enum
+                                       {"lang"_sd, _lang}});
+
     // This field will only be seralized when desugaring $where in $expr + $_internalJs
     if (_assignFirstArgToThis) {
-        d["_internalSetObjToThis"] = Value(_assignFirstArgToThis);
+        innerOpts["_internalSetObjToThis"] = options.serializeLiteral(_assignFirstArgToThis);
     }
-    return Value(Document{{kExpressionName, d.freezeToValue()}});
-}
-
-void ExpressionFunction::_doAddDependencies(mongo::DepsTracker* deps) const {
-    _children[0]->addDependencies(deps);
+    return Value(Document{{kExpressionName, innerOpts.freezeToValue()}});
 }
 
 boost::intrusive_ptr<Expression> ExpressionFunction::parse(ExpressionContext* const expCtx,
                                                            BSONElement expr,
                                                            const VariablesParseState& vps) {
+    expCtx->hasServerSideJs.function = true;
 
     uassert(4660800,
             str::stream() << kExpressionName << " cannot be used inside a validator.",

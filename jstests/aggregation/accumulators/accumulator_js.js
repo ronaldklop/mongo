@@ -1,8 +1,9 @@
 // Test the behavior of user-defined (Javascript) accumulators.
-(function() {
-"use strict";
-
-load('jstests/aggregation/extras/utils.js');
+//
+// @tags: [
+//   requires_scripting,
+// ]
+import {resultsEq} from "jstests/aggregation/extras/utils.js";
 
 db.accumulator_js.drop();
 
@@ -192,8 +193,9 @@ command.pipeline = [{
         }
     }
 }];
-// 16554 means "$add only supports numeric or date types"
-assert.commandFailedWithCode(db.runCommand(command), 16554);
+// ErrorCodes.TypeMismatch means "$add only supports numeric or date types". Code 16554 represented
+// a type mismatch before 6.1 for this specific check.
+assert.commandFailedWithCode(db.runCommand(command), [16554, ErrorCodes.TypeMismatch]);
 
 // Test that initArgs can have a different length per group.
 assert(db.accumulator_js.drop());
@@ -340,4 +342,3 @@ expectedResults = [
     {_id: 1, value: {len: 3, types: ['object', 'object', 'object'], values: [null, null, null]}},
 ];
 assert(resultsEq(res.cursor.firstBatch, expectedResults), res.cursor);
-})();

@@ -2,8 +2,7 @@
  * Test dropDatabase command in a sharded cluster.
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2});
 
@@ -30,7 +29,6 @@ function listDatabases(options) {
 
 function assertDatabaseExists(dbName) {
     // Check that listDatabase return the db
-    // TODO SERVER-54377 listDatabases doesn't show shareded DBs without collections
     assert.gte(1, listDatabases({nameOnly: true, filter: {name: dbName}}).length);
     // Database entry exists
     assert.eq(1, configDB.databases.countDocuments({_id: dbName}));
@@ -44,14 +42,8 @@ function assertDatabaseDropped(dbName) {
     // No more tags for this database
     assert.eq(0, configDB.tags.countDocuments({ns: getDbPrefixRegExp(dbName)}));
 
-    // Check dropped collections (they either do not exist or all have the dropped field set)
-    //
-    // TODO (SERVER-51881): Remove this check after 5.0 is released
-    const droppedCollEntries =
-        configDB.collections.countDocuments({_id: getDbPrefixRegExp(dbName)});
-    if (droppedCollEntries > 0) {
-        droppedCollEntries.forEach((collEntry) => assert.eq(true, collEntry.dropped));
-    }
+    // Check dropped collections.
+    assert.eq(0, configDB.collections.countDocuments({_id: getDbPrefixRegExp(dbName)}));
 }
 
 jsTest.log("Test that dropping admin/config DB is illegal");
@@ -176,6 +168,128 @@ jsTest.log(
     assertDatabaseDropped(db.getName());
 }
 
+{
+    const db = getNewDb();
+    const conn = st.rs0.getPrimary().getDB(db.getName());
+    const fcvDoc = conn.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+    if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '6.3') >= 0) {
+        jsTest.log(
+            "Tests that dropping a database also removes all associated zones for nonexisting and " +
+            "unsharded collections.");
+        {
+            const coll = db['shardedColl'];
+            const unshardedColl = db['unshardedColl'];
+            const zoneName = 'zone';
+
+            st.shardColl(coll, {x: 1});
+            assertDatabaseExists(db.getName());
+
+            // Create an unsharded collection
+            assert.commandWorked(unshardedColl.insert({x: 3}));
+
+            // Append zones for a sharded collection, unsharded collection, a nonexisting collection
+            // and a collection from another database.
+            st.addShardTag(st.shard0.shardName, zoneName);
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: coll.getFullName(),
+                min: {x: 0},
+                max: {x: 10},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: unshardedColl.getFullName(),
+                min: {x: 10},
+                max: {x: 15},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: db.getName() + '.nonexisting',
+                min: {x: 15},
+                max: {x: 20},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand(
+                {updateZoneKeyRange: 'otherDb.coll', min: {x: 20}, max: {x: 25}, zone: zoneName}));
+
+            // Assert that has been added some entries on 'config.tags'
+            assert.eq(3, configDB.tags.countDocuments({ns: getDbPrefixRegExp(db.getName())}));
+
+            // Drop the database
+            assert.commandWorked(db.dropDatabase());
+            assertDatabaseDropped(db.getName());
+
+            // Assert that there are no zones left for database
+            assert.eq(0, configDB.tags.countDocuments({ns: getDbPrefixRegExp(db.getName())}));
+
+            // Assert that there is one zone from another database that has not been deleted.
+            assert.eq(1, configDB.tags.countDocuments({ns: getDbPrefixRegExp('otherDb')}));
+        }
+    }
+}
+
+{
+    const db = st.s.getDB("db[a-z]+");
+    const conn = st.rs0.getPrimary().getDB(db.getName());
+    const fcvDoc = conn.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+    if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '6.3') >= 0) {
+        jsTest.log(
+            "Tests that dropping a database with regex characters also removes all associated " +
+            "zones for nonexisting and unsharded collections.");
+        {
+            const coll = db['shardedColl'];
+            const unshardedColl = db['unshardedColl'];
+            const zoneName = 'zone';
+
+            st.shardColl(coll, {x: 1});
+            assertDatabaseExists(db.getName());
+
+            // Create an unsharded collection
+            assert.commandWorked(unshardedColl.insert({x: 3}));
+
+            // Append zones for a sharded collection, unsharded collection, a nonexisting collection
+            // and a collection from another database.
+            st.addShardTag(st.shard0.shardName, zoneName);
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: coll.getFullName(),
+                min: {x: 0},
+                max: {x: 10},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: unshardedColl.getFullName(),
+                min: {x: 10},
+                max: {x: 15},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: db.getName() + '.nonexisting',
+                min: {x: 15},
+                max: {x: 20},
+                zone: zoneName
+            }));
+            assert.commandWorked(st.s.adminCommand({
+                updateZoneKeyRange: 'otherDbRegex.coll',
+                min: {x: 20},
+                max: {x: 25},
+                zone: zoneName
+            }));
+
+            // Assert that has been added some entries on 'config.tags'
+            assert.eq(3, configDB.tags.countDocuments({ns: getDbPrefixRegExp(db.getName())}));
+
+            // Drop the database
+            assert.commandWorked(db.dropDatabase());
+            assertDatabaseDropped(db.getName());
+
+            // Assert that there are no zones left for database
+            assert.eq(0, configDB.tags.countDocuments({ns: getDbPrefixRegExp(db.getName())}));
+
+            // Assert that there is one zone from another database that has not been deleted.
+            assert.eq(1, configDB.tags.countDocuments({ns: getDbPrefixRegExp('otherDbRegex')}));
+        }
+    }
+}
+
 jsTest.log("Tests that dropping a database doesn't affects other database with the same prefix.");
 // Original bug SERVER-3471
 {
@@ -243,11 +357,11 @@ jsTest.log(
     // Verify that the drop database start event has been logged
     const startLogCount =
         configDB.changelog.countDocuments({what: 'dropDatabase.start', ns: db.getName()});
-    assert.gte(1, startLogCount, "dropDatabase start event not found in changelog");
+    assert.gte(startLogCount, 1, "dropDatabase start event not found in changelog");
 
     // Verify that the drop database end event has been logged
-    const endLogCount = configDB.changelog.countDocuments({what: 'dropDatabase', ms: db.getName()});
-    assert.gte(1, endLogCount, "dropDatabase end event not found in changelog");
+    const endLogCount = configDB.changelog.countDocuments({what: 'dropDatabase', ns: db.getName()});
+    assert.gte(endLogCount, 1, "dropDatabase end event not found in changelog");
 }
 
 jsTest.log("Test that dropping a sharded database, relevant events are properly logged on CSRS");
@@ -262,12 +376,11 @@ jsTest.log("Test that dropping a sharded database, relevant events are properly 
     // Verify that the drop database start event has been logged
     const startLogCount =
         configDB.changelog.countDocuments({what: 'dropDatabase.start', ns: db.getName()});
-    assert.gte(1, startLogCount, "dropDatabase start event not found in changelog");
+    assert.gte(startLogCount, 1, "dropDatabase start event not found in changelog");
 
     // Verify that the drop database end event has been logged
     const endLogCount = configDB.changelog.countDocuments({what: 'dropDatabase', ns: db.getName()});
-    assert.gte(1, endLogCount, "dropDatabase end event not found in changelog");
+    assert.gte(endLogCount, 1, "dropDatabase end event not found in changelog");
 }
 
 st.stop();
-})();

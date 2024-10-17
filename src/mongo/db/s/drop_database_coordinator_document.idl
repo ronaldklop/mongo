@@ -34,7 +34,7 @@ global:
         - "mongo/s/catalog/type_collection.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/s/sharding_ddl_coordinator.idl"
 
 enums:
@@ -52,12 +52,13 @@ types:
         cpp_type: CollectionType
         serializer: "mongo::CollectionType::toBSON"
         deserializer: "mongo::CollectionType"
+        is_view: false
 
 structs:
     DropDatabaseCoordinatorDocument:
         description: "Represents a drop database operation on the coordinator shard."
         generate_comparison_operators: false
-        strict: true
+        strict: false
         chained_structs:
             ShardingDDLCoordinatorMetadata: ShardingDDLCoordinatorMetadata
         fields:

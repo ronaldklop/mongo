@@ -7,9 +7,10 @@
  *     dropTarget: <if true, creates target collection that will be dropped. Default: false>,
  * }
  */
-var RenameAcrossDatabasesTest = function(options) {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
+export var RenameAcrossDatabasesTest = function(options) {
     if (!(this instanceof RenameAcrossDatabasesTest)) {
         return new RenameAcrossDatabasesTest(options);
     }
@@ -31,9 +32,6 @@ var RenameAcrossDatabasesTest = function(options) {
      */
     this.run = function() {
         const options = this.options;
-
-        load('jstests/replsets/rslib.js');
-
         let nodes = [{}, {}, {}];
         if (options.nodes) {
             assert.eq(nodes.length, options.nodes.length);
@@ -48,11 +46,22 @@ var RenameAcrossDatabasesTest = function(options) {
         replTest.startSet();
         replTest.initiate();
 
+        // This test performs a reconfig that will change the implicit default write concern
+        // from {w: "majority"} to {w: 1}. In order for this reconfig to succeed, we must first
+        // set the cluster-wide write concern.
+        assert.commandWorked(replTest.getPrimary().adminCommand({
+            setDefaultRWConcern: 1,
+            defaultWriteConcern: {w: "majority"},
+            writeConcern: {w: "majority"}
+        }));
+
         // If provided in 'options', we set the featureCompatibilityVersion. We do this prior to
         // adding any other members to the replica set.
         if (options.setFeatureCompatibilityVersion) {
-            assert.commandWorked(replTest.getPrimary().adminCommand(
-                {setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion}));
+            assert.commandWorked(replTest.getPrimary().adminCommand({
+                setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion,
+                confirm: true
+            }));
         }
 
         for (let i = 1; i < nodes.length; ++i) {
@@ -156,6 +165,7 @@ var RenameAcrossDatabasesTest = function(options) {
         _testLog('Checking oplogs and dbhashes after renaming collection.');
         replTest.awaitReplication();
         replTest.checkOplogs(testName);
+        replTest.checkPreImageCollection(testName);
         replTest.checkReplicatedDataHashes(testName);
 
         _testLog('Test completed. Stopping replica set.');

@@ -1,14 +1,17 @@
 // Test commands that are not allowed in multi-document transactions.
+//
 // @tags: [
+//   # The test runs commands that are not allowed with security token: applyOps, endSession,
+//   # mapReduce.
+//   not_allowed_with_signed_security_token,
 //   uses_snapshot_read_concern,
 //   uses_transactions,
+//   # Tenant migrations don't support applyOps.
+//   tenant_migration_incompatible,
 // ]
-(function() {
-"use strict";
 
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
-// For retryOnceOnTransientOnMongos.
-load('jstests/libs/auto_retry_transaction_in_sharding.js');
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
+import {retryOnceOnTransientOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
 const dbName = "test";
 const collName = "commands_not_allowed_in_txn";
@@ -24,7 +27,7 @@ const sessionOptions = {
 const session = db.getMongo().startSession(sessionOptions);
 const sessionDb = session.getDatabase(dbName);
 
-const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
+const runningOnMongos = session.getClient().isMongos() || TestData.testingReplicaSetEndpoint;
 
 assert.commandWorked(testDB.createCollection(testColl.getName(), {writeConcern: {w: "majority"}}));
 assert.commandWorked(testDB.runCommand({
@@ -64,7 +67,7 @@ function testCommand(command) {
     assert(res.errmsg.match(errmsgRegExp), res);
 
     // Mongos has special handling for commitTransaction to support commit recovery.
-    if (!isMongos) {
+    if (!runningOnMongos) {
         assert.commandFailedWithCode(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -129,9 +132,17 @@ const commands = [
 ];
 
 // There is no applyOps command on mongos.
-if (!isMongos) {
-    commands.push(
-        {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]});
+if (!runningOnMongos) {
+    commands.push({
+        applyOps: [{
+            op: "u",
+            ns: testColl.getFullName(),
+            o2: {_id: 0},
+            o:
+
+                {$v: 2, diff: {u: {a: 5}}}
+        }]
+    });
 }
 
 commands.forEach(testCommand);
@@ -151,7 +162,7 @@ assert.commandFailedWithCode(sessionDb.runCommand({
                              ErrorCodes.OperationNotSupportedInTransaction);
 
 // Mongos has special handling for commitTransaction to support commit recovery.
-if (!isMongos) {
+if (!runningOnMongos) {
     // The failed find should abort the transaction so a commit should fail.
     assert.commandFailedWithCode(sessionDb.adminCommand({
         commitTransaction: 1,
@@ -163,4 +174,3 @@ if (!isMongos) {
 }
 
 session.endSession();
-}());

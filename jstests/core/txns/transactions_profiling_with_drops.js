@@ -1,10 +1,22 @@
 // Tests that locks acquisitions for profiling in a transaction have a 0-second timeout.
-// @tags: [uses_transactions, uses_parallel_shell]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession, profile.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions,
+//   uses_parallel_shell,
+//   requires_profiling,
+//   # The config fuzzer with a very low level of concurrency is exhausting the write tickets.
+//   does_not_support_config_fuzzer,
+//   # Uses $where
+//   requires_scripting
+// ]
 
-load("jstests/libs/profiler.js");  // For getLatestProfilerEntry.
-load("jstests/libs/wait_for_command.js");
+import {
+    profilerHasSingleMatchingEntryOrThrow,
+    profilerHasZeroMatchingEntriesOrThrow,
+} from "jstests/libs/profiler.js";
+import {waitForCommand} from "jstests/libs/wait_for_command.js";
 
 const dbName = "test";
 const collName = "transactions_profiling_with_drops";
@@ -16,7 +28,10 @@ const sessionColl = sessionDb[collName];
 
 sessionDb.runCommand({dropDatabase: 1, writeConcern: {w: "majority"}});
 assert.commandWorked(sessionColl.insert({_id: "doc"}, {w: "majority"}));
-assert.commandWorked(sessionDb.runCommand({profile: 1, slowms: 1}));
+// Don't profile the setFCV command, which could be run during this test in the
+// fcv_upgrade_downgrade_replica_sets_jscore_passthrough suite.
+assert.commandWorked(sessionDb.runCommand(
+    {profile: 1, filter: {'command.setFeatureCompatibilityVersion': {'$exists': false}}}));
 
 jsTest.log("Test read profiling with operation holding database X lock.");
 
@@ -97,5 +112,5 @@ profilerHasSingleMatchingEntryOrThrow(
 jsTest.log("Both writes should succeed");
 assert.docEq({_id: "doc", good: 2}, sessionColl.findOne());
 
+assert.commandWorked(sessionDb.runCommand({profile: 0}));
 session.endSession();
-}());

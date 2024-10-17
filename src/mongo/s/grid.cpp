@@ -27,21 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/s/grid.h"
 
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/vector_clock.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/executor/task_executor_pool.h"
-#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/client/shard_factory.h"
-#include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/query/exec/cluster_cursor_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -62,7 +60,7 @@ Grid* Grid::get(OperationContext* operationContext) {
 
 void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
                 std::unique_ptr<CatalogCache> catalogCache,
-                std::unique_ptr<ShardRegistry> shardRegistry,
+                std::shared_ptr<ShardRegistry> shardRegistry,
                 std::unique_ptr<ClusterCursorManager> cursorManager,
                 std::unique_ptr<BalancerConfiguration> balancerConfig,
                 std::unique_ptr<executor::TaskExecutorPool> executorPool,
@@ -83,11 +81,23 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _executorPool = std::move(executorPool);
     _network = network;
 
-    _shardRegistry->init(grid.owner(this));
+    _shardRegistry->init();
+
+    _isGridInitialized.store(true);
+}
+
+bool Grid::isInitialized() const {
+    return _isGridInitialized.load();
 }
 
 bool Grid::isShardingInitialized() const {
     return _shardingInitialized.load();
+}
+
+void Grid::assertShardingIsInitialized() const {
+    uassert(ErrorCodes::ShardingStateNotInitialized,
+            "Sharding is not enabled",
+            isShardingInitialized());
 }
 
 void Grid::setShardingInitialized() {
@@ -96,98 +106,14 @@ void Grid::setShardingInitialized() {
 }
 
 Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _customConnectionPoolStatsFn;
 }
 
 void Grid::setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(!_customConnectionPoolStatsFn || !statsFn);
     _customConnectionPoolStatsFn = std::move(statsFn);
-}
-
-bool Grid::allowLocalHost() const {
-    return _allowLocalShard;
-}
-
-void Grid::setAllowLocalHost(bool allow) {
-    _allowLocalShard = allow;
-}
-
-repl::ReadConcernArgs Grid::readConcernWithConfigTime(
-    repl::ReadConcernLevel readConcernLevel) const {
-    return ReadConcernArgs(configOpTime(), readConcernLevel);
-}
-
-ReadPreferenceSetting Grid::readPreferenceWithConfigTime(
-    const ReadPreferenceSetting& readPreference) const {
-    ReadPreferenceSetting readPrefToReturn(readPreference);
-    readPrefToReturn.minClusterTime = configOpTime().getTimestamp();
-    return readPrefToReturn;
-}
-
-// TODO SERVER-50675: directly use VectorClock's configTime once 5.0 becomes last-lts.
-repl::OpTime Grid::configOpTime() const {
-    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
-
-    auto configTime = [this] {
-        stdx::lock_guard<Latch> lk(_mutex);
-        return _configOpTime;
-    }();
-
-    const auto& fcv = serverGlobalParams.featureCompatibility;
-    if (fcv.isVersionInitialized() &&
-        fcv.isGreaterThanOrEqualTo(ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
-        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
-        const auto vcConfigTimeTs = currentTime.configTime().asTimestamp();
-        if (!vcConfigTimeTs.isNull() && vcConfigTimeTs >= configTime.getTimestamp()) {
-            // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
-            // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
-            // previous primary's committed opTime
-            configTime =
-                mongo::repl::OpTime(vcConfigTimeTs, mongo::repl::OpTime::kUninitializedTerm);
-        }
-    }
-
-    return configTime;
-}
-
-boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
-                                                        repl::OpTime opTime,
-                                                        StringData what) {
-    const auto prevOpTime = _advanceConfigOpTime(opTime);
-    if (prevOpTime && prevOpTime->getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
-        opTime.getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
-        prevOpTime->getTerm() != opTime.getTerm()) {
-        std::string clientAddr = "(unknown)";
-        if (opCtx && opCtx->getClient()) {
-            clientAddr = opCtx->getClient()->clientAddress(true);
-        }
-        LOGV2(22792,
-              "Received {reason} {clientAddress} indicating config server"
-              " term has increased, previous opTime {prevOpTime}, now {opTime}",
-              "Term advanced for config server",
-              "opTime"_attr = opTime,
-              "prevOpTime"_attr = prevOpTime,
-              "reason"_attr = what,
-              "clientAddress"_attr = clientAddr);
-    }
-    return prevOpTime;
-}
-
-boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
-    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
-    auto vectorClock = VectorClock::get(grid.owner(this));
-    if (vectorClock->isEnabled()) {
-        vectorClock->gossipInConfigOpTime(opTime);
-    }
-    stdx::lock_guard<Latch> lk(_mutex);
-    if (_configOpTime < opTime) {
-        repl::OpTime prev = _configOpTime;
-        _configOpTime = opTime;
-        return prev;
-    }
-    return boost::none;
 }
 
 void Grid::clearForUnitTests() {
@@ -198,8 +124,8 @@ void Grid::clearForUnitTests() {
     _balancerConfig.reset();
     _executorPool.reset();
     _network = nullptr;
-
-    _configOpTime = repl::OpTime();
+    _isGridInitialized.store(false);
+    _shardingInitialized.store(false);
 }
 
 }  // namespace mongo

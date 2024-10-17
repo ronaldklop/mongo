@@ -29,15 +29,18 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/auth/auth_types.idl"
     - "mongo/db/auth/address_restriction.idl"
+    - "mongo/db/auth/parsed_privilege.idl"
     - "mongo/db/auth/user_management_commands_parser.idl"
+    - "mongo/db/multitenancy.idl"
 
 structs:
     dropAllUsersFromDatabaseReply:
         description: "Response for dropAllUsersFromDatabase command"
         strict: false
+        is_command_reply: true
         fields:
             n:
                 description: "Number of users dropped from database"
@@ -47,6 +50,7 @@ structs:
     dropAllRolesFromDatabaseReply:
         description: "Response for dropAllRolesFromDatabase command"
         strict: false
+        is_command_reply: true
         fields:
             n:
                 description: "Number of roles dropped from database"
@@ -56,14 +60,16 @@ structs:
     usersInfoReply:
         description: "Reply from usersInfo command"
         strict: false
+        is_command_reply: true
         fields:
             users:
                 description: "Users descriptions"
                 type: array<object_owned>
 
     rolesInfoReply:
-        description: "Reply from usersInfo command"
+        description: "Reply from rolesInfo command"
         strict: false
+        is_command_reply: true
         fields:
             roles:
                 description: "Users descriptions"
@@ -77,6 +83,7 @@ structs:
     GetUserCacheGenerationReply:
         description: "Reply from _getUserCacheGeneration command"
         strict: false
+        is_command_reply: true
         fields:
             cacheGeneration:
                 description: "Cache generation"
@@ -115,10 +122,6 @@ commands:
                 description: "True if the server should digest the password, false for pre-digested"
                 type: safeBool
                 default: true
-            writeConcern:
-                description: "The level of write concern for the creation operation"
-                type: object
-                optional: true
             authenticationRestrictions:
                 description: "Authentication restrictions to enforce on the user"
                 type: array<address_restriction>
@@ -153,10 +156,6 @@ commands:
                 description: "True if the server should digest the password, false for pre-digested"
                 type: safeBool
                 default: true
-            writeConcern:
-                description: "The level of write concern for the update operation"
-                type: object
-                optional: true
             authenticationRestrictions:
                 description: "Authentication restrictions to enforce on the user"
                 type: array<address_restriction>
@@ -182,6 +181,7 @@ commands:
         api_version: ""
         cpp_name: DropAllUsersFromDatabaseCommand
         strict: true
+        reply_type: dropAllUsersFromDatabaseReply
 
     grantRolesToUser:
         description: "Grant additional roles to a user"
@@ -220,7 +220,7 @@ commands:
         fields:
             privileges:
                 description: "Actions explicitly granted to this role"
-                type: array<Privilege>
+                type: array<ParsedPrivilege>
             roles:
                 description: "Roles to inherit additional privileges from"
                 type: array<RoleNameOrString>
@@ -240,7 +240,7 @@ commands:
         fields:
             privileges:
                 description: "Actions explicitly granted to this role"
-                type: array<Privilege>
+                type: array<ParsedPrivilege>
                 optional: true
             roles:
                 description: "Roles to inherit additional privileges from"
@@ -262,7 +262,7 @@ commands:
         fields:
             privileges:
                 description: "Privileges to grant to this role"
-                type: array<Privilege>
+                type: array<ParsedPrivilege>
 
     revokePrivilegesFromRole:
         description: "Grants privileges to a role"
@@ -275,7 +275,7 @@ commands:
         fields:
             privileges:
                 description: "Privileges to revoke from this role"
-                type: array<Privilege>
+                type: array<ParsedPrivilege>
 
     grantRolesToRole:
         description: "Grant roles to a role"
@@ -327,6 +327,7 @@ commands:
         api_version: ""
         cpp_name: DropAllRolesFromDatabaseCommand
         strict: true
+        reply_type: dropAllRolesFromDatabaseReply
 
     usersInfo:
         description: "Returns information about users."
@@ -336,6 +337,7 @@ commands:
         type: UsersInfoCommandArg
         cpp_name: UsersInfoCommand
         strict: true
+        reply_type: usersInfoReply
         fields:
             showPrivileges:
                 description: >-
@@ -355,6 +357,12 @@ commands:
                     If viewing all users, you cannot specify this field.
                 type: safeBool
                 default: false
+            showCustomData:
+                description: >-
+                    Set the field to false to omit the custom data provided by the client for the
+                    user. 
+                type: safeBool
+                default: true
             filter:
                 description: >-
                     A document that specifies $match stage conditions to return information
@@ -370,6 +378,7 @@ commands:
         type: RolesInfoCommandArg
         cpp_name: RolesInfoCommand
         strict: true
+        reply_type: rolesInfoReply
         fields:
             showPrivileges:
                 description: >-
@@ -407,6 +416,7 @@ commands:
         command_name: _getUserCacheGeneration
         cpp_name: GetUserCacheGenerationCommand
         strict: true
+        reply_type: GetUserCacheGenerationReply
 
     _mergeAuthzCollections:
         description: "Internal command used by mongorestore for updating user/role data"
@@ -419,11 +429,11 @@ commands:
             tempUsersCollection:
                 description: "Temporary users collection name"
                 type: string
-                default: ''
+                default: '""'
             tempRolesCollection:
                 description: "Temporary roles collection name"
                 type: string
-                default: ''
+                default: '""'
             db:
                 description: "Database name"
                 type: string

@@ -27,15 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/data_builder.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/http_client_gen.h"
-#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
 
@@ -107,7 +117,7 @@ public:
             client->allowInsecureHTTP(isLocalhost);
             auto timeoutSecs = cmd.getTimeoutSecs();
             if (timeoutSecs) {
-                client->setTimeout(Seconds(timeoutSecs.get()));
+                client->setTimeout(Seconds(timeoutSecs.value()));
             }
 
             auto ret = client->request(HttpClient::HttpMethod::kGET, uri, {nullptr, 0});
@@ -127,7 +137,7 @@ public:
         void doCheckAuthorization(OperationContext*) const final {}
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -140,7 +150,7 @@ public:
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(CmdHttpClient);
+MONGO_REGISTER_COMMAND(CmdHttpClient).testOnly().forShard();
 
 }  // namespace
 }  // namespace mongo

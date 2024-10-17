@@ -2,10 +2,8 @@
  * Tests that the index's full specification is included in the oplog entry corresponding to its
  * creation.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/get_index_helpers.js");
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -19,7 +17,7 @@ const oplogColl = primary.getDB("local").oplog.rs;
 function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
     assert.commandWorked(coll.createIndex(keyPattern, indexOptions));
     const allIndexes = coll.getIndexes();
-    const indexSpec = GetIndexHelpers.findByKeyPattern(allIndexes, keyPattern);
+    const indexSpec = IndexCatalogHelpers.findByKeyPattern(allIndexes, keyPattern);
 
     assert.neq(
         null,
@@ -92,4 +90,3 @@ testOplogEntryContainsIndexInfoObj(
     testDB.oplog_format_collation, {withSimpleCollation: 1}, {collation: {locale: "simple"}});
 
 rst.stopSet();
-})();

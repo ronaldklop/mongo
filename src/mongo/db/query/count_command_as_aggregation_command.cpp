@@ -27,12 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/count_command_as_aggregation_command.h"
-
 #include "mongo/db/query/query_request_helper.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -65,13 +65,13 @@ StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommandRequest& 
 
     if (auto skip = cmd.getSkip()) {
         BSONObjBuilder skipBuilder(pipelineBuilder.subobjStart());
-        skipBuilder.append("$skip", skip.get());
+        skipBuilder.append("$skip", skip.value());
         skipBuilder.doneFast();
     }
 
     if (auto limit = cmd.getLimit()) {
         BSONObjBuilder limitBuilder(pipelineBuilder.subobjStart());
-        limitBuilder.append("$limit", limit.get());
+        limitBuilder.append("$limit", limit.value());
         limitBuilder.doneFast();
     }
 
@@ -82,27 +82,25 @@ StatusWith<BSONObj> countCommandAsAggregationCommand(const CountCommandRequest& 
 
     // Complete the command by appending the other options to the aggregate command.
     if (auto collation = cmd.getCollation()) {
-        aggregationBuilder.append(kCollationField, collation.get());
+        aggregationBuilder.append(kCollationField, collation.value());
     }
 
     aggregationBuilder.append(kHintField, cmd.getHint());
 
     if (auto maxTime = cmd.getMaxTimeMS()) {
-        if (maxTime.get() > 0) {
-            aggregationBuilder.append(kMaxTimeMSField, maxTime.get());
+        if (maxTime.value() > 0) {
+            aggregationBuilder.append(kMaxTimeMSField, maxTime.value());
         }
     }
 
-    if (auto readConcern = cmd.getReadConcern()) {
-        if (!readConcern->isEmpty()) {
-            aggregationBuilder.append(kReadConcernField, readConcern.get());
-        }
+    if (auto& readConcern = cmd.getReadConcern(); readConcern && !readConcern->isEmpty()) {
+        aggregationBuilder.append(kReadConcernField, readConcern->toBSONInner());
     }
 
-    if (auto unwrapped = cmd.getQueryOptions()) {
+    if (auto unwrapped = cmd.getUnwrappedReadPref()) {
         if (!unwrapped->isEmpty()) {
             aggregationBuilder.append(query_request_helper::kUnwrappedReadPrefField,
-                                      unwrapped.get());
+                                      unwrapped.value());
         }
     }
 

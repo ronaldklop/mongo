@@ -27,14 +27,16 @@
  *    it in the license file.
  */
 
+#include <algorithm>
 #include <string>
 
-#include "mongo/base/error_codes.h"
-#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/str.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -90,6 +92,17 @@ TEST(Normal, SinglePart) {
     ASSERT_EQUALS(fieldRef.getPart(0), field);
     ASSERT_EQUALS(fieldRef.dottedField(), field);
 }
+
+DEATH_TEST_REGEX(Normal, Overflow, "Tripwire assertion.*1589700") {
+    std::string field = "a";
+    for (size_t s = 1; s <= BSONObjMaxInternalSize / 2; s++) {
+        field.append(".a");
+    }
+    ASSERT_GT(field.size(), BSONObjMaxInternalSize);
+    FieldRef fieldRef;
+    ASSERT_THROWS_CODE(fieldRef.parse(field), AssertionException, 1589700);
+}
+
 
 TEST(Normal, ParseTwice) {
     std::string field = "a";
@@ -228,6 +241,37 @@ TEST(PrefixSize, Empty) {
     FieldRef fieldA("a"), empty;
     ASSERT_EQUALS(fieldA.commonPrefixSize(empty), 0U);
     ASSERT_EQUALS(empty.commonPrefixSize(fieldA), 0U);
+}
+
+TEST(FullyOverlapsWith, Normal) {
+    FieldRef fieldA("a"), fieldB("a.b"), fieldC("a.b.c");
+    FieldRef fieldD("a.b.d");
+    ASSERT(fieldA.fullyOverlapsWith(fieldA));
+    ASSERT(fieldA.fullyOverlapsWith(fieldB));
+    ASSERT(fieldA.fullyOverlapsWith(fieldC));
+    ASSERT(fieldA.fullyOverlapsWith(fieldD));
+    ASSERT(fieldB.fullyOverlapsWith(fieldA));
+    ASSERT(fieldB.fullyOverlapsWith(fieldB));
+    ASSERT(fieldB.fullyOverlapsWith(fieldC));
+    ASSERT(fieldB.fullyOverlapsWith(fieldD));
+    ASSERT(fieldC.fullyOverlapsWith(fieldA));
+    ASSERT(fieldC.fullyOverlapsWith(fieldB));
+    ASSERT(fieldC.fullyOverlapsWith(fieldC));
+
+    ASSERT_FALSE(fieldD.fullyOverlapsWith(fieldC));
+    ASSERT_FALSE(fieldC.fullyOverlapsWith(fieldD));
+}
+
+TEST(FullyOverlapsWith, NoCommonality) {
+    FieldRef fieldA("a.b.c"), fieldB("b.c.d");
+    ASSERT_FALSE(fieldA.fullyOverlapsWith(fieldB));
+    ASSERT_FALSE(fieldB.fullyOverlapsWith(fieldA));
+}
+
+TEST(FullyOverlapsWith, Empty) {
+    FieldRef field("a"), empty;
+    ASSERT_FALSE(field.fullyOverlapsWith(empty));
+    ASSERT_FALSE(empty.fullyOverlapsWith(field));
 }
 
 TEST(Equality, Simple1) {

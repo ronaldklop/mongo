@@ -5,8 +5,8 @@
  *
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Verifies the command works and properly updates operation or cluster time.
 function runCommandAndCheckLogicalTimes(cmdObj, db, shouldAdvance) {
@@ -54,7 +54,6 @@ const rst = new ReplSetTest({
     nodes: 1,
     name: rsName,
     nodeOptions: {
-        enableMajorityReadConcern: "",
         shardsvr: "",
     }
 });
@@ -177,6 +176,5 @@ assert.commandFailedWithCode(testDB.runCommand(invalidCmd),
                                  ", should not be ahead of the clusterTime, " +
                                  tojson(session.getClusterTime().clusterTime));
 
-rst.stopSet();
 st.stop();
-})();
+rst.stopSet();

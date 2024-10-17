@@ -27,34 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/rpc/factory.h"
-
 #include <memory>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/rpc/factory.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
 #include "mongo/rpc/legacy_request.h"
-#include "mongo/rpc/legacy_request_builder.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/rpc/protocol.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/reply_interface.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
-
-Message messageFromOpMsgRequest(Protocol proto, const OpMsgRequest& request) {
-    switch (proto) {
-        case Protocol::kOpMsg:
-            return request.serialize();
-        case Protocol::kOpQuery:
-            return legacyRequestFromOpMsgRequest(request);
-    }
-    MONGO_UNREACHABLE;
-}
 
 std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     switch (unownedMessage->operation()) {
@@ -69,12 +57,13 @@ std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     }
 }
 
-OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
+OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage, Client* client) {
     switch (unownedMessage.operation()) {
         case mongo::dbMsg:
-            return OpMsgRequest::parseOwned(unownedMessage);
-        case mongo::dbQuery:
+            return OpMsgRequest::parseOwned(unownedMessage, client);
+        case mongo::dbQuery: {
             return opMsgRequestFromLegacyRequest(unownedMessage);
+        }
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "

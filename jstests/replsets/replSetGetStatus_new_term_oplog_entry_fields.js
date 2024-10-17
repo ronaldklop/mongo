@@ -3,10 +3,8 @@
  * replSetGetStatus 'electionCandidateMetrics' section are present only when they should be.
  */
 
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartReplSetReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({name: name, nodes: 3});
@@ -15,6 +13,10 @@ rst.startSet();
 rst.initiateWithHighElectionTimeout();
 rst.awaitReplication();
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 stopServerReplication(rst.nodes);
 
 // Step up one of the secondaries.
@@ -61,4 +63,3 @@ assert(
         tojson(res.electionCandidateMetrics));
 
 rst.stopSet();
-})();

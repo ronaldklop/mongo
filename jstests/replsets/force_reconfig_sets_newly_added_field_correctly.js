@@ -1,13 +1,13 @@
 /**
  * Verify that force reconfigs overwrite the 'newlyAdded' field correctly in a replica set.
  *
- * @tags: [ requires_fcv_47 ]
+ * @tags: [
+ * ]
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
-load('jstests/libs/fail_point_util.js');
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {assertVoteCount, isMemberNewlyAdded} from "jstests/replsets/rslib.js";
 
 const rst = new ReplSetTest({name: jsTestName(), nodes: 1});
 rst.startSet();
@@ -173,4 +173,3 @@ assertVoteCount(primary, {
 });
 
 rst.stopSet();
-})();

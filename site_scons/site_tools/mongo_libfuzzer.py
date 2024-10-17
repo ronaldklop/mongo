@@ -19,10 +19,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
-
-"""Pseudo-builders for building and registering libfuzzer tests.
-"""
-from SCons.Script import Action
+"""Pseudo-builders for building and registering libfuzzer tests."""
 
 
 def exists(env):
@@ -48,25 +45,29 @@ def build_cpp_libfuzzer_test(env, target, source, **kwargs):
     myenv.Prepend(LINKFLAGS=[sanitizer_option])
 
     libfuzzer_test_components = {"tests", "fuzzertests"}
-    if "AIB_COMPONENT" in kwargs and not kwargs["AIB_COMPONENTS"].endswith(
-        "-fuzzertest"
-    ):
-        kwargs["AIB_COMPONENT"] += "-fuzzertest"
+    primary_component = kwargs.get("AIB_COMPONENT", env.get("AIB_COMPONENT", ""))
+    if primary_component and not primary_component.endswith("-fuzzertest"):
+        kwargs["AIB_COMPONENT"] = primary_component + "-fuzzertest"
+    elif primary_component:
+        kwargs["AIB_COMPONENT"] = primary_component
+    else:
+        kwargs["AIB_COMPONENT"] = "fuzzertests"
+        libfuzzer_test_components = {"tests"}
 
     if "AIB_COMPONENTS_EXTRA" in kwargs:
-        libfuzzer_test_components = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(
+        kwargs["AIB_COMPONENTS_EXTRA"] = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(
             libfuzzer_test_components
         )
-
-    kwargs["AIB_COMPONENTS_EXTRA"] =  list(libfuzzer_test_components)
+    else:
+        kwargs["AIB_COMPONENTS_EXTRA"] = list(libfuzzer_test_components)
 
     # Fuzzer tests are inherenently undecidable (see
     # mongo_test_execution.py for details on undecidability).
-    kwargs['UNDECIDABLE_TEST'] = True
+    kwargs["UNDECIDABLE_TEST"] = True
 
     result = myenv.Program(target, source, **kwargs)
     myenv.RegisterTest("$LIBFUZZER_TEST_LIST", result[0])
-    myenv.Alias("$LIBFUZZER_TEST_ALIAS", result)
+    myenv.Alias("$LIBFUZZER_TEST_ALIAS", result[0])
 
     return result
 

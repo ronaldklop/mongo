@@ -29,52 +29,94 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/drop_collection_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/namespace_string_util.h"
 
 namespace mongo {
 
-class DropCollectionCoordinator final : public ShardingDDLCoordinator {
+class DropCollectionCoordinator final
+    : public RecoverableShardingDDLCoordinator<DropCollectionCoordinatorDocument,
+                                               DropCollectionCoordinatorPhaseEnum> {
 public:
     using StateDoc = DropCollectionCoordinatorDocument;
     using Phase = DropCollectionCoordinatorPhaseEnum;
 
-    DropCollectionCoordinator(const BSONObj& initialState);
-    ~DropCollectionCoordinator() = default;
+    DropCollectionCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "DropCollectionCoordinator", initialState),
+          _critSecReason(BSON("command"
+                              << "dropCollection"
+                              << "ns"
+                              << NamespaceStringUtil::serialize(
+                                     originalNss(), SerializationContext::stateDefault()))) {}
 
-    void checkIfOptionsConflict(const BSONObj& doc) const override {}
+    ~DropCollectionCoordinator() override = default;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void checkIfOptionsConflict(const BSONObj& doc) const final {}
+
+    /**
+     * Locally drops a collection, cleans its CollectionShardingRuntime metadata and refreshes the
+     * catalog cache.
+     *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility.
+     *
+     * When dropSystemCollections is set, system collections are allowed to be dropped. Therefore,
+     * if nss is a system collection but dropSystemCollections is false, the drop will fail.
+     *
+     * If expectedUUID is set and doesn't match the value persisted on the CollectionCatalog, then
+     * this is a no-op. If expectedUUID is not set, no UUID check will be performed.
+     */
+    static void dropCollectionLocally(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      bool fromMigrate,
+                                      bool dropSystemCollections,
+                                      const boost::optional<UUID>& expectedUUID = boost::none);
 
 private:
+    const BSONObj _critSecReason;
+
+    StringData serializePhase(const Phase& phase) const override {
+        return DropCollectionCoordinatorPhase_serializer(phase);
+    }
+
+    bool _mustAlwaysMakeProgress() override {
+        return _doc.getPhase() > Phase::kUnset;
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
+    void _checkPreconditionsAndSaveArgumentsOnDoc();
 
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
+    void _freezeMigrations(std::shared_ptr<executor::ScopedTaskExecutor> executor);
 
-    void _insertStateDocument(StateDoc&& doc);
-    void _updateStateDocument(StateDoc&& newStateDoc);
-    void _removeStateDocument();
-    void _enterPhase(Phase newPhase);
+    void _enterCriticalSection(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                               const CancellationToken& token);
 
-    DropCollectionCoordinatorDocument _doc;
+    void _commitDropCollection(std::shared_ptr<executor::ScopedTaskExecutor> executor);
+
+    void _exitCriticalSection(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                              const CancellationToken& token);
 };
 
 }  // namespace mongo

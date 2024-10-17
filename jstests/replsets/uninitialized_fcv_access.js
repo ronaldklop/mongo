@@ -5,8 +5,7 @@
  * This tests behavior dependent on a specific FCV.
  * @tags: [multiversion_incompatible]
  */
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 let rst = new ReplSetTest({nodes: 2});
 rst.startSet();
@@ -34,4 +33,3 @@ assert.commandWorked(res);
 assert.eq(res.featureCompatibilityVersion.version, latestFCV, tojson(res));
 
 rst.stopSet();
-})();

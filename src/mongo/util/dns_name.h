@@ -30,15 +30,19 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <iostream>
 #include <iterator>
 #include <sstream>
+#include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/ctype.h"
 
@@ -315,7 +319,9 @@ public:
      * case.
      */
     friend bool operator==(const HostName& lhs, const HostName& rhs) {
-        auto lens = [](const auto& h) { return std::tie(h._fullyQualified, h._nameComponents); };
+        auto lens = [](const auto& h) {
+            return std::tie(h._fullyQualified, h._nameComponents);
+        };
         return lens(lhs) == lens(rhs);
     }
 

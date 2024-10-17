@@ -27,19 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 #include <algorithm>
+#include <compare>
 #include <iterator>
+#include <mutex>
 #include <set>
+#include <utility>
 
-#include "mongo/db/curop.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -48,13 +64,13 @@ MONGO_FAIL_POINT_DEFINE(exchangeFailLoadNextBatch);
 class MutexAndResourceLock {
     OperationContext* _opCtx;
     ResourceYielder* _resourceYielder;
-    stdx::unique_lock<Latch> _lock;
+    stdx::unique_lock<stdx::mutex> _lock;
 
 public:
     // Must be constructed with the mutex held. 'yielder' may be null if there are no resources
     // which need to be yielded while waiting.
     MutexAndResourceLock(OperationContext* opCtx,
-                         stdx::unique_lock<Latch> m,
+                         stdx::unique_lock<stdx::mutex> m,
                          ResourceYielder* yielder)
         : _opCtx(opCtx), _resourceYielder(yielder), _lock(std::move(m)) {
         invariant(_lock.owns_lock());
@@ -78,7 +94,7 @@ public:
      * Releases ownership of the lock to the caller. May only be called when the mutex is held
      * (after a call to unlock(), for example).
      */
-    stdx::unique_lock<Latch> releaseLockOwnership() {
+    stdx::unique_lock<stdx::mutex> releaseLockOwnership() {
         invariant(_lock.owns_lock());
         return std::move(_lock);
     }
@@ -91,8 +107,8 @@ const char* DocumentSourceExchange::getSourceName() const {
     return kStageName.rawData();
 }
 
-Value DocumentSourceExchange::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(getSourceName() << _exchange->getSpec().toBSON()));
+Value DocumentSourceExchange::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << _exchange->getSpec().toBSON(opts)));
 }
 
 DocumentSourceExchange::DocumentSourceExchange(
@@ -162,7 +178,7 @@ std::vector<std::string> Exchange::extractBoundaries(
             kb << "" << elem;
         }
 
-        KeyString::Builder key{KeyString::Version::V1, kb.obj(), ordering};
+        key_string::Builder key{key_string::Version::V1, kb.obj(), ordering};
         std::string keyStr{key.getBuffer(), key.getSize()};
 
         ret.emplace_back(std::move(keyStr));
@@ -183,8 +199,8 @@ std::vector<std::string> Exchange::extractBoundaries(
         kbMax << "" << MAXKEY;
     }
 
-    KeyString::Builder minKey{KeyString::Version::V1, kbMin.obj(), ordering};
-    KeyString::Builder maxKey{KeyString::Version::V1, kbMax.obj(), ordering};
+    key_string::Builder minKey{key_string::Version::V1, kbMin.obj(), ordering};
+    key_string::Builder maxKey{key_string::Version::V1, kbMax.obj(), ordering};
     StringData minKeyStr{minKey.getBuffer(), minKey.getSize()};
     StringData maxKeyStr{maxKey.getBuffer(), maxKey.getSize()};
 
@@ -280,7 +296,7 @@ DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx,
                                                 size_t consumerId,
                                                 ResourceYielder* resourceYielder) {
     // Grab a lock.
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     for (;;) {
         // Guard against some of the trickiness we do with moving the lock to/from the
@@ -404,7 +420,7 @@ size_t Exchange::getTargetConsumer(const Document& input) {
     // Build the key.
     BSONObjBuilder kb;
     size_t counter = 0;
-    for (auto elem : _keyPattern) {
+    for (const auto& elem : _keyPattern) {
         auto value = input.getNestedField(_keyPaths[counter]);
 
         // By definition we send documents with missing fields to the consumer 0.
@@ -422,7 +438,7 @@ size_t Exchange::getTargetConsumer(const Document& input) {
         ++counter;
     }
 
-    KeyString::Builder key{KeyString::Version::V1, kb.obj(), _ordering};
+    key_string::Builder key{key_string::Version::V1, kb.obj(), _ordering};
     std::string keyStr{key.getBuffer(), key.getSize()};
 
     // Binary search for the consumer id.
@@ -439,7 +455,7 @@ size_t Exchange::getTargetConsumer(const Document& input) {
 }
 
 void Exchange::dispose(OperationContext* opCtx, size_t consumerId) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     invariant(_disposeRunDown < getConsumers());
 

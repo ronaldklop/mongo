@@ -1,15 +1,14 @@
-/*
+/**
  * Tests that coordinateCommitTransaction returns the decision once the decision has been written
  * with the client's writeConcern.
- * @tags: [uses_transactions, uses_multi_shard_transaction, requires_fcv_47]
+ * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const st = new ShardingTest({
     mongos: 1,
@@ -37,8 +36,12 @@ const lsid = {
 };
 let txnNumber = 0;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: kDbName, primaryShard: st.shard0.shardName}));
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 assert.commandWorked(st.s.adminCommand({shardCollection: kNs, key: {x: 1}}));
 
 // Make both shards have chunks for the collection so that two-phase commit is required.
@@ -99,7 +102,7 @@ function isCommitDecision(decision) {
  * Returns the number of coordinator replica set nodes that have written the commit decision
  * to the config.transactions collection.
  */
-function getNumNodesWithCommitDecision(coordinatorRs) {
+function getNumNodesWithCommitDecision() {
     const decision = getDecision(st.rs0.getPrimary(), lsid, txnNumber);
     assert(isCommitDecision(decision));
     let numNodes = 1;
@@ -125,7 +128,7 @@ function assertDecisionCommittedOnNodes(coordinatorRs, numNodes) {
 /*
  * Asserts that the coordinator doc has been majority replicated.
  */
-function assertDecisionMajorityCommitted(coordinatorRs, numNodes) {
+function assertDecisionMajorityCommitted(coordinatorRs) {
     assert.gte(getNumNodesWithCommitDecision(coordinatorRs), coordinatorRs.nodes.length / 2);
 }
 
@@ -171,6 +174,13 @@ function testCommitDecisionWriteConcern(writeConcern) {
         `Verify that commitTransaction returns once the decision is written with client's writeConcern ${
             tojson(writeConcern)}`);
     awaitResult();
+    if (writeConcern.w == "majority") {
+        // When using majority write concern, secondaries acknowledge/make durable writes
+        // independently from applying them, so before checking for the commit decision we need to
+        // ensure lastApplied is caught up on the relevant node(s).
+        const nodesToAwait = st.rs0.getSecondaries().slice(-1 * st.rs0.nodes.length / 2);
+        st.rs0.awaitReplication(null, null, nodesToAwait);
+    }
     assertDecisionCommittedOnNodes(st.rs0, st.rs0.nodes.length - nodesToStopReplication.length);
 
     jsTest.log(
@@ -180,6 +190,7 @@ function testCommitDecisionWriteConcern(writeConcern) {
     if (nodesToStopReplication.length > 0) {
         restartServerReplication(nodesToStopReplication);
     }
+    st.rs0.awaitReplication();
     deleteCoordDocFailPoint.wait();
     assertDecisionMajorityCommitted(st.rs0);
     deleteCoordDocFailPoint.off();
@@ -197,4 +208,3 @@ testCommitDecisionWriteConcern({w: "majority"});
 testCommitDecisionWriteConcern({w: 3});
 
 st.stop();
-})();

@@ -1,15 +1,15 @@
-"use strict";
-
-var CreateShardedCollectionUtil = (function() {
+export var CreateShardedCollectionUtil = (function() {
     /**
-     * Shards a non-existing collection using the specified shard key and chunk ranges.
+     * Shards a non-existing collection (or an unsharded empty collection) using
+     * the specified shard key and chunk ranges.
      *
      * @param collection - a DBCollection object with an underlying Mongo connection to a mongos.
      * @param chunks - an array of
      * {min: <shardKeyValue0>, max: <shardKeyValue1>, shard: <shardName>} objects. The chunks must
      * form a partition of the {shardKey: MinKey} --> {shardKey: MaxKey} space.
+     * @param shardCollOptions: options that are passed in to the shardCollection cmd.
      */
-    function shardCollectionWithChunks(collection, shardKey, chunks) {
+    function shardCollectionWithChunks(collection, shardKey, chunks, shardCollOptions) {
         assert(collection.getDB().getMongo().isMongos(),
                "collection must have an underlying connection to a mongos");
 
@@ -19,7 +19,9 @@ var CreateShardedCollectionUtil = (function() {
         assert.eq(null,
                   configDB.collections.findOne({ns: collection.getFullName()}),
                   "collection already exists as sharded");
-        assert.eq(null, collection.exists(), "collection already exists as unsharded");
+        assert.eq([],
+                  collection.aggregate([{$limit: 1}, {$replaceWith: {}}]).toArray(),
+                  "collection already exists as non-empty unsharded collection");
 
         // We include a UUID in the temporary zone names being generated to avoid conflicting with
         // the names of any existing zones.
@@ -40,6 +42,11 @@ var CreateShardedCollectionUtil = (function() {
         assert(Object.values(chunks[chunks.length - 1].max).every(x => x === MaxKey),
                "last chunk must have all MaxKey as max: " + tojson(chunks[chunks.length - 1].max));
 
+        const zoneNss =
+            (shardCollOptions !== undefined && shardCollOptions.hasOwnProperty("timeseries"))
+            ? `${collection.getDB().getName()}.system.buckets.${collection.getName()}`
+            : collection.getFullName();
+
         let prevChunk;
         for (let chunk of chunks) {
             if (prevChunk !== undefined) {
@@ -49,7 +56,7 @@ var CreateShardedCollectionUtil = (function() {
             }
 
             assert.commandWorked(adminDB.runCommand({
-                updateZoneKeyRange: collection.getFullName(),
+                updateZoneKeyRange: zoneNss,
                 min: chunk.min,
                 max: chunk.max,
                 zone: makeZoneName(chunk.shard),
@@ -58,16 +65,17 @@ var CreateShardedCollectionUtil = (function() {
         }
 
         assert.commandWorked(adminDB.runCommand({enableSharding: collection.getDB().getName()}));
-        assert.commandWorked(adminDB.runCommand({
+        assert.commandWorked(adminDB.runCommand(Object.merge({
             shardCollection: collection.getFullName(),
             key: shardKey,
             presplitHashedZones: false,
-        }));
+        },
+                                                             shardCollOptions)));
 
         // We disassociate the chunk ranges from the zones to allow removing the zones altogether.
         for (let chunk of chunks) {
             assert.commandWorked(adminDB.runCommand({
-                updateZoneKeyRange: collection.getFullName(),
+                updateZoneKeyRange: zoneNss,
                 min: chunk.min,
                 max: chunk.max,
                 zone: null,

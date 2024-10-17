@@ -29,29 +29,30 @@
 
 global:
   cpp_namespace: "mongo"
-  cpp_includes:
-    - "mongo/s/mongos_server_parameters.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
   readHedgingMode:
     description: >-
-        Enables hedged reads.
+        DEPRECATED. Has no effect on server behavior.
+        Previously enabled hedged reads.
     set_at: [ startup, runtime ]
     cpp_class:
-      name: HedgingModeServerParameter
+      name: ReadHedgingModeParameter
+      override_set: true
+    redact: false
 
   maxTimeMSForHedgedReads:
     description: >-
-        The maxTimeMS to set on hedged reads.
+        DEPRECATED. Has no effect on server behavior.
+        Previously was the maxTimeMS to set on hedged reads.
     set_at: [ startup, runtime ]
-    cpp_vartype: AtomicWord<int>
-    cpp_varname: "gMaxTimeMSForHedgedReads"
-    validator:
-        gte: 0
-    default: 150
+    cpp_class:
+      name: MaxTimeMSForHedgedReadsParameter
+      override_set: true
+    redact: false
 
   mongosShutdownTimeoutMillisForSignaledShutdown:
     description: >-
@@ -62,3 +63,34 @@ server_parameters:
     default: 15000
     validator:
         gte: 0
+    redact: false
+
+  loadBalancerPort:
+    description: >-
+        The port over which proxied connections using the Proxy Protocol may be made.
+        A value of 0 disables the port entirely.
+    set_at: [ startup ]
+    cpp_vartype: AtomicWord<int>
+    cpp_varname: "loadBalancerPort"
+    default: 0
+    validator: { gte: 0, lte: 65535 }
+    redact: false
+
+  testMongosOnlyRuntimeParameter:
+    description: "Test runtime-only mongos server parameter"
+    test_only: true
+    set_at: runtime
+    cpp_vartype: bool
+    cpp_varname: gTestMongosRuntimeParameter
+    default: false
+    redact: false
+
+  maxRoundsWithoutProgressParameter:
+    description: "Max num rounds without progress"
+    test_only: true
+    set_at: [ startup, runtime ]
+    cpp_vartype: AtomicWord<int>
+    cpp_varname: "gMaxRoundsWithoutProgress"
+    default: 5
+    validator: { gte: 5, lte: 20 }
+    redact: false

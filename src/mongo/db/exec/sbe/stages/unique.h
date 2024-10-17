@@ -29,27 +29,44 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo::sbe {
 /**
- * This stage deduplicates by a given key. Unlike a HashAgg, this stage is not blocking
- * and rows are returned in the same order as they appear in the input stream.
+ * This stage deduplicates by a given key. Unlike a HashAgg, this stage is not blocking and rows are
+ * returned in the same order as they appear in the input stream.
  *
- * TODO: It is possible to optimize this stage in the case where the input is sorted
- * by key X, we are "uniquing" by key Y, and we are guaranteed that all identical values
- * of Y appear are associated with the same key X. In this case the hash table of seen elements
- * can be cleared each time a new key X is encountered.
+ * TODO: It is possible to optimize this stage in the case where the input is sorted by key X, we
+ * are "uniquing" by key Y, and we are guaranteed that all identical values of Y appear are
+ * associated with the same key X. In this case the hash table of seen elements can be cleared each
+ * time a new key X is encountered.
  *
  * For example, this optimization is possible when the UniqueStage is uniquing by record ID and
  * below it there are non-multikey index scans merged via a SortMerge stage. Each duplicate record
  * ID will be associated with the same sort key.
+ *
+ * Debug string representation:
+ *
+ *   unique [<keys>] childStage
  */
 class UniqueStage final : public PlanStage {
 public:
-    UniqueStage(std::unique_ptr<PlanStage> input, value::SlotVector keys, PlanNodeId planNodeId);
+    UniqueStage(std::unique_ptr<PlanStage> input,
+                value::SlotVector keys,
+                PlanNodeId planNodeId,
+                bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -62,6 +79,12 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
 
 private:
     const value::SlotVector _keySlots;
@@ -69,7 +92,7 @@ private:
     std::vector<value::SlotAccessor*> _inKeyAccessors;
 
     // Table of keys that have been seen.
-    stdx::unordered_set<value::MaterializedRow,
+    absl::flat_hash_set<value::MaterializedRow,
                         value::MaterializedRowHasher,
                         value::MaterializedRowEq>
         _seen;

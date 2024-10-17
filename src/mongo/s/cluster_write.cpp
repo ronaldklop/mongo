@@ -27,29 +27,50 @@
  *    it in the license file.
  */
 
+
+#include <boost/move/utility_core.hpp>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/cluster_write.h"
+#include "mongo/s/collection_routing_info_targeter.h"
+#include "mongo/s/ns_targeter.h"
+#include "mongo/s/write_ops/bulk_write_exec.h"
+#include "mongo/util/decorable.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/logv2/log.h"
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/s/cluster_write.h"
-
-#include "mongo/db/lasterror.h"
-#include "mongo/s/chunk_manager_targeter.h"
-#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace cluster {
 
 void write(OperationContext* opCtx,
            const BatchedCommandRequest& request,
+           NamespaceString* nss,
            BatchWriteExecStats* stats,
            BatchedCommandResponse* response,
            boost::optional<OID> targetEpoch) {
-    LastError::Disabled disableLastError(&LastError::get(opCtx->getClient()));
+    if (request.hasEncryptionInformation()) {
+        FLEBatchResult result = processFLEBatch(opCtx, request, stats, response, targetEpoch);
+        if (result == FLEBatchResult::kProcessed) {
+            return;
+        }
 
-    ChunkManagerTargeter targeter(opCtx, request.getNS(), targetEpoch);
+        // fall through
+    }
+
+    NotPrimaryErrorTracker::Disabled scopeDisabledTracker(
+        &NotPrimaryErrorTracker::get(opCtx->getClient()));
+
+    CollectionRoutingInfoTargeter targeter(opCtx, request.getNS(), targetEpoch);
+    if (nss) {
+        *nss = targeter.getNS();
+    }
 
     LOGV2_DEBUG_OPTIONS(
         4817400, 2, {logv2::LogComponent::kShardMigrationPerf}, "Starting batch write");
@@ -58,6 +79,26 @@ void write(OperationContext* opCtx,
 
     LOGV2_DEBUG_OPTIONS(
         4817401, 2, {logv2::LogComponent::kShardMigrationPerf}, "Finished batch write");
+}
+
+bulk_write_exec::BulkWriteReplyInfo bulkWrite(
+    OperationContext* opCtx,
+    const BulkWriteCommandRequest& request,
+    const std::vector<std::unique_ptr<NSTargeter>>& targeters) {
+    if (request.getNsInfo().size() > 1) {
+        for (const auto& nsInfo : request.getNsInfo()) {
+            uassert(ErrorCodes::BadValue,
+                    "BulkWrite with Queryable Encryption supports only a single namespace.",
+                    !nsInfo.getEncryptionInformation().has_value());
+        }
+    } else if (request.getNsInfo()[0].getEncryptionInformation().has_value()) {
+        auto [result, replies] = bulk_write_exec::attemptExecuteFLE(opCtx, request);
+        if (result == FLEBatchResult::kProcessed) {
+            return replies;
+        }  // else fallthrough.
+    }
+
+    return bulk_write_exec::execute(opCtx, targeters, request);
 }
 
 }  // namespace cluster

@@ -4,12 +4,10 @@
  * replica set by successfully stepping up one of the secondaries, then failing to step up the
  * original primary. We check that the metrics are appropriately set or unset after each election.
  */
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = jsTestName();
-const rst = ReplSetTest({name: testName, nodes: [{}, {}, {rsConfig: {priority: 0}}]});
+const rst = new ReplSetTest({name: testName, nodes: [{}, {}, {rsConfig: {priority: 0}}]});
 rst.startSet();
 
 // Make sure there are no election timeouts firing for the duration of the test. This helps
@@ -27,9 +25,7 @@ assert.commandWorked(
     originalPrimary.adminCommand({configureFailPoint: "voteNoInElection", mode: "alwaysOn"}));
 
 // Step up the new primary.
-assert.commandWorked(newPrimary.adminCommand({replSetStepUp: 1}));
-rst.awaitNodesAgreeOnPrimary();
-assert.eq(newPrimary, rst.getPrimary());
+rst.stepUp(newPrimary);
 
 // Since the new term oplog entry needs to be replicated onto testNode for the metrics to be set, we
 // must await replication before checking the metrics.
@@ -106,4 +102,3 @@ assert(!testNodeElectionParticipantMetrics.newTermAppliedDate,
            tojson(testNodeElectionParticipantMetrics));
 
 rst.stopSet();
-})();

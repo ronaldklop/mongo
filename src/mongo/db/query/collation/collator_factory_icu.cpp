@@ -27,20 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/query/collation/collator_factory_icu.h"
-
 #include <memory>
-
+#include <string>
 #include <unicode/coll.h>
 #include <unicode/errorcode.h>
 #include <unicode/ucol.h>
 #include <unicode/uvernum.h>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <unicode/locid.h>
+#include <unicode/uloc.h>
+#include <unicode/utypes.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/query/collation/collator_factory_icu.h"
 #include "mongo/db/query/collation/collator_interface_icu.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -261,7 +272,8 @@ Status updateCollationSpecFromICUCollator(const BSONObj& spec,
         try {
             // For backwards compatibility, "strength" is parsed from any int, long, or double.
             // Check it matches an enum value.
-            CollationStrength_parse({"collation.strength"}, collation->getStrength());
+            CollationStrength_parse(IDLParserContext{"collation.strength"},
+                                    collation->getStrength());
         } catch (const DBException& exc) {
             return exc.toStatus();
         }
@@ -498,7 +510,7 @@ StatusWith<std::unique_ptr<CollatorInterface>> CollatorFactoryICU::makeFromBSON(
 
     Collation collation;
     try {
-        collation = Collation::parse({"collation"}, spec);
+        collation = Collation::parse(IDLParserContext{"collation"}, spec);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }

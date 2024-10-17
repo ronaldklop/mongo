@@ -2,11 +2,14 @@
  * Checks that commands included/omitted in API V1 behave correctly with various combinations of API
  * parameters.
  *
- * @tags: [requires_fcv_47, requires_non_retryable_commands, uses_api_parameters]
+ * @tags: [
+ *   # The test runs commands that are not allowed with security token: createUser, dropUser.
+ *   not_allowed_with_signed_security_token,
+ *   requires_non_retryable_commands,
+ *   uses_api_parameters,
+ *   creates_and_authenticates_user,
+ * ]
  */
-
-(function() {
-"use strict";
 
 let counter = 0;
 const counter_fun = function() {
@@ -14,7 +17,8 @@ const counter_fun = function() {
 };
 
 const testDB = db.getSiblingDB(jsTestName());
-const testColl = testDB.getCollection("test");
+const collName = jsTestName();
+const testColl = testDB.getCollection(collName);
 
 function runTest({cmd, apiVersion1, apiStrict, apiDeprecationErrors}) {
     // Instantiate "cmd" so we can modify it.
@@ -39,11 +43,10 @@ const commands = [
     {cmd: () => ({buildInfo: 1}), apiVersion1: false},
     {cmd: () => ({createUser: counter_fun(), pwd: "pwd", roles: []}), apiVersion1: false},
     {cmd: () => ({dropUser: counter_fun()}), apiVersion1: false},
-    {cmd: () => ({getLastError: 1}), apiVersion1: false},
     {cmd: () => ({serverStatus: 1}), apiVersion1: false},
     {cmd: () => ({usersInfo: 1}), apiVersion1: false},
     {cmd: () => ({aggregate: testColl.getName(), pipeline: [], cursor: {}}), apiVersion1: true},
-    {cmd: () => ({count: "system.js"}), apiVersion1: false},
+    {cmd: () => ({count: "system.js"}), apiVersion1: true},
     {cmd: () => ({create: counter_fun()}), apiVersion1: true},
     {cmd: () => ({find: counter_fun()}), apiVersion1: true},
     {
@@ -78,4 +81,3 @@ for (let {cmd, apiVersion1} of commands) {
         }
     }
 }
-})();

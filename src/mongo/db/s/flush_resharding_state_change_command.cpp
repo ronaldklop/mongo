@@ -27,87 +27,56 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_resharding_state_change_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 namespace {
-
-void refreshShardVersion(OperationContext* opCtx, const NamespaceString& nss) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->getClient()->isInDirectClient());
-    invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
-
-    if (nss.isNamespaceAlwaysUnsharded())
-        return;
-
-    {
-        boost::optional<Lock::DBLock> dbLock;
-        dbLock.emplace(opCtx, nss.db(), MODE_IS);
-
-        boost::optional<Lock::CollectionLock> collLock;
-        collLock.emplace(opCtx, nss, MODE_IS);
-
-        const auto csr = CollectionShardingRuntime::get(opCtx, nss);
-        auto critSec =
-            csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
-
-        if (critSec) {
-            auto inRecoverOrRefresh = [&] {
-                invariant(critSec);
-
-                boost::optional<CollectionShardingRuntime::CSRLock> csrLock =
-                    CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-
-                auto metadata = csr->getCurrentMetadataIfKnown();
-
-                csrLock.reset();
-                csrLock.emplace(CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr));
-
-                // If the shard doesn't yet know its filtering metadata, recovery needs to be run
-                bool runRecover = metadata ? false : true;
-                csr->setShardVersionRecoverRefreshFuture(
-                    recoverRefreshShardVersion(opCtx->getServiceContext(), nss, runRecover),
-                    *csrLock);
-                return csr->getShardVersionRecoverRefreshFuture(opCtx);
-            }();
-
-            collLock.reset();
-            dbLock.reset();
-
-            inRecoverOrRefresh->get(opCtx);
-        } else {
-            collLock.reset();
-            dbLock.reset();
-
-            onShardVersionMismatch(opCtx, nss, boost::none);
-        }
-    }
-}
-
 class FlushReshardingStateChangeCmd final : public TypedCommand<FlushReshardingStateChangeCmd> {
 public:
     using Request = _flushReshardingStateChange;
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
 
     std::string help() const override {
         return "Internal command used by the resharding coordinator to flush state changes to the "
@@ -134,17 +103,22 @@ public:
             return request().getCommandParameter();
         }
 
+        UUID reshardingUUID() const {
+            return request().getReshardingUUID();
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
 
         void typedRun(OperationContext* opCtx) {
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             uassert(ErrorCodes::IllegalOperation,
                     "Can't issue _flushReshardingStateChange from 'eval'",
@@ -152,16 +126,34 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "Can't call _flushReshardingStateChange if in read-only mode",
-                    !storageGlobalParams.readOnly);
+                    !opCtx->readOnly());
 
-            refreshShardVersion(opCtx, ns());
+            // We use the fixed executor here since it may cause the thread to block. This would
+            // cause potential liveness issues since the arbitrary executor is a NetworkInterfaceTL
+            // executor in sharded clusters and that executor is one that executes networking
+            // operations.
+            ExecutorFuture<void>(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor())
+                .then([svcCtx = opCtx->getServiceContext(), nss = ns()] {
+                    ThreadClient tc("FlushReshardingStateChange",
+                                    svcCtx->getService(ClusterRole::ShardServer));
+                    auto opCtx = tc->makeOperationContext();
+                    FilteringMetadataCache::get(opCtx.get())
+                        ->onCollectionPlacementVersionMismatch(
+                            opCtx.get(), nss, boost::none /* chunkVersionReceived */);
+                })
+                .onError([](const Status& status) {
+                    LOGV2_WARNING(5808100,
+                                  "Error on deferred _flushReshardingStateChange execution",
+                                  "error"_attr = redact(status));
+                })
+                .getAsync([](auto) {});
 
-            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, ns());
-
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            // Ensure the command isn't run on a stale primary.
+            resharding::doNoopWrite(opCtx, "_flushReshardingStateChange no-op", ns());
         }
     };
-} _flushReshardingStateChange;
+};
+MONGO_REGISTER_COMMAND(FlushReshardingStateChangeCmd).forShard();
 
 }  // namespace
 }  // namespace mongo

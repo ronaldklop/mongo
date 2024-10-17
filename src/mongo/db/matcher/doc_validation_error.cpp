@@ -27,26 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/doc_validation_error.h"
-
+#include <cstddef>
+#include <set>
 #include <stack>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "mongo/base/init.h"
+#include <absl/container/flat_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <s2cellid.h>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/geo/geoparser.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/matcher/doc_validation_error.h"
 #include "mongo/db/matcher/doc_validation_util.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_path.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
 #include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/matcher/match_expression_util.h"
 #include "mongo/db/matcher/match_expression_walker.h"
+#include "mongo/db/matcher/matchable.h"
+#include "mongo/db/matcher/path.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_cond.h"
@@ -58,11 +77,19 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_min_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_min_length.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_min_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_num_array_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_str_length.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_unique_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
+#include "mongo/db/query/tree_walker.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::doc_validation_error {
 namespace {
@@ -309,7 +336,7 @@ struct ValidationErrorContext {
     }
 
     bool haveLatestCompleteError() {
-        return !stdx::holds_alternative<std::monostate>(latestCompleteError);
+        return !holds_alternative<std::monostate>(latestCompleteError);
     }
 
     /**
@@ -317,35 +344,37 @@ struct ValidationErrorContext {
      */
     void appendLatestCompleteError(BSONObjBuilder* builder) {
         const static std::string kDetailsString = "details";
-        stdx::visit(
-            visit_helper::Overloaded{[&](const auto& details) -> void {
-                                         verifySizeAndAppend(details, kDetailsString, builder);
-                                     },
-                                     [&](const std::monostate& state) -> void { MONGO_UNREACHABLE },
-                                     [&](const std::string& str) -> void { MONGO_UNREACHABLE }},
-            latestCompleteError);
+        visit(OverloadedVisitor{[&](const auto& details) -> void {
+                                    verifySizeAndAppend(details, kDetailsString, builder);
+                                },
+                                [&](const std::monostate& state) -> void { MONGO_UNREACHABLE },
+                                [&](const std::string& str) -> void {
+                                    MONGO_UNREACHABLE
+                                }},
+              latestCompleteError);
     }
     /**
      * Appends the latest complete error to 'builder'. This should only be called by nodes which
      * construct an array as part of their error.
      */
     void appendLatestCompleteError(BSONArrayBuilder* builder) {
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
-                [&](const std::string& str) -> void { builder->append(str); },
-                [&](const BSONArray& arr) -> void {
-                    // The '$_internalSchemaAllowedProperties' match expression represents two
-                    // JSONSchema keywords: 'additionalProperties' and 'patternProperties'. As
-                    // such, if both keywords produce an error, their errors will be packaged
-                    // into an array which the parent expression must absorb when constructing
-                    // its array of error details.
-                    for (auto&& elem : arr) {
-                        verifySizeAndAppend(elem, builder);
-                    }
-                },
-                [&](const std::monostate& state) -> void { MONGO_UNREACHABLE }},
-            latestCompleteError);
+        visit(OverloadedVisitor{
+                  [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
+                  [&](const std::string& str) -> void { builder->append(str); },
+                  [&](const BSONArray& arr) -> void {
+                      // The '$_internalSchemaAllowedProperties' match expression represents
+                      // two JSONSchema keywords: 'additionalProperties' and
+                      // 'patternProperties'. As such, if both keywords produce an error,
+                      // their errors will be packaged into an array which the parent
+                      // expression must absorb when constructing its array of error details.
+                      for (auto&& elem : arr) {
+                          verifySizeAndAppend(elem, builder);
+                      }
+                  },
+                  [&](const std::monostate& state) -> void {
+                      MONGO_UNREACHABLE
+                  }},
+              latestCompleteError);
     }
 
     /**
@@ -353,11 +382,11 @@ struct ValidationErrorContext {
      * caller expects an object.
      */
     BSONObj getLatestCompleteErrorObject() const {
-        return stdx::get<BSONObj>(latestCompleteError);
+        return get<BSONObj>(latestCompleteError);
     }
 
     BSONArray getLatestCompleteErrorArray() const {
-        return stdx::get<BSONArray>(latestCompleteError);
+        return get<BSONArray>(latestCompleteError);
     }
 
     /**
@@ -424,7 +453,7 @@ struct ValidationErrorContext {
     // in an array and passed to the parent expression.
     // - Finally, BSONObj indicates the most common case of an error: a detailed object which
     // describes the reasons for failure. The final error will be of this type.
-    stdx::variant<std::monostate, std::string, BSONObj, BSONArray> latestCompleteError =
+    std::variant<std::monostate, std::string, BSONObj, BSONArray> latestCompleteError =
         std::monostate();
     // Document which failed to match against the collection's validator.
     const BSONObj& rootDoc;
@@ -449,6 +478,10 @@ BSONObj toObjectWithPlaceholder(BSONElement element) {
     return BSON(JSONSchemaParser::kNamePlaceholder << element);
 }
 
+void appendSchemaAnnotations(const MatchExpression& expr, BSONObjBuilder& builder) {
+    expr.getErrorAnnotation()->schemaAnnotations.appendElements(builder);
+}
+
 /**
  * Append the error generated by one of 'expr's children to the current array builder of 'expr'
  * if said child generated an error.
@@ -467,6 +500,7 @@ void finishLogicalOperatorChildError(const ListOfMatchExpression* expr,
                 BSONObjBuilder subBuilder = ctx->getCurrentArrayBuilder().subobjStart();
                 subBuilder.appendNumber("index",
                                         static_cast<long long>(ctx->getCurrentChildIndex()));
+                appendSchemaAnnotations(*expr->getChild(ctx->getCurrentChildIndex()), subBuilder);
                 ctx->appendLatestCompleteError(&subBuilder);
                 subBuilder.done();
             } else {
@@ -525,7 +559,8 @@ BSONArray findAdditionalProperties(const BSONObj& doc,
         if (!properties.contains(fieldName)) {
             bool additional = true;
             for (auto&& pattern : patternProperties) {
-                if (pattern.first.regex->PartialMatch(fieldName.toString())) {
+                auto&& re = pattern.first.regex;
+                if (re && re->matchView(fieldName)) {
                     additional = false;
                     break;
                 }
@@ -578,7 +613,8 @@ BSONElement findFailingProperty(const InternalSchemaAllowedPropertiesMatchExpres
     auto filter = patternSchema.second->getFilter();
     for (auto&& elem : ctx->getCurrentDocument()) {
         auto field = elem.fieldNameStringData();
-        if (pattern.regex->PartialMatch(field.toString()) && !filter->matchesBSONElement(elem)) {
+        auto&& re = pattern.regex;
+        if (re && *re && re->matchView(field) && !filter->matchesBSONElement(elem)) {
             return elem;
         }
     }
@@ -606,6 +642,7 @@ void generatePatternPropertyError(const InternalSchemaAllowedPropertiesMatchExpr
         auto propertyName = element.fieldNameStringData().toString();
         BSONObjBuilder patternBuilder;
         patternBuilder.append("propertyName", propertyName);
+        appendSchemaAnnotations(*patternSchema.second->getFilter(), patternBuilder);
         patternBuilder.append("regexMatched", patternSchema.first.rawRegex);
         ctx->appendLatestCompleteError(&patternBuilder);
         ctx->verifySizeAndAppend(patternBuilder.obj(), &ctx->getCurrentArrayBuilder());
@@ -637,6 +674,7 @@ void generateAdditionalPropertiesSchemaError(
     invariant(firstFailingElement);
     auto& builder = ctx->getCurrentObjBuilder();
     builder.append("operatorName", "additionalProperties");
+    appendSchemaAnnotations(*expr.getChild(0), builder);
     builder.append("reason", "at least one additional property did not match the subschema");
     builder.append("failingProperty", firstFailingElement.fieldNameStringData().toString());
     ctx->appendLatestCompleteError(&builder);
@@ -806,11 +844,13 @@ public:
         static constexpr auto kInvertedReason = "matching value found in array";
         generatePathError(*expr, kNormalReason, kInvertedReason);
     }
+    void visit(const InternalBucketGeoWithinMatchExpression* expr) final {}
     void visit(const InternalExprEqMatchExpression* expr) final {}
     void visit(const InternalExprGTMatchExpression* expr) final {}
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems: {
@@ -870,8 +910,8 @@ public:
         }
     }
     void visit(const InternalSchemaBinDataEncryptedTypeExpression* expr) final {
-        static constexpr auto kNormalReason = "encrypted value has wrong type";
         // This node will never generate an error in the inverted case.
+        static constexpr auto kNormalReason = "encrypted value has wrong type";
         static constexpr auto kInvertedReason = "";
         _context->pushNewFrame(*expr);
         if (_context->shouldGenerateError(*expr)) {
@@ -889,6 +929,28 @@ public:
                 appendErrorReason(kNormalReason, kInvertedReason);
             } else {
                 _context->setCurrentRuntimeState(RuntimeState::kNoError);
+            }
+        }
+    }
+    void visit(const InternalSchemaBinDataFLE2EncryptedTypeExpression* expr) final {
+        static constexpr auto kNotEncryptedReason = "value was not encrypted";
+        static constexpr auto kBadValueTypeReason =
+            "Queryable Encryption encrypted value has wrong type";
+        static constexpr auto kInvertedReason = "value was encrypted";
+
+        _context->pushNewFrame(*expr);
+        if (_context->shouldGenerateError(*expr)) {
+            ElementPath path(expr->path(), LeafArrayBehavior::kNoTraversal);
+            BSONMatchableDocument doc(_context->getCurrentDocument());
+            MatchableDocument::IteratorHolder cursor(&doc, &path);
+            invariant(cursor->more());
+            auto elem = cursor->next().element();
+
+            appendOperatorName(*expr);
+            if (elem.type() != BSONType::BinData || elem.binDataType() != BinDataType::Encrypt) {
+                appendErrorReason(kNotEncryptedReason, kInvertedReason);
+            } else {
+                appendErrorReason(kBadValueTypeReason, kInvertedReason);
             }
         }
     }
@@ -1746,6 +1808,7 @@ private:
         if (auto attributeValue =
                 getValueForKeywordExpressionIfShouldGenerateError(*expr, {BSONType::Array})) {
             appendOperatorName(*expr);
+            appendSchemaAnnotations(*expr->getChild(0), _context->getCurrentObjBuilder());
             appendErrorReason(normalReason, invertedReason);
             auto failingElement =
                 expr->findFirstMismatchInArray(attributeValue.embeddedObject(), nullptr);
@@ -1801,11 +1864,13 @@ public:
         MONGO_UNREACHABLE;
     }
     void visit(const InMatchExpression* expr) final {}
+    void visit(const InternalBucketGeoWithinMatchExpression* expr) final {}
     void visit(const InternalExprEqMatchExpression* expr) final {}
     void visit(const InternalExprGTMatchExpression* expr) final {}
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {}
     void visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) final {
         if (_context->shouldGenerateError(*expr)) {
@@ -1827,6 +1892,7 @@ public:
         _context->incrementCurrentChildIndex();
     }
     void visit(const InternalSchemaBinDataEncryptedTypeExpression* expr) final {}
+    void visit(const InternalSchemaBinDataFLE2EncryptedTypeExpression* expr) final {}
     void visit(const InternalSchemaBinDataSubTypeExpression* expr) final {}
     void visit(const InternalSchemaCondMatchExpression* expr) final {
         if (_context->shouldGenerateError(*expr)) {
@@ -1954,6 +2020,7 @@ public:
             {"dependencies", {"failingDependencies", ""}},
             {"required", {"missingProperties", ""}},
             {"_property", {"details", ""}},
+            {"implicitFLESchema", {"schemaRulesNotSatisfied", "schemaRulesSatisfied"}},
             {"", {"details", ""}}};
         auto detailsStringPair = detailsStringMap.find(tag);
         invariant(detailsStringPair != detailsStringMap.end());
@@ -2013,11 +2080,13 @@ public:
     void visit(const InMatchExpression* expr) final {
         _context->finishCurrentError(expr);
     }
+    void visit(const InternalBucketGeoWithinMatchExpression* expr) final {}
     void visit(const InternalExprEqMatchExpression* expr) final {}
     void visit(const InternalExprGTMatchExpression* expr) final {}
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems:
@@ -2062,6 +2131,9 @@ public:
         _context->popFrame();
     }
     void visit(const InternalSchemaBinDataEncryptedTypeExpression* expr) final {
+        _context->finishCurrentError(expr);
+    }
+    void visit(const InternalSchemaBinDataFLE2EncryptedTypeExpression* expr) final {
         _context->finishCurrentError(expr);
     }
     void visit(const InternalSchemaBinDataSubTypeExpression* expr) final {
@@ -2193,6 +2265,7 @@ public:
 private:
     void postVisitTreeOperator(const ListOfMatchExpression* expr,
                                const std::string& detailsString) {
+        appendSchemaAnnotations(*expr, _context->getCurrentObjBuilder());
         finishLogicalOperatorChildError(expr, _context);
         // If this node represents a 'properties' keyword or an individual property schema (denoted
         // by '_property') and the current array builder has no elements, then this node will not
@@ -2322,10 +2395,6 @@ BSONObj generateErrorHelper(const MatchExpression& validatorExpr,
 }  // namespace
 
 std::shared_ptr<const ErrorExtraInfo> DocumentValidationFailureInfo::parse(const BSONObj& obj) {
-    if (!obj.hasField("errInfo"_sd)) {
-        // TODO SERVER-50524: remove this block when 5.0 becomes last-lts.
-        return nullptr;
-    }
     auto errInfo = obj["errInfo"];
     uassert(4878100,
             "DocumentValidationFailureInfo must have a field 'errInfo' of type object",

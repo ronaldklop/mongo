@@ -29,26 +29,32 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
 #include <utility>
 
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/logical_session_id_gen.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
-
 namespace executor {
 
 class TaskExecutor;
 
 }  // namespace executor
-
-class OperationContext;
 
 /**
  * Transfer config.transaction information from a given source shard to this shard.
@@ -71,11 +77,30 @@ public:
         std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
         const boost::optional<LogicalSessionId>& startAfter);
 
+    /**
+     * Schedules work to repeatedly fetch and update config.transactions records.
+     *
+     * Returns a future that becomes ready when either:
+     *   (a) all config.transactions records have been fetched and updated, or
+     *   (b) the cancellation token was canceled due to a stepdown or abort.
+     */
     SemiFuture<void> run(
         std::shared_ptr<executor::TaskExecutor> executor,
         std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
         CancellationToken cancelToken,
+        CancelableOperationContextFactory factory,
         std::shared_ptr<MongoProcessInterface> mongoProcessInterface_forTest = nullptr);
+
+    /**
+     * Updates this shard's config.transactions table based on a retryable write or multi-statement
+     * transaction that already executed on the donor shard.
+     *
+     * Returns boost::none unless this shard has an active prepared transaction for the
+     * corresponding config.transactions record. It otherwise returns a future that becomes ready
+     * once the active prepared transaction on this shard commits or aborts.
+     */
+    boost::optional<SharedSemiFuture<void>> doOneRecord(OperationContext* opCtx,
+                                                        const SessionTxnRecord& donorRecord);
 
     void updateProgressDocument_forTest(OperationContext* opCtx, const LogicalSessionId& progress) {
         _updateProgressDocument(opCtx, progress);
@@ -87,10 +112,12 @@ private:
     std::unique_ptr<Pipeline, PipelineDeleter> _targetAggregationRequest(OperationContext* opCtx,
                                                                          const Pipeline& pipeline);
 
-    void _updateProgressDocument(OperationContext* opCtx, const LogicalSessionId& progress);
+    std::unique_ptr<Pipeline, PipelineDeleter> _restartPipeline(
+        OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface);
 
-    template <typename Callable>
-    auto _withTemporaryOperationContext(Callable&& callable);
+    boost::optional<SessionTxnRecord> _getNextRecord(OperationContext* opCtx, Pipeline& pipeline);
+
+    void _updateProgressDocument(OperationContext* opCtx, const LogicalSessionId& progress);
 
     const ReshardingSourceId _sourceId;
     const Timestamp _fetchTimestamp;

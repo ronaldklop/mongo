@@ -1,12 +1,5 @@
 // Tests that a pipeline isn't allowed to specify an arbitrary number of sub-pipelines within
 // $lookups and other similar stages.
-// @tags: [
-//   # TODO SERVER-29159 $lookup doesn't support sharded collections.
-//   assumes_unsharded_collection
-// ]
-(function() {
-"use strict";
-
 const coll = db.max_subpipeline_depth;
 coll.drop();
 
@@ -31,15 +24,15 @@ function makeUnionNDeep(n) {
 }
 
 const maxDepth = 20;
-assert.commandWorked(db.runCommand(
-    {aggregate: coll.getName(), pipeline: [makeLookupNDeep(maxDepth - 1)], cursor: {}}));
-assert.commandFailedWithCode(
-    db.runCommand({aggregate: coll.getName(), pipeline: [makeLookupNDeep(maxDepth)], cursor: {}}),
-    ErrorCodes.MaxSubPipelineDepthExceeded);
 
 assert.commandWorked(db.runCommand(
     {aggregate: coll.getName(), pipeline: [makeUnionNDeep(maxDepth - 1)], cursor: {}}));
 assert.commandFailedWithCode(
     db.runCommand({aggregate: coll.getName(), pipeline: [makeUnionNDeep(maxDepth)], cursor: {}}),
     ErrorCodes.MaxSubPipelineDepthExceeded);
-}());
+
+assert.commandWorked(db.runCommand(
+    {aggregate: coll.getName(), pipeline: [makeLookupNDeep(maxDepth - 1)], cursor: {}}));
+assert.commandFailedWithCode(
+    db.runCommand({aggregate: coll.getName(), pipeline: [makeLookupNDeep(maxDepth)], cursor: {}}),
+    ErrorCodes.MaxSubPipelineDepthExceeded);

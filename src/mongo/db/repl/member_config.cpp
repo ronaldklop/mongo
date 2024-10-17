@@ -27,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/algorithm/string/trim.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/repl/member_config.h"
-
-#include <boost/algorithm/string.hpp>
-
-#include "mongo/bson/util/bson_check.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -59,7 +64,7 @@ MemberConfig MemberConfig::parseFromBSON(const BSONObj& mcfg) {
 }
 
 MemberConfig::MemberConfig(const BSONObj& mcfg) {
-    parseProtected(IDLParserErrorContext("MemberConfig"), mcfg);
+    parseProtected(IDLParserContext("MemberConfig"), mcfg);
 
     std::string hostAndPortString = getHost().toString();
     boost::trim(hostAndPortString);
@@ -92,7 +97,7 @@ MemberConfig::MemberConfig(const BSONObj& mcfg) {
             uasserted(ErrorCodes::BadValue, "priority must be 0 when non-voting (votes:0)");
         }
         if (getSecondaryDelay() > Seconds(0)) {
-            uasserted(ErrorCodes::BadValue, "priority must be 0 when slaveDelay is used");
+            uasserted(ErrorCodes::BadValue, "priority must be 0 when secondaryDelaySecs is used");
         }
         if (isHidden()) {
             uasserted(ErrorCodes::BadValue, "priority must be 0 when hidden=true");
@@ -116,7 +121,7 @@ void MemberConfig::addTagInfo(ReplSetTagConfig* tagConfig) {
     // Parse "tags" field.
     //
     if (getTags()) {
-        for (auto&& tag : getTags().get()) {
+        for (auto&& tag : getTags().value()) {
             if (tag.type() != String) {
                 uasserted(ErrorCodes::TypeMismatch,
                           str::stream()
@@ -198,8 +203,8 @@ BSONObj MemberConfig::toBSON(bool omitNewlyAddedField) const {
 
     if (!omitNewlyAddedField && getNewlyAdded()) {
         // We should never have _newlyAdded if automatic reconfigs aren't enabled.
-        invariant(getNewlyAdded().get());
-        configBuilder.append(kNewlyAddedFieldName, getNewlyAdded().get());
+        invariant(getNewlyAdded().value());
+        configBuilder.append(kNewlyAddedFieldName, getNewlyAdded().value());
     }
 
     configBuilder.append(kBuildIndexesFieldName, getBuildIndexes());
@@ -212,10 +217,7 @@ BSONObj MemberConfig::toBSON(bool omitNewlyAddedField) const {
     _splitHorizon.toBSON(configBuilder);
 
     if (getSecondaryDelaySecs()) {
-        configBuilder.append(kSecondaryDelaySecsFieldName, getSecondaryDelaySecs().get());
-    }
-    if (getSlaveDelaySecs()) {
-        configBuilder.append(kSlaveDelaySecsFieldName, getSlaveDelaySecs().get());
+        configBuilder.append(kSecondaryDelaySecsFieldName, getSecondaryDelaySecs().value());
     }
 
     configBuilder.append(kVotesFieldName, MemberConfigBase::getVotes() ? 1 : 0);

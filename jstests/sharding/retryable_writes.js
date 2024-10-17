@@ -2,15 +2,8 @@
  * Test basic retryable write without errors by checking that the resulting collection after the
  * retry is as expected and it does not create additional oplog entries.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function checkFindAndModifyResult(expected, toCheck) {
     assert.eq(expected.ok, toCheck.ok);
@@ -42,6 +35,12 @@ function verifyServerStatusChanges(
 
 function runTests(mainConn, priConn) {
     var lsid = UUID();
+
+    if (TestData.configShard) {
+        // Creating a collection updates counters on the config server, so do that before getting
+        // the initial stats.
+        assert.commandWorked(mainConn.getDB("test").createCollection("user"));
+    }
 
     ////////////////////////////////////////////////////////////////////////
     // Test insert command
@@ -389,7 +388,7 @@ function runFailpointTests(mainConn, priConn) {
     assert.commandWorked(
         priConn.adminCommand({configureFailPoint: 'onPrimaryTransactionalWrite', mode: 'off'}));
 
-    var writeResult = testDb.runCommand(cmd);
+    writeResult = testDb.runCommand(cmd);
     assert.eq(2, writeResult.nModified);
 
     var collContents = testDb.user.find({}).sort({x: 1}).toArray();
@@ -552,4 +551,3 @@ runFailpointTests(st.s0, st.rs0.getPrimary());
 runMultiTests(st.s0);
 
 st.stop();
-})();

@@ -29,18 +29,30 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
 
+#include "mongo/base/status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/transaction_coordinator.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
 /**
- * This class is a registry for all the active TransactionCoordinator objects, indexed by lsid and
- * txnNumber. It supports holding several coordinator objects per session.
+ * This class is a registry for all the active TransactionCoordinator objects, indexed by lsid,
+ * txnNumber and txnRetryCounter. It supports holding several coordinator objects per session.
  */
 class TransactionCoordinatorCatalog {
     TransactionCoordinatorCatalog(const TransactionCoordinatorCatalog&) = delete;
@@ -63,17 +75,17 @@ public:
     /**
      * Inserts a coordinator to be tracked by the catalog.
      *
-     * Duplicate lsid + txnNumber are not legal and will lead to invariant. The consumer of this
-     * class (TransactionCoordinatorService) guarantees this will not happen through the following
-     * means:
+     * Duplicate lsid + txnNumber + txnRetryCounter are not legal and will lead to invariant. The
+     * consumer of this class (TransactionCoordinatorService) guarantees this will not happen
+     * through the following means:
      *  - At step-up recovery time - the catalog starts empty and the coordinators inserted are read
      *    from the `config.coordinators` collection, which only contains unique entries
      *  - At regular run time - the session check-out mechanism guarantees that calls to get,
-     *    followed by insert are atomic for the same lsid + txnNumber
+     *    followed by insert are atomic for the same lsid + txnNumber + txnRetryCounter
      */
     void insert(OperationContext* opCtx,
                 const LogicalSessionId& lsid,
-                TxnNumber txnNumber,
+                const TxnNumberAndRetryCounter& txnNumberAndRetryCounter,
                 std::shared_ptr<TransactionCoordinator> coordinator,
                 bool forStepUp = false);
 
@@ -81,15 +93,16 @@ public:
      * Returns the coordinator with the given session id and transaction number, if it exists. If it
      * does not exist, return nullptr.
      */
-    std::shared_ptr<TransactionCoordinator> get(OperationContext* opCtx,
-                                                const LogicalSessionId& lsid,
-                                                TxnNumber txnNumber);
+    std::shared_ptr<TransactionCoordinator> get(
+        OperationContext* opCtx,
+        const LogicalSessionId& lsid,
+        const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
 
     /**
      * Returns the coordinator with the highest transaction number with the given session id, if it
      * exists. If it does not exist, return boost::none.
      */
-    boost::optional<std::pair<TxnNumber, std::shared_ptr<TransactionCoordinator>>>
+    boost::optional<std::pair<TxnNumberAndRetryCounter, std::shared_ptr<TransactionCoordinator>>>
     getLatestOnSession(OperationContext* opCtx, const LogicalSessionId& lsid);
 
     /**
@@ -106,26 +119,29 @@ public:
 
     using FilterPredicate =
         std::function<bool(const LogicalSessionId lsid,
-                           const TxnNumber txnNumber,
+                           const TxnNumberAndRetryCounter txnNumberAndRetryCounter,
                            const std::shared_ptr<TransactionCoordinator> transactionCoordinator)>;
     using FilterVisitor =
         std::function<void(const LogicalSessionId lsid,
-                           const TxnNumber txnNumber,
+                           const TxnNumberAndRetryCounter txnNumberAndRetryCounter,
                            const std::shared_ptr<TransactionCoordinator> transactionCoordinator)>;
 
     void filter(FilterPredicate predicate, FilterVisitor visitor);
 
 private:
-    // Map of transaction coordinators, ordered in decreasing transaction number with the most
-    // recent transaction at the front
-    using TransactionCoordinatorMap =
-        std::map<TxnNumber, std::shared_ptr<TransactionCoordinator>, std::greater<TxnNumber>>;
+    // Map of transaction coordinators, ordered by decreasing txnNumber and txnRetryCounter  with
+    // the most recent transaction and retry at the front.
+    using TransactionCoordinatorMap = std::map<TxnNumber,
+                                               std::map<TxnRetryCounter,
+                                                        std::shared_ptr<TransactionCoordinator>,
+                                                        std::greater<TxnRetryCounter>>,
+                                               std::greater<TxnNumber>>;
 
     /**
      * Blocks in an interruptible wait until the catalog is not marked as having a stepup in
      * progress.
      */
-    void _waitForStepUpToComplete(stdx::unique_lock<Latch>& lk, OperationContext* opCtx);
+    void _waitForStepUpToComplete(stdx::unique_lock<stdx::mutex>& lk, OperationContext* opCtx);
 
     /**
      * Removes the coordinator with the given session id and transaction number from the catalog, if
@@ -134,7 +150,8 @@ private:
      *
      * Note: The coordinator must be in a state suitable for removal (i.e. committed or aborted).
      */
-    void _remove(const LogicalSessionId& lsid, TxnNumber txnNumber);
+    void _remove(const LogicalSessionId& lsid,
+                 const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
 
     /**
      * Constructs a string representation of all the coordinators registered on the catalog.
@@ -142,7 +159,7 @@ private:
     std::string _toString(WithLock wl) const;
 
     // Protects the state below.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinatorCatalog::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Contains TransactionCoordinator objects by session id and transaction number. May contain
     // more than one coordinator per session. All coordinators for a session that do not correspond

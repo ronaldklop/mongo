@@ -4,9 +4,12 @@
 // there are.
 // @tags: [requires_sharding]
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // The config servers are not reachable at shutdown.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 var st = new ShardingTest({
     shards: 1,
@@ -27,7 +30,7 @@ db.createUser({user: 'user', pwd: 'pwd', roles: ['clusterAdmin']});
 db.auth('user', 'pwd');
 
 // open a new connection to mongos (unauthorized)
-var conn = new Mongo(mongos.host);
+conn = new Mongo(mongos.host);
 db = conn.getDB('admin');
 
 // first serverStatus should fail since user is not authorized

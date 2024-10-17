@@ -7,18 +7,24 @@ import os.path
 
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.hooks import jsfile
-from buildscripts.resmokelib.testing.hooks.background_job import _BackgroundJob, _ContinuousDynamicJSTestCase
+from buildscripts.resmokelib.testing.hooks.background_job import (
+    _BackgroundJob,
+    _ContinuousDynamicJSTestCase,
+)
 
 
 class DoReconfigInBackground(jsfile.JSHook):
     """A hook for running a safe reconfig against a replica set while a test is running."""
 
+    IS_BACKGROUND = True
+
     def __init__(self, hook_logger, fixture, shell_options=None):
         """Initialize DoReconfigInBackground."""
         description = "Run reconfigs against the primary while the test is running."
         js_filename = os.path.join("jstests", "hooks", "run_reconfig_background.js")
-        jsfile.JSHook.__init__(self, hook_logger, fixture, js_filename, description,
-                               shell_options=shell_options)
+        jsfile.JSHook.__init__(
+            self, hook_logger, fixture, js_filename, description, shell_options=shell_options
+        )
 
         self._background_job = None
 
@@ -28,7 +34,7 @@ class DoReconfigInBackground(jsfile.JSHook):
         self.logger.info("Starting the background reconfig thread.")
         self._background_job.start()
 
-    def after_suite(self, test_report):
+    def after_suite(self, test_report, teardown_flag=None):
         """Signal the background thread to exit, and wait until it does."""
         if self._background_job is None:
             return
@@ -42,7 +48,8 @@ class DoReconfigInBackground(jsfile.JSHook):
             return
 
         hook_test_case = _ContinuousDynamicJSTestCase.create_before_test(
-            test.logger, test, self, self._js_filename, self._shell_options)
+            test.logger, test, self, self._js_filename, self._shell_options
+        )
         hook_test_case.configure(self.fixture)
 
         self.logger.info("Resuming the background reconfig thread.")
@@ -65,6 +72,8 @@ class DoReconfigInBackground(jsfile.JSHook):
                 # test execution to stop.
                 raise errors.ServerFailure(self._background_job.exc_info[1].args[0])
             else:
-                self.logger.error("Encountered an error inside the background reconfig thread.",
-                                  exc_info=self._background_job.exc_info)
+                self.logger.error(
+                    "Encountered an error inside the background reconfig thread.",
+                    exc_info=self._background_job.exc_info,
+                )
                 raise self._background_job.exc_info[1]

@@ -29,15 +29,15 @@
 
 #pragma once
 
-#include "mongo/config.h"
-
 #include <cstring>
+#include <iosfwd>
 #include <type_traits>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 namespace mongo {
 
@@ -59,13 +59,10 @@ struct DataType {
     template <typename T, typename = void>
     struct Handler {
         static void unsafeLoad(T* t, const char* ptr, size_t* advanced) {
-#if MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE
-            MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable<T>::value,
+            MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable_v<T>,
                                     "The generic DataType implementation requires values to be "
                                     "trivially copyable. You may specialize the template to use it "
                                     "with other types.");
-#endif
-
             if (t) {
                 std::memcpy(t, ptr, sizeof(T));
             }
@@ -87,13 +84,10 @@ struct DataType {
         }
 
         static void unsafeStore(const T& t, char* ptr, size_t* advanced) {
-#if MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE
-            MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable<T>::value,
+            MONGO_STATIC_ASSERT_MSG(std::is_trivially_copyable_v<T>,
                                     "The generic DataType implementation requires values to be "
                                     "trivially copyable. You may specialize the template to use it "
                                     "with other types.");
-#endif
-
             if (ptr) {
                 std::memcpy(ptr, &t, sizeof(T));
             }
@@ -172,4 +166,5 @@ struct DataType {
 // Force the visibility of the DataType::Handler specializations.
 #define MONGO_BASE_DATA_TYPE_H_INCLUDE_HANDSHAKE_
 #include "mongo/base/data_type_string_data.h"
+
 #undef MONGO_BASE_DATA_TYPE_H_INCLUDE_HANDSHAKE_

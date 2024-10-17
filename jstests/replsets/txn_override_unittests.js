@@ -25,15 +25,12 @@
  * us to keep more tests running now. That said, these should ideally all throw so we do not rely on
  * the test itself calling assert.commandWorked.
  *
- * @tags: [requires_replication, uses_transactions]
+ * @tags: [requires_replication, uses_transactions, requires_scripting]
  */
-(function() {
-"use strict";
-load("jstests/libs/transactions_util.js");
-load('jstests/libs/write_concern_util.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Commands not to override since they can log excessively.
-const runCommandOverrideBlacklistedCommands =
+const runCommandOverrideDenylistedCommands =
     ["getCmdLineOpts", "serverStatus", "configureFailPoint"];
 
 // cmdResponseOverrides is a map from commands to responses that should be provided in lieu of
@@ -53,7 +50,7 @@ let postCommandFuncs = {};
  * Deletes the command override from the given command.
  */
 function clearCommandOverride(cmdName) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     delete cmdResponseOverrides[cmdName];
 }
@@ -62,7 +59,7 @@ function clearCommandOverride(cmdName) {
  * Deletes the post-command function for the given command.
  */
 function clearPostCommandFunc(cmdName) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     delete postCommandFuncs[cmdName];
 }
@@ -79,7 +76,7 @@ function clearAllCommandOverrides() {
  * Sets the provided function as the post-command function for the given command.
  */
 function attachPostCmdFunction(cmdName, func) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     postCommandFuncs[cmdName] = func;
 }
@@ -89,7 +86,7 @@ function attachPostCmdFunction(cmdName, func) {
  * be run.
  */
 function setCommandMockResponse(cmdName, mockResponse) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     cmdResponseOverrides[cmdName] = {responseObj: mockResponse};
 }
@@ -99,7 +96,7 @@ function setCommandMockResponse(cmdName, mockResponse) {
  * The command will not actually be run.
  */
 function failCommandWithWCENoRun(cmdName, writeConcernErrorCode, writeConcernErrorCodeName) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     cmdResponseOverrides[cmdName] = {
         responseObj: {
@@ -115,7 +112,7 @@ function failCommandWithWCENoRun(cmdName, writeConcernErrorCode, writeConcernErr
  */
 function failCommandWithErrorAndWCENoRun(
     cmdName, errorCode, errorCodeName, writeConcernErrorCode, writeConcernErrorCodeName) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     cmdResponseOverrides[cmdName] = {
         responseObj: {
@@ -132,7 +129,7 @@ function failCommandWithErrorAndWCENoRun(
  * used.
  */
 function runPostCommandFunc(cmdName) {
-    assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+    assert(!runCommandOverrideDenylistedCommands.includes(cmdName));
 
     if (postCommandFuncs[cmdName]) {
         jsTestLog("Running post-command function for " + cmdName);
@@ -146,7 +143,7 @@ function runPostCommandFunc(cmdName) {
 
 /**
  * Overrides 'runCommand' to provide a specific pre-set response to the given command. If the
- * command is in the blacklist, it is not overridden. Otherwise, if a command response has been
+ * command is in the denylist, it is not overridden. Otherwise, if a command response has been
  * specified, returns that without running the function. If a post-command function is specified
  * for the command, runs that after the command is run. The post-command function is run
  * regardless of whether the command response was overridden or not.
@@ -154,7 +151,7 @@ function runPostCommandFunc(cmdName) {
 const mongoRunCommandOriginal = Mongo.prototype.runCommand;
 Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
     const cmdName = Object.keys(cmdObj)[0];
-    if (runCommandOverrideBlacklistedCommands.includes(cmdName)) {
+    if (runCommandOverrideDenylistedCommands.includes(cmdName)) {
         return mongoRunCommandOriginal.apply(this, arguments);
     }
 
@@ -365,10 +362,10 @@ const retryOnNetworkErrorTests = [
             let obj2 = {_id: 2, x: 5};
             assert.commandWorked(coll1.insert(obj1));
             assert.commandWorked(coll1.insert(obj2));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 5}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 5}], coll1.find().toArray());
             obj1.x = 7;
             assert.commandWorked(coll1.update({_id: 2}, {$set: {x: 8}}));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
         }
     },
     {
@@ -1349,6 +1346,7 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
             failCommandWithFailPoint(["insert"], {errorCode: ErrorCodes.NotWritablePrimary});
 
             assert.commandWorked(coll1.insert({a: 2, b: {c: 7, d: "d is good"}}));
+            /* eslint-disable */
             const cursor = coll1.find({
                 $where: function() {
                     assert.eq(3, Object.keySet(obj).length);
@@ -1358,6 +1356,7 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
                     return true;
                 }
             });
+            /* eslint-enable */
             assert.eq(1, cursor.toArray().length);
         }
     },
@@ -1398,13 +1397,13 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
             let obj2 = {_id: 2, x: 5};
             assert.commandWorked(coll1.insert(obj1));
             assert.commandWorked(coll1.insert(obj2));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 5}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 5}], coll1.find().toArray());
             obj1.x = 7;
             assert.commandWorked(coll1.update({_id: 2}, {$set: {x: 8}}));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
 
             endCurrentTransactionIfOpen();
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
         }
     },
     {
@@ -1878,7 +1877,7 @@ TestData.overrideRetryAttempts = 3;
 let session = conn.startSession(TestData.sessionOptions);
 let testDB = session.getDatabase(dbName);
 
-load("jstests/libs/override_methods/network_error_and_txn_override.js");
+await import("jstests/libs/override_methods/network_error_and_txn_override.js");
 
 jsTestLog("=-=-=-=-=-= Testing with 'retry on network error' by itself. =-=-=-=-=-=");
 TestData.sessionOptions = new SessionOptions({retryWrites: true});
@@ -1966,4 +1965,3 @@ doNotRetryReadErrorWithOutBackgroundReconfigTest.forEach(
     (testCase) => runTest("doNotRetryReadErrorWithOutBackgroundReconfigTest", testCase));
 
 rst.stopSet();
-})();

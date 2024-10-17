@@ -1,25 +1,26 @@
-load("jstests/replsets/rslib.js");
-
 /**
  * Test for making sure that the replica seed list in the config server does not
  * become invalid when a replica set reconfig happens.
  * @tags: [multiversion_incompatible]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {awaitRSClientHosts, reconfig} from "jstests/replsets/rslib.js";
 
-// Skip db hash check and shard replication since the removed node has wrong config and is still
-// alive.
+// Skip the following checks since the removed node has wrong config and is still alive.
 TestData.skipCheckDBHashes = true;
 TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 var NODE_COUNT = 3;
 var st = new ShardingTest({shards: {rs0: {nodes: NODE_COUNT, oplogSize: 10}}});
 var replTest = st.rs0;
 var mongos = st.s;
 
-var shardDoc = mongos.getDB('config').shards.findOne();
-assert.eq(NODE_COUNT, shardDoc.host.split(',').length);  // seed list should contain all nodes
+var shardDoc;
+assert.soon(() => {
+    shardDoc = mongos.getDB('config').shards.findOne();
+    return NODE_COUNT == shardDoc.host.split(',').length;  // seed list should contain all nodes
+});
 
 /* Make sure that the first node is not the primary (by making the second one primary).
  * We need to do this since the ReplicaSetMonitor iterates over the nodes one
@@ -86,5 +87,4 @@ assert.soon(
                 shardDoc.host.split(',').length + " in " + shardDoc.host);
     });
 
-st.stop();
-}());
+st.stop({parallelSupported: false, skipValidation: true});

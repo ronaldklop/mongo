@@ -29,40 +29,67 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/platform/bitwise_enum_operators.h"
+#include "mongo/stdx/utility.h"
 
 namespace mongo {
 
 /**
  * Valid flags to pass to initializeStorageEngine. Used as a bitfield.
  */
-enum StorageEngineInitFlags {
-    kNone = 0,
+enum class StorageEngineInitFlags {
     kAllowNoLockFile = 1 << 0,
     kSkipMetadataFile = 1 << 1,
+    kForRestart = 1 << 2,  // Used by reinitialzeStorageEngine only.
 };
 
-/**
- * Information on last server shutdown state that is relevant to the recovery process.
- * Determined by initializeStorageEngine() during mongod.lock initialization.
- */
-enum class LastStorageEngineShutdownState { kClean, kUnclean };
+constexpr StorageEngineInitFlags operator&(StorageEngineInitFlags a,
+                                           StorageEngineInitFlags b) noexcept {
+    return StorageEngineInitFlags{stdx::to_underlying(a) & stdx::to_underlying(b)};
+}
+
+constexpr StorageEngineInitFlags operator|(StorageEngineInitFlags a,
+                                           StorageEngineInitFlags b) noexcept {
+    return StorageEngineInitFlags{stdx::to_underlying(a) | stdx::to_underlying(b)};
+}
 
 /**
  * Initializes the storage engine on "service".
+ * The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+ * this function into one single builder that records the time elapsed during startup. Its default
+ * value is nullptr because we only want to time this function when it is called during startup.
  */
-LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
-                                                       StorageEngineInitFlags initFlags);
+StorageEngine::LastShutdownState initializeStorageEngine(
+    OperationContext* opCtx,
+    StorageEngineInitFlags initFlags,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
 
 /**
  * Shuts down storage engine cleanly and releases any locks on mongod.lock.
  */
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service);
+
+/**
+ * Changes the storage engine for the given service by shutting down the old one and starting
+ * up a new one.  Kills all opCtxs on the service context which have a storage recovery unit,
+ * except the one passed in which has its recovery unit replaced.
+ *
+ * Changes to the configuration (e.g. to storageGlobalParams.dbpath) which need to happen while
+ * no storage engine is active may be made in the changeConfigurationCallback.  At that point the
+ * opCtx will have a no op recovery unit and any access to storage is not allowed.
+ */
+StorageEngine::LastShutdownState reinitializeStorageEngine(
+    OperationContext* opCtx,
+    StorageEngineInitFlags initFlags,
+    std::function<void()> changeConfigurationCallback = [] {});
 
 /**
  * Registers a storage engine onto the given "service".
@@ -101,7 +128,5 @@ Status validateStorageOptions(
  * Appends a the list of available storage engines to a BSONObjBuilder for reporting purposes.
  */
 void appendStorageEngineList(ServiceContext* service, BSONObjBuilder* result);
-
-ENABLE_BITMASK_OPERATORS(StorageEngineInitFlags)
 
 }  // namespace mongo

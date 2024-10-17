@@ -2,8 +2,7 @@
  * Verify that a non force replica set reconfig can be committed by a primary and arbiter, with a
  * secondary down.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Make the secondary unelectable.
 let rst =
@@ -30,4 +29,3 @@ for (let i = 0; i < 2; i++) {
 rst.restart(secondary);
 rst.awaitReplication();
 rst.stopSet();
-}());

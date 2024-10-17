@@ -1,21 +1,29 @@
-
 /**
  * @tags: [
  *   uses_multiple_connections,
+ *   uses_parallel_shell,
+ *   # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+ *   simulate_atlas_proxy_incompatible,
+ *   # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+ *   grpc_incompatible,
  * ]
  */
-t = db.bench_test2;
+const t = db.bench_test2;
 t.drop();
 
-for (i = 0; i < 100; i++)
-    t.insert({_id: i, x: 0});
+let docs = [];
+for (let i = 0; i < 100; i++) {
+    docs.push({_id: i, x: 0});
+}
+assert.commandWorked(t.insert(docs));
 
-benchArgs = {
+const benchArgs = {
     ops: [{
         ns: t.getFullName(),
         op: "update",
         query: {_id: {"#RAND_INT": [0, 100]}},
-        update: {$inc: {x: 1}}
+        update: {$inc: {x: 1}},
+        writeCmd: true
     }],
     parallel: 2,
     seconds: 1,
@@ -28,14 +36,14 @@ if (jsTest.options().auth) {
     benchArgs['password'] = jsTest.options().authPassword;
 }
 
-res = benchRun(benchArgs);
+const res = benchRun(benchArgs);
 printjson(res);
 
-sumsq = 0;
-sum = 0;
+let sumsq = 0;
+let sum = 0;
 
-min = 1000;
-max = 0;
+let min = 1000;
+let max = 0;
 t.find().forEach(function(z) {
     sum += z.x;
     sumsq += Math.pow((res.update / 100) - z.x, 2);
@@ -43,8 +51,8 @@ t.find().forEach(function(z) {
     max = Math.max(z.x, max);
 });
 
-avg = sum / 100;
-std = Math.sqrt(sumsq / 100);
+const avg = sum / 100;
+const std = Math.sqrt(sumsq / 100);
 
 print("Avg: " + avg);
 print("Std: " + std);

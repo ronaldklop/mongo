@@ -27,18 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/uuid.h"
-
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
 #include <fmt/format.h>
-#include <pcrecpp.h>
+#include <new>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/static_immortal.h"
+#include "mongo/util/synchronized_value.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -46,8 +51,10 @@ namespace {
 
 using namespace fmt::literals;
 
-Mutex uuidGenMutex;
-SecureRandom uuidGen;
+synchronized_value<SecureRandom>& uuidGen() {
+    static StaticImmortal<synchronized_value<SecureRandom>> uuidGen;
+    return uuidGen.value();
+}
 
 }  // namespace
 
@@ -59,7 +66,7 @@ StatusWith<UUID> UUID::parse(BSONElement from) {
     }
 }
 
-StatusWith<UUID> UUID::parse(const std::string& s) {
+StatusWith<UUID> UUID::parse(StringData s) {
     if (!isUUIDString(s)) {
         return {ErrorCodes::InvalidUUID, "Invalid UUID string: {}"_format(s)};
     }
@@ -73,7 +80,7 @@ StatusWith<UUID> UUID::parse(const std::string& s) {
         if (s[j] == '-')
             j++;
 
-        uuid[i] = hexblob::decodePair(StringData(s).substr(j, 2));
+        uuid[i] = hexblob::decodePair(s.substr(j, 2));
         j += 2;
     }
 
@@ -86,15 +93,12 @@ UUID UUID::parse(const BSONObj& obj) {
     return res.getValue();
 }
 
-bool UUID::isUUIDString(const std::string& s) {
-    // Regex to match valid version 4 UUIDs with variant bits set
-    static StaticImmortal<pcrecpp::RE> uuidRegex(
-        "[[:xdigit:]]{8}-"
-        "[[:xdigit:]]{4}-"
-        "[[:xdigit:]]{4}-"
-        "[[:xdigit:]]{4}-"
-        "[[:xdigit:]]{12}");
-    return uuidRegex->FullMatch(s);
+bool UUID::isUUIDString(StringData s) {
+    static constexpr auto pat = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"_sd;
+    return s.size() == pat.size() &&
+        std::mismatch(s.begin(), s.end(), pat.begin(), [](char a, char b) {
+            return b == 'x' ? ctype::isXdigit(a) : a == b;
+        }).first == s.end();
 }
 
 bool UUID::isRFC4122v4() const {
@@ -103,10 +107,7 @@ bool UUID::isRFC4122v4() const {
 
 UUID UUID::gen() {
     UUIDStorage randomBytes;
-    {
-        stdx::lock_guard<Latch> lk(uuidGenMutex);
-        uuidGen.fill(&randomBytes, sizeof(randomBytes));
-    }
+    uuidGen()->fill(&randomBytes, sizeof(randomBytes));
 
     // Set version in high 4 bits of byte 6 and variant in high 2 bits of byte 8, see RFC 4122,
     // section 4.1.1, 4.1.2 and 4.1.3.

@@ -1,20 +1,18 @@
 //
 // Tests writeConcerns with findAndModify command
 //
-(function() {
-'use strict';
+// Skip this test when running with storage engines other than inMemory, as the test relies on
+// journaling not being active.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-// Skip this test if running with the "wiredTiger" storage engine, since it requires
-// using 'nojournal' in a replica set, which is not supported when using WT.
-if (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger") {
-    // WT is currently the default engine so it is used when 'storageEngine' is not set.
-    jsTest.log("Skipping test because it is not applicable for the wiredTiger storage engine");
-    return;
+if (jsTest.options().storageEngine !== "inMemory") {
+    jsTest.log("Skipping test because it is only applicable for the inMemory storage engine");
+    quit();
 }
 
 var nodeCount = 3;
 var rst = new ReplSetTest({nodes: nodeCount});
-rst.startSet({nojournal: ""});
+rst.startSet();
 rst.initiate();
 
 var primary = rst.getPrimary();
@@ -74,4 +72,3 @@ assert(!res.writeConcernError);
 });
 
 rst.stopSet();
-})();

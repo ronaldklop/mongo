@@ -27,18 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <list>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -88,6 +98,23 @@ TEST_F(DocumentSourceLimitTest, TwoLimitStagesShouldCombineIntoOne) {
     firstLimit->optimizeAt(container.begin(), &container);
     ASSERT_EQUALS(5, firstLimit->getLimit());
     ASSERT_EQUALS(1U, container.size());
+}
+
+TEST_F(DocumentSourceLimitTest, DoesNotPushProjectBeforeSelf) {
+    Pipeline::SourceContainer container;
+    auto limit = DocumentSourceLimit::create(getExpCtx(), 10);
+    auto project =
+        DocumentSourceProject::create(BSON("fullDocument" << true), getExpCtx(), "$project"_sd);
+
+    container.push_back(limit);
+    container.push_back(project);
+
+    limit->optimizeAt(container.begin(), &container);
+
+    ASSERT_EQUALS(2U, container.size());
+    ASSERT(dynamic_cast<DocumentSourceLimit*>(container.begin()->get()));
+    ASSERT(dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+        std::next(container.begin())->get()));
 }
 
 TEST_F(DocumentSourceLimitTest, DisposeShouldCascadeAllTheWayToSource) {
@@ -141,6 +168,13 @@ TEST_F(DocumentSourceLimitTest, ShouldPropagatePauses) {
     ASSERT_TRUE(limit->getNext().isEOF());
     ASSERT_TRUE(limit->getNext().isEOF());
     ASSERT_TRUE(limit->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceLimitTest, RedactsCorrectly) {
+    auto limit = DocumentSourceLimit::create(getExpCtx(), 2);
+    ASSERT_VALUE_EQ_AUTO(  // NOLINT
+        "{ $limit: \"?number\" }",
+        redact(*limit));
 }
 
 }  // namespace

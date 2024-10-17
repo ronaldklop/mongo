@@ -29,23 +29,23 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
-// DBClientMockCursor supports only a small subset of DBClientCursor operations.
-// It supports only iteration, including use of DBClientCursorBatchIterator.  If a batchsize
-// is given, iteration is broken up into multiple batches at batchSize boundaries.
 class DBClientMockCursor : public DBClientCursor {
 public:
     DBClientMockCursor(mongo::DBClientBase* client,
                        const BSONArray& mockCollection,
-                       const bool provideResumeToken = false,
+                       bool provideResumeToken = false,
                        unsigned long batchSize = 0);
 
-    virtual ~DBClientMockCursor() {}
+    ~DBClientMockCursor() override {}
 
     bool more() override;
 

@@ -1,36 +1,34 @@
-var syncFrom;
-var wait;
-var occasionally;
-var reconnect;
-var getLatestOp;
-var getLeastRecentOp;
-var waitForAllMembers;
-var reconfig;
-var awaitOpTime;
-var waitUntilAllNodesCaughtUp;
-var waitForState;
-var reInitiateWithoutThrowingOnAbortedMember;
-var awaitRSClientHosts;
-var getLastOpTime;
-var getFirstOplogEntry;
-var setLogVerbosity;
-var stopReplicationAndEnforceNewPrimaryToCatchUp;
-var setFailPoint;
-var clearFailPoint;
-var isConfigCommitted;
-var assertSameConfigContent;
-var getConfigWithNewlyAdded;
-var isMemberNewlyAdded;
-var replConfigHasNewlyAddedMembers;
-var waitForNewlyAddedRemovalForNodeToBeCommitted;
-var assertVoteCount;
-var disconnectSecondaries;
-var reconnectSecondaries;
-var selectDelayFieldName;
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
+export var syncFrom;
+export var wait;
+export var occasionally;
+export var reconnect;
+export var getLatestOp;
+export var waitForAllMembers;
+export var reconfig;
+export var safeReconfigShouldFail;
+export var awaitOpTime;
+export var waitUntilAllNodesCaughtUp;
+export var waitForState;
+export var reInitiateWithoutThrowingOnAbortedMember;
+export var awaitRSClientHosts;
+export var getLastOpTime;
+export var getFirstOplogEntry;
+export var setLogVerbosity;
+export var stopReplicationAndEnforceNewPrimaryToCatchUp;
+export var isConfigCommitted;
+export var assertSameConfigContent;
+export var isSameConfigContent;
+export var getConfigWithNewlyAdded;
+export var isMemberNewlyAdded;
+export var waitForNewlyAddedRemovalForNodeToBeCommitted;
+export var assertVoteCount;
+export var disconnectSecondaries;
+export var reconnectSecondaries;
+export var createRstArgs;
+export var createRst;
 
 var count = 0;
 var w = 0;
@@ -130,13 +128,13 @@ reconnect = function(conn) {
         try {
             // Make this work with either dbs or connections.
             if (typeof (conn.getDB) == "function") {
-                db = conn.getDB('foo');
+                db = conn.getDB('config');
             } else {
                 db = conn;
             }
 
             // Run a simple command to re-establish connection.
-            db.bar.stats();
+            db.settings.stats();
 
             // SERVER-4241: Shell connections don't re-authenticate on reconnect.
             if (jsTest.options().keyFile) {
@@ -154,16 +152,6 @@ getLatestOp = function(server) {
     server.getDB("admin").getMongo().setSecondaryOk();
     var log = server.getDB("local")['oplog.rs'];
     var cursor = log.find({}).sort({'$natural': -1}).limit(1);
-    if (cursor.hasNext()) {
-        return cursor.next();
-    }
-    return null;
-};
-
-getLeastRecentOp = function({server, readConcern}) {
-    server.getDB("admin").getMongo().setSecondaryOk();
-    const oplog = server.getDB("local").oplog.rs;
-    const cursor = oplog.find().sort({$natural: 1}).limit(1).readConcern(readConcern);
     if (cursor.hasNext()) {
         return cursor.next();
     }
@@ -206,8 +194,9 @@ waitForAllMembers = function(master, timeout) {
  * Run a 'replSetReconfig' command with one retry on NodeNotFound and multiple retries on
  * ConfigurationInProgress, CurrentConfigNotCommittedYet, and
  * NewReplicaSetConfigurationIncompatible.
+ * Expect the reconfig to fail if shouldFail is set to true.
  */
-function reconfigWithRetry(primary, config, force) {
+function reconfigWithRetry(primary, config, force, shouldFail = false, errCode, errMsg) {
     const admin = primary.getDB("admin");
     force = force || false;
     let reconfigCommand = {
@@ -253,7 +242,19 @@ function reconfigWithRetry(primary, config, force) {
             }
         }
 
-        assert.commandWorked(res);
+        if (!shouldFail) {
+            assert.commandWorked(res);
+        } else {
+            assert.commandFailed(res);
+            if (errCode) {
+                assert.eq(res.code, errCode);
+            }
+
+            if (errMsg) {
+                assert(res.errmsg.includes(errMsg));
+            }
+        }
+
         return true;
     });
 }
@@ -397,7 +398,6 @@ function autoReconfig(rst, targetConfig) {
  *     secondary, or arbiter states
  */
 reconfig = function(rst, config, force, doNotWaitForMembers) {
-    "use strict";
     var primary = rst.getPrimary();
     config = rst._updateConfigIfNotDurable(config);
 
@@ -417,6 +417,20 @@ reconfig = function(rst, config, force, doNotWaitForMembers) {
         waitForAllMembers(primaryAdminDB);
     }
     return primaryAdminDB;
+};
+
+/**
+ * Tests that a replica set safe reconfiguration on the given ReplSetTest instance should fail.
+ *
+ * @param rst - a ReplSetTest instance.
+ * @param config - the desired target config.
+ * @param force - should this be a 'force' reconfig or not.
+ * @param errCode - if exists, we verify that the reconfig fails with this errCode.
+ * @param errMsg - if exists, we verify that the reconfig fails with error message containing this
+ * errMsg.
+ */
+safeReconfigShouldFail = function(rst, config, force, errCode, errMsg) {
+    reconfigWithRetry(rst.getPrimary(), config, force, true /* shouldFail */, errCode, errMsg);
 };
 
 awaitOpTime = function(catchingUpNode, latestOpTimeNode) {
@@ -516,8 +530,8 @@ reInitiateWithoutThrowingOnAbortedMember = function(replSetTest) {
     try {
         replSetTest.reInitiate();
     } catch (e) {
-        // reInitiate can throw because it tries to run an ismaster command on
-        // all secondaries, including the new one that may have already aborted
+        // reInitiate can throw because it tries to run a "hello" command on all secondaries,
+        // including the new one that may have already aborted
         const errMsg = tojson(e);
         if (isNetworkError(e)) {
             // Ignore these exceptions, which are indicative of an aborted node
@@ -571,7 +585,7 @@ awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
                 // Check that *all* host properties are set correctly
                 var propOk = true;
                 for (var prop in hostOk) {
-                    // Use special comparator for tags because isMaster can return the fields in
+                    // Use special comparator for tags because hello can return the fields in
                     // different order. The fields of the tags should be treated like a set of
                     // strings and 2 tags should be considered the same if the set is equal.
                     if (prop == 'tags') {
@@ -631,16 +645,22 @@ getLastOpTime = function(conn) {
 /**
  * Returns the oldest oplog entry.
  */
-getFirstOplogEntry = function(conn) {
-    let firstEntry;
+getFirstOplogEntry = function(server, opts = {}) {
+    server.getDB("admin").getMongo().setSecondaryOk();
+
+    let firstEntryQuery = server.getDB('local').oplog.rs.find().sort({$natural: 1}).limit(1);
+    if (opts.readConcern) {
+        firstEntryQuery = firstEntryQuery.readConcern(opts.readConcern);
+    }
+
     // The query plan may yield between the cursor establishment and iterating to retrieve the first
     // result. During this yield it's possible for the oplog to "roll over" or shrink. This is rare,
     // but if these both happen the cursor will be unable to resume after yielding and return a
     // "CappedPositionLost" error. This can be safely retried.
+    let firstEntry;
     assert.soon(() => {
         try {
-            firstEntry =
-                conn.getDB('local').oplog.rs.find().sort({$natural: 1}).limit(1).toArray()[0];
+            firstEntry = firstEntryQuery.toArray()[0];
             return true;
         } catch (e) {
             if (e.code == ErrorCodes.CappedPositionLost) {
@@ -677,7 +697,26 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
     const oldSecondaries = rst.getSecondaries();
     const oldPrimary = rst.getPrimary();
 
+    // It's possible for the old primary to be running internal writes from the PrimaryOnlyService
+    // at random. This means that when we halt replication on the secondaries, a race may occur
+    // in which one secondary may have replicated the internal write already while the other hasn't
+    // yet. Therefore, we ensure that the passed in 'node' is ahead of the other secondaries through
+    // some writes to a junk collection 'junk_coll' to guarantee that 'node' can get elected.
+    assert.commandWorked(oldPrimary.getDB("test").junk_coll.remove({}));
+    rst.awaitReplication();
     stopServerReplication(oldSecondaries);
+    // Restart replication on just the selected node, and allow it to progress ahead of the other
+    // secondaries before stopping replication on it again.
+    restartServerReplication(node);
+    assert.commandWorked(oldPrimary.getDB("test").junk_coll.insert({junk: 0}));
+    assert.soon(
+        () => {
+            return node.getDB("test").junk_coll.find().readConcern("local").itcount() == 1;
+        },
+        `Unexpected document count: ${
+            node.getDB("test").junk_coll.find().readConcern("local").itcount()}`);
+    stopServerReplication(node);
+
     for (let i = 0; i < 3; i++) {
         assert.commandWorked(oldPrimary.getDB("test").foo.insert({x: i}));
     }
@@ -702,26 +741,6 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
 };
 
 /**
- * Sets the specified failpoint to 'alwaysOn' on the node and returns the number of
- * times the fail point has been entered so far.
- */
-setFailPoint = function(node, failpoint, data = {}) {
-    jsTestLog("Setting fail point " + failpoint);
-    let configureFailPointRes =
-        node.adminCommand({configureFailPoint: failpoint, mode: "alwaysOn", data: data});
-    assert.commandWorked(configureFailPointRes);
-    return configureFailPointRes.count;
-};
-
-/**
- * Sets the specified failpoint to 'off' on the node.
- */
-clearFailPoint = function(node, failpoint) {
-    jsTestLog("Clearing fail point " + failpoint);
-    assert.commandWorked(node.adminCommand({configureFailPoint: failpoint, mode: "off"}));
-};
-
-/**
  * Returns the replSetGetConfig field 'commitmentStatus', which is true or false.
  */
 isConfigCommitted = function(node) {
@@ -735,19 +754,28 @@ isConfigCommitted = function(node) {
  * 'term' field.
  */
 assertSameConfigContent = function(configA, configB) {
+    assert(isSameConfigContent(configA, configB));
+};
+
+/**
+ * Returns true if replica set config A is the same as replica set config B ignoring the 'version'
+ * and 'term' field.
+ */
+isSameConfigContent = function(configA, configB) {
     // Save original versions and terms.
     const [versionA, termA] = [configA.version, configA.term];
     const [versionB, termB] = [configB.version, configB.term];
 
     configA.version = configA.term = 0;
     configB.version = configB.term = 0;
-    assert.eq(configA, configB);
+    const isEqual = tojson(configA) === tojson(configB);
 
     // Reset values so we don't modify the original objects.
     configA.version = versionA;
     configA.term = termA;
     configB.version = versionB;
     configB.term = termB;
+    return isEqual;
 };
 
 /**
@@ -789,11 +817,6 @@ isMemberNewlyAdded = function(node, memberIndex) {
     }
 
     return hasNewlyAdded(memberIndex);
-};
-
-// Returns true if at least one member in the repl set config contains "newlyAdded" field.
-replConfigHasNewlyAddedMembers = function(conn) {
-    return isMemberNewlyAdded(conn);
 };
 
 waitForNewlyAddedRemovalForNodeToBeCommitted = function(node, memberIndex, force = false) {
@@ -838,16 +861,37 @@ reconnectSecondaries = function(rst) {
     }
 };
 
-/**
- * If featureFlagUseSecondaryDelaySecs is enabled, we must use the 'secondaryDelaySecs' field name
- * in our config. Otherwise, we use 'slaveDelay'. This helper implements the logic to determine
- * which field to use.
- */
-selectDelayFieldName = function(rst) {
-    const useSecondaryDelaySecs =
-        rst.nodes[0]
-            .adminCommand({getParameter: 1, featureFlagUseSecondaryDelaySecs: 1})
-            .featureFlagUseSecondaryDelaySecs.value;
-    return useSecondaryDelaySecs ? "secondaryDelaySecs" : "slaveDelay";
+createRstArgs = function(rst) {
+    const rstArgs = {
+        name: rst.name,
+        nodeHosts: rst.nodes.map(node => `127.0.0.1:${node.port}`),
+        nodeOptions: rst.nodeOptions,
+        keyFile: rst.keyFile,
+        host: rst.host,
+        waitForKeys: false,
+    };
+    return rstArgs;
 };
-}());
+
+/**
+ * Returns a new ReplSetTest created based on the given 'rstArgs'. If 'retryOnRetryableErrors'
+ * is true, retries on retryable errors (e.g. errors caused by shutdown).
+ */
+createRst = function(rstArgs, retryOnRetryableErrors) {
+    const kCreateRstRetryIntervalMS = 100;
+
+    while (true) {
+        try {
+            return new ReplSetTest({rstArgs: rstArgs});
+        } catch (e) {
+            if (retryOnRetryableErrors && isNetworkError(e)) {
+                jsTest.log(`Failed to create ReplSetTest for ${
+                    rstArgs.name} inside tenant migration thread: ${tojson(e)}. Retrying in ${
+                    kCreateRstRetryIntervalMS}ms.`);
+                sleep(kCreateRstRetryIntervalMS);
+                continue;
+            }
+            throw e;
+        }
+    }
+};

@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
 #include "mongo/platform/visibility_test_lib2.h"
-
-#include <cstdlib>
+#include "mongo/util/exit_code.h"
 
 int main(int argc, char* argv[]) {
     mongo::visibility_test_lib2::Derived d("hello", argc);
-    return (d.value() == argc) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (d.value() == argc) ? static_cast<int>(mongo::ExitCode::clean)
+                               : static_cast<int>(mongo::ExitCode::fail);
 }

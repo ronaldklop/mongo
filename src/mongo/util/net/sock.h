@@ -29,11 +29,11 @@
 
 #pragma once
 
-#include <stdio.h>
+#include <cstdio>
 
 #ifndef _WIN32
 
-#include <errno.h>
+#include <cerrno>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -63,7 +63,7 @@ namespace mongo {
 class SSLManagerInterface;
 class SSLConnectionInterface;
 #endif
-struct SSLPeerInfo;
+class SSLPeerInfo;
 
 extern const int portSendFlags;
 extern const int portRecvFlags;
@@ -109,12 +109,12 @@ public:
      *  an error, or due to a timeout on connection, or due to the system socket deciding the
      *  socket is invalid.
      */
-    bool connect(SockAddr& remote, Milliseconds connectTimeoutMillis);
+    bool connect(const SockAddr& remote, Milliseconds connectTimeoutMillis);
 
     /**
      * Connect using a default connect timeout of min(_timeout * 1000, kMaxConnectTimeoutMS)
      */
-    bool connect(SockAddr& remote);
+    bool connect(const SockAddr& remote);
 
     void close();
     void send(const char* data, int len, const char* context);

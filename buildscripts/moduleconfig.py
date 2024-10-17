@@ -24,8 +24,12 @@ MongoDB module SConscript files can describe libraries, programs and unit tests,
 MongoDB SConscript files do.
 """
 
-__all__ = ('discover_modules', 'discover_module_directories', 'configure_modules',
-           'register_module_test')  # pylint: disable=undefined-all-variable
+__all__ = (
+    "discover_modules",
+    "discover_module_directories",
+    "configure_modules",
+    "register_module_test",
+)  # pylint: disable=undefined-all-variable
 
 import imp
 import inspect
@@ -38,19 +42,28 @@ def discover_modules(module_root, allowed_modules):
     Return a list of imported build.py module objects.
     """
     found_modules = []
+    found_module_names = []
 
     if allowed_modules is not None:
-        allowed_modules = allowed_modules.split(',')
+        allowed_modules = allowed_modules.split(",")
+        # When `--modules=` is passed, the split on empty string is represented
+        # in memory as ['']
+        if allowed_modules == [""]:
+            allowed_modules = []
 
     if not os.path.isdir(module_root):
+        if allowed_modules:
+            raise RuntimeError(
+                f"Requested the following modules: {allowed_modules}, but the module root '{module_root}' could not be found. Check the module root, or remove the module from the scons invocation."
+            )
         return found_modules
 
     for name in os.listdir(module_root):
         root = os.path.join(module_root, name)
-        if name.startswith('.') or not os.path.isdir(root):
+        if name.startswith(".") or not os.path.isdir(root):
             continue
 
-        build_py = os.path.join(root, 'build.py')
+        build_py = os.path.join(root, "build.py")
         module = None
 
         if allowed_modules is not None and name not in allowed_modules:
@@ -61,15 +74,22 @@ def discover_modules(module_root, allowed_modules):
             print("adding module: %s" % (name))
             fp = open(build_py, "r")
             try:
-                module = imp.load_module("module_" + name, fp, build_py,
-                                         (".py", "r", imp.PY_SOURCE))
+                module = imp.load_module(
+                    "module_" + name, fp, build_py, (".py", "r", imp.PY_SOURCE)
+                )
                 if getattr(module, "name", None) is None:
                     module.name = name
                 found_modules.append(module)
+                found_module_names.append(name)
             finally:
                 fp.close()
         except (FileNotFoundError, IOError):
             pass
+
+    if allowed_modules is not None:
+        missing_modules = set(allowed_modules) - set(found_module_names)
+        if missing_modules:
+            raise RuntimeError(f"Failed to locate all modules. Could not find: {missing_modules}")
 
     return found_modules
 
@@ -85,14 +105,14 @@ def discover_module_directories(module_root, allowed_modules):
     found_modules = []
 
     if allowed_modules is not None:
-        allowed_modules = allowed_modules.split(',')
+        allowed_modules = allowed_modules.split(",")
 
     for name in os.listdir(module_root):
         root = os.path.join(module_root, name)
-        if name.startswith('.') or not os.path.isdir(root):
+        if name.startswith(".") or not os.path.isdir(root):
             continue
 
-        build_py = os.path.join(root, 'build.py')
+        build_py = os.path.join(root, "build.py")
 
         if allowed_modules is not None and name not in allowed_modules:
             print("skipping module: %s" % (name))
@@ -113,16 +133,16 @@ def configure_modules(modules, conf):
     The configure() function should prepare the Mongo build system for building the module.
     """
     env = conf.env
-    env['MONGO_MODULES'] = []
+    env["MONGO_MODULES"] = []
     for module in modules:
         name = module.name
         print("configuring module: %s" % (name))
         modules_configured = module.configure(conf, env)
         if modules_configured:
             for module_name in modules_configured:
-                env['MONGO_MODULES'].append(module_name)
+                env["MONGO_MODULES"].append(module_name)
         else:
-            env['MONGO_MODULES'].append(name)
+            env["MONGO_MODULES"].append(name)
 
 
 def get_module_sconscripts(modules):
@@ -130,7 +150,7 @@ def get_module_sconscripts(modules):
     sconscripts = []
     for mod in modules:
         module_dir_path = __get_src_relative_path(os.path.join(os.path.dirname(mod.__file__)))
-        sconscripts.append(os.path.join(module_dir_path, 'SConscript'))
+        sconscripts.append(os.path.join(module_dir_path, "SConscript"))
     return sconscripts
 
 
@@ -141,11 +161,11 @@ def __get_src_relative_path(path):
     established in the SConstruct file.  For variant directories to work properly
     in SCons, paths relative to the src or BUILD_DIR must often be generated.
     """
-    src_dir = os.path.abspath('src')
+    src_dir = os.path.abspath("src")
     path = os.path.abspath(os.path.normpath(path))
     if not path.startswith(src_dir):
         raise ValueError('Path "%s" is not relative to the src directory "%s"' % (path, src_dir))
-    result = path[len(src_dir) + 1:]
+    result = path[len(src_dir) + 1 :]
     return result
 
 
@@ -164,7 +184,7 @@ def __get_module_src_path(module_frame_depth):
     module_frame_depth is the number of frames above the current one in which one can find a
     function from the MongoDB module's build.py function.
     """
-    return os.path.join('src', __get_module_path(module_frame_depth + 1))
+    return os.path.join("src", __get_module_path(module_frame_depth + 1))
 
 
 def __get_module_build_path(module_frame_depth):
@@ -173,7 +193,7 @@ def __get_module_build_path(module_frame_depth):
     module_frame_depth is the number of frames above the current one in which one can find a
     function from the MongoDB module's build.py function.
     """
-    return os.path.join('$BUILD_DIR', __get_module_path(module_frame_depth + 1))
+    return os.path.join("$BUILD_DIR", __get_module_path(module_frame_depth + 1))
 
 
 def get_current_module_src_path():

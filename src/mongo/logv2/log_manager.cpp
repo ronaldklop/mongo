@@ -27,19 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <functional>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_domain.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_domain_internal.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/logv2/log_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/logv2/log_manager.h"
-
-#include <boost/log/core.hpp>
-
-#include "mongo/base/init.h"
-#include "mongo/logv2/log.h"
-#include "mongo/logv2/log_domain.h"
-#include "mongo/logv2/log_domain_global.h"
-#include "mongo/logv2/log_util.h"
 
 namespace mongo::logv2 {
 
@@ -52,33 +54,6 @@ struct LogManager::Impl {
 
 LogManager::LogManager() {
     _impl = std::make_unique<Impl>();
-
-    boost::log::core::get()->set_exception_handler([]() {
-        thread_local uint32_t depth = 0;
-        auto depthGuard = makeGuard([]() { --depth; });
-        ++depth;
-        // Try and log that we failed to log
-        if (depth == 1) {
-            std::exception_ptr ex = nullptr;
-            try {
-                throw;
-            } catch (const DBException&) {
-                ex = std::current_exception();
-            } catch (...) {
-                LOGV2(4638200,
-                      "Exception during log, message not written to stream",
-                      "exception"_attr = exceptionToStatus());
-            }
-            if (ex)
-                std::rethrow_exception(ex);
-        }
-
-        // Logging exceptions are fatal in debug builds. Guard ourselves from additional logging
-        // during the assert that might also fail
-        if (kDebugBuild && depth <= 2) {
-            dassert(false, "Exception during log");
-        }
-    });
 }
 
 LogManager::~LogManager() {}
@@ -101,9 +76,12 @@ LogComponentSettings& LogManager::getGlobalSettings() {
 }
 
 MONGO_INITIALIZER(GlobalLogRotator)(InitializerContext*) {
-    addLogRotator(logv2::kServerLogTag, [](bool renameFiles, StringData suffix) {
-        return LogManager::global().getGlobalDomainInternal().rotate(renameFiles, suffix);
-    });
+    addLogRotator(
+        logv2::kServerLogTag,
+        [](bool renameFiles, StringData suffix, std::function<void(Status)> onMinorError) {
+            return LogManager::global().getGlobalDomainInternal().rotate(
+                renameFiles, suffix, onMinorError);
+        });
 }
 
 }  // namespace mongo::logv2

@@ -29,15 +29,102 @@
 
 #pragma once
 
+#include "mongo/db/query/plan_insert_listener.h"
 #include <boost/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <deque>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/restore_context.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/yieldable.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
+
+/**
+ * Query execution helper. Runs the argument function 'f'. If 'f' throws an exception other than
+ * 'WriteConflictException' or 'TemporarilyUnavailableException', then these exceptions escape
+ * this function. In contrast 'WriteConflictException' or 'TemporarilyUnavailableException' are
+ * caught, the given 'yieldHandler' is run, and the helper returns PlanStage::NEED_YIELD.
+ *
+ * In a multi-document transaction, it rethrows a TemporarilyUnavailableException as a
+ * WriteConflictException.
+ */
+template <typename F, typename H>
+MONGO_WARN_UNUSED_RESULT_FUNCTION PlanStage::StageState handlePlanStageYield(
+    ExpressionContext* expCtx, StringData opStr, F&& f, H&& yieldHandler) {
+    auto opCtx = expCtx->opCtx;
+    invariant(opCtx);
+    invariant(shard_role_details::getLocker(opCtx));
+    invariant(shard_role_details::getRecoveryUnit(opCtx));
+    invariant(!expCtx->getTemporarilyUnavailableException());
+
+    try {
+        return f();
+    } catch (const ExceptionFor<ErrorCodes::WriteConflict>&) {
+        CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
+        yieldHandler();
+        return PlanStage::NEED_YIELD;
+    } catch (const ExceptionFor<ErrorCodes::TemporarilyUnavailable>& e) {
+        if (opCtx->inMultiDocumentTransaction()) {
+            convertToWCEAndRethrow(opCtx, opStr, e);
+        }
+        expCtx->setTemporarilyUnavailableException(true);
+        yieldHandler();
+        return PlanStage::NEED_YIELD;
+    } catch (const ExceptionFor<ErrorCodes::TransactionTooLargeForCache>&) {
+        if (opCtx->writesAreReplicated()) {
+            // Surface error on primaries.
+            throw;
+        }
+
+        // If an operation succeeds on primary, it should always be retried on secondaries.
+        // Secondaries always retry TemporarilyUnavailableExceptions and WriteConflictExceptions
+        // indefinitely, the only difference being the rate of retry. We prefer retrying faster, by
+        // converting to WriteConflictException, to avoid stalling replication longer than
+        // necessary.
+        yieldHandler();
+        return PlanStage::NEED_YIELD;
+    } catch (const ExceptionFor<ErrorCodes::ShardCannotRefreshDueToLocksHeld>& ex) {
+        // An operation may need to obtain the cached routing table (CatalogCache) for some
+        // namespace other than the main nss of the plan. When that cache is not immediately
+        // available, a refresh of the CatalogCache is needed. However, this refresh cannot be done
+        // while locks are being held. We handle this by requesting a yield and then refreshing the
+        // CatalogCache after having released the locks.
+        const auto& extraInfo = ex.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+        planExecutorShardingState(expCtx->opCtx).catalogCacheRefreshRequired = extraInfo->getNss();
+        yieldHandler();
+        return PlanStage::NEED_YIELD;
+    }
+}
 
 class CappedInsertNotifier;
 class CollectionScan;
@@ -59,36 +146,52 @@ public:
                      std::unique_ptr<QuerySolution> qs,
                      std::unique_ptr<CanonicalQuery> cq,
                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                     const CollectionPtr& collection,
+                     VariantCollectionPtrOrAcquisition collection,
                      bool returnOwnedBson,
                      NamespaceString nss,
-                     PlanYieldPolicy::YieldPolicy yieldPolicy);
+                     PlanYieldPolicy::YieldPolicy yieldPolicy,
+                     boost::optional<size_t> cachedPlanHash,
+                     QueryPlanner::CostBasedRankerResult cbrResult,
+                     stage_builder::PlanStageToQsnMap planStageQsnMap,
+                     std::vector<std::unique_ptr<PlanStage>> cbrRejectedPlanStages);
 
-    virtual ~PlanExecutorImpl();
+    ~PlanExecutorImpl() override;
     CanonicalQuery* getCanonicalQuery() const final;
     const NamespaceString& nss() const final;
+    const std::vector<NamespaceStringOrUUID>& getSecondaryNamespaces() const final;
     OperationContext* getOpCtx() const final;
     void saveState() final;
     void restoreState(const RestoreContext& context) final;
     void detachFromOperationContext() final;
     void reattachToOperationContext(OperationContext* opCtx) final;
+
     ExecState getNextDocument(Document* objOut, RecordId* dlOut) final;
     ExecState getNext(BSONObj* out, RecordId* dlOut) final;
+    size_t getNextBatch(size_t batchSize, AppendBSONObjFn append) final;
+
     bool isEOF() final;
     long long executeCount() override;
-    UpdateResult executeUpdate() override;
     UpdateResult getUpdateResult() const override;
-    long long executeDelete() override;
+    long long getDeleteResult() const override;
+    BatchedDeleteStats getBatchedDeleteStats() override;
     void markAsKilled(Status killStatus) final;
     void dispose(OperationContext* opCtx) final;
-    void enqueue(const BSONObj& obj) final;
-    bool isMarkedAsKilled() const final;
+    void stashResult(const BSONObj& obj) final;
+
+    MONGO_COMPILER_ALWAYS_INLINE bool isMarkedAsKilled() const final {
+        return !_killStatus.isOK();
+    }
+
     Status getKillStatus() final;
     bool isDisposed() const final;
     Timestamp getLatestOplogTimestamp() const final;
     BSONObj getPostBatchResumeToken() const final;
     LockPolicy lockPolicy() const final;
     const PlanExplainer& getPlanExplainer() const final;
+
+    PlanExecutor::QueryFramework getQueryFramework() const final {
+        return PlanExecutor::QueryFramework::kClassicOnly;
+    }
 
     /**
      * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
@@ -104,32 +207,65 @@ public:
 
     PlanStage* getRootStage() const;
 
-private:
-    /**
-     *  Executes the underlying PlanStage tree until it indicates EOF. Throws an exception if the
-     *  plan results in an error.
-     *
-     *  Useful for cases where the caller wishes to execute the plan and extract stats from it (e.g.
-     *  the result of a count or update) rather than returning a set of resulting documents.
-     */
-    void _executePlan();
+    void enableSaveRecoveryUnitAcrossCommandsIfSupported() override {}
+    bool isSaveRecoveryUnitAcrossCommandsEnabled() const override {
+        return false;
+    }
+
+    void setReturnOwnedData(bool returnOwnedData) final {
+        _mustReturnOwnedBson = returnOwnedData;
+    }
+
+    bool usesCollectionAcquisitions() const final;
 
     /**
-     * Called on construction in order to ensure that when callers receive a new instance of a
-     * 'PlanExecutorImpl', plan selection has already been completed.
-     *
-     * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
-     * this calls into their underlying plan selection facilities. Otherwise, does nothing.
-     *
-     * If a YIELD_AUTO policy is set then locks are yielded during plan selection.
-     *
-     * Returns a non-OK status if query planning fails. In particular, this function returns
-     * ErrorCodes::QueryPlanKilled if plan execution cannot proceed due to a concurrent write or
-     * catalog operation.
+     * It is used to detect if the plan excutor obtained after multiplanning is using a distinct
+     * scan stage. That's because in this scenario modifications to the pipeline in the context of
+     * aggregation need to be made.
      */
-    Status _pickBestPlan();
+    bool isUsingDistinctScan() const final {
+        auto soln = getQuerySolution();
+        return soln && soln->root()->hasNode(STAGE_DISTINCT_SCAN);
+    }
+
+private:
+    const QuerySolution* getQuerySolution() const {
+        if (_qs) {
+            return _qs.get();
+        }
+        if (const MultiPlanStage* mps = getMultiPlanStage()) {
+            return mps->bestSolution();
+        }
+        return nullptr;
+    }
 
     ExecState _getNextImpl(Snapshotted<Document>* objOut, RecordId* dlOut);
+
+    // Helper for handling the NEED_YIELD stage state.
+    void _handleNeedYield(size_t& writeConflictsInARow, size_t& tempUnavailErrorsInARow);
+
+    // Helper for handling the EOF stage state. Returns whether or not to stop doing work().
+    bool _handleEOFAndExit(PlanStage::StageState code,
+                           std::unique_ptr<insert_listener::Notifier>& notifier);
+
+    MONGO_COMPILER_ALWAYS_INLINE void _checkIfMustYield(std::function<void()> whileYieldingFn) {
+        // These are the conditions which can cause us to yield:
+        //   1) The yield policy's timer elapsed, or
+        //   2) some stage requested a yield, or
+        //   3) we need to yield and retry due to a WriteConflictException.
+        // In all cases, the actual yielding happens here.
+        if (_yieldPolicy->shouldYieldOrInterrupt(_opCtx)) {
+            uassertStatusOK(_yieldPolicy->yieldOrInterrupt(_opCtx, whileYieldingFn));
+        }
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE void _checkIfKilled() {
+        if (MONGO_unlikely(isMarkedAsKilled())) {
+            uassertStatusOK(_killStatus);
+        }
+    }
+
+    std::unique_ptr<insert_listener::Notifier> makeNotifier();
 
     // The OperationContext that we're executing within. This can be updated if necessary by using
     // detachFromOperationContext() and reattachToOperationContext().
@@ -154,7 +290,7 @@ private:
     Status _killStatus = Status::OK();
 
     // Whether the executor must return owned BSON.
-    const bool _mustReturnOwnedBson;
+    bool _mustReturnOwnedBson;
 
     // What namespace are we operating over?
     NamespaceString _nss;
@@ -165,7 +301,7 @@ private:
     // A stash of results generated by this plan that the user of the PlanExecutor didn't want
     // to consume yet. We empty the queue before retrieving further results from the plan
     // stages.
-    std::queue<Document> _stash;
+    std::deque<Document> _stash;
 
     // The output document that is used by getNext BSON API. This allows us to avoid constantly
     // allocating and freeing DocumentStorage.

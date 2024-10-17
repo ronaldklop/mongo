@@ -27,26 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <ostream>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/thread_pool_test_common.h"
-#include "mongo/util/concurrency/thread_pool_test_fixture.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace {
 using namespace mongo;
@@ -71,7 +80,7 @@ protected:
     }
 
     void blockingWork() {
-        stdx::unique_lock<Latch> lk(mutex);
+        stdx::unique_lock<stdx::mutex> lk(mutex);
         ++count1;
         cv1.notify_all();
         while (!flag2) {
@@ -79,7 +88,7 @@ protected:
         }
     }
 
-    Mutex mutex = MONGO_MAKE_LATCH("ThreadPoolTest::mutex");
+    stdx::mutex mutex;
     stdx::condition_variable cv1;
     stdx::condition_variable cv2;
     size_t count1 = 0U;
@@ -87,7 +96,7 @@ protected:
 
 private:
     void tearDown() override {
-        stdx::unique_lock<Latch> lk(mutex);
+        stdx::unique_lock<stdx::mutex> lk(mutex);
         flag2 = true;
         cv2.notify_all();
         lk.unlock();
@@ -104,7 +113,7 @@ TEST_F(ThreadPoolTest, MinPoolSize0) {
     auto& pool = makePool(options);
     pool.startup();
     ASSERT_EQ(0U, pool.getStats().numThreads);
-    stdx::unique_lock<Latch> lk(mutex);
+    stdx::unique_lock<stdx::mutex> lk(mutex);
     pool.schedule([this](auto status) {
         ASSERT_OK(status);
         blockingWork();
@@ -156,7 +165,7 @@ TEST_F(ThreadPoolTest, MaxPoolSize20MinPoolSize15) {
     options.maxIdleThreadAge = Milliseconds(100);
     auto& pool = makePool(options);
     pool.startup();
-    stdx::unique_lock<Latch> lk(mutex);
+    stdx::unique_lock<stdx::mutex> lk(mutex);
     for (size_t i = 0U; i < 30U; ++i) {
         pool.schedule([this, i](auto status) {
             ASSERT_OK(status) << i;
@@ -218,42 +227,50 @@ TEST(ThreadPoolTest, LivePoolCleanedByDestructor) {
 DEATH_TEST_REGEX(ThreadPoolTest,
                  DestructionDuringJoinDies,
                  "Attempted to join pool.*more than once.*DoubleJoinPool") {
-    // This test is a little complicated. We need to ensure that the ThreadPool destructor runs
-    // while some thread is blocked running ThreadPool::join, to see that double-join is fatal in
-    // the pool destructor. To do this, we first wait for minThreads threads to have started. Then,
-    // we create and lock a mutex in the test thread, schedule a work item in the pool to lock that
-    // mutex, schedule an independent thread to call join, and wait for numIdleThreads to hit 0
-    // inside the test thread. When that happens, we know that the thread in the pool executing our
-    // mutex-lock is blocked waiting for the mutex, so the independent thread must be blocked inside
-    // of join(), until the pool thread finishes. At this point, if we destroy the pool, its
-    // destructor should trigger a fatal error due to double-join.
-    auto mutex = MONGO_MAKE_LATCH();
+    // This test ensures that the ThreadPool destructor runs while some thread is blocked
+    // running ThreadPool::join, to see that double-join is fatal in the pool destructor.
+    stdx::mutex mutex;
     ThreadPool::Options options;
-    options.minThreads = 2;
+    options.minThreads = 1;
+    options.maxThreads = 1;
     options.poolName = "DoubleJoinPool";
     boost::optional<ThreadPool> pool;
     pool.emplace(options);
     pool->startup();
-    while (pool->getStats().numThreads < 2U) {
-        sleepmillis(50);
-    }
-    stdx::unique_lock<Latch> lk(mutex);
+    ASSERT_EQ(1U, pool->getStats().numThreads);
+
+    stdx::unique_lock<stdx::mutex> lk(mutex);
+    // Schedule 2 tasks to ensure that independent thread join() is blocked draining the tasks and
+    // causing the ThreadPool destructor join to fail due to double-join.
     pool->schedule([&mutex](auto status) {
         ASSERT_OK(status);
-        stdx::lock_guard<Latch> lk(mutex);
+        stdx::lock_guard<stdx::mutex> lk(mutex);
     });
-    stdx::thread t([&pool] {
+    pool->schedule([&mutex](auto status) {
+        ASSERT_OK(status);
+        stdx::lock_guard<stdx::mutex> lk(mutex);
+    });
+
+    stdx::thread t;
+    ScopeGuard onExitGuard([&] {
+        lk.unlock();
+        if (t.joinable()) {
+            t.join();
+        }
+    });
+    t = stdx::thread([&pool] {
         pool->shutdown();
         pool->join();
     });
     ThreadPool::Stats stats;
-    while ((stats = pool->getStats()).numIdleThreads != 0U) {
-        sleepmillis(50);
+    while ((stats = pool->getStats()).numPendingTasks != 0U) {
+        sleepmillis(10);
     }
-    ASSERT_EQ(0U, stats.numPendingTasks);
+    // Accounts for cleanup and regular worker thread.
+    ASSERT_EQ(2U, stats.numThreads);
+    ASSERT_EQ(0U, stats.numIdleThreads);
     pool.reset();
-    lk.unlock();
-    t.join();
+    MONGO_UNREACHABLE;
 }
 
 TEST_F(ThreadPoolTest, ThreadPoolRunsOnCreateThreadFunctionBeforeConsumingTasks) {
@@ -282,7 +299,9 @@ TEST(ThreadPoolTest, JoinAllRetiredThreads) {
     options.minThreads = 4;
     options.maxThreads = 8;
     options.maxIdleThreadAge = Milliseconds(100);
-    options.onJoinRetiredThread = [&](const stdx::thread& t) { retiredThreads.addAndFetch(1); };
+    options.onJoinRetiredThread = [&](const stdx::thread& t) {
+        retiredThreads.addAndFetch(1);
+    };
     unittest::Barrier barrier(options.maxThreads + 1);
 
     ThreadPool pool(options);

@@ -29,8 +29,21 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -61,7 +74,7 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         StringData specifiedName) try {
 
-        auto projection = projection_ast::parse(
+        auto projection = projection_ast::parseAndAnalyze(
             expCtx, projectSpec, ProjectionPolicies::aggregateProjectionPolicies());
         return create(projection, expCtx, specifiedName);
     } catch (DBException& ex) {

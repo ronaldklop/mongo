@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/rpc/message.h"
-
 #include <fmt/format.h>
+#include <ostream>
+#include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
 
 namespace mongo {
@@ -44,6 +44,17 @@ AtomicWord<int32_t> NextMsgId;
 
 int32_t nextMessageId() {
     return NextMsgId.fetchAndAdd(1);
+}
+
+void Message::setData(int operation, const char* msgdata, size_t len) {
+    const size_t dataLen = sizeof(MsgData::Value) + len;
+    auto buf = SharedBuffer::allocate(dataLen);
+    MsgData::View d = buf.get();
+    d.setLen(dataLen);
+    d.setOperation(operation);
+    if (len)
+        memcpy(d.data(), msgdata, len);
+    setData(std::move(buf));
 }
 
 std::string Message::opMsgDebugString() const {

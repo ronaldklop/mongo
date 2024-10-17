@@ -27,17 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <map>
 
-#include "mongo/db/update/object_replace_executor.h"
 
+#include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/bson/mutable/element.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/field_ref_set.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/vector_clock_mutable.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -45,19 +58,24 @@ namespace {
 constexpr StringData kIdFieldName = "_id"_sd;
 }  // namespace
 
-ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
-    : _replacementDoc(replacement.getOwned()), _containsId(false) {
-
-    // Replace all zero-valued timestamps with the current time and check for the existence of _id.
+ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement, bool bypassEmptyTsReplacement)
+    : _replacementDoc(replacement.getOwned()),
+      _containsId(false),
+      _bypassEmptyTsReplacement(bypassEmptyTsReplacement) {
+    // Check for the existence of the "_id" field, and if approrpriate replace all zero-valued
+    // timestamps with the current time.
     for (auto&& elem : _replacementDoc) {
-
         // Do not change the _id field.
         if (elem.fieldNameStringData() == kIdFieldName) {
             _containsId = true;
             continue;
         }
 
-        if (elem.type() == BSONType::bsonTimestamp) {
+        // For updates that originated from the oplog, we're required to apply the update
+        // exactly as it was recorded (even if it contains zero-valued timestamps). Therefore,
+        // we should only replace zero-valued timestamps with the current time when
+        // '_bypassEmptyTsReplacement' is false.
+        if (!_bypassEmptyTsReplacement && elem.type() == BSONType::bsonTimestamp) {
             auto timestampView = DataView(const_cast<char*>(elem.value()));
 
             // We don't need to do an endian-safe read here, because 0 is 0 either way.
@@ -72,7 +90,10 @@ ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
-    ApplyParams applyParams, const BSONObj& replacementDoc, bool replacementDocContainsIdField) {
+    ApplyParams applyParams,
+    const BSONObj& replacementDoc,
+    bool replacementDocContainsIdField,
+    bool allowTopLevelDollarPrefixedFields) {
     auto originalDoc = applyParams.element.getDocument().getObject();
 
     // Check for noop.
@@ -100,9 +121,15 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         invariant(applyParams.element.appendElement(elem));
     }
 
-    // Validate for storage.
-    if (applyParams.validateForStorage) {
-        storage_validation::storageValid(applyParams.element.getDocument());
+    ApplyResult ret;
+
+    if (!applyParams.skipDotsDollarsCheck || applyParams.validateForStorage) {
+        // Validate for storage and check if the document contains any '.'/'$' field name. We pass
+        // 'containsDotsAndDollarsField' unconditionally for now.
+        storage_validation::scanDocument(applyParams.element.getDocument(),
+                                         allowTopLevelDollarPrefixedFields,
+                                         applyParams.validateForStorage,
+                                         &ret.containsDotsAndDollarsField);
     }
 
     // Check immutable paths.
@@ -142,7 +169,7 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         }
     }
 
-    return ApplyResult{};
+    return ret;
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyUpdate(ApplyParams applyParams) const {

@@ -6,15 +6,15 @@
  * read.
  *
  * @tags: [
- *   requires_fcv_47,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
 const replSet = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 replSet.startSet();
@@ -80,4 +80,3 @@ for (let db of [primaryDB, secondaryDB]) {
 
 restartReplicationOnSecondaries(replSet);
 replSet.stopSet();
-}());

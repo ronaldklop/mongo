@@ -33,65 +33,104 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/s/sharding_ddl_coordinator.idl"
     - "mongo/s/request_types/sharded_ddl_commands.idl"
 
 enums:
+    # TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
+    CreateCollectionCoordinatorPhaseLegacy:
+        description: "Current create collection coordinator's operation state."
+        type: string
+        values:
+            kUnset: "unset"
+            kCommit: "commit"
+    
     CreateCollectionCoordinatorPhase:
         description: "Current create collection coordinator's operation state."
         type: string
         values:
             kUnset: "unset"
-            kCheck: "check"
-            kCommit: "commit"
+            kEnterWriteCriticalSectionOnCoordinator: "enterWriteCriticalSectionOnCoordinator"
+            kTranslateRequestParameters: "translateRequestParameters"
+            kEnterWriteCSOnDataShardAndCheckEmpty: "enterWriteCSOnDataShardAndCheckEmpty"
+            kSyncIndexesOnCoordinator: "syncIndexesOnCoordinator"
+            kCreateCollectionOnCoordinator: "createCollectionOnCoordinator"
+            kEnterCriticalSection: "enterCriticalSection"
+            kCreateCollectionOnParticipants: "createCollectionOnParticipants"
+            kCommitOnShardingCatalog: "commitOnShardingCatalog"
+            kSetPostCommitMetadata: "setPostCommitMetadata"
+            kExitCriticalSection: "exitCriticalSection"
 
 structs:
+    TranslatedRequestParams:
+        description: "Subset of ShardsvrCreateCollectionRequest fields that may get overridden once the kTranslateRequest phase gets executed"
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            nss:
+                type: namespacestring
+                description: "The namespace that will be used by the DDL while accessing the Sharding Catalog"
+                optional: false
+            keyPattern:
+                type: KeyPattern
+                description: "The shard key that will be used by the DDL while accessing the Sharding Catalog"
+                optional: false
+            collation:
+                type: object_owned
+                description: "Collation value from the targeted unsharded collection if this exists; otherwise, simple-collation"
+                optional: false
+            timeseries:
+                type: TimeseriesOptions
+                description: "The options to create the time-series collection with."
+                optional: true
+
+    # TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
+    CreateCollectionCoordinatorDocumentLegacy:
+        description: "Object with necessary fields to create a collection"
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingDDLCoordinatorMetadata: ShardingDDLCoordinatorMetadata
+            ShardsvrCreateCollectionRequest: ShardsvrCreateCollectionRequest
+        fields:
+            phase:
+                type: CreateCollectionCoordinatorPhaseLegacy
+                description: "Coordinator phase."
+                default: kUnset
+            translatedRequestParams:
+                type: TranslatedRequestParams
+                description: "The field is populated only once the kTranslateRequest phase is completed"
+                optional: true
+
     CreateCollectionCoordinatorDocument:
         description: "Object with neccessary fields to create a collection"
         generate_comparison_operators: false
-        strict: true
+        strict: false
         chained_structs:
             ShardingDDLCoordinatorMetadata: ShardingDDLCoordinatorMetadata
+            ShardsvrCreateCollectionRequest: ShardsvrCreateCollectionRequest
         fields:
             phase:
                 type: CreateCollectionCoordinatorPhase
                 description: "Coordinator phase."
                 default: kUnset
-            shardKeyAlreadyCreated:
-                type: bool
-                description: >- 
-                    If set then the collection already had the shard key index created when the 
-                    command was first invoked. If a step down happens, then the shard index will 
-                    not be dropped on the next attempt at startup.
-                default: false
-            shardKey:
-                type: object_owned
-                description: "The index specification document to use as the shard key."
+            translatedRequestParams:
+                type: TranslatedRequestParams
+                description: "The field is populated only once the kTranslateRequest phase is completed."
                 optional: true
-            unique:
+            collectionIsEmpty:
                 type: bool
-                description: "Whether the shard key index should enforce a unique constraint."
+                description: "True if the collection has no data or does not exist. False otherwise."
                 optional: true
-            numInitialChunks:
-                type: safeInt64
+            shardIds:
+                type: array<shard_id>
+                description: "The list of shards involved in the create collection operation."
+                optional: true
+            originalDataShard:
+                type: shard_id
                 description: >-
-                    The number of chunks to create initially when sharding an empty collection with
-                    a hashed shard key.
-                optional: true
-            presplitHashedZones:
-                type: bool
-                description: >- 
-                    True if the chunks should be pre-split based on the existing zones when 
-                    sharding a collection with hashed shard key.
-                optional: true
-            initialSplitPoints:
-                type: array<object_owned>
-                description: >- 
-                    A specific set of points to create initial splits at, currently used only by
-                    mapReduce.
-                optional: true
-            collation:
-                type: object_owned
-                description: "The collation to use for the shard key index."
+                    The current data shard that the collection lives on. Will be the coordinator
+                    shard if the collection does not yet exist. Only guaranteed to be set after the
+                    enterWriteCSOnDataShardAndCheckEmpty phase completes.
                 optional: true

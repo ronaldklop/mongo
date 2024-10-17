@@ -27,14 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
+#include <boost/cstdint.hpp>
+#include <cstdint>
+#include <initializer_list>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -49,43 +73,16 @@ namespace {
 class DBClientConnectionForTest : public DBClientConnection {
 public:
     DBClientConnectionForTest() {
-        _setServerRPCProtocols(rpc::supports::kAll);       // allow all protocol types by default.
         _serverAddress = HostAndPort("localhost", 27017);  // dummy server address.
     }
 
-    bool call(Message& toSend,
-              Message& response,
-              bool assertOk,
-              std::string* actualServer) override {
-
-        // Intercept request.
-        const auto reqId = nextMessageId();
-        toSend.header().setId(reqId);
-        toSend.header().setResponseToMsgId(0);
-        OpMsg::appendChecksum(&toSend);
-        _lastSent = toSend;
-
-        // Mock response.
-        response = _mockCallResponse;
-        response.header().setId(nextMessageId());
-        response.header().setResponseToMsgId(reqId);
-        OpMsg::appendChecksum(&response);
-
-        return true;
-    }
-
-    Status recv(Message& m, int lastRequestId) override {
-        m = _mockRecvResponse;
-        return Status::OK();
+    Message recv(int lastRequestId) override {
+        return _mockRecvResponse;
     }
 
     // No-op.
     void killCursor(const NamespaceString& ns, long long cursorID) override {
         LOGV2(20131, "Killing cursor in DBClientConnectionForTest");
-    }
-
-    void setSupportedProtocols(rpc::ProtocolSet protocols) {
-        _setServerRPCProtocols(protocols);
     }
 
     void setCallResponse(Message reply) {
@@ -105,6 +102,24 @@ public:
     }
 
 private:
+    Message _call(Message& toSend, std::string* actualServer) override {
+
+        // Intercept request.
+        const auto reqId = nextMessageId();
+        toSend.header().setId(reqId);
+        toSend.header().setResponseToMsgId(0);
+        OpMsg::appendChecksum(&toSend);
+        _lastSent = toSend;
+
+        // Mock response.
+        Message response = _mockCallResponse;
+        response.header().setId(nextMessageId());
+        response.header().setResponseToMsgId(reqId);
+        OpMsg::appendChecksum(&response);
+
+        return response;
+    }
+
     Message _mockCallResponse;
     Message _mockRecvResponse;
     Message _lastSent;
@@ -152,8 +167,9 @@ protected:
 TEST_F(DBClientCursorTest, DBClientCursorCallsMetaDataReaderOncePerBatch) {
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, 0, 0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(2);
 
     // Set up mock 'find' response.
@@ -194,13 +210,59 @@ TEST_F(DBClientCursorTest, DBClientCursorCallsMetaDataReaderOncePerBatch) {
     ASSERT_EQ(2, numMetaRead);
 }
 
+TEST_F(DBClientCursorTest, DBClientCursorGetMoreWithTenant) {
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const TenantId tenantId(OID::gen());
+    const NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test", "coll");
+    FindCommandRequest findCmd{nss};
+
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
+    for (bool flagStatus : {false, true}) {
+        RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",
+                                                                   flagStatus);
+
+        DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
+        cursor.setBatchSize(2);
+        ASSERT_EQ(cursor.getNamespaceString(), nss);
+
+        // Set up mock 'find' response.
+        const long long cursorId = 42;
+        Message findResponseMsg = mockFindResponse(nss, cursorId, {docObj(1), docObj(2)});
+        conn.setCallResponse(findResponseMsg);
+
+        // Trigger a find command.
+        ASSERT(cursor.init());
+
+        // First batch from the initial find command.
+        ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+        ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+        ASSERT_FALSE(cursor.moreInCurrentBatch());
+
+        // Set a terminal getMore response with cursorId 0.
+        auto getMoreResponseMsg = mockGetMoreResponse(nss, 0, {docObj(3), docObj(4)});
+        conn.setCallResponse(getMoreResponseMsg);
+
+        // Trigger a subsequent getMore command.
+        ASSERT_TRUE(cursor.more());
+
+        // Second batch from the getMore command.
+        ASSERT_BSONOBJ_EQ(docObj(3), cursor.next());
+        ASSERT_BSONOBJ_EQ(docObj(4), cursor.next());
+        ASSERT_FALSE(cursor.moreInCurrentBatch());
+        ASSERT_TRUE(cursor.isDead());
+    }
+}
+
 TEST_F(DBClientCursorTest, DBClientCursorHandlesOpMsgExhaustCorrectly) {
 
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(
-        &conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, QueryOption_Exhaust, 0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, true /*isExhaust*/);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -262,9 +324,9 @@ TEST_F(DBClientCursorTest, DBClientCursorResendsGetMoreIfMoreToComeFlagIsOmitted
 
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(
-        &conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, QueryOption_Exhaust, 0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, true /*isExhaust*/);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -344,12 +406,11 @@ TEST_F(DBClientCursorTest, DBClientCursorResendsGetMoreIfMoreToComeFlagIsOmitted
 }
 
 TEST_F(DBClientCursorTest, DBClientCursorMoreThrowsExceptionOnNonOKResponse) {
-
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(
-        &conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, QueryOption_Exhaust, 0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, true /*isExhaust*/);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -376,12 +437,11 @@ TEST_F(DBClientCursorTest, DBClientCursorMoreThrowsExceptionOnNonOKResponse) {
 }
 
 TEST_F(DBClientCursorTest, DBClientCursorMoreThrowsExceptionWhenMoreToComeFlagSetWithZeroCursorId) {
-
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(
-        &conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, QueryOption_Exhaust, 0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, true /*isExhaust*/);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -409,67 +469,13 @@ TEST_F(DBClientCursorTest, DBClientCursorMoreThrowsExceptionWhenMoreToComeFlagSe
     ASSERT_THROWS_CODE(cursor.more(), DBException, 50935);
 }
 
-TEST_F(DBClientCursorTest, DBClientCursorIgnoresExhaustForOpQueryMessages) {
-    // Set up the DBClientCursor and a mock client connection. If we set the server RPC protocol to
-    // OpQuery, then when we assemble a command request in DBClientCursor, we will make a command
-    // style OpQuery request, as opposed to an OpMsg request. We want to make sure that for command
-    // style OpQuery requests, we ignore the exhaust option, and that cursor queries work normally.
-    DBClientConnectionForTest conn;
-    conn.setSupportedProtocols(rpc::supports::kOpQueryOnly);
-
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(
-        &conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, QueryOption_Exhaust, 0);
-    cursor.setBatchSize(0);
-
-    // Set up mock 'find' response.
-    const long long cursorId = 42;
-    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
-
-    conn.setCallResponse(findResponseMsg);
-    ASSERT(cursor.init());
-
-    // Verify that the initial 'find' request was sent.
-    auto m = conn.getLastSentMessage();
-    ASSERT(!m.empty());
-    QueryMessage queryMsg(m);
-    ASSERT_EQ(queryMsg.query.getStringField("find"), nss.coll());
-    ASSERT_EQ(queryMsg.query["batchSize"].number(), 0);
-    ASSERT_EQ(0, queryMsg.queryOptions);
-
-    // Create and set a non-exhaust getMore response.
-    cursor.setBatchSize(2);
-    auto getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(1), docObj(2)});
-    conn.setCallResponse(getMoreResponseMsg);
-
-    // Trigger another 'getMore' request.
-    conn.clearLastSentMessage();
-    ASSERT(cursor.more());
-
-    // Make sure the sent request has no exhaust query options set.
-    m = conn.getLastSentMessage();
-    ASSERT(!m.empty());
-    queryMsg = QueryMessage(m);
-    ASSERT_EQ(queryMsg.query["getMore"].number(), cursorId);
-    ASSERT_EQ(queryMsg.query["collection"].str(), nss.coll());
-    ASSERT_EQ(0, queryMsg.queryOptions);
-    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
-    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
-}
-
 TEST_F(DBClientCursorTest, DBClientCursorPassesReadOnceFlag) {
-
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          QUERY("query" << BSONObj() << "$readOnce" << true).obj,
-                          0,
-                          0,
-                          nullptr,
-                          /*QueryOption*/ 0,
-                          0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    findCmd.setReadOnce(true);
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -493,17 +499,11 @@ TEST_F(DBClientCursorTest, DBClientCursorPassesReadOnceFlag) {
 TEST_F(DBClientCursorTest, DBClientCursorPassesResumeFields) {
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          QUERY("query" << BSONObj() << "$_requestResumeToken" << true
-                                        << "$_resumeAfter" << BSON("$recordId" << 5LL))
-                              .obj,
-                          0,
-                          0,
-                          nullptr,
-                          /*QueryOption*/ 0,
-                          0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    findCmd.setRequestResumeToken(true);
+    findCmd.setResumeAfter(BSON("$recordId" << 5LL));
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -535,15 +535,10 @@ TEST_F(DBClientCursorTest, DBClientCursorTailable) {
 
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          Query().obj,
-                          0,
-                          0,
-                          nullptr,
-                          QueryOption_CursorTailable,
-                          0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    findCmd.setTailable(true);
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -634,15 +629,11 @@ TEST_F(DBClientCursorTest, DBClientCursorTailableAwaitData) {
 
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          Query().obj,
-                          0,
-                          0,
-                          nullptr,
-                          QueryOption_CursorTailable | QueryOption_AwaitData,
-                          0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    findCmd.setTailable(true);
+    findCmd.setAwaitData(true);
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -700,15 +691,11 @@ TEST_F(DBClientCursorTest, DBClientCursorTailableAwaitDataExhaust) {
 
     // Set up the DBClientCursor and a mock client connection.
     DBClientConnectionForTest conn;
-    const NamespaceString nss("test", "coll");
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          Query().obj,
-                          0,
-                          0,
-                          nullptr,
-                          QueryOption_CursorTailable | QueryOption_AwaitData | QueryOption_Exhaust,
-                          0);
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    FindCommandRequest findCmd{nss};
+    findCmd.setTailable(true);
+    findCmd.setAwaitData(true);
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, true /*isExhaust*/);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -850,20 +837,19 @@ TEST_F(DBClientCursorTest, DBClientCursorOplogQuery) {
     DBClientConnectionForTest conn;
     const NamespaceString nss = NamespaceString::kRsOplogNamespace;
     const BSONObj filterObj = BSON("ts" << BSON("$gte" << Timestamp(123, 4)));
-    const BSONObj readConcernObj = BSON("afterClusterTime" << Timestamp(0, 1));
+    const auto readConcern = repl::ReadConcernArgs(LogicalTime(Timestamp(0, 1)), boost::none);
     const long long maxTimeMS = 5000LL;
     const long long term = 5;
-    const auto oplogQuery = QUERY("query" << filterObj << "readConcern" << readConcernObj
-                                          << "$maxTimeMS" << maxTimeMS << "term" << term);
 
-    DBClientCursor cursor(&conn,
-                          NamespaceStringOrUUID(nss),
-                          oplogQuery.obj,
-                          0,
-                          0,
-                          nullptr,
-                          QueryOption_CursorTailable | QueryOption_AwaitData,
-                          0);
+    FindCommandRequest findCmd{nss};
+    findCmd.setFilter(filterObj);
+    findCmd.setReadConcern(readConcern);
+    findCmd.setMaxTimeMS(maxTimeMS);
+    findCmd.setTerm(term);
+    findCmd.setTailable(true);
+    findCmd.setAwaitData(true);
+
+    DBClientCursor cursor(&conn, findCmd, ReadPreferenceSetting{}, false);
     cursor.setBatchSize(0);
 
     // Set up mock 'find' response.
@@ -886,7 +872,7 @@ TEST_F(DBClientCursorTest, DBClientCursorOplogQuery) {
     ASSERT_EQ(msg.body["maxTimeMS"].numberLong(), maxTimeMS) << msg.body;
     ASSERT_EQ(msg.body["batchSize"].number(), 0) << msg.body;
     ASSERT_EQ(msg.body["term"].numberLong(), term) << msg.body;
-    ASSERT_BSONOBJ_EQ(msg.body["readConcern"].Obj(), readConcernObj);
+    ASSERT_BSONOBJ_EQ(msg.body["readConcern"].Obj(), readConcern.toBSONInner());
 
     cursor.setAwaitDataTimeoutMS(Milliseconds{5000});
     ASSERT_EQ(cursor.getAwaitDataTimeoutMS(), Milliseconds{5000});

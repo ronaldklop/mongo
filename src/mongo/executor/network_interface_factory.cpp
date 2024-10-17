@@ -27,17 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/executor/network_interface_factory.h"
-
 #include <memory>
+#include <utility>
 
-#include "mongo/base/init.h"
-#include "mongo/base/status.h"
-#include "mongo/config.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/config.h"     // IWYU pragma: keep
+#include "mongo/db/service_context.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/executor/egress_connection_closer_manager.h"
 #include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_tl.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 
@@ -54,9 +53,9 @@ std::unique_ptr<NetworkInterface> makeNetworkInterface(
     std::unique_ptr<rpc::EgressMetadataHook> metadataHook,
     ConnectionPool::Options connPoolOptions) {
 
-    if (!connPoolOptions.egressTagCloserManager && hasGlobalServiceContext()) {
-        connPoolOptions.egressTagCloserManager =
-            &EgressTagCloserManager::get(getGlobalServiceContext());
+    if (!connPoolOptions.egressConnectionCloserManager && hasGlobalServiceContext()) {
+        connPoolOptions.egressConnectionCloserManager =
+            &EgressConnectionCloserManager::get(getGlobalServiceContext());
     }
 
     auto svcCtx = hasGlobalServiceContext() ? getGlobalServiceContext() : nullptr;

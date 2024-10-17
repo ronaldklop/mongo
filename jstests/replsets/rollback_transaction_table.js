@@ -16,24 +16,12 @@
  *  - There is no record for the second session id.
  *  - A record for the third session id was created during oplog replay.
  */
-(function() {
-"use strict";
-
 // This test drops a collection in the config database, which is not allowed under a session. It
 // also manually simulates a session, which is not compatible with implicit sessions.
 TestData.disableImplicitSessions = true;
 
-// TODO (SERVER-24266): Once fast counts are tolerant to rollbacks, remove this guard.
-TestData.skipEnforceFastCountOnValidate = true;
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
-
-load("jstests/replsets/rslib.js");
+import {reconnect, waitForState} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function assertSameRecordOnBothConnections(primary, secondary, lsid) {
     let primaryRecord = primary.getDB("config").transactions.findOne({"_id.id": lsid.id});
@@ -73,6 +61,10 @@ let replTest = new ReplSetTest({
 let nodes = replTest.startSet();
 replTest.initiate();
 
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(replTest.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 let downstream = nodes[0];
 let upstream = nodes[1];
 let arbiter = nodes[2];
@@ -86,6 +78,15 @@ assert.commandWorked(downstream.getDB("config").transactions.renameCollection("f
 assert.commandWorked(downstream.getDB("config").foo.renameCollection("transactions"));
 assert(downstream.getDB("config").transactions.drop());
 assert.commandWorked(downstream.getDB("config").createCollection("transactions"));
+assert.commandWorked(downstream.getDB("config").runCommand({
+    createIndexes: "transactions",
+    indexes: [{
+        name: "parent_lsid",
+        key: {parentLsid: 1, "_id.txnNumber": 1, _id: 1},
+        partialFilterExpression: {parentLsid: {$exists: true}},
+        v: 2
+    }]
+}));
 
 jsTestLog("Running a transaction on the 'downstream node' and waiting for it to replicate.");
 let firstLsid = {id: UUID()};
@@ -229,7 +230,5 @@ assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
 // Confirm the nodes are consistent.
 replTest.checkOplogs();
 replTest.checkReplicatedDataHashes(testName);
-replTest.checkCollectionCounts();
 
 replTest.stopSet();
-}());

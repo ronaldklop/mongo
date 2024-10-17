@@ -27,38 +27,67 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_merge_spec.h"
-
 #include <fmt/format.h>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_merge_gen.h"
+#include "mongo/db/pipeline/document_source_merge_spec.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/namespace_string_util.h"
 
 namespace mongo {
 using namespace fmt::literals;
 
-NamespaceString mergeTargetNssParseFromBSON(const BSONElement& elem) {
+NamespaceString mergeTargetNssParseFromBSON(boost::optional<TenantId> tenantId,
+                                            const BSONElement& elem,
+                                            const SerializationContext& sc) {
     uassert(51178,
             "{} 'into' field  must be either a string or an object, "
             "but found {}"_format(DocumentSourceMerge::kStageName, typeName(elem.type())),
             elem.type() == BSONType::String || elem.type() == BSONType::Object);
 
     if (elem.type() == BSONType::String) {
-        return {"", elem.valueStringData()};
+        uassert(5786800,
+                "{} 'into' field cannot be an empty string"_format(DocumentSourceMerge::kStageName),
+                !elem.valueStringData().empty());
+        return NamespaceStringUtil::deserialize(tenantId, "", elem.valueStringData(), sc);
     }
+    const auto vts = tenantId
+        ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+              *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+        : boost::none;
+    auto spec = NamespaceSpec::parse(
+        IDLParserContext(elem.fieldNameStringData(), vts, tenantId, sc), elem.embeddedObject());
+    auto coll = spec.getColl();
+    uassert(5786801,
+            "{} 'into' field must specify a 'coll' that is not empty, null or undefined"_format(
+                DocumentSourceMerge::kStageName),
+            coll && !coll->empty());
 
-    auto spec = NamespaceSpec::parse({elem.fieldNameStringData()}, elem.embeddedObject());
-    return {spec.getDb().value_or(""), spec.getColl().value_or("")};
+    return NamespaceStringUtil::deserialize(
+        spec.getDb().value_or(DatabaseNameUtil::deserialize(tenantId, "", sc)), *coll);
 }
 
 void mergeTargetNssSerializeToBSON(const NamespaceString& targetNss,
                                    StringData fieldName,
-                                   BSONObjBuilder* bob) {
-    bob->append(fieldName, BSON("db" << targetNss.db() << "coll" << targetNss.coll()));
+                                   BSONObjBuilder* bob,
+                                   const SerializationContext& sc,
+                                   const SerializationOptions& opts) {
+    bob->append(
+        fieldName,
+        BSON("db" << opts.serializeIdentifier(DatabaseNameUtil::serialize(targetNss.dbName(), sc))
+                  << "coll" << opts.serializeIdentifier(targetNss.coll())));
 }
 
 std::vector<std::string> mergeOnFieldsParseFromBSON(const BSONElement& elem) {
@@ -95,11 +124,12 @@ std::vector<std::string> mergeOnFieldsParseFromBSON(const BSONElement& elem) {
 
 void mergeOnFieldsSerializeToBSON(const std::vector<std::string>& fields,
                                   StringData fieldName,
-                                  BSONObjBuilder* bob) {
+                                  BSONObjBuilder* bob,
+                                  const SerializationOptions& opts) {
     if (fields.size() == 1) {
-        bob->append(fieldName, fields.front());
+        bob->append(fieldName, opts.serializeFieldPathFromString(fields.front()));
     } else {
-        bob->append(fieldName, fields);
+        bob->append(fieldName, opts.serializeFieldPathFromString(fields));
     }
 }
 
@@ -115,7 +145,7 @@ MergeWhenMatchedPolicy mergeWhenMatchedParseFromBSON(const BSONElement& elem) {
 
     invariant(elem.type() == BSONType::String);
 
-    IDLParserErrorContext ctx{DocumentSourceMergeSpec::kWhenMatchedFieldName};
+    IDLParserContext ctx{DocumentSourceMergeSpec::kWhenMatchedFieldName};
     auto value = elem.valueStringData();
     auto mode = MergeWhenMatchedMode_parse(ctx, value);
 

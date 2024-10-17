@@ -3,13 +3,10 @@
  * will be interrupted when maxTimeMS is exceeded, but moveChunk will eventually succeed in the
  * background.
  */
-(function() {
-
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
-load("jstests/sharding/libs/find_chunks_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var st = new ShardingTest({shards: 2});
 
@@ -20,8 +17,8 @@ let testDB = st.s.getDB(dbName);
 let testColl = testDB.foo;
 
 // Create a sharded collection with one chunk on shard0.
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 
 // Enable failpoint which will cause moveChunk to hang indefinitely.
@@ -53,4 +50,3 @@ assert.soon(() => {
 });
 
 st.stop();
-})();

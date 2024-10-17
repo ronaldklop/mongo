@@ -1,12 +1,11 @@
-"use strict";
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 /**
  * Library used to test that prepared transactions survive failovers due to reconfig.
  */
 
-var testPrepareFailoverDueToReconfig = function(name, reconfigOnPrimary) {
-    load("jstests/core/txns/libs/prepare_helpers.js");
-
+export var testPrepareFailoverDueToReconfig = function(name, reconfigOnPrimary) {
     const dbName = "test";
     const collName = name;
 

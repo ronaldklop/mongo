@@ -3,15 +3,12 @@
  * reconfig.
  *
  * @tags: [
- *   requires_fcv_47,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 const rst = new ReplSetTest(
     {nodes: 1, nodeOptions: {setParameter: {logComponentVerbosity: tojson({replication: 3})}}});
@@ -43,4 +40,3 @@ assert.commandWorked(newNode.adminCommand({configureFailPoint: "failIsSelfCheck"
 jsTestLog("New node re-checks isSelf and becomes secondary");
 waitForState(newNode, ReplSetTest.State.SECONDARY);
 rst.stopSet();
-})();

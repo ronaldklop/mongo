@@ -50,10 +50,17 @@ struct ProjectionPolicies {
 
     // Allows the caller to specify whether computed fields should be allowed within inclusion
     // projections. Computed fields are implicitly prohibited by exclusion projections.
-    enum class ComputedFieldsPolicy { kBanComputedFields, kAllowComputedFields };
+    enum class ComputedFieldsPolicy {
+        kBanComputedFields,
+        kAllowComputedFields,
+        kOnlyComputedFields
+    };
 
     // Whether $elemMatch, find() $slice and positional projection are allowed.
     enum class FindOnlyFeaturesPolicy { kBanFindOnlyFeatures, kAllowFindOnlyFeatures };
+
+    // Whether the empty projection, {}, is permitted.
+    enum class EmptyProjectionPolicy { kBanEmptyProjection, kAllowEmptyProjection };
 
     static const DefaultIdPolicy kDefaultIdPolicyDefault = DefaultIdPolicy::kIncludeId;
     static const ArrayRecursionPolicy kArrayRecursionPolicyDefault =
@@ -62,45 +69,65 @@ struct ProjectionPolicies {
         ComputedFieldsPolicy::kAllowComputedFields;
     static const FindOnlyFeaturesPolicy kFindOnlyFeaturesPolicyDefault =
         FindOnlyFeaturesPolicy::kBanFindOnlyFeatures;
+    static const EmptyProjectionPolicy kEmptyProjectionPolicyDefault =
+        EmptyProjectionPolicy::kBanEmptyProjection;
 
     static ProjectionPolicies findProjectionPolicies() {
         return ProjectionPolicies{kDefaultIdPolicyDefault,
                                   kArrayRecursionPolicyDefault,
                                   kComputedFieldsPolicyDefault,
-                                  FindOnlyFeaturesPolicy::kAllowFindOnlyFeatures};
+                                  FindOnlyFeaturesPolicy::kAllowFindOnlyFeatures,
+                                  EmptyProjectionPolicy::kAllowEmptyProjection};
     }
 
     static ProjectionPolicies aggregateProjectionPolicies() {
         return ProjectionPolicies{kDefaultIdPolicyDefault,
                                   kArrayRecursionPolicyDefault,
                                   kComputedFieldsPolicyDefault,
-                                  FindOnlyFeaturesPolicy::kBanFindOnlyFeatures};
+                                  FindOnlyFeaturesPolicy::kBanFindOnlyFeatures,
+                                  kEmptyProjectionPolicyDefault};
+    }
+
+    static ProjectionPolicies addFieldsProjectionPolicies() {
+        return ProjectionPolicies{kDefaultIdPolicyDefault,
+                                  kArrayRecursionPolicyDefault,
+                                  ComputedFieldsPolicy::kOnlyComputedFields,
+                                  FindOnlyFeaturesPolicy::kBanFindOnlyFeatures,
+                                  EmptyProjectionPolicy::kAllowEmptyProjection};
     }
 
     static ProjectionPolicies wildcardIndexSpecProjectionPolicies() {
         return ProjectionPolicies{DefaultIdPolicy::kExcludeId,
                                   ArrayRecursionPolicy::kDoNotRecurseNestedArrays,
                                   ComputedFieldsPolicy::kBanComputedFields,
-                                  FindOnlyFeaturesPolicy::kBanFindOnlyFeatures};
+                                  FindOnlyFeaturesPolicy::kBanFindOnlyFeatures,
+                                  kEmptyProjectionPolicyDefault};
     }
 
     ProjectionPolicies(
         DefaultIdPolicy idPolicy = kDefaultIdPolicyDefault,
         ArrayRecursionPolicy arrayRecursionPolicy = kArrayRecursionPolicyDefault,
         ComputedFieldsPolicy computedFieldsPolicy = kComputedFieldsPolicyDefault,
-        FindOnlyFeaturesPolicy findOnlyFeaturesPolicy = kFindOnlyFeaturesPolicyDefault)
+        FindOnlyFeaturesPolicy findOnlyFeaturesPolicy = kFindOnlyFeaturesPolicyDefault,
+        EmptyProjectionPolicy emptyProjectionPolicy = kEmptyProjectionPolicyDefault)
         : idPolicy(idPolicy),
           arrayRecursionPolicy(arrayRecursionPolicy),
           computedFieldsPolicy(computedFieldsPolicy),
-          findOnlyFeaturesPolicy(findOnlyFeaturesPolicy) {}
+          findOnlyFeaturesPolicy(findOnlyFeaturesPolicy),
+          emptyProjectionPolicy(emptyProjectionPolicy) {}
 
     const DefaultIdPolicy idPolicy;
     const ArrayRecursionPolicy arrayRecursionPolicy;
     const ComputedFieldsPolicy computedFieldsPolicy;
     const FindOnlyFeaturesPolicy findOnlyFeaturesPolicy;
+    const EmptyProjectionPolicy emptyProjectionPolicy;
 
     bool findOnlyFeaturesAllowed() const {
         return findOnlyFeaturesPolicy == FindOnlyFeaturesPolicy::kAllowFindOnlyFeatures;
+    }
+
+    bool emptyProjectionAllowed() const {
+        return emptyProjectionPolicy == EmptyProjectionPolicy::kAllowEmptyProjection;
     }
 };
 

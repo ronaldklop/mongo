@@ -1,10 +1,7 @@
 // Test for logging of certificate information
-// @tags: [live_record_incompatible]
 
-(function() {
-'use strict';
-
-load("jstests/ssl/libs/ssl_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 const CA_CERT = "jstests/libs/ca.pem";
 const SERVER_CERT = "jstests/libs/server.pem";
@@ -15,16 +12,16 @@ const SERVER_CERT_INFO = {
     "type": "Server",
     "subject": "CN=server,OU=Kernel,O=MongoDB,L=New York City,ST=New York,C=US",
     "issuer": "CN=Kernel Test CA,OU=Kernel,O=MongoDB,L=New York City,ST=New York,C=US",
-    "thumbprint": "BF2E341D28D7CEAADA534A11D75189D4ECABB551"
+    "thumbprint": cat(SERVER_CERT + ".digest.sha1")
 };
 const CLUSTER_CERT_INFO = {
     "type": "Cluster",
     "subject": "CN=clustertest,OU=Kernel,O=MongoDB,L=New York City,ST=New York,C=US",
     "issuer": "CN=Kernel Test CA,OU=Kernel,O=MongoDB,L=New York City,ST=New York,C=US",
-    "thumbprint": "FD85F9F6F380EE53F46F497253453731DC885335"
+    "thumbprint": cat(CLUSTER_CERT + ".digest.sha1")
 };
 const CRL_INFO = {
-    "thumbprint": "551FEF8D916CE363E5488AD7F4BD60E3D1EC2BD8"
+    "thumbprint": cat(CRL_FILE + ".digest.sha1")
 };
 
 function runTest(checkMongos,
@@ -78,7 +75,7 @@ function runTest(checkMongos,
 function runTests(checkMongos) {
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
                 tlsCAFile: CA_CERT,
                 tlsClusterFile: CLUSTER_CERT,
@@ -94,7 +91,7 @@ function runTests(checkMongos) {
 
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
                 tlsCAFile: CA_CERT,
                 tlsClusterFile: CLUSTER_CERT,
@@ -108,10 +105,10 @@ function runTests(checkMongos) {
 
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
-                sslCAFile: CA_CERT,
-                sslCRLFile: CRL_FILE,
+                tlsCAFile: CA_CERT,
+                tlsCRLFile: CRL_FILE,
             },
             true,
             false,
@@ -123,4 +120,3 @@ function runTests(checkMongos) {
 
 // runTests(true);
 runTests(false);
-})();

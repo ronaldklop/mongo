@@ -35,11 +35,16 @@
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index_container.hpp>
+// IWYU pragma: no_include "boost/multi_index/detail/adl_swap.hpp"
+#include <boost/multi_index/indexed_by.hpp>
 #include <functional>
+#include <mutex>
 
 #include "mongo/logv2/log_severity.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo::logv2 {
@@ -109,30 +114,41 @@ private:
     Milliseconds _period;
     LogSeverity _normal;
     LogSeverity _quiet;
-    Mutex _mutex;
+    stdx::mutex _mutex;
     Suppressions _suppressions;
 };
 
 class SeveritySuppressor {
 public:
+    SeveritySuppressor(ClockSource* cs, Milliseconds period, LogSeverity normal, LogSeverity quiet)
+        : _clock(cs), _period{period}, _normal{normal}, _quiet{quiet} {}
+
     SeveritySuppressor(Milliseconds period, LogSeverity normal, LogSeverity quiet)
-        : _period{period}, _normal{normal}, _quiet{quiet} {}
+        : SeveritySuppressor(nullptr, period, normal, quiet) {}
 
     LogSeverity operator()() {
-        auto now = Date_t::now();
+        auto now = _now();
         auto lg = stdx::lock_guard(_mutex);
         if (_expire <= now) {
-            _expire = now + Seconds{1};
-            return _quiet;
+            _expire = now + _period;
+            return _normal;
         }
-        return _normal;
+        return _quiet;
     }
 
 private:
+    Date_t _now() {
+        if (_clock) {
+            return _clock->now();
+        }
+        return Date_t::now();
+    }
+
+    ClockSource* _clock;
     Milliseconds _period;
     LogSeverity _normal;
     LogSeverity _quiet;
-    Mutex _mutex;
+    stdx::mutex _mutex;
     Date_t _expire;
 };
 

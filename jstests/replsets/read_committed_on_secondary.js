@@ -5,8 +5,7 @@
  *
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function printStatus() {
     var primaryStatus;
@@ -29,8 +28,7 @@ function log(arg) {
 }
 // Set up a set and grab things for later.
 var name = "read_committed_on_secondary";
-var replTest =
-    new ReplSetTest({name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}});
+var replTest = new ReplSetTest({name: name, nodes: 3});
 replTest.startSet();
 var nodes = replTest.nodeList();
 var config = {
@@ -57,17 +55,17 @@ var collSecondary = dbSecondary[name];
 
 function saveDoc(state) {
     log("saving doc.");
-    var res = dbPrimary.runCommandWithMetadata(  //
+    var res = dbPrimary.runCommand(  //
         {
             update: name,
             writeConcern: {w: 2, wtimeout: ReplSetTest.kDefaultTimeoutMS},
             updates: [{q: {_id: 1}, u: {_id: 1, state: state}, upsert: true}],
-        },
-        {"$replData": 1});
-    assert.commandWorked(res.commandReply);
-    assert.eq(res.commandReply.writeErrors, undefined);
-    log("done saving doc: optime " + tojson(res.commandReply.$replData.lastOpVisible));
-    return res.commandReply.$replData.lastOpVisible;
+            $replData: 1
+        });
+    assert.commandWorked(res);
+    assert.eq(res.writeErrors, undefined);
+    log("done saving doc: optime " + tojson(res.$replData.lastOpVisible));
+    return res.$replData.lastOpVisible;
 }
 
 function doDirtyRead(lastOp) {
@@ -92,6 +90,11 @@ function doCommittedRead(lastOp) {
     return new DBCommandCursor(dbSecondary, res).toArray()[0].state;
 }
 
+// The default WC is majority and disableSnapshotting failpoint will prevent satisfying any majority
+// writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 // Do a write, wait for it to replicate, and ensure it is visible.
 var op0 = saveDoc(0);
 assert.eq(doDirtyRead(op0), 0);
@@ -127,4 +130,3 @@ log(replTest.status());
 assert.eq(doCommittedRead(op2), 2);
 log("test success!");
 replTest.stopSet();
-}());

@@ -29,14 +29,21 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
 class BSONObj;
-class ChunkWritesTracker;
 
 /**
  * Represents a cache entry for a single Chunk. Owned by a RoutingTableHistory.
@@ -50,8 +57,7 @@ public:
               ShardId shardId,
               ChunkVersion version,
               std::vector<ChunkHistory> history,
-              bool jumbo,
-              std::shared_ptr<ChunkWritesTracker> writesTracker);
+              bool jumbo);
 
     const auto& getRange() const {
         return _range;
@@ -63,6 +69,13 @@ public:
 
     const BSONObj& getMax() const {
         return _range.getMax();
+    }
+
+    bool overlapsWith(const ChunkInfo& other) const {
+        // Comparing keystrings is more performant than comparing BSONObj
+        const auto minKeyString = ShardKeyPattern::toKeyString(getMin());
+        return minKeyString < other.getMaxKeyString() &&
+            getMaxKeyString() > ShardKeyPattern::toKeyString(other.getMin());
     }
 
     const std::string& getMaxKeyString() const {
@@ -92,20 +105,15 @@ public:
     }
 
     bool isJumbo() const {
-        return _jumbo;
-    }
-
-    /**
-     * Get writes tracker for this chunk.
-     */
-    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
-        return _writesTracker;
+        return _jumbo.load();
     }
 
     /**
      * Returns a string represenation of the chunk for logging.
      */
     std::string toString() const;
+
+    BSONObj toBSON() const;
 
     // Returns true if this chunk contains the given shard key, and false otherwise
     //
@@ -130,18 +138,15 @@ private:
 
     // Indicates whether this chunk should be treated as jumbo and not attempted to be moved or
     // split
-    mutable bool _jumbo;
-
-    // Used for tracking writes to this chunk, to estimate its size for the autosplitter. Since
-    // ChunkInfo objects are always treated as const, and this contains metadata about the chunk
-    // that needs to change, it's okay (and necessary) to mark it mutable.
-    mutable std::shared_ptr<ChunkWritesTracker> _writesTracker;
+    AtomicWord<bool> _jumbo;
 };
 
 class Chunk {
 public:
     Chunk(ChunkInfo& chunkInfo, const boost::optional<Timestamp>& atClusterTime)
         : _chunkInfo(chunkInfo), _atClusterTime(atClusterTime) {}
+
+    Chunk(const Chunk& other) = default;
 
     const BSONObj& getMin() const {
         return _chunkInfo.getMin();
@@ -180,18 +185,10 @@ public:
     }
 
     /**
-     * Get writes tracker for this chunk.
-     */
-    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
-        return _chunkInfo.getWritesTracker();
-    }
-
-    /**
      * Returns a string represenation of the chunk for logging.
      */
-    std::string toString() const {
-        return _chunkInfo.toString();
-    }
+    std::string toString() const;
+    BSONObj toBSON() const;
 
     // Returns true if this chunk contains the given shard key, and false otherwise
     //

@@ -27,11 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace repl {
@@ -328,19 +333,17 @@ TEST(ReadAfterParse, BadLevelType) {
 
 TEST(ReadAfterParse, BadLevelValue) {
     ReadConcernArgs readConcern;
-    ASSERT_EQ(ErrorCodes::FailedToParse,
-              readConcern.initialize(BSON("find"
-                                          << "test" << ReadConcernArgs::kReadConcernFieldName
-                                          << BSON(ReadConcernArgs::kLevelFieldName
-                                                  << "seven is not a real level"))));
+    ASSERT_NOT_OK(readConcern.initialize(BSON("find"
+                                              << "test" << ReadConcernArgs::kReadConcernFieldName
+                                              << BSON(ReadConcernArgs::kLevelFieldName
+                                                      << "seven is not a real level"))));
 }
 
 TEST(ReadAfterParse, BadOption) {
     ReadConcernArgs readConcern;
-    ASSERT_EQ(ErrorCodes::InvalidOptions,
-              readConcern.initialize(BSON("find"
-                                          << "test" << ReadConcernArgs::kReadConcernFieldName
-                                          << BSON("asdf" << 1))));
+    ASSERT_NOT_OK(readConcern.initialize(BSON("find"
+                                              << "test" << ReadConcernArgs::kReadConcernFieldName
+                                              << BSON("asdf" << 1))));
 }
 
 TEST(ReadAfterParse, AtClusterTimeAndAfterClusterTime) {

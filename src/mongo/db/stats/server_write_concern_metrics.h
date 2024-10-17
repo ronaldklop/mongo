@@ -29,9 +29,16 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <map>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -76,28 +83,57 @@ public:
     BSONObj toBSON() const;
 
 private:
+    struct WriteConcernCounters {
+        WriteConcernCounters() = default;
+
+        WriteConcernCounters(bool exportWTag) : exportWTag(exportWTag) {}
+
+        // Count of operations with writeConcern w:"majority".
+        std::uint64_t wMajorityCount = 0;
+
+        // Counts of operations with writeConcern w:<num>.
+        std::map<int, std::uint64_t> wNumCounts;
+
+        // Set to true to include "wTag" section when exporting to BSON.
+        bool exportWTag = true;
+
+        // Counts of operations with writeConcern w:"tag".
+        StringMap<std::uint64_t> wTagCounts;
+
+        /**
+         * Updates counters for the 'w' value of 'writeConcernOptions'.
+         */
+        void recordWriteConcern(const WriteConcernOptions& writeConcernOptions, size_t numOps);
+
+        void toBSON(BSONObjBuilder* builder) const;
+    };
+
     struct WriteConcernMetricsForOperationType {
         /**
-         * Updates counter for the 'w' value of 'writeConcernOptions'.
+         * Updates the corresponding WC counters for the 'w' value of 'writeConcernOptions'.
          */
         void recordWriteConcern(const WriteConcernOptions& writeConcernOptions, size_t numOps = 1);
 
         void toBSON(BSONObjBuilder* builder) const;
 
-        // Count of operations with writeConcern w:"majority".
-        std::uint64_t wMajorityCount = 0;
+        // Counts of operations with writeConcern with 'w' value explicitly set by client.
+        WriteConcernCounters explicitWC;
 
-        // Count of operations without a writeConcern "w" value.
-        std::uint64_t noWCount = 0;
+        // Counts of operations used cluster-wide writeConcern.
+        WriteConcernCounters cWWC;
 
-        // Counts of operations with writeConcern w:<num>.
-        std::map<int, std::uint64_t> wNumCounts;
+        // Counts of operations used implicit default writeConcern.
+        WriteConcernCounters implicitDefaultWC = WriteConcernCounters(false);
 
-        // Counts of operations with writeConcern w:"tag".
-        StringMap<std::uint64_t> wTagCounts;
+        // Count of operations without an explicit writeConcern with "w" value.
+        std::uint64_t notExplicitWCount = 0;
+
+        // Count of operations with explicit write concern { "w" : majority, "j" : false }
+        // overridden to "j" : true.
+        std::uint64_t majorityJFalseOverriddenCount = 0;
     };
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ServerWriteConcernMetrics::_mutex");
+    mutable stdx::mutex _mutex;
     WriteConcernMetricsForOperationType _insertMetrics;
     WriteConcernMetricsForOperationType _updateMetrics;
     WriteConcernMetricsForOperationType _deleteMetrics;

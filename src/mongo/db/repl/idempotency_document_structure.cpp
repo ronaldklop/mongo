@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/repl/idempotency_document_structure.h"
-
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/repl/idempotency_document_structure.h"
 
 namespace mongo {
 
@@ -98,7 +97,7 @@ void DocumentStructureEnumerator::_enumerateFixedLenArrs(
     nextLayerConfig.length += arr.nFields();
     // Subarray.
     std::vector<BSONArray> subArrs = _enumerateArrs(nextLayerConfig, scalarGenerator);
-    for (auto subArr : subArrs) {
+    for (const auto& subArr : subArrs) {
         BSONArrayBuilder arrayArr = _getArrayBuilderFromArr(arr);
         arrayArr.append(subArr);
         _enumerateFixedLenArrs(nextElementConfig, scalarGenerator, arrayArr.arr(), arrs);
@@ -109,7 +108,7 @@ void DocumentStructureEnumerator::_enumerateFixedLenArrs(
         BSONObj blankDoc;
         std::vector<BSONObj> subDocs;
         _enumerateDocs(nextLayerConfig, scalarGenerator, blankDoc, &subDocs);
-        for (auto subDoc : subDocs) {
+        for (const auto& subDoc : subDocs) {
             BSONArrayBuilder docArr = _getArrayBuilderFromArr(arr);
             docArr.append(subDoc);
             _enumerateFixedLenArrs(nextElementConfig, scalarGenerator, docArr.arr(), arrs);
@@ -160,7 +159,7 @@ void DocumentStructureEnumerator::_enumerateDocs(const DocumentStructureEnumerat
 
     if (!config.skipSubArrs) {
         // Array.
-        for (auto subArr : _enumerateArrs(nextLayerConfig, scalarGenerator)) {
+        for (const auto& subArr : _enumerateArrs(nextLayerConfig, scalarGenerator)) {
             BSONObjBuilder arrayDoc(doc);
             arrayDoc.append(field, subArr);
             _enumerateDocs(nextFieldConfig, scalarGenerator, arrayDoc.obj(), docs);
@@ -172,7 +171,7 @@ void DocumentStructureEnumerator::_enumerateDocs(const DocumentStructureEnumerat
         BSONObj blankDoc;
         std::vector<BSONObj> subDocs;
         _enumerateDocs(nextLayerConfig, scalarGenerator, blankDoc, &subDocs);
-        for (auto subDoc : subDocs) {
+        for (const auto& subDoc : subDocs) {
             BSONObjBuilder docDoc(doc);
             docDoc.append(field, subDoc);
             _enumerateDocs(nextFieldConfig, scalarGenerator, docDoc.obj(), docs);

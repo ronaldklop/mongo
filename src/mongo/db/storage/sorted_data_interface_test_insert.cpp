@@ -27,13 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
 
-#include "mongo/db/storage/key_string.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 namespace {
@@ -51,6 +67,7 @@ TEST(SortedDataInterface, Insert) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
@@ -60,11 +77,13 @@ TEST(SortedDataInterface, Insert) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 }
 
@@ -83,6 +102,7 @@ TEST(SortedDataInterface, InsertKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyString1, true));
@@ -92,11 +112,13 @@ TEST(SortedDataInterface, InsertKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 }
 
@@ -108,11 +130,13 @@ TEST(SortedDataInterface, InsertCompoundKey) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(
@@ -123,6 +147,7 @@ TEST(SortedDataInterface, InsertCompoundKey) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
     }
 }
@@ -142,6 +167,7 @@ TEST(SortedDataInterface, InsertSameDiskLoc) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
@@ -152,11 +178,13 @@ TEST(SortedDataInterface, InsertSameDiskLoc) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc1), true));
@@ -166,6 +194,7 @@ TEST(SortedDataInterface, InsertSameDiskLoc) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
     }
 }
@@ -185,6 +214,7 @@ TEST(SortedDataInterface, InsertSameDiskLocWithDupsAllowed) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), false));
@@ -196,11 +226,13 @@ TEST(SortedDataInterface, InsertSameDiskLocWithDupsAllowed) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(
@@ -211,6 +243,7 @@ TEST(SortedDataInterface, InsertSameDiskLocWithDupsAllowed) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
     }
 }
@@ -229,8 +262,10 @@ TEST(SortedDataInterface, InsertSameKey) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), false));
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), false));
             ASSERT_NOT_OK(
                 sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc2), false));
@@ -240,15 +275,18 @@ TEST(SortedDataInterface, InsertSameKey) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_NOT_OK(
@@ -259,11 +297,13 @@ TEST(SortedDataInterface, InsertSameKey) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 }
 
@@ -276,9 +316,9 @@ TEST(SortedDataInterface, InsertSameKeyString) {
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
 
-    KeyString::Builder keyStringLoc1(
+    key_string::Builder keyStringLoc1(
         sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
-    KeyString::Builder keyStringLoc2(
+    key_string::Builder keyStringLoc2(
         sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc2);
 
     {
@@ -288,6 +328,7 @@ TEST(SortedDataInterface, InsertSameKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyStringLoc1.getValueCopy(), false));
@@ -298,15 +339,18 @@ TEST(SortedDataInterface, InsertSameKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_NOT_OK(sorted->insert(opCtx.get(), keyStringLoc2.getValueCopy(), false));
@@ -316,21 +360,23 @@ TEST(SortedDataInterface, InsertSameKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
     }
 }
 
-namespace {
-
-// Insert the same key multiple times and verify that all entries exists
-// in the index when duplicates are allowed. Since it is illegal to open a cursor to an unique
-// index while the unique constraint is violated, this is tested by running the test 3 times,
-// removing all but one loc each time and verifying the correct loc remains.
-void _testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
+/**
+ * Insert the same key multiple times and verify that all entries exists in the index when
+ * duplicates are allowed. Since it is illegal to open a cursor to an unique index while the unique
+ * constraint is violated, this is tested by running the test 3 times, removing all but one loc each
+ * time and verifying the correct loc remains.
+ */
+void testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
     for (int keeper = 0; keeper < 3; keeper++) {
         const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
         const std::unique_ptr<SortedDataInterface> sorted(
@@ -345,6 +391,7 @@ void _testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
         {
             const ServiceContext::UniqueOperationContext opCtx(
                 harnessHelper->newOperationContext());
+            Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
             {
                 WriteUnitOfWork uow(opCtx.get());
                 ASSERT_OK(
@@ -360,6 +407,7 @@ void _testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
         {
             const ServiceContext::UniqueOperationContext opCtx(
                 harnessHelper->newOperationContext());
+            Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
             {
                 WriteUnitOfWork uow(opCtx.get());
                 for (int i = 0; i < 3; i++) {
@@ -375,30 +423,31 @@ void _testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
         {
             const ServiceContext::UniqueOperationContext opCtx(
                 harnessHelper->newOperationContext());
+            Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
             ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 
             const std::unique_ptr<SortedDataInterface::Cursor> cursor(
                 sorted->newCursor(opCtx.get()));
-            ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                      IndexKeyEntry(key1, locs[keeper]));
+            ASSERT_EQ(
+                cursor->seek(
+                    makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+                IndexKeyEntry(key1, locs[keeper]));
         }
     }
 }
-
-}  // namespace
-
 TEST(SortedDataInterface, InsertSameKeyWithDupsAllowedLocsAscending) {
     const RecordId locs[3] = {loc1, loc2, loc3};
-    _testInsertSameKeyWithDupsAllowed(locs);
+    testInsertSameKeyWithDupsAllowed(locs);
 }
-
 TEST(SortedDataInterface, InsertSameKeyWithDupsAllowedLocsDescending) {
     const RecordId locs[3] = {loc3, loc2, loc1};
-    _testInsertSameKeyWithDupsAllowed(locs);
+    testInsertSameKeyWithDupsAllowed(locs);
 }
 
-// Insert multiple keys and verify that the number of entries
-// in the index equals the number that were inserted.
+/**
+ * Insert multiple keys and verify that the number of entries in the index equals the number that
+ * were inserted.
+ */
 TEST(SortedDataInterface, InsertMultiple) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
@@ -411,6 +460,7 @@ TEST(SortedDataInterface, InsertMultiple) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), false));
@@ -421,17 +471,21 @@ TEST(SortedDataInterface, InsertMultiple) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
-                  IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key2, loc2));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc3), false));
@@ -441,19 +495,23 @@ TEST(SortedDataInterface, InsertMultiple) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
-                  IndexKeyEntry(key2, loc2));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true)),
-                  IndexKeyEntry(key3, loc3));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key3, loc3));
     }
 }
 
-/*
+/**
  * Insert multiple KeyStrings and verify that the number of entries in the index equals the number
  * that were inserted.
  */
@@ -473,6 +531,7 @@ TEST(SortedDataInterface, InsertMultipleKeyStrings) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyString1, false));
@@ -483,17 +542,21 @@ TEST(SortedDataInterface, InsertMultipleKeyStrings) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
-                  IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key2, loc2));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyString3, false));
@@ -503,19 +566,23 @@ TEST(SortedDataInterface, InsertMultipleKeyStrings) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
-                  IndexKeyEntry(key1, loc1));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
-                  IndexKeyEntry(key2, loc2));
-        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true)),
-                  IndexKeyEntry(key3, loc3));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(
+            cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key3, loc3));
     }
 }
 
-/*
+/**
  * Insert multiple KeyStrings and seek to the inserted KeyStrings
  */
 TEST(SortedDataInterface, InsertAndSeekKeyString) {
@@ -536,6 +603,7 @@ TEST(SortedDataInterface, InsertAndSeekKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyString1, false));
@@ -546,22 +614,37 @@ TEST(SortedDataInterface, InsertAndSeekKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
 
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        auto ksEntry1 = cursor->seekForKeyString(keyString1WithoutRecordId);
+        auto ksEntry1 = cursor->seekForKeyString(
+            {keyString1WithoutRecordId.getBuffer(),
+             static_cast<StringData::size_type>(keyString1WithoutRecordId.getSize())});
         ASSERT_EQUALS(ksEntry1->keyString.compare(keyString1), 0);
         ASSERT_EQUALS(ksEntry1->keyString.compare(keyString2), -1);
+        auto kvEntry1 = cursor->seekForKeyValueView(
+            {keyString1WithoutRecordId.getBuffer(),
+             static_cast<StringData::size_type>(keyString1WithoutRecordId.getSize())});
+        ASSERT(!kvEntry1.isEmpty());
+        ASSERT_EQUALS(ksEntry1->keyString.compare(kvEntry1.getValueCopy()), 0);
 
-        auto ksEntry2 = cursor->seekForKeyString(keyString2WithoutRecordId);
+        auto ksEntry2 = cursor->seekForKeyString(
+            {keyString2WithoutRecordId.getBuffer(),
+             static_cast<StringData::size_type>(keyString2WithoutRecordId.getSize())});
         ASSERT_EQUALS(ksEntry2->keyString.compare(keyString2), 0);
         ASSERT_EQUALS(ksEntry2->keyString.compare(keyString1), 1);
+        auto kvEntry2 = cursor->seekForKeyValueView(
+            {keyString2WithoutRecordId.getBuffer(),
+             static_cast<StringData::size_type>(keyString2WithoutRecordId.getSize())});
+        ASSERT(!kvEntry2.isEmpty());
+        ASSERT_EQUALS(ksEntry2->keyString.compare(kvEntry2.getValueCopy()), 0);
     }
 }
 
-/*
- * Insert multiple KeyStrings and seekExact to the inserted KeyStrings
+/**
+ * Insert multiple KeyStrings and use findLoc on the inserted KeyStrings.
  */
 TEST(SortedDataInterface, InsertAndSeekExactKeyString) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
@@ -571,9 +654,6 @@ TEST(SortedDataInterface, InsertAndSeekExactKeyString) {
     auto keyString1 = makeKeyString(sorted.get(), key1, loc1);
     auto keyString2 = makeKeyString(sorted.get(), key2, loc2);
 
-    auto keyString1WithoutRecordId = makeKeyString(sorted.get(), key1);
-    auto keyString2WithoutRecordId = makeKeyString(sorted.get(), key2);
-
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         ASSERT(sorted->isEmpty(opCtx.get()));
@@ -581,6 +661,7 @@ TEST(SortedDataInterface, InsertAndSeekExactKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(opCtx.get(), keyString1, false));
@@ -591,68 +672,22 @@ TEST(SortedDataInterface, InsertAndSeekExactKeyString) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
 
-        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-
-        auto ksEntry1 = cursor->seekExactForKeyString(keyString1WithoutRecordId);
-        ASSERT_EQUALS(ksEntry1->keyString.compare(keyString1), 0);
-        ASSERT_EQUALS(ksEntry1->keyString.compare(keyString2), -1);
-
-        auto ksEntry2 = cursor->seekExactForKeyString(keyString2WithoutRecordId);
-        ASSERT_EQUALS(ksEntry2->keyString.compare(keyString2), 0);
-        ASSERT_EQUALS(ksEntry2->keyString.compare(keyString1), 1);
+        ASSERT_EQ(loc1,
+                  sorted->findLoc(opCtx.get(),
+                                  makeKeyStringForSeek(sorted.get(), key1).finishAndGetBuffer()));
+        ASSERT_EQ(loc2,
+                  sorted->findLoc(opCtx.get(),
+                                  makeKeyStringForSeek(sorted.get(), key2).finishAndGetBuffer()));
     }
 }
 
-/*
- * Insert multiple KeyStrings and seekExact to the inserted KeyStrings with reverse cursor.
+/**
+ * Insert multiple compound keys and verify that the number of entries in the index equals the
+ * number that were inserted.
  */
-TEST(SortedDataInterface, InsertAndSeekExactKeyString_Reverse) {
-    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(
-        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
-
-    auto keyString1 = makeKeyString(sorted.get(), key1, loc1);
-    auto keyString2 = makeKeyString(sorted.get(), key2, loc2);
-
-    auto keyString1WithoutRecordId = makeKeyString(sorted.get(), key1);
-    auto keyString2WithoutRecordId = makeKeyString(sorted.get(), key2);
-
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT(sorted->isEmpty(opCtx.get()));
-    }
-
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), keyString1, false));
-            ASSERT_OK(sorted->insert(opCtx.get(), keyString2, false));
-            uow.commit();
-        }
-    }
-
-    {
-        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
-
-        const std::unique_ptr<SortedDataInterface::Cursor> cursor(
-            sorted->newCursor(opCtx.get(), false));
-
-        auto ksEntry1 = cursor->seekExactForKeyString(keyString1WithoutRecordId);
-        ASSERT_EQUALS(ksEntry1->keyString.compare(keyString1), 0);
-        ASSERT_EQUALS(ksEntry1->keyString.compare(keyString2), -1);
-
-        auto ksEntry2 = cursor->seekExactForKeyString(keyString2WithoutRecordId);
-        ASSERT_EQUALS(ksEntry2->keyString.compare(keyString2), 0);
-        ASSERT_EQUALS(ksEntry2->keyString.compare(keyString1), 1);
-    }
-}
-
-// Insert multiple compound keys and verify that the number of entries
-// in the index equals the number that were inserted.
 TEST(SortedDataInterface, InsertMultipleCompoundKeys) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
@@ -665,6 +700,7 @@ TEST(SortedDataInterface, InsertMultipleCompoundKeys) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(
@@ -679,11 +715,13 @@ TEST(SortedDataInterface, InsertMultipleCompoundKeys) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
         {
             WriteUnitOfWork uow(opCtx.get());
             ASSERT_OK(sorted->insert(
@@ -696,26 +734,280 @@ TEST(SortedDataInterface, InsertMultipleCompoundKeys) {
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         ASSERT_EQUALS(5, sorted->numEntries(opCtx.get()));
     }
 }
 
-TEST(SortedDataInterface, InsertReservedRecordId) {
+TEST(SortedDataInterface, InsertReservedRecordIdLong) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
     const std::unique_ptr<SortedDataInterface> sorted(
         harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
     ASSERT(sorted->isEmpty(opCtx.get()));
     WriteUnitOfWork uow(opCtx.get());
-    RecordId reservedLoc(
-        RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId));
-    invariant(RecordId::isReserved<int64_t>(reservedLoc));
+    RecordId reservedLoc(record_id_helpers::reservedIdFor(
+        record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long));
+    invariant(record_id_helpers::isReserved(reservedLoc));
     ASSERT_OK(sorted->insert(opCtx.get(),
                              makeKeyString(sorted.get(), key1, reservedLoc),
                              /*dupsAllowed*/ true));
     uow.commit();
     ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
 }
+
+TEST(SortedDataInterface, InsertReservedRecordIdIntoUniqueIndex) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(
+        /*unique=*/true, /*partial=*/false, KeyFormat::String));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+
+        constexpr char reservation[] = {
+            static_cast<char>(0xFF),
+            static_cast<char>(record_id_helpers::ReservationId::kWildcardMultikeyMetadataId)};
+        RecordId reservedId = RecordId(reservation, sizeof(reservation));
+        ASSERT(record_id_helpers::isReserved(reservedId));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(sorted->insert(opCtx.get(),
+                                 makeKeyString(sorted.get(), key1, reservedId),
+                                 /*dupsAllowed=*/false));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+
+        // There is only one reserved RecordId, kWildcardMultikeyMetadataId. In order to test that
+        // the upper bound for unique indexes works properly we insert a key with RecordId
+        // kWildcardMultikeyMetadataId + 1. This will result in a DuplicateKey as the key with
+        // RecordId kWildcardMultikeyMetadataId will be detected by the bounded cursor.
+        constexpr char reservation[] = {
+            static_cast<char>(0xFF),
+            static_cast<char>(record_id_helpers::ReservationId::kWildcardMultikeyMetadataId) + 1};
+        RecordId reservedId = RecordId(reservation, sizeof(reservation));
+        ASSERT(record_id_helpers::isReserved(reservedId));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        Status status = sorted->insert(opCtx.get(),
+                                       makeKeyString(sorted.get(), key1, reservedId),
+                                       /*dupsAllowed=*/false);
+        ASSERT_NOT_OK(status);
+        ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
+    }
+}
+
+TEST(SortedDataInterface, InsertWithDups1) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 2)), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(6, 2)), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+    }
+}
+
+TEST(SortedDataInterface, InsertWithDups2) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 18)), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 20)), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+    }
+}
+
+TEST(SortedDataInterface, InsertWithDups3AndRollback) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 18)), true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 20)), true));
+            // no commit
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+TEST(SortedDataInterface, InsertNoDups1) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 18)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 2), RecordId(5, 20)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+    }
+}
+
+TEST(SortedDataInterface, InsertNoDups2) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 2)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_NOT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 4)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+TEST(SortedDataInterface, InsertNoDups3) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 2)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_NOT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), BSON("" << 1), RecordId(5, 4)), false));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
 
 }  // namespace
 }  // namespace mongo

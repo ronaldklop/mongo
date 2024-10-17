@@ -27,33 +27,55 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include <math.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <sstream>
+#include <string>
+#include <variant>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/dbtests/dbtests.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/time_support.h"
 
-namespace DocumentTests {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-using std::numeric_limits;
-using std::string;
-using std::vector;
+namespace mongo {
+namespace {
 
-mongo::Document::FieldPair getNthField(mongo::Document doc, size_t index) {
-    mongo::FieldIterator it(doc);
+Document::FieldPair getNthField(Document doc, size_t index) {
+    FieldIterator it(doc);
     while (index--)  // advance index times
         it.next();
     return it.next();
@@ -177,23 +199,24 @@ TEST(DocumentSerialization, CannotSerializeDocumentThatExceedsDepthLimit) {
 }
 
 TEST(DocumentGetFieldNonCaching, UncachedTopLevelFields) {
-    BSONObj bson = BSON("scalar" << 1 << "array" << BSON_ARRAY(1 << 2 << 3) << "scalar2" << true);
+    BSONObj bson = BSON("scalar" << 1 << "scalar2" << true);
     Document document = fromBson(bson);
 
     // Should be able to get all top level fields without caching.
+    const auto* storage = static_cast<const DocumentStorage*>(document.getPtr());
     for (auto&& elt : bson) {
-        auto valueVariant = document.getNestedFieldNonCaching(elt.fieldNameStringData());
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
-        ASSERT_TRUE(stdx::get<BSONElement>(valueVariant).binaryEqual(elt));
+        auto value = document.getNestedScalarFieldNonCaching(elt.fieldNameStringData());
+        ASSERT_EQ(Value::compare(*value, Value(elt), nullptr), 0);
 
-        // Get the field again to be sure it wasn't cached during the access above.
-        auto valueVariantAfterAccess = document.getNestedFieldNonCaching(elt.fieldNameStringData());
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariantAfterAccess));
+        // Verify that the cache does not contain the field.
+        auto pos = storage->findField(elt.fieldNameStringData(),
+                                      DocumentStorage::LookupPolicy::kCacheOnly);
+        ASSERT_FALSE(pos.found());
     }
 
     // Try to get a top level field which doesn't exist.
-    auto nonExistentFieldVariant = document.getNestedFieldNonCaching("doesnotexist");
-    ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentFieldVariant));
+    auto nonExistentField = document.getNestedScalarFieldNonCaching("doesnotexist");
+    ASSERT_TRUE(nonExistentField->missing());
 
     assertRoundTrips(document);
 }
@@ -207,27 +230,28 @@ TEST(DocumentGetFieldNonCaching, CachedTopLevelFields) {
 
     // Attempt to access scalar2 with the non caching accessor. It should be cached already.
     {
-        auto valueVariant = document.getNestedFieldNonCaching("scalar2");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
-        ASSERT_EQ(stdx::get<Value>(valueVariant).getBool(), true);
+        auto value = document.getNestedScalarFieldNonCaching("scalar2");
+        ASSERT_EQ(value->getBool(), true);
     }
+}
 
-    // Attempt to access 'array' with the non caching accessor. It should not be cached.
+TEST(DocumentGetFieldNonCaching, ModifiedTopLevelFields) {
+    // Update "val1" and "val2.val2" to be scalar and in document cache.
+    MutableDocument mutDocument(fromBson(BSON("val1" << BSON("val1" << BSONObj()))));
+    mutDocument.setField("val1", Value(true));
+    MutableDocument mutSubDocument(fromBson(BSON("val2" << BSON("val2" << BSONObj()))));
+    mutSubDocument.setField("val2", Value(true));
+    mutDocument.addField("val2", mutSubDocument.freezeToValue());
+    Document document = mutDocument.freeze();
+
+    // Attempt to access the top-level and nested fields that reside in the cache with the non
+    // caching accessor.
     {
-        auto valueVariant = document.getNestedFieldNonCaching("array");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
-        auto elt = stdx::get<BSONElement>(valueVariant);
-        ASSERT_TRUE(bson["array"].binaryEqual(elt));
-    }
+        ASSERT_EQ(document.getNestedScalarFieldNonCaching("val1")->getBool(), true);
+        ASSERT_EQ(document.getNestedScalarFieldNonCaching("val1.val1")->getType(), EOO);
 
-    // Force 'array' to be cached.
-    ASSERT_FALSE(document["array"].missing());
-
-    // Check that 'array' is cached and that we can read it with the non caching accessor.
-    {
-        auto valueVariant = document.getNestedFieldNonCaching("array");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
-        ASSERT_EQ(stdx::get<Value>(valueVariant).getArrayLength(), 3);
+        ASSERT_EQ(document.getNestedScalarFieldNonCaching("val2.val2")->getBool(), true);
+        ASSERT_EQ(document.getNestedScalarFieldNonCaching("val2.val2.val2")->getType(), EOO);
     }
 }
 
@@ -236,33 +260,38 @@ TEST(DocumentGetFieldNonCaching, NonArrayDottedPaths) {
                                                 << "foo"));
     Document document = fromBson(bson);
 
+    auto isFieldCached = [&](StringData field) {
+        const DocumentStorage* storage = static_cast<const DocumentStorage*>(document.getPtr());
+        auto pos = storage->findField(field, DocumentStorage::LookupPolicy::kCacheOnly);
+        return pos.found();
+    };
+
     // With no fields cached.
     {
         // Get a nested field without caching.
-        auto zipVariant = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariant));
-        ASSERT_EQ(stdx::get<BSONElement>(zipVariant).numberInt(), 123);
+        auto zip = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_EQ(zip->getInt(), 123);
 
         // Check that it was not cached.
-        auto zipVariantAfterAccess = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariantAfterAccess));
+        auto zipAfterAccess = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_FALSE(isFieldCached("address.zip"));
 
         // Check that the top level field isn't cached after accessing one of its children.
-        auto addressVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+        auto address = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_FALSE(isFieldCached("address"));
 
         // Get a dotted field which does not exist.
-        auto nonExistentVariant = document.getNestedFieldNonCaching("address.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentVariant));
+        auto nonExistent = document.getNestedScalarFieldNonCaching("address.doesnotexist");
+        ASSERT_TRUE(nonExistent->missing());
 
         // Check that the top level field isn't cached after a failed attempt to access one of its
         // children.
-        addressVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+        address = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_FALSE(isFieldCached("address"));
 
         // Get a dotted field which extends past a scalar.
-        auto pathPastScalarVariant = document.getNestedFieldNonCaching("address.zip.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(pathPastScalarVariant));
+        auto pathPastScalar = document.getNestedScalarFieldNonCaching("address.zip.doesnotexist");
+        ASSERT_TRUE(pathPastScalar->missing());
     }
 
     // Now force 'address.street' to be cached.
@@ -271,24 +300,23 @@ TEST(DocumentGetFieldNonCaching, NonArrayDottedPaths) {
     // Check that we get the right value when accessing it with the non caching accessor.
     {
         // The top level field should be cached.
-        auto topLevelVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(topLevelVariant));
+        auto topLevel = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_TRUE(topLevel.has_value());
 
-        auto variant = document.getNestedFieldNonCaching("address.street");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
-        ASSERT_EQ(stdx::get<Value>(variant).getString(), "foo");
+        auto street = document.getNestedScalarFieldNonCaching("address.street");
+        ASSERT_EQ(street->getString(), "foo");
     }
 
     // Check that the other subfield, 'zip' is not cached.
     {
-        auto variant = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
+        auto zip = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_FALSE(isFieldCached("address.zip"));
     }
 
-    // Check that attempting to get a subfield of 'address.street' returns monostate.
+    // Check that attempting to get a subfield of 'address.street' returns an empty Value.
     {
-        auto variant = document.getNestedFieldNonCaching("address.street.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(variant));
+        auto nonExistent = document.getNestedScalarFieldNonCaching("address.street.doesnotexist");
+        ASSERT_TRUE(nonExistent->missing());
     }
 }
 
@@ -298,9 +326,8 @@ TEST(DocumentGetFieldNonCaching, NonArrayLongDottedPath) {
 
     // Not cached.
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
-        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 
     // Force part of the path to get cached.
@@ -308,18 +335,16 @@ TEST(DocumentGetFieldNonCaching, NonArrayLongDottedPath) {
 
     // The function should be able to traverse a path which is part Value and part BSONElement.
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
-        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 
     // Force the entire path to be cached.
     ASSERT_FALSE(document.getNestedField("a.b.c.d.e").missing());
 
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
-        ASSERT_EQ(stdx::get<Value>(variant).getInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 }
 
@@ -329,30 +354,120 @@ TEST(DocumentGetFieldNonCaching, TraverseArray) {
                              << "subObj" << BSON("subArray" << BSON_ARRAY(1 << 2)));
     Document document = fromBson(bson);
 
-    auto checkArrayTagIsReturned = [&document]() {
-        auto topLevelArrayVariant = document.getNestedFieldNonCaching("topLevelArray.foo");
-        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(topLevelArrayVariant));
+    auto checkBoostNoneIsReturned = [&document]() {
+        auto topLevelArray = document.getNestedScalarFieldNonCaching("topLevelArray.foo");
+        ASSERT_EQ(topLevelArray, boost::none);
 
-        // Attempting to traverse an uncached nested array results in TraversesArrayTag being
+        // Attempting to traverse an uncached nested array results in boost::none being
         // returned.
-        auto subArrayVariant = document.getNestedFieldNonCaching("subObj.subArray.foobar");
-        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(subArrayVariant));
+        auto subArray = document.getNestedScalarFieldNonCaching("subObj.subArray.foobar");
+        ASSERT_EQ(subArray, boost::none);
+
+        // Landing on either array field should return boost::none.
+        topLevelArray = document.getNestedScalarFieldNonCaching("topLevelArray");
+        ASSERT_EQ(topLevelArray, boost::none);
+
+        subArray = document.getNestedScalarFieldNonCaching("subObj.subArray");
+        ASSERT_EQ(subArray, boost::none);
     };
 
     // Check with no fields cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
 
     // Force the top level array to be cached.
     ASSERT_FALSE(document["topLevelArray"].missing());
 
     // Check with one field cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
 
     // Force the array that's in a sub object to be cached.
     ASSERT_FALSE(document.getNestedField("subObj.subArray").missing());
 
     // Check it works with both fields (and the full sub object) cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
+}
+
+TEST(DocumentSize, ApproximateSizeIsSnapshotted) {
+    const auto rawBson = BSON("field"
+                              << "value");
+    const Document document{rawBson};
+    const auto noCacheSize = document.getApproximateSize();
+
+    // Force the cache construction, making the total size of the 'Document' bigger.
+    // 'getApproximateSize()' must still return the same value.
+    document["field"];
+    const auto fullCacheSizeSnapshot = document.getApproximateSize();
+    const auto fullCacheSizeCurrent = document.getCurrentApproximateSize();
+    ASSERT_EQ(noCacheSize, fullCacheSizeSnapshot);
+    ASSERT_LT(noCacheSize, fullCacheSizeCurrent);
+}
+
+TEST(DocumentSize, ApproximateSizeDuringBuildIsUpdated) {
+    MutableDocument builder;
+    builder.addField("a1", Value(1));
+    builder.addField("a2", mongo::Value(2));
+    builder.addField("a3", mongo::Value(3));
+    auto middleBuildSize = builder.getApproximateSize();
+
+    builder.addField("a4", Value(4));
+    builder.addField("a5", mongo::Value(5));
+    builder.addField("a6", mongo::Value(6));
+    auto peekSize = builder.peek().getApproximateSize();
+
+    builder.addField("a7", Value(7));
+    builder.addField("a8", mongo::Value(8));
+    builder.addField("a9", mongo::Value(9));
+    auto beforeFreezeSize = builder.getApproximateSize();
+
+    Document result = builder.freeze();
+    auto frozenSize = result.getApproximateSize();
+
+    ASSERT_LT(middleBuildSize, peekSize);
+    ASSERT_LT(peekSize, beforeFreezeSize);
+    ASSERT_EQ(beforeFreezeSize, frozenSize);
+}
+
+TEST(ShredDocument, OutputHasNoBackingBSON) {
+    BSONObj bson =
+        BSON("a" << 1 << "subObj" << BSON("a" << 1) << "subArray" << BSON_ARRAY(BSON("a" << 1)));
+    auto original = fromBson(bson);
+    auto originalSize = original.getApproximateSize();
+
+    auto shredded = original.shred();
+    auto originalSizeAfterShredding = original.getApproximateSize();
+    // Fields in the original doc shouldn't be cached since it was raw bson
+    ASSERT_EQ(originalSize, originalSizeAfterShredding);
+
+    // BSON is more compact than ValueElement
+    auto shreddedSize = shredded.getApproximateSize();
+    ASSERT_LT(originalSize, shreddedSize);
+
+    // Accessing a field shouldn't change the size since all fields are already cached.
+    shredded["a"];
+    ASSERT_EQ(shredded.getCurrentApproximateSize(), shreddedSize);
+}
+
+TEST(ShredDocument, HandlesModifiedDocuments) {
+    BSONObj bson = BSON("a" << 1 << "subObj" << BSON("a" << 1));
+    Document original = fromBson(bson);
+    MutableDocument md(original);
+    md["b"] = Value(2);
+    md["subObj"]["b"] = Value(2);
+    Document shredded = md.freeze().shred();
+
+    ASSERT(!shredded["b"].missing());
+    ASSERT(!shredded["subObj"]["b"].missing());
+}
+
+TEST(ShredDocument, HandlesMetadata) {
+    BSONObj bson = BSON("a" << 1 << "subObj" << BSON("a" << 1));
+    Document original = fromBson(bson);
+    MutableDocument md(original);
+    DocumentMetadataFields meta;
+    meta.setSearchScore(6);
+    md.setMetadata(std::move(meta));
+    Document shredded = md.freeze().shred();
+    ASSERT_EQ(6, shredded.metadata().getSearchScore());
 }
 
 /** Add Document fields. */
@@ -372,6 +487,23 @@ public:
         Document final = md.freeze();
         ASSERT_EQUALS(3ULL, final.computeSize());
         assertRoundTrips(final);
+
+        // Add field to the document as an lvalue.
+        MutableDocument md1;
+        Value v1(1);
+        md1.addField("a", v1);
+        ASSERT_VALUE_EQ(md1.peek().getField("a"), v1);
+
+        // Set field to the document as an lvalue.
+        Value v2(2);
+        md1.setField("a", v2);
+        ASSERT_VALUE_EQ(md1.peek().getField("a"), v2);
+
+        // Set nested field to the document as an lvalue.
+        FieldPath xxyyzz("xx.yy.zz");
+        Value v3("nested"_sd);
+        md1.setNestedField(xxyyzz, v3);
+        ASSERT_VALUE_EQ(md1.peek().getNestedField(xxyyzz), v3);
     }
 };
 
@@ -499,7 +631,9 @@ public:
     int cmp(const BSONObj& a, const BSONObj& b) {
         int result = DocumentComparator().compare(fromBson(a), fromBson(b));
         return  // sign
-            result < 0 ? -1 : result > 0 ? 1 : 0;
+            result < 0   ? -1
+            : result > 0 ? 1
+                         : 0;
     }
     void assertComparison(int expectedResult, const BSONObj& a, const BSONObj& b) {
         ASSERT_EQUALS(expectedResult, cmp(a, b));
@@ -510,7 +644,7 @@ public:
     }
     size_t hash(const BSONObj& obj) {
         size_t seed = 0x106e1e1;
-        const StringData::ComparatorInterface* stringComparator = nullptr;
+        const StringDataComparator* stringComparator = nullptr;
         Document(obj).hash_combine(seed, stringComparator);
         return seed;
     }
@@ -538,7 +672,7 @@ public:
         // setNestedField and ensure the original document is unchanged.
 
         cloneOnDemand.reset(document);
-        vector<Position> path;
+        std::vector<Position> path;
         ASSERT_VALUE_EQ(Value(1), document.getNestedField(FieldPath("a.b"), &path));
 
         cloneOnDemand.setNestedField(path, Value(2));
@@ -683,11 +817,27 @@ public:
         values.push_back(mongo::Value(thing));
     }
 
-    vector<mongo::Value> values;
+    std::vector<mongo::Value> values;
     MutableDocument docBuilder;
     BSONObjBuilder objBuilder;
     BSONArrayBuilder arrBuilder;
 };
+
+TEST(DocumentTest, ToBsonSizeTraits) {
+    constexpr size_t longStringLength = 9 * 1024 * 1024;
+    static_assert(longStringLength <= BSONObjMaxInternalSize &&
+                  2 * longStringLength > BSONObjMaxInternalSize &&
+                  2 * longStringLength <= BufferMaxSize);
+    std::string longString(longStringLength, 'A');
+    MutableDocument md;
+    md.addField("a", Value(longString));
+    ASSERT_DOES_NOT_THROW(md.peek().toBson());
+    md.addField("b", Value(longString));
+    ASSERT_THROWS_CODE(md.peek().toBson(), DBException, ErrorCodes::BSONObjectTooLarge);
+    ASSERT_THROWS_CODE(
+        md.peek().toBson<BSONObj::DefaultSizeTrait>(), DBException, ErrorCodes::BSONObjectTooLarge);
+    ASSERT_DOES_NOT_THROW(md.peek().toBson<BSONObj::LargeSizeTrait>());
+}
 }  // namespace Document
 
 namespace MetaFields {
@@ -814,6 +964,15 @@ TEST(MetaFields, FromBsonWithMetadataAcceptsIndexKeyMetadata) {
     ASSERT_BSONOBJ_EQ(bsonWithoutMetadata, BSON("a" << 1));
 }
 
+TEST(MetaFields, FromBsonWithMetadataHandlesEmptyFieldName) {
+    auto bson = BSON("" << 1 << "$indexKey" << BSON("b" << 1));
+    auto doc = Document::fromBsonWithMetaData(bson);
+    ASSERT_TRUE(doc.metadata().hasIndexKey());
+    ASSERT_BSONOBJ_EQ(doc.metadata().getIndexKey(), BSON("b" << 1));
+    auto bsonWithoutMetadata = doc.toBson();
+    ASSERT_BSONOBJ_EQ(bsonWithoutMetadata, BSON("" << 1));
+}
+
 TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
     Document source = Document::fromBsonWithMetaData(
         BSON("a" << 1 << "$textScore" << 9.9 << "b" << 1 << "$randVal" << 42.0 << "c" << 1
@@ -823,7 +982,9 @@ TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
                  << "foo"
                  << "h" << 1 << "$indexKey" << BSON("y" << 1) << "$searchScoreDetails"
                  << BSON("scoreDetails"
-                         << "foo")));
+                         << "foo")
+                 << "$searchSortValues" << BSON("a" << 1) << "$vectorSearchScore" << 6.7 << "$score"
+                 << 8.1));
 
     MutableDocument destination{};
     destination.copyMetaDataFrom(source);
@@ -840,6 +1001,9 @@ TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
     ASSERT_BSONOBJ_EQ(result.metadata().getSearchScoreDetails(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(result.metadata().getSearchSortValues(), BSON("a" << 1));
+    ASSERT_EQ(result.metadata().getVectorSearchScore(), 6.7);
+    ASSERT_EQ(result.metadata().getScore(), 8.1);
 }
 
 class SerializationTest : public unittest::Test {
@@ -860,6 +1024,9 @@ protected:
         ASSERT_EQ(output.metadata().hasSearchScore(), input.metadata().hasSearchScore());
         ASSERT_EQ(output.metadata().hasSearchHighlights(), input.metadata().hasSearchHighlights());
         ASSERT_EQ(output.metadata().hasIndexKey(), input.metadata().hasIndexKey());
+        ASSERT_EQ(output.metadata().hasVectorSearchScore(),
+                  input.metadata().hasVectorSearchScore());
+        ASSERT_EQ(output.metadata().hasScore(), input.metadata().hasScore());
         if (input.metadata().hasTextScore()) {
             ASSERT_EQ(output.metadata().getTextScore(), input.metadata().getTextScore());
         }
@@ -880,6 +1047,13 @@ protected:
             ASSERT_BSONOBJ_EQ(output.metadata().getSearchScoreDetails(),
                               input.metadata().getSearchScoreDetails());
         }
+        if (input.metadata().hasVectorSearchScore()) {
+            ASSERT_EQ(output.metadata().getVectorSearchScore(),
+                      input.metadata().getVectorSearchScore());
+        }
+        if (input.metadata().hasScore()) {
+            ASSERT_EQ(output.metadata().getScore(), input.metadata().getScore());
+        }
 
         ASSERT(output.toBson().binaryEqual(input.toBson()));
     }
@@ -894,6 +1068,8 @@ TEST_F(SerializationTest, MetaSerializationNoVals) {
                                                         << "def"_sd));
     docBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
                                                      << "foo"));
+    docBuilder.metadata().setVectorSearchScore(40.0);
+    docBuilder.metadata().setScore(60.0);
     assertRoundTrips(docBuilder.freeze());
 }
 
@@ -908,6 +1084,8 @@ TEST_F(SerializationTest, MetaSerializationWithVals) {
     docBuilder.metadata().setIndexKey(BSON("key" << 42));
     docBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
                                                      << "foo"));
+    docBuilder.metadata().setVectorSearchScore(40.0);
+    docBuilder.metadata().setScore(60.0);
     assertRoundTrips(docBuilder.freeze());
 }
 
@@ -930,6 +1108,9 @@ TEST(MetaFields, ToAndFromBson) {
                                                         << "def"_sd));
     docBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
                                                      << "foo"));
+    docBuilder.metadata().setSearchSortValues(BSON("a" << 42));
+    docBuilder.metadata().setVectorSearchScore(40.0);
+    docBuilder.metadata().setScore(60.0);
     Document doc = docBuilder.freeze();
     BSONObj obj = doc.toBsonWithMetaData();
     ASSERT_EQ(10.0, obj[Document::metaFieldTextScore].Double());
@@ -941,6 +1122,9 @@ TEST(MetaFields, ToAndFromBson) {
     ASSERT_BSONOBJ_EQ(obj[Document::metaFieldSearchScoreDetails].Obj(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(BSON("a" << 42), obj[Document::metaFieldSearchSortValues].Obj());
+    ASSERT_EQ(40.0, obj[Document::metaFieldVectorSearchScore].Double());
+    ASSERT_EQ(60.0, obj[Document::metaFieldScore].Double());
     Document fromBson = Document::fromBsonWithMetaData(obj);
     ASSERT_TRUE(fromBson.metadata().hasTextScore());
     ASSERT_TRUE(fromBson.metadata().hasRandVal());
@@ -949,6 +1133,111 @@ TEST(MetaFields, ToAndFromBson) {
     ASSERT_BSONOBJ_EQ(BSON("scoreDetails"
                            << "foo"),
                       fromBson.metadata().getSearchScoreDetails());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 42), fromBson.metadata().getSearchSortValues());
+    ASSERT_EQ(40.0, fromBson.metadata().getVectorSearchScore());
+    ASSERT_EQ(60.0, fromBson.metadata().getScore());
+}
+
+TEST(MetaFields, ToAndFromBsonTrivialConvertibility) {
+    Value sortKey{Document{{"token"_sd, "SOMENCODEDATA"_sd}}};
+    // Create a document with a backing BSONObj and separate metadata.
+    auto origObjNoMetadata = BSON("a" << 42);
+    ASSERT_FALSE(origObjNoMetadata.hasField(Document::metaFieldSortKey));
+
+    MutableDocument docBuilder;
+    docBuilder.reset(origObjNoMetadata, false);
+    docBuilder.metadata().setSortKey(sortKey, true);
+    Document docWithSeparateBsonAndMetadata = docBuilder.freeze();
+
+    BSONObj origObjWithMetadata = docWithSeparateBsonAndMetadata.toBsonWithMetaData();
+    ASSERT_TRUE(origObjWithMetadata.hasField(Document::metaFieldSortKey));
+    Document restoredDocWithMetadata = Document::fromBsonWithMetaData(origObjWithMetadata);
+    ASSERT_DOCUMENT_EQ(docWithSeparateBsonAndMetadata, restoredDocWithMetadata);
+
+    // Test the 'isTriviallyConvertible()' function.
+    // The original document is trivially convertible without metadata because the metadata was
+    // added to the document separately from the backing BSON object.
+    ASSERT_TRUE(docWithSeparateBsonAndMetadata.isTriviallyConvertible());
+    // The original document is NOT trivially convertible with metadata because the metadata was
+    // added to the document and does not exist in the BSONObj.
+    ASSERT_FALSE(docWithSeparateBsonAndMetadata.isTriviallyConvertibleWithMetadata());
+    // The restored document is trivially convertible with metadata because the underlying BSONObj
+    // contains the metadata serialized from the original document.
+    ASSERT_TRUE(restoredDocWithMetadata.isTriviallyConvertibleWithMetadata());
+    // The restored document is NOT trivially convertible without metadata because the metadata
+    // fields need to be stripped from the underlying BSONObj.
+    ASSERT_FALSE(restoredDocWithMetadata.isTriviallyConvertible());
+
+    // Test that the conversion with metadata 'origObjWithMetadata' -> 'restoredDocWithMetadata' ->
+    // 'restoredObjWithMetadata' is trivial because the backing BSON already contains metadata and
+    // neither the metadata nor the non-metadata fields have been modified.
+    BSONObj restoredObjWithMetadata = restoredDocWithMetadata.toBsonWithMetaData();
+    ASSERT_TRUE(restoredObjWithMetadata.hasField(Document::metaFieldSortKey));
+    // Test that 'restoredObjWithMetadata' is referring to the exact same memory location as
+    // 'origObjWithMetadata', i.e. both objdata() and objsize() match.
+    ASSERT_EQ(origObjWithMetadata.objdata(), restoredObjWithMetadata.objdata());
+    ASSERT_EQ(origObjWithMetadata.objsize(), restoredObjWithMetadata.objsize());
+
+    // Test that the conversion without metadata 'origObjWithMetadata' -> 'restoredDocWithMetadata'
+    // -> 'strippedRestoredObj' is NOT trivial because the backing BSON has metadata that must be
+    // omitted during serialization.
+    BSONObj strippedRestoredObj = restoredDocWithMetadata.toBson();
+    ASSERT_FALSE(strippedRestoredObj.hasField(Document::metaFieldSortKey));
+    // 'restoredDocWithMetadata' is trivially convertible with metadata and converting it to BSON
+    // without metadata will return a new BSON object.
+    ASSERT_TRUE(origObjNoMetadata.binaryEqual(strippedRestoredObj));
+    ASSERT_NE(origObjNoMetadata.objdata(), strippedRestoredObj.objdata());
+
+    // Test that the conversion without metadata 'origObjNoMetadata' ->
+    // 'docWithSeparateBsonAndMetadata' -> 'restoredObjNoMetadata' is trivial because
+    // 'origObjNoMetadata' does not contain any metadata.
+    BSONObj restoredObjNoMetadata = docWithSeparateBsonAndMetadata.toBson();
+    ASSERT_FALSE(restoredObjNoMetadata.hasField(Document::metaFieldSortKey));
+    // Test that 'restoredObjNoMetadata' is referring to the exact same memory location as
+    // 'origObjNoMetadata', i.e. both objdata() and objsize() match.
+    ASSERT_EQ(origObjNoMetadata.objdata(), restoredObjNoMetadata.objdata());
+    ASSERT_EQ(origObjNoMetadata.objsize(), restoredObjNoMetadata.objsize());
+}
+
+TEST(MetaFields, TrivialConvertibilityBsonWithoutMetadata) {
+    // Test that an unmodified document without metadata is trivially convertible to BSON with and
+    // without metadata.
+    auto bsonWithoutMetadata = BSON("a" << 42);
+    Document doc(bsonWithoutMetadata);
+    ASSERT_TRUE(doc.isTriviallyConvertible());
+    ASSERT_TRUE(doc.isTriviallyConvertibleWithMetadata());
+}
+
+TEST(MetaFields, TrivialConvertibilityNoBson) {
+    // A Document created with no backing BSON is not trivially convertible.
+    auto docNoBson = Document{{"a", 42}};
+    ASSERT_FALSE(docNoBson.isTriviallyConvertible());
+    ASSERT_FALSE(docNoBson.isTriviallyConvertibleWithMetadata());
+
+    // An empty Document is trivially convertible, since the default BSONObj is also empty.
+    auto emptyDoc = Document{};
+    ASSERT_TRUE(emptyDoc.isTriviallyConvertible());
+    ASSERT_TRUE(emptyDoc.isTriviallyConvertibleWithMetadata());
+}
+
+TEST(MetaFields, TrivialConvertibilityModified) {
+    // Modifying a document with a backing BSON renders it not trivially convertible.
+    MutableDocument mutDocModified(Document(BSON("a" << 42)));
+    mutDocModified.addField("b", Value(43));
+    auto modifiedDoc = mutDocModified.freeze();
+    ASSERT_FALSE(modifiedDoc.isTriviallyConvertible());
+    ASSERT_FALSE(modifiedDoc.isTriviallyConvertibleWithMetadata());
+}
+
+TEST(MetaFields, TrivialConvertibilityMetadataModified) {
+    // Modifying the metadata of a document with a backing BSON renders it not trivially convertible
+    // with metadata.
+    MutableDocument mutDocModifiedMd(
+        Document::fromBsonWithMetaData(BSON(Document::metaFieldTextScore << 10.0)));
+    mutDocModifiedMd.metadata().setRandVal(20.0);
+    auto modifiedMdDoc = mutDocModifiedMd.freeze();
+    ASSERT_FALSE(modifiedMdDoc.isTriviallyConvertible());
+    ASSERT_FALSE(modifiedMdDoc.isTriviallyConvertibleWithMetadata());
 }
 
 TEST(MetaFields, MetaFieldsIncludedInDocumentApproximateSize) {
@@ -966,8 +1255,10 @@ TEST(MetaFields, MetaFieldsIncludedInDocumentApproximateSize) {
     const size_t bigMetadataDocSize = doc2.getApproximateSize();
     ASSERT_GT(bigMetadataDocSize, smallMetadataDocSize);
 
-    // Do a sanity check on the amount of space taken by metadata in document 2.
-    ASSERT_LT(doc2.getMetadataApproximateSize(), 300U);
+    // Do a sanity check on the amount of space taken by metadata in document 2. Note that the size
+    // of certain data types may vary on different build variants, so we cannot assert on the exact
+    // size.
+    ASSERT_LT(doc2.getMetadataApproximateSize(), 400U);
 
     Document emptyDoc;
     ASSERT_LT(emptyDoc.getMetadataApproximateSize(), 100U);
@@ -1021,7 +1312,7 @@ class BSONArrayTest {
 public:
     void run() {
         ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2 << 3)), DOC_ARRAY(1 << 2 << 3));
-        ASSERT_VALUE_EQ(Value(BSONArray()), Value(vector<Value>()));
+        ASSERT_VALUE_EQ(Value(BSONArray()), Value(std::vector<Value>()));
     }
 };
 
@@ -1076,7 +1367,7 @@ public:
 class StringWithNull {
 public:
     void run() {
-        string withNull("a\0b", 3);
+        std::string withNull("a\0b", 3);
         BSONObj objWithNull = BSON("" << withNull);
         ASSERT_EQUALS(withNull, objWithNull[""].str());
         Value value = fromBson(objWithNull);
@@ -1095,7 +1386,12 @@ public:
     void run() {
         std::string longString(16793500, 'x');
         auto obj = BSON("str" << longString);
-        ASSERT_THROWS_CODE([&]() { Value{obj["str"]}; }(), DBException, 16493);
+        ASSERT_THROWS_CODE(
+            [&]() {
+                Value{obj["str"]};
+            }(),
+            DBException,
+            16493);
     }
 };
 
@@ -1157,6 +1453,17 @@ public:
         ASSERT_EQUALS(-.3, document["banana"].getDouble());
         ASSERT_EQUALS(Object, value.getType());
         assertRoundTrips(value);
+
+        MutableDocument md1;
+        Value v(1);
+        md1.addField("a", v);
+
+        MutableDocument md2;
+        // Construct Value from an rvalue.
+        md2.addField("nested", Value(md1.freeze()));
+
+        ASSERT_VALUE_EQ(md2.peek().getNestedField("nested.a"), v);
+        ASSERT_DOCUMENT_EQ(md1.freeze(), mongo::Document());
     }
 };
 
@@ -1164,9 +1471,9 @@ public:
 class EmptyArray {
 public:
     void run() {
-        vector<Value> array;
+        std::vector<Value> array;
         Value value(array);
-        const vector<Value>& array2 = value.getArray();
+        const std::vector<Value>& array2 = value.getArray();
 
         ASSERT(array2.empty());
         ASSERT_EQUALS(Array, value.getType());
@@ -1179,12 +1486,12 @@ public:
 class Array {
 public:
     void run() {
-        vector<Value> array;
+        std::vector<Value> array;
         array.push_back(Value(5));
         array.push_back(Value("lala"_sd));
         array.push_back(Value(3.14));
         Value value = Value(array);
-        const vector<Value>& array2 = value.getArray();
+        const std::vector<Value>& array2 = value.getArray();
 
         ASSERT(!array2.empty());
         ASSERT_EQUALS(array2.size(), 3U);
@@ -1224,7 +1531,7 @@ class Regex {
 public:
     void run() {
         Value value = fromBson(fromjson("{'':/abc/}"));
-        ASSERT_EQUALS(string("abc"), value.getRegex());
+        ASSERT_EQUALS(std::string("abc"), value.getRegex());
         ASSERT_EQUALS(RegEx, value.getType());
         assertRoundTrips(value);
     }
@@ -1331,118 +1638,118 @@ protected:
 };
 
 class ToBoolTrue : public ToBoolBase {
-    bool expected() {
+    bool expected() override {
         return true;
     }
 };
 
 class ToBoolFalse : public ToBoolBase {
-    bool expected() {
+    bool expected() override {
         return false;
     }
 };
 
 /** Coerce 0 to bool. */
 class ZeroIntToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0);
     }
 };
 
 /** Coerce -1 to bool. */
 class NonZeroIntToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(-1);
     }
 };
 
 /** Coerce 0LL to bool. */
 class ZeroLongToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0LL);
     }
 };
 
 /** Coerce 5LL to bool. */
 class NonZeroLongToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(5LL);
     }
 };
 
 /** Coerce 0.0 to bool. */
 class ZeroDoubleToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0);
     }
 };
 
 /** Coerce -1.3 to bool. */
 class NonZeroDoubleToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(-1.3);
     }
 };
 
 /** Coerce "" to bool. */
 class StringToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(StringData());
     }
 };
 
 /** Coerce {} to bool. */
 class ObjectToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(mongo::Document());
     }
 };
 
 /** Coerce [] to bool. */
 class ArrayToBool : public ToBoolTrue {
-    Value value() {
-        return Value(vector<Value>());
+    Value value() override {
+        return Value(std::vector<Value>());
     }
 };
 
 /** Coerce Date(0) to bool. */
 class DateToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(Date_t{});
     }
 };
 
 /** Coerce js literal regex to bool. */
 class RegexToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return fromBson(fromjson("{''://}"));
     }
 };
 
 /** Coerce true to bool. */
 class TrueToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return fromBson(BSON("" << true));
     }
 };
 
 /** Coerce false to bool. */
 class FalseToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return fromBson(BSON("" << false));
     }
 };
 
 /** Coerce null to bool. */
 class NullToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
 };
 
 /** Coerce undefined to bool. */
 class UndefinedToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
 };
@@ -1469,50 +1776,50 @@ protected:
 
 /** Coerce -5 to int. */
 class IntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    int expected() {
+    int expected() override {
         return -5;
     }
 };
 
 /** Coerce long to int. */
 class LongToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(0xff00000007LL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce 9.8 to int. */
 class DoubleToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    int expected() {
+    int expected() override {
         return 9;
     }
 };
 
 /** Coerce null to int. */
 class NullToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to int. */
 class UndefinedToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1527,40 +1834,40 @@ public:
 
 /** Coerce maxInt to int */
 class MaxIntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::max());
     }
-    int expected() {
+    int expected() override {
         return std::numeric_limits<int>::max();
     }
 };
 
 /** Coerce minInt to int */
 class MinIntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::min());
     }
-    int expected() {
+    int expected() override {
         return std::numeric_limits<int>::min();
     }
 };
 
 /** Coerce maxInt + 1 to int */
 class TooLargeToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::max() + 1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce minInt - 1 to int */
 class TooLargeNegativeToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::min() - 1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1587,101 +1894,101 @@ protected:
 
 /** Coerce -5 to long. */
 class IntToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    long long expected() {
+    long long expected() override {
         return -5;
     }
 };
 
 /** Coerce long to long. */
 class LongToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(0xff00000007LL);
     }
-    long long expected() {
+    long long expected() override {
         return 0xff00000007LL;
     }
 };
 
 /** Coerce 9.8 to long. */
 class DoubleToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    long long expected() {
+    long long expected() override {
         return 9;
     }
 };
 
 /** Coerce infinity to long. */
 class InfToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(std::numeric_limits<double>::infinity());
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce negative infinity to long. **/
 class NegInfToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(std::numeric_limits<double>::infinity() * -1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce large to long. **/
 class InvalidLargeToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(pow(2, 63));
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce lowest double to long. **/
 class LowestDoubleToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(static_cast<double>(std::numeric_limits<long long>::lowest()));
     }
-    long long expected() {
+    long long expected() override {
         return std::numeric_limits<long long>::lowest();
     }
 };
 
 /** Coerce 'towards infinity' to long **/
 class TowardsInfinityToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(static_cast<double>(std::nextafter(std::numeric_limits<long long>::lowest(),
                                                         std::numeric_limits<double>::lowest())));
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce null to long. */
 class NullToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to long. */
 class UndefinedToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1716,51 +2023,51 @@ protected:
 
 /** Coerce -5 to double. */
 class IntToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    double expected() {
+    double expected() override {
         return -5;
     }
 };
 
 /** Coerce long to double. */
 class LongToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         // A long that cannot be exactly represented as a double.
         return Value(static_cast<double>(0x8fffffffffffffffLL));
     }
-    double expected() {
+    double expected() override {
         return static_cast<double>(0x8fffffffffffffffLL);
     }
 };
 
 /** Coerce double to double. */
 class DoubleToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    double expected() {
+    double expected() override {
         return 9.8;
     }
 };
 
 /** Coerce null to double. */
 class NullToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to double. */
 class UndefinedToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1787,10 +2094,10 @@ protected:
 
 /** Coerce date to date. */
 class DateToDate : public ToDateBase {
-    Value value() {
+    Value value() override {
         return Value(Date_t::fromMillisSinceEpoch(888));
     }
-    long long expected() {
+    long long expected() override {
         return 888;
     }
 };
@@ -1800,10 +2107,10 @@ class DateToDate : public ToDateBase {
  * is different from BSON behavior of interpreting all bytes as a date.
  */
 class TimestampToDate : public ToDateBase {
-    Value value() {
+    Value value() override {
         return Value(Timestamp(777, 666));
     }
-    long long expected() {
+    long long expected() override {
         return 777 * 1000;
     }
 };
@@ -1825,81 +2132,81 @@ public:
 
 protected:
     virtual Value value() = 0;
-    virtual string expected() {
+    virtual std::string expected() {
         return "";
     }
 };
 
 /** Coerce -0.2 to string. */
 class DoubleToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(-0.2);
     }
-    string expected() {
+    std::string expected() override {
         return "-0.2";
     }
 };
 
 /** Coerce -4 to string. */
 class IntToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(-4);
     }
-    string expected() {
+    std::string expected() override {
         return "-4";
     }
 };
 
 /** Coerce 10000LL to string. */
 class LongToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(10000LL);
     }
-    string expected() {
+    std::string expected() override {
         return "10000";
     }
 };
 
 /** Coerce string to string. */
 class StringToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value("fO_o"_sd);
     }
-    string expected() {
+    std::string expected() override {
         return "fO_o";
     }
 };
 
 /** Coerce timestamp to string. */
 class TimestampToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(Timestamp(1, 2));
     }
-    string expected() {
+    std::string expected() override {
         return Timestamp(1, 2).toStringPretty();
     }
 };
 
 /** Coerce date to string. */
 class DateToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(Date_t::fromMillisSinceEpoch(1234567890123LL));
     }
-    string expected() {
+    std::string expected() override {
         return "2009-02-13T23:31:30.123Z";
     }  // from js
 };
 
 /** Coerce null to string. */
 class NullToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
 };
 
 /** Coerce undefined to string. */
 class UndefinedToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
 };
@@ -2030,9 +2337,10 @@ public:
         assertComparison(-1, -2, 2.1);
         assertComparison(1, 90LL, 89.999);
         assertComparison(-1, 90, 90.1);
-        assertComparison(
-            0, numeric_limits<double>::quiet_NaN(), numeric_limits<double>::signaling_NaN());
-        assertComparison(-1, numeric_limits<double>::quiet_NaN(), 5);
+        assertComparison(0,
+                         std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::signaling_NaN());
+        assertComparison(-1, std::numeric_limits<double>::quiet_NaN(), 5);
 
         // strings compare between numbers and objects
         assertComparison(1, "abc", 90);
@@ -2051,7 +2359,7 @@ public:
         assertComparison(1, "b-", "b");
         assertComparison(-1, "b-", "ba");
         // With a null character.
-        assertComparison(1, string("a\0", 2), "a");
+        assertComparison(1, std::string("a\0", 2), "a");
 
         // Object.
         assertComparison(0, fromjson("{'':{}}"), fromjson("{'':{}}"));
@@ -2103,8 +2411,8 @@ public:
         assertComparison(-1, Value(1), Value("string"_sd));
         assertComparison(0, Value("string"_sd), Value(BSONSymbol("string")));
         assertComparison(-1, Value("string"_sd), Value(mongo::Document()));
-        assertComparison(-1, Value(mongo::Document()), Value(vector<Value>()));
-        assertComparison(-1, Value(vector<Value>()), Value(BSONBinData("", 0, MD5Type)));
+        assertComparison(-1, Value(mongo::Document()), Value(std::vector<Value>()));
+        assertComparison(-1, Value(std::vector<Value>()), Value(BSONBinData("", 0, MD5Type)));
         assertComparison(-1, Value(BSONBinData("", 0, MD5Type)), Value(mongo::OID()));
         assertComparison(-1, Value(mongo::OID()), Value(false));
         assertComparison(-1, Value(false), Value(Date_t()));
@@ -2168,7 +2476,7 @@ private:
     }
     size_t hash(const Value& v) {
         size_t seed = 0xf00ba6;
-        const StringData::ComparatorInterface* stringComparator = nullptr;
+        const StringDataComparator* stringComparator = nullptr;
         v.hash_combine(seed, stringComparator);
         return seed;
     }
@@ -2180,38 +2488,37 @@ public:
         const Value val = fromBson(fromjson("{'': {a: [{x:1, b:[1, {y:1, c:1234, z:1}, 1]}]}}"));
         // ^ this outer object is removed by fromBson
 
-        ASSERT(val.getType() == mongo::Object);
+        ASSERT(val.getType() == BSONType::Object);
 
         ASSERT(val[999].missing());
         ASSERT(val["missing"].missing());
-        ASSERT(val["a"].getType() == mongo::Array);
+        ASSERT(val["a"].getType() == BSONType::Array);
 
         ASSERT(val["a"][999].missing());
         ASSERT(val["a"]["missing"].missing());
-        ASSERT(val["a"][0].getType() == mongo::Object);
+        ASSERT(val["a"][0].getType() == BSONType::Object);
 
         ASSERT(val["a"][0][999].missing());
         ASSERT(val["a"][0]["missing"].missing());
-        ASSERT(val["a"][0]["b"].getType() == mongo::Array);
+        ASSERT(val["a"][0]["b"].getType() == BSONType::Array);
 
         ASSERT(val["a"][0]["b"][999].missing());
         ASSERT(val["a"][0]["b"]["missing"].missing());
-        ASSERT(val["a"][0]["b"][1].getType() == mongo::Object);
+        ASSERT(val["a"][0]["b"][1].getType() == BSONType::Object);
 
         ASSERT(val["a"][0]["b"][1][999].missing());
         ASSERT(val["a"][0]["b"][1]["missing"].missing());
-        ASSERT(val["a"][0]["b"][1]["c"].getType() == mongo::NumberInt);
+        ASSERT(val["a"][0]["b"][1]["c"].getType() == BSONType::NumberInt);
         ASSERT_EQUALS(val["a"][0]["b"][1]["c"].getInt(), 1234);
     }
 };
-
 
 class SerializationOfMissingForSorter {
     // Can't be tested in AllTypesDoc since missing values are omitted when adding to BSON.
 public:
     void run() {
         const Value missing;
-        const Value arrayOfMissing = Value(vector<Value>(10));
+        const Value arrayOfMissing = Value(std::vector<Value>(10));
 
         BufBuilder bb;
         missing.serializeForSorter(bb);
@@ -2224,8 +2531,6 @@ public:
                         Value::deserializeForSorter(reader, Value::SorterDeserializeSettings()));
     }
 };
-
-namespace {
 
 // Integer limits.
 const int kIntMax = std::numeric_limits<int>::max();
@@ -2250,8 +2555,6 @@ const double kDoubleMax = std::numeric_limits<double>::max();
 const double kDoubleMin = std::numeric_limits<double>::lowest();
 const Decimal128 kDoubleMaxAsDecimal = Decimal128(kDoubleMin);
 const Decimal128 kDoubleMinAsDecimal = Decimal128(kDoubleMin);
-
-}  // namespace
 
 TEST(ValueIntegral, CorrectlyIdentifiesValidIntegralValues) {
     ASSERT_TRUE(Value(kIntMax).integral());
@@ -2295,17 +2598,17 @@ TEST(ValueIntegral, CorrectlyIdentifiesInvalid64BitIntegralValues) {
 
 TEST(ValueOutput, StreamOutputForIllegalDateProducesErrorToken) {
     auto sout = std::ostringstream{};
-    sout << mongo::Value{Date_t::min()};
+    sout << Value{Date_t::min()};
     ASSERT_EQ("illegal date", sout.str());
 }
 
 }  // namespace Value
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("document") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Document::AddField>();
         add<Document::GetValue>();
         add<Document::SetField>();
@@ -2407,6 +2710,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
-}  // namespace DocumentTests
+}  // namespace
+}  // namespace mongo

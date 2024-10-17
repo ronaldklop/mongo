@@ -29,13 +29,23 @@
 
 #include "mongo/db/matcher/doc_validation_util.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bson_depth.h"
+
 namespace mongo::doc_validation_error {
 std::unique_ptr<MatchExpression::ErrorAnnotation> createAnnotation(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const std::string& tag,
-    BSONObj annotation) {
+    BSONObj annotation,
+    const BSONObj& jsonSchemaElement) {
     if (expCtx->isParsingCollectionValidator) {
-        return std::make_unique<MatchExpression::ErrorAnnotation>(tag, std::move(annotation));
+        return std::make_unique<MatchExpression::ErrorAnnotation>(
+            tag, std::move(annotation), jsonSchemaElement);
     } else {
         return nullptr;
     }

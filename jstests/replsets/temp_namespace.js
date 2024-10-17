@@ -2,6 +2,8 @@
 // This is to make sure that temp collections get cleaned up on promotion to primary
 // @tags: [requires_replication]
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 var nodes = replTest.nodeList();
 printjson(nodes);
@@ -65,12 +67,12 @@ assert.eq(countIndexesFor(secondaryDB, /temp\d$/), 4);  // indexes (2 _id + 2 x)
 assert.eq(countCollection(secondaryDB, /keep\d$/), 4);
 
 // restart secondary and reconnect
-replTest.restart(replTest.getNodeId(secondary), {}, /*wait=*/true);
+replTest.restart(replTest.getNodeId(secondary), {}, /*wait=*/ true);
 
 // wait for the secondary to achieve secondary status
 assert.soon(function() {
     try {
-        res = secondary.getDB("admin").runCommand({replSetGetStatus: 1});
+        let res = secondary.getDB("admin").runCommand({replSetGetStatus: 1});
         return res.myState == 2;
     } catch (e) {
         return false;

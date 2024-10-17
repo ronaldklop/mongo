@@ -1,7 +1,12 @@
+/**
+ * @tags: [
+ *   requires_scripting
+ * ]
+ */
+
 // Confirms that JavaScript heap limits are respected in aggregation. Includes testing for mapReduce
 // and $where which use aggregation for execution.
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 const mongos = st.s;
@@ -46,7 +51,8 @@ const aggregateWithJSFunction = {
     pipeline: [
         {$group: {_id: "$x"}},
         {$project: {y: {"$function": {args: [], body: allocateLargeString, lang: "js"}}}}
-    ]
+    ],
+    allowDiskUse: false
 };
 const aggregateWithInternalJsReduce = {
     aggregate: "coll",
@@ -61,7 +67,8 @@ const aggregateWithInternalJsReduce = {
                 }
             }
         }
-    }]
+    }],
+    allowDiskUse: false
 };
 const aggregateWithUserDefinedAccumulator = {
     aggregate: "coll",
@@ -79,7 +86,8 @@ const aggregateWithUserDefinedAccumulator = {
                 }
             }
         }
-    }]
+    }],
+    allowDiskUse: false
 };
 const findWithJavaScriptFunction = {
     find: "coll",
@@ -167,4 +175,3 @@ runCommonTests(shardDB);
 runShardTests(shardDB);
 
 st.stop();
-}());

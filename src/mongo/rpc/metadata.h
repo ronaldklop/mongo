@@ -32,7 +32,14 @@
 #include <functional>
 #include <tuple>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/database_name.h"
+#include "mongo/idl/generic_argument_gen.h"
 #include "mongo/rpc/op_msg.h"
 
 namespace mongo {
@@ -54,7 +61,9 @@ BSONObj makeEmptyMetadata();
 /**
  * Reads metadata from a metadata object and sets it on this OperationContext.
  */
-void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bool requiresAuth);
+void readRequestMetadata(OperationContext* opCtx,
+                         const GenericArguments& requestArgs,
+                         bool cmdRequiresAuth);
 
 /**
  * A legacy command object and a corresponding query flags bitfield. The legacy command object
@@ -65,7 +74,11 @@ using LegacyCommandAndFlags = std::tuple<BSONObj, int>;
 /**
  * Upconverts a legacy command request into an OpMessageRequest.
  */
-OpMsgRequest upconvertRequest(StringData db, BSONObj legacyCmdObj, int queryFlags);
+OpMsgRequest upconvertRequest(const DatabaseName& dbName,
+                              BSONObj legacyCmdObj,
+                              int queryFlags,
+                              boost::optional<auth::ValidatedTenancyScope> vts = boost::none);
+
 
 /**
  * A function type for writing request metadata. The function takes a pointer to an optional

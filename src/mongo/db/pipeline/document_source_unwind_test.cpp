@@ -27,19 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
 #include <deque>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
@@ -48,8 +51,11 @@
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -71,8 +77,10 @@ public:
     CheckResultsBase()
         : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()),
-          _ctx(new ExpressionContextForTest(_opCtx.get(),
-                                            AggregateCommandRequest(NamespaceString(ns), {}))) {}
+          _ctx(new ExpressionContextForTest(
+              _opCtx.get(),
+              AggregateCommandRequest(NamespaceString::createNamespaceString_forTest(ns),
+                                      std::vector<mongo::BSONObj>()))) {}
 
     virtual ~CheckResultsBase() {}
 
@@ -816,11 +824,31 @@ TEST_F(UnwindStageTest, ShouldRejectUnrecognizedOption) {
                        28811);
 }
 
-class All : public OldStyleSuiteSpecification {
+TEST_F(UnwindStageTest, Redaction) {
+    auto spec = fromjson(R"({
+        $unwind: {
+            path: "$foo.bar",
+            includeArrayIndex: "foo.baz",
+            preserveNullAndEmptyArrays: true
+        }
+    })");
+    auto docSource = DocumentSourceUnwind::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$unwind": {
+                "path": "$HASH<foo>.HASH<bar>",
+                "preserveNullAndEmptyArrays": "?bool",
+                "includeArrayIndex": "HASH<foo>.HASH<baz>"
+            }
+        })",
+        redact(*docSource));
+}
+
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("DocumentSourceUnwindTests") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Empty>();
         add<EmptyArray>();
         add<MissingValue>();
@@ -843,7 +871,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

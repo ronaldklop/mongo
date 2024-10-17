@@ -27,37 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <vector>
 
+#include "mongo/db/exec/plan_stats_walker.h"
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
-
-#include <queue>
+#include "mongo/db/query/plan_summary_stats_visitor.h"
+#include "mongo/db/query/tree_walker.h"
 
 namespace mongo::sbe {
 size_t calculateNumberOfReads(const PlanStageStats* root) {
-    size_t numReads{0};
-    std::queue<const sbe::PlanStageStats*> remaining;
-    remaining.push(root);
+    auto visitor = PlanStatsNumReadsVisitor{};
+    auto walker = PlanStageStatsWalker<true, CommonStats>(nullptr, nullptr, &visitor);
+    tree_walker::walk<true, PlanStageStats>(root, &walker);
+    return visitor.numReads;
+}
 
-    while (!remaining.empty()) {
-        auto stats = remaining.front();
-        remaining.pop();
+PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats& root) {
+    PlanSummaryStats summary;
+    summary.nReturned = root.common.advances;
 
-        if (!stats) {
-            continue;
-        }
+    summary.executionTime = root.common.executionTime;
 
-        if (auto scanStats = dynamic_cast<sbe::ScanStats*>(stats->specific.get())) {
-            numReads += scanStats->numReads;
-        } else if (auto indexScanStats =
-                       dynamic_cast<sbe::IndexScanStats*>(stats->specific.get())) {
-            numReads += indexScanStats->numReads;
-        }
-
-        for (auto&& child : stats->children) {
-            remaining.push(child.get());
-        }
-    }
-    return numReads;
+    auto visitor = PlanSummaryStatsVisitor(summary);
+    auto walker = PlanStageStatsWalker<true, CommonStats>(nullptr, nullptr, &visitor);
+    tree_walker::walk<true, PlanStageStats>(&root, &walker);
+    return summary;
 }
 }  // namespace mongo::sbe

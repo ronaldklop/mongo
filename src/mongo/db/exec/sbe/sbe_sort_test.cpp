@@ -27,11 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
 
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
 #include "mongo/db/exec/sbe/stages/sort.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo::sbe {
 
@@ -55,9 +68,11 @@ TEST_F(SortStageTest, SortNumbersTest) {
                              makeSV(scanSlots[0]),
                              std::vector<value::SortDirection>{value::SortDirection::Ascending},
                              makeSV(scanSlots[1]),
-                             std::numeric_limits<std::size_t>::max(),
+                             makeE<EConstant>(value::TypeTags::NumberInt64,
+                                              value::bitcastFrom<int64_t>(4)) /*limit*/,
                              204857600,
                              false,
+                             nullptr /* yieldPolicy */,
                              kEmptyPlanNodeId);
 
         return std::make_pair(scanSlots, std::move(sortStage));

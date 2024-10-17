@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/pipeline/pipeline.h"
 
@@ -87,6 +88,13 @@ public:
  */
 boost::optional<long long> extractLimitForPushdown(Pipeline::SourceContainer::iterator itr,
                                                    Pipeline::SourceContainer* container);
+
+/**
+ * This is similar to extractLimitForPushdown, except that it should be used when the caller does
+ * not want to modify the pipeline but still obtain the calculated limit value of the query.
+ */
+boost::optional<long long> getUserLimit(Pipeline::SourceContainer::iterator itr,
+                                        Pipeline::SourceContainer* container);
 
 /**
  * If there are any $skip stages that could be logically swapped forward to the position of the

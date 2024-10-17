@@ -4,13 +4,13 @@
  * 2. Test that rollback can successfully recover aborted prepared transactions that were prepared
  * and aborted between the stable timestamp and the common point.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/rollback_test.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 const dbName = "test";
 const collName = "recover_committed_aborted_prepared_transactions";
@@ -131,4 +131,3 @@ assert.sameMembers(testColl.find().toArray(), [{_id: 1}, {_id: 2}, {_id: 5}]);
 assert.eq(testColl.count(), 3);
 
 rollbackTest.stop();
-}());

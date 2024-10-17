@@ -27,22 +27,76 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/s/stale_shard_version_helpers.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/db/database_name.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/stale_exception.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
-void logFailedRetryAttempt(StringData taskDescription, const DBException& exception) {
-    LOGV2_DEBUG(4553800,
-                3,
-                "Retrying {task_description}. Got error: {exception}",
-                "task_description"_attr = taskDescription,
-                "exception"_attr = exception);
+namespace shard_version_retry {
+
+void checkErrorStatusAndMaxRetries(const Status& status,
+                                   const NamespaceString& nss,
+                                   CatalogCache* catalogCache,
+                                   StringData taskDescription,
+                                   size_t numAttempts,
+                                   size_t altMaxNumRetries) {
+    auto logAndTestMaxRetries =
+        [numAttempts, taskDescription, altMaxNumRetries](const Status& status) {
+            size_t maxNumRetries = kMaxNumStaleVersionRetries;
+            if (MONGO_unlikely(altMaxNumRetries > 0)) {
+                maxNumRetries = altMaxNumRetries;
+            }
+            if (numAttempts > maxNumRetries) {
+                uassertStatusOKWithContext(status,
+                                           str::stream()
+                                               << "Exceeded maximum number of " << maxNumRetries
+                                               << " retries attempting " << taskDescription);
+            }
+
+            LOGV2_DEBUG(4553800,
+                        3,
+                        "Retrying {task_description}. Got error: {exception}",
+                        "task_description"_attr = taskDescription,
+                        "exception"_attr = status);
+        };
+
+    if (status == ErrorCodes::StaleDbVersion) {
+        auto staleInfo = status.extraInfo<
+            error_details::ErrorExtraInfoForImpl<ErrorCodes::StaleDbVersion>::type>();
+        // If the database version is stale, refresh its entry in the catalog cache.
+        catalogCache->onStaleDatabaseVersion(staleInfo->getDb(), staleInfo->getVersionWanted());
+
+        logAndTestMaxRetries(status);
+        return;
+    }
+
+    if (status.isA<ErrorCategory::StaleShardVersionError>()) {
+        // If the exception provides a shardId, add it to the set of shards requiring a refresh.
+        // If the cache currently considers the collection to be unsharded, this will trigger an
+        // epoch refresh. If no shard is provided, then the epoch is stale and we must refresh.
+        if (auto staleInfo = status.extraInfo<StaleConfigInfo>()) {
+            catalogCache->onStaleCollectionVersion(staleInfo->getNss(),
+                                                   staleInfo->getVersionWanted());
+        } else {
+            catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+        }
+
+        logAndTestMaxRetries(status);
+        return;
+    }
+
+    uassertStatusOK(status);
 }
 
+}  // namespace shard_version_retry
 }  // namespace mongo

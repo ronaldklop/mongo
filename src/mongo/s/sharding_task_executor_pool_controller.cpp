@@ -27,14 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <set>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/executor/connection_pool_stats.h"
-#include "mongo/s/is_mongos.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
+
 
 namespace mongo {
 
@@ -54,9 +69,14 @@ void emplaceOrInvariant(Map&& map, Args&&... args) noexcept {
     invariant(ret.second, "Element already existed in map/set");
 }
 
+bool isConfigServer(const ShardRegistry* sr, const HostAndPort& peer) {
+    return sr && sr->isConfigServer(peer);
+}
+
 }  // namespace
 
-Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS,
+                                                               const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     auto pendingTimeoutMS = gParameters.pendingTimeoutMS.load();
     if (hostTimeoutMS >= (toRefreshTimeoutMS + pendingTimeoutMS)) {
@@ -70,7 +90,8 @@ Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTi
     return Status(ErrorCodes::BadValue, msg);
 }
 
-Status ShardingTaskExecutorPoolController::validatePendingTimeout(const int& pendingTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validatePendingTimeout(
+    const int& pendingTimeoutMS, const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     if (pendingTimeoutMS < toRefreshTimeoutMS) {
         return Status::OK();
@@ -83,9 +104,8 @@ Status ShardingTaskExecutorPoolController::validatePendingTimeout(const int& pen
 }
 
 Status ShardingTaskExecutorPoolController::onUpdateMatchingStrategy(const std::string& str) {
-    // TODO Fix up after SERVER-40224
     if (str == "automatic") {
-        if (isMongos()) {
+        if (serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
             gParameters.matchingStrategy.store(MatchingStrategy::kMatchPrimaryNode);
         } else {
             gParameters.matchingStrategy.store(MatchingStrategy::kDisabled);
@@ -197,6 +217,7 @@ void ShardingTaskExecutorPoolController::addHost(PoolId id, const HostAndPort& h
 
     PoolData poolData;
     poolData.host = host;
+    poolData.isConfigServer = isConfigServer(_shardRegistry.lock().get(), host);
 
     // Set up the GroupAndId
     auto& groupAndId = _groupAndIds[host];
@@ -220,11 +241,29 @@ auto ShardingTaskExecutorPoolController::updateHost(PoolId id, const HostState& 
 
     auto& poolData = getOrInvariant(_poolDatas, id);
 
-    const size_t minConns = gParameters.minConnections.load();
-    const size_t maxConns = gParameters.maxConnections.load();
+    const auto [minConns, maxConns] = [&] {
+        size_t lo = gParameters.minConnections.load();
+        size_t hi = gParameters.maxConnections.load();
+        if (poolData.isConfigServer) {
+            auto maybeOverride = [](size_t& t, int val) {
+                if (val >= 0)
+                    t = val;
+            };
+            maybeOverride(lo, gParameters.minConnectionsForConfigServers.load());
+            maybeOverride(hi, gParameters.maxConnectionsForConfigServers.load());
+        }
+        return std::tuple(lo, hi);
+    }();
+    // conn_pool_csrs.js looks for this message in the log.
+    LOGV2_DEBUG(6265600,
+                5,
+                "Update connection pool",
+                "host"_attr = poolData.host,
+                "minConns"_attr = minConns,
+                "maxConns"_attr = maxConns);
 
     // Update the target for just the pool first
-    poolData.target = stats.requests + stats.active;
+    poolData.target = stats.requests + stats.active + stats.leased;
 
     if (poolData.target < minConns) {
         poolData.target = minConns;

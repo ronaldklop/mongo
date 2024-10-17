@@ -27,29 +27,50 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/db/auth/action_set.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/commands/cluster_commands_gen.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/clear_jumbo_flag_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
 
 class ClearJumboFlagCommand final : public TypedCommand<ClearJumboFlagCommand> {
 public:
-    using Request = ClearJumboFlag;
+    using Request = ClusterClearJumboFlag;
 
     class Invocation : public MinimalInvocationBase {
     public:
@@ -73,9 +94,10 @@ public:
         }
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-            const auto cm = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                             ns()));
+            const auto [cm, _] = uassertStatusOK(
+                Grid::get(opCtx)
+                    ->catalogCache()
+                    ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, ns()));
 
             uassert(ErrorCodes::InvalidOptions,
                     "bounds can only have exactly 2 elements",
@@ -92,8 +114,8 @@ public:
             boost::optional<Chunk> chunk;
 
             if (request().getFind()) {
-                BSONObj shardKey = uassertStatusOK(cm.getShardKeyPattern().extractShardKeyFromQuery(
-                    opCtx, ns(), *request().getFind()));
+                BSONObj shardKey = uassertStatusOK(extractShardKeyFromBasicQuery(
+                    opCtx, ns(), cm.getShardKeyPattern(), *request().getFind()));
                 uassert(51260,
                         str::stream()
                             << "no shard key found in chunk query " << *request().getFind(),
@@ -117,14 +139,14 @@ public:
             ConfigsvrClearJumboFlag configCmd(
                 ns(), cm.getVersion().epoch(), chunk->getMin(), chunk->getMax());
             configCmd.setDbName(request().getDbName());
+            generic_argument_util::setMajorityWriteConcern(configCmd, &opCtx->getWriteConcern());
 
             auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
             auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(configCmd.toBSON({}),
-                                                           opCtx->getWriteConcern()),
+                DatabaseName::kAdmin,
+                configCmd.toBSON(),
                 Shard::RetryPolicy::kIdempotent));
 
             uassertStatusOK(cmdResponse.commandStatus);
@@ -145,8 +167,8 @@ public:
         return "clears the jumbo flag of the chunk that contains the key\n"
                "   { clearJumboFlag : 'alleyinsider.blog.posts' , find : { ts : 1 } }\n";
     }
-
-} clusterClearJumboFlag;
+};
+MONGO_REGISTER_COMMAND(ClearJumboFlagCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

@@ -29,7 +29,27 @@
 
 #pragma once
 
+#include <memory>
+#include <set>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/transaction_coordinator_catalog.h"
+#include "mongo/db/s/transaction_coordinator_futures_util.h"
+#include "mongo/db/s/transaction_coordinator_structures.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -54,7 +74,7 @@ public:
      */
     void createCoordinator(OperationContext* opCtx,
                            LogicalSessionId lsid,
-                           TxnNumber txnNumber,
+                           TxnNumberAndRetryCounter txnNumberAndRetryCounter,
                            Date_t commitDeadline);
 
     /**
@@ -64,28 +84,29 @@ public:
     void reportCoordinators(OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops);
 
     /**
-     * If a coordinator for the (lsid, txnNumber) exists, delivers the participant list to the
-     * coordinator, which will cause the coordinator to start coordinating the commit if the
-     * coordinator had not yet received a list, and returns a Future that will contain the decision
-     * when the transaction finishes committing or aborting.
+     * If a coordinator for the (lsid, txnNumber, txnRetryCounter) exists, delivers the participant
+     * list to the coordinator, which will cause the coordinator to start coordinating the commit if
+     * the coordinator had not yet received a list, and returns a Future that will contain the
+     * decision when the transaction finishes committing or aborting.
      *
-     * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
+     * If no coordinator for the (lsid, txnNumber, txnRetryCounter) exists, returns boost::none.
      */
     boost::optional<SharedSemiFuture<txn::CommitDecision>> coordinateCommit(
         OperationContext* opCtx,
         LogicalSessionId lsid,
-        TxnNumber txnNumber,
+        TxnNumberAndRetryCounter txnNumberAndRetryCounter,
         const std::set<ShardId>& participantList);
 
     /**
-     * If a coordinator for the (lsid, txnNumber) exists, returns a Future that will contain the
-     * decision when the transaction finishes committing or aborting.
+     * If a coordinator for the (lsid, txnNumber, txnRetryCounter) exists, returns a Future that
+     * will contain the decision when the transaction finishes committing or aborting.
      *
-     * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
+     * If no coordinator for the (lsid, txnNumber, txnRetryCounter) exists, returns boost::none.
      */
-    boost::optional<SharedSemiFuture<txn::CommitDecision>> recoverCommit(OperationContext* opCtx,
-                                                                         LogicalSessionId lsid,
-                                                                         TxnNumber txnNumber);
+    boost::optional<SharedSemiFuture<txn::CommitDecision>> recoverCommit(
+        OperationContext* opCtx,
+        LogicalSessionId lsid,
+        TxnNumberAndRetryCounter txnNumberAndRetryCounter);
 
     /**
      * Marks the coordinator catalog as stepping up, which blocks all incoming requests for
@@ -103,6 +124,11 @@ public:
     void onStepDown();
 
     /**
+     * Shuts down this service. This will no longer be usable once shutdown is called.
+     */
+    void shutdown();
+
+    /**
      * Called when an already established replica set is added as a shard to a cluster. Ensures that
      * the TransactionCoordinator service is started up if the replica set is currently primary.
      */
@@ -113,7 +139,7 @@ public:
      */
     void cancelIfCommitNotYetStarted(OperationContext* opCtx,
                                      LogicalSessionId lsid,
-                                     TxnNumber txnNumber);
+                                     TxnNumberAndRetryCounter txnNumberAndRetryCounter);
 
     /**
      * Blocking call which waits for the previous stepUp/stepDown round to join and ensures all
@@ -146,11 +172,17 @@ private:
     std::shared_ptr<CatalogAndScheduler> _catalogAndSchedulerToCleanup;
 
     // Protects the state below
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinatorService::_mutex");
+    mutable stdx::mutex _mutex;
 
     // The catalog + scheduler instantiated at the last step-up attempt. When nullptr, it means
     // onStepUp has not been called yet after the last stepDown (or construction).
     std::shared_ptr<CatalogAndScheduler> _catalogAndScheduler;
+
+    // Sets to false once shutdown was called at least once.
+    bool _isShuttingDown{false};
+
+    // Used to cancel WaitForMajority for TransactionCoordinator when this service steps down.
+    CancellationSource _cancelSource;
 };
 
 }  // namespace mongo

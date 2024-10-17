@@ -7,15 +7,13 @@
  *    database are allowed.
  *
  * @tags: [
- *   requires_find_command,
  *   uses_transactions,
+ *    # TODO (SERVER-88122): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1});
 const mongosSession = st.s.startSession();
@@ -60,4 +58,3 @@ assert.commandFailedWithCode(error, ErrorCodes.OperationNotSupportedInTransactio
 
 shardSession.endSession();
 st.stop();
-}());

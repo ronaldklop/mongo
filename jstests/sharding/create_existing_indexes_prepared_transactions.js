@@ -3,14 +3,11 @@
 // aware of the existing index fails.
 //
 // @tags: [
-//   requires_find_command,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
-//   live_record_incompatible,
 // ]
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "TestDB";
 const collName = "foo";
@@ -80,4 +77,3 @@ st.shard1.getDB(dbName).getCollection(collName).runCommand(
     {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]});
 
 st.stop();
-})();

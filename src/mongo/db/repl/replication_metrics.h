@@ -29,10 +29,20 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_metrics_gen.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -81,15 +91,16 @@ public:
     // All the election candidate metrics that should be set when a node calls an election are set
     // in this one function, so that the 'electionCandidateMetrics' section of replSetStatus shows a
     // consistent state.
-    void setElectionCandidateMetrics(const StartElectionReasonEnum reason,
-                                     const Date_t lastElectionDate,
-                                     const long long electionTerm,
-                                     const OpTime lastCommittedOpTime,
-                                     const OpTime lastSeenOpTime,
-                                     const int numVotesNeeded,
-                                     const double priorityAtElection,
-                                     const Milliseconds electionTimeoutMillis,
-                                     const boost::optional<int> priorPrimary);
+    void setElectionCandidateMetrics(StartElectionReasonEnum reason,
+                                     Date_t lastElectionDate,
+                                     long long electionTerm,
+                                     OpTime lastCommittedOpTime,
+                                     OpTime latestWrittenOpTime,
+                                     OpTime latestAppliedOpTime,
+                                     int numVotesNeeded,
+                                     double priorityAtElection,
+                                     Milliseconds electionTimeoutMillis,
+                                     boost::optional<int> priorPrimary);
     void setTargetCatchupOpTime(OpTime opTime);
     void setNumCatchUpOps(long numCatchUpOps);
     void setCandidateNewTermStartDate(Date_t newTermStartDate);
@@ -106,26 +117,28 @@ public:
     // All the election participant metrics that should be set when a node votes in an election are
     // set in this one function, so that the 'electionParticipantMetrics' section of replSetStatus
     // shows a consistent state.
-    void setElectionParticipantMetrics(const bool votedForCandidate,
-                                       const long long electionTerm,
-                                       const Date_t lastVoteDate,
-                                       const int electionCandidateMemberId,
-                                       const std::string voteReason,
-                                       const OpTime lastAppliedOpTime,
-                                       const OpTime maxAppliedOpTimeInSet,
-                                       const double priorityAtElection);
+    void setElectionParticipantMetrics(bool votedForCandidate,
+                                       long long electionTerm,
+                                       Date_t lastVoteDate,
+                                       int electionCandidateMemberId,
+                                       std::string voteReason,
+                                       OpTime lastWrittenOpTime,
+                                       OpTime maxWrittenOpTimeInSet,
+                                       OpTime lastAppliedOpTime,
+                                       OpTime maxAppliedOpTimeInSet,
+                                       double priorityAtElection);
 
     BSONObj getElectionParticipantMetricsBSON();
     void setParticipantNewTermDates(Date_t newTermStartDate, Date_t newTermAppliedDate);
     void clearParticipantNewTermDates();
 
 
-private:
     class ElectionMetricsSSS;
 
+private:
     void _updateAverageCatchUpOps(WithLock lk);
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationMetrics::_mutex");
+    mutable stdx::mutex _mutex;
     ElectionMetrics _electionMetrics;
     ElectionCandidateMetrics _electionCandidateMetrics;
     ElectionParticipantMetrics _electionParticipantMetrics;

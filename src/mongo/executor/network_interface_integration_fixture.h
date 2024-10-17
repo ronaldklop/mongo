@@ -28,13 +28,31 @@
  */
 #pragma once
 
-#include "mongo/unittest/unittest.h"
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <mutex>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/db/baton.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/executor/executor_integration_test_fixture.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/random.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -62,7 +80,7 @@ inline TaskExecutor::CallbackHandle makeCallbackHandle() {
 
 using StartCommandCB = std::function<void(const RemoteCommandResponse&)>;
 
-class NetworkInterfaceIntegrationFixture : public mongo::unittest::Test {
+class NetworkInterfaceIntegrationFixture : public ExecutorIntegrationTestFixture {
 public:
     void createNet(std::unique_ptr<NetworkConnectionHook> connectHook = nullptr,
                    ConnectionPool::Options options = {});
@@ -70,6 +88,11 @@ public:
     void tearDown() override;
 
     NetworkInterface& net();
+
+    /**
+     * A NetworkInterface used for test fixture needs (e.g. failpoints).
+     */
+    NetworkInterface& fixtureNet();
 
     ConnectionString fixture();
 
@@ -79,46 +102,81 @@ public:
 
     PseudoRandom* getRandomNumberGenerator();
 
-    void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                      RemoteCommandRequest& request,
-                      StartCommandCB onFinish);
-
-    Future<RemoteCommandResponse> runCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                             RemoteCommandRequest request);
-
-    Future<RemoteCommandOnAnyResponse> runCommandOnAny(const TaskExecutor::CallbackHandle& cbHandle,
-                                                       RemoteCommandRequestOnAny request);
-
-    Future<void> startExhaustCommand(
+    /**
+     * Runs a command, returning a future representing its response. When waiting on this future,
+     * use the interruptible returned by interruptible() and only do so from one thread.
+     */
+    Future<RemoteCommandResponse> runCommand(
         const TaskExecutor::CallbackHandle& cbHandle,
         RemoteCommandRequest request,
-        std::function<void(const RemoteCommandResponse&)> exhaustUtilCB,
-        const BatonHandle& baton = nullptr);
+        const CancellationToken& token = CancellationToken::uncancelable());
 
+    void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle);
+
+    /**
+     * Runs a command on the fixture NetworkInterface and asserts it suceeded.
+     */
+    BSONObj runSetupCommandSync(const DatabaseName& db, BSONObj cmdObj) override;
+
+    /**
+     * Runs a command synchronously, returning its response. While this executes, no other thread
+     * may use interruptible().
+     */
     RemoteCommandResponse runCommandSync(RemoteCommandRequest& request);
 
-    void assertCommandOK(StringData db,
+    /**
+     * Asserts that a command succeeds or fails in some disposition. While these execute, no other
+     * thread may use interruptible().
+     */
+    void assertCommandOK(const DatabaseName& db,
                          const BSONObj& cmd,
                          Milliseconds timeoutMillis = Minutes(5),
                          transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode);
-    void assertCommandFailsOnClient(StringData db,
+    void assertCommandFailsOnClient(const DatabaseName& db,
                                     const BSONObj& cmd,
                                     ErrorCodes::Error reason,
                                     Milliseconds timeoutMillis = Minutes(5));
 
-    void assertCommandFailsOnServer(StringData db,
+    void assertCommandFailsOnServer(const DatabaseName& db,
                                     const BSONObj& cmd,
                                     ErrorCodes::Error reason,
                                     Milliseconds timeoutMillis = Minutes(5));
 
-    void assertWriteError(StringData db,
+    void assertWriteError(const DatabaseName& db,
                           const BSONObj& cmd,
                           ErrorCodes::Error reason,
                           Milliseconds timeoutMillis = Minutes(5));
 
+    size_t getInProgress() {
+        auto lk = stdx::unique_lock(_mutex);
+        return _workInProgress;
+    }
+
+    /**
+     * Returns a Baton that can be used to run commands on, or nullptr for reactor-only operation.
+     * Implicitly used by runCommand, cancelCommand, runCommandSync, and assertCommand* variants.
+     */
+    virtual BatonHandle baton() {
+        return nullptr;
+    }
+
+    /** Returns an Interruptible appropriate for the Baton returned from baton(). */
+    virtual Interruptible* interruptible() {
+        return Interruptible::notInterruptible();
+    }
+
 private:
+    void _onSchedulingCommand();
+    void _onCompletingCommand();
+
+    std::unique_ptr<NetworkInterface> _fixtureNet;
     std::unique_ptr<NetworkInterface> _net;
     PseudoRandom* _rng = nullptr;
+
+    size_t _workInProgress = 0;
+    stdx::condition_variable _fixtureIsIdle;
+    mutable stdx::mutex _mutex;
 };
+
 }  // namespace executor
 }  // namespace mongo

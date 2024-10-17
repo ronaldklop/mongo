@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional/optional.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
-#include <stdlib.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
@@ -42,19 +41,24 @@
 #include "mongo/base/status_with.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
+#include "mongo/transport/ssl_connection_context.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/net/cidr.h"
 #include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/net/ssl_peer_info.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 using asio::ssl::apple::CFUniquePtr;
 
@@ -68,6 +72,8 @@ using asio::ssl::apple::CFUniquePtr;
 extern "C" SecIdentityRef SecIdentityCreate(CFAllocatorRef, SecCertificateRef, SecKeyRef);
 
 namespace mongo {
+
+using transport::SSLConnectionContext;
 
 namespace {
 
@@ -206,10 +212,6 @@ void uassertOSStatusOK(::OSStatus status, SocketErrorKind kind) {
         throwSocketError(kind, str::stream() << "Unknown SSL error" << static_cast<int>(status));
     }
     throwSocketError(kind, swMsg.getValue());
-}
-
-bool isUnixDomainSocket(const std::string& hostname) {
-    return end(hostname) != std::find(begin(hostname), end(hostname), '/');
 }
 
 ::OSStatus posixErrno(int err) {
@@ -1153,7 +1155,6 @@ public:
         }
 
         uassertOSStatusOK(::SSLSetConnection(_ssl.get(), static_cast<void*>(this)));
-        uassertOSStatusOK(::SSLSetPeerID(_ssl.get(), _ssl.get(), sizeof(_ssl)));
         uassertOSStatusOK(::SSLSetIOFuncs(_ssl.get(), read_func, write_func));
         uassertOSStatusOK(::SSLSetProtocolVersionMin(_ssl.get(), ctx->protoMin));
         uassertOSStatusOK(::SSLSetProtocolVersionMax(_ssl.get(), ctx->protoMax));
@@ -1269,11 +1270,16 @@ namespace {
 
 class SSLManagerApple : public SSLManagerInterface {
 public:
-    explicit SSLManagerApple(const SSLParams& params, bool isServer);
+    explicit SSLManagerApple(const SSLParams& params,
+                             const boost::optional<TransientSSLParams>& transientSSLParams,
+                             bool isServer);
 
     Status initSSLContext(asio::ssl::apple::Context* context,
                           const SSLParams& params,
                           ConnectionDirection direction) final;
+
+    void registerOwnedBySSLContext(
+        std::weak_ptr<const transport::SSLConnectionContext> ownedByContext) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
@@ -1302,6 +1308,8 @@ public:
 
     void stopJobs() final;
 
+    SSLManagerMode getSSLManagerMode() const final;
+
 private:
     bool _weakValidation;
     bool _allowInvalidCertificates;
@@ -1309,6 +1317,8 @@ private:
     bool _suppressNoCertificateWarning;
     asio::ssl::apple::Context _clientCtx;
     asio::ssl::apple::Context _serverCtx;
+    // If set, this parameters are used to create new transient SSL connection.
+    const boost::optional<TransientSSLParams> _transientSSLParams;
 
     /* _clientCA represents the CA to use when acting as a client
      * and validating remotes during outbound connections.
@@ -1324,13 +1334,50 @@ private:
     CFUniquePtr<::CFArrayRef> _serverCA;
 
     SSLConfiguration _sslConfiguration;
+
+    // Weak pointer to verify that this manager is still owned by this context.
+    // Will be used if stapling is implemented.
+    synchronized_value<std::weak_ptr<const SSLConnectionContext>> _ownedByContext;
 };
 
-SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
+SSLManagerApple::SSLManagerMode SSLManagerApple::getSSLManagerMode() const {
+    if (!_transientSSLParams) {
+        return SSLManagerMode::Normal;
+    } else if (_transientSSLParams->createNewConnection()) {
+        return SSLManagerMode::TransientWithOverride;
+    } else {
+        return SSLManagerMode::TransientNoOverride;
+    }
+}
+
+SSLManagerApple::SSLManagerApple(const SSLParams& params,
+                                 const boost::optional<TransientSSLParams>& transientSSLParams,
+                                 bool isServer)
     : _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames),
-      _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning) {
+      _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning),
+      _transientSSLParams(transientSSLParams) {
+
+    SSLManagerMode managerMode = getSSLManagerMode();
+    const std::string& cafile = [&]() -> const std::string& {
+        if (MONGO_unlikely(managerMode != SSLManagerMode::Normal)) {
+            uassert(
+                ErrorCodes::InvalidSSLConfiguration,
+                "New transient TLS connections are only supported from client-to-server and when "
+                "`tlsOverrideGlobalParams` is set to true",
+                !isServer && managerMode == SSLManagerMode::TransientWithOverride);
+
+            // Transient connections have priority over global SSL params.
+            const auto& tlsParams = transientSSLParams->getTLSCredentials();
+
+            _allowInvalidCertificates = tlsParams->tlsAllowInvalidCertificates;
+            _allowInvalidHostnames = tlsParams->tlsAllowInvalidHostnames;
+            return _transientSSLParams->getTLSCredentials()->tlsCAFile;
+        } else {
+            return params.sslCAFile;
+        }
+    }();
 
     uassertStatusOK(initSSLContext(&_clientCtx, params, ConnectionDirection::kOutgoing));
     if (_clientCtx.certs) {
@@ -1359,26 +1406,21 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
         }
     }
 
-    if (!params.sslCAFile.empty()) {
-        auto ca = uassertStatusOK(loadPEM(params.sslCAFile, "", kLoadPEMStripKeys));
+    // If the user has specified --setParameter tlsUseSystemCA=true, then no cafile nor
+    // params.sslClusterCAFile will be defined, and the SSL Manager will fall back to the System CA.
+    if (!cafile.empty()) {
+        auto ca = uassertStatusOK(loadPEM(cafile, "", kLoadPEMStripKeys));
         _clientCA = std::move(ca);
-        _sslConfiguration.hasCA = _clientCA && ::CFArrayGetCount(_clientCA.get());
-    }
-
-    if (!params.sslCertificateSelector.empty() || !params.sslClusterCertificateSelector.empty()) {
-        // By using the system keychain, we acknowledge it exists.
-        _sslConfiguration.hasCA = true;
     }
 
     if (!_clientCA) {
-        // No explicit CA was specified, use the Keychain CA explicitly on client connects,
-        // even though we're going to pretend it doesn't exist on server.
+        // No explicit CA was specified, use the Keychain CA explicitly
         ::CFArrayRef certs = nullptr;
         uassertOSStatusOK(SecTrustCopyAnchorCertificates(&certs));
         _clientCA.reset(certs);
     }
 
-    if (!params.sslClusterCAFile.empty()) {
+    if (!params.sslClusterCAFile.empty() && managerMode != SSLManagerMode::TransientWithOverride) {
         auto ca = uassertStatusOK(loadPEM(params.sslClusterCAFile, "", kLoadPEMStripKeys));
         _serverCA = std::move(ca);
     } else {
@@ -1389,10 +1431,12 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
     }
 }
 
-StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(const SSLParams& params) {
+StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(
+    const std::vector<SSLParams::Protocols>* disabledProtocols) {
+
     // Map disabled protocols to range.
     bool tls10 = true, tls11 = true, tls12 = true;
-    for (const SSLParams::Protocols& protocol : params.sslDisabledProtocols) {
+    for (const SSLParams::Protocols& protocol : *disabledProtocols) {
         if (protocol == SSLParams::Protocols::TLS1_0) {
             tls10 = false;
         } else if (protocol == SSLParams::Protocols::TLS1_1) {
@@ -1424,8 +1468,21 @@ StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(const SSL
 Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
                                        const SSLParams& params,
                                        ConnectionDirection direction) {
+    auto sslConfig = parseSSLCoreParams(params, _transientSSLParams);
+
+    const auto [certificateSelector,
+                disabledProtocols] = [&]() -> std::pair<const SSLParams::CertificateSelector*,
+                                                        const std::vector<SSLParams::Protocols>*> {
+        if (MONGO_unlikely(_transientSSLParams)) {
+            const auto& tlsParams = _transientSSLParams->getTLSCredentials();
+            return {&tlsParams->tlsCertificateSelector, &tlsParams->tlsDisabledProtocols};
+        } else {
+            return {&params.sslCertificateSelector, &params.sslDisabledProtocols};
+        }
+    }();
+
     // Protocol Version.
-    const auto swProto = parseProtocolRange(params);
+    const auto swProto = parseProtocolRange(disabledProtocols);
     if (!swProto.isOK()) {
         return swProto.getStatus();
     }
@@ -1457,7 +1514,8 @@ Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
         return Status::OK();
     };
 
-    if (direction == ConnectionDirection::kOutgoing) {
+    if (direction == ConnectionDirection::kOutgoing &&
+        getSSLManagerMode() != SSLManagerMode::TransientWithOverride) {
         if (params.tlsWithholdClientCertificate) {
             return Status::OK();
         }
@@ -1470,8 +1528,12 @@ Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
         // Fallthrough...
     }
 
-    return selectCertificate(
-        params.sslCertificateSelector, params.sslPEMKeyFile, params.sslPEMKeyPassword);
+    return selectCertificate(*certificateSelector, sslConfig.clientPEM, sslConfig.clientPassword);
+}
+
+void SSLManagerApple::registerOwnedBySSLContext(
+    std::weak_ptr<const transport::SSLConnectionContext> ownedByContext) {
+    _ownedByContext = ownedByContext;
 }
 
 SSLConnectionInterface* SSLManagerApple::connect(Socket* socket) {
@@ -1542,27 +1604,12 @@ Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
 
     recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
-    /* While we always have a system CA via the Keychain,
-     * we'll pretend not to in terms of validation if the server
-     * was started using a PEM file (legacy mode).
-     *
-     * When a certificate selector is used, we'll override hasCA to true
-     * so that the validation path runs anyway.
-     */
-    if (!_sslConfiguration.hasCA && isSSLServer) {
-        return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
-    }
-
     const auto badCert = [&](StringData msg, bool warn = false) -> Future<SSLPeerInfo> {
         if (warn) {
-            LOGV2_WARNING(23209,
-                          "SSL peer certificate validation failed: {error}",
-                          "SSL peer certificate validation failed",
-                          "error"_attr = msg);
+            LOGV2_WARNING(23209, "SSL peer certificate validation failed", "error"_attr = msg);
             return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
         } else {
             LOGV2_ERROR(23212,
-                        "SSL peer certificate validation failed {error}; connection rejected",
                         "SSL peer certificate validation failed; connection rejected",
                         "error"_attr = msg);
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
@@ -1577,7 +1624,7 @@ Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
             return SSLPeerInfo(sniName);
         } else {
             if (status == ::errSecSuccess) {
-                return badCert(str::stream() << "no SSL certificate provided by peer: "
+                return badCert(str::stream() << "No SSL certificate provided by peer: "
                                              << stringFromOSStatus(status),
                                _weakValidation);
             } else {
@@ -1655,11 +1702,15 @@ Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         return swPeerSubjectName.getStatus();
     }
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
-    LOGV2_DEBUG(23207,
-                2,
-                "Accepted TLS connection from peer: {peerSubjectName}",
-                "Accepted TLS connection from peer",
-                "peerSubjectName"_attr = peerSubjectName);
+    // The cipher will be presented as a number.
+    ::SSLCipherSuite cipher;
+    uassertOSStatusOK(::SSLGetNegotiatedCipher(ssl, &cipher));
+    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines.load()) {
+        LOGV2_INFO(6723803,
+                   "Accepted TLS connection from peer",
+                   "peerSubjectName"_attr = peerSubjectName,
+                   "cipher"_attr = cipher);
+    }
 
     // Server side.
     if (remoteHost.empty()) {
@@ -1857,14 +1908,15 @@ extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
     const SSLParams& params,
-    const std::optional<TransientSSLParams>& transientSSLParams,
+    const boost::optional<TransientSSLParams>& transientSSLParams,
     bool isServer) {
-    return std::make_shared<SSLManagerApple>(params, isServer);
+    return std::make_shared<SSLManagerApple>(params, transientSSLParams, isServer);
 }
 
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return std::make_shared<SSLManagerApple>(params, isServer);
+    return std::make_shared<SSLManagerApple>(
+        params, boost::optional<TransientSSLParams>{}, isServer);
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
@@ -1872,8 +1924,24 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
     kMongoDBRolesOID = ::CFStringCreateWithCString(
         nullptr, mongodbRolesOID.identifier.c_str(), ::kCFStringEncodingUTF8);
 
+    constexpr int kMaxRetries = 10;
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManagerCoordinator = new SSLManagerCoordinator();
+        for (int i = 0; i < kMaxRetries; i++) {
+            try {
+                theSSLManagerCoordinator = new SSLManagerCoordinator();
+                return;
+            } catch (const ExceptionFor<ErrorCodes::InvalidSSLConfiguration>& e) {
+                bool isRetriableError = nullptr != strstr(e.what(), "No keychain is available.");
+                if (!isRetriableError || i == kMaxRetries - 1) {
+                    // Rethrow if a different error or we fail on final iteration
+                    throw;
+                }
+                LOGV2_INFO(6741800,
+                           "Caught exception during apple SSLManagerCoordinator creation, retrying",
+                           "try"_attr = i,
+                           "error"_attr = e.what());
+            }
+        }
     }
 }
 

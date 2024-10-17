@@ -3,10 +3,9 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/rslib.js");  // For reconnect()
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -128,4 +127,3 @@ testTransactionsWithFailover(doInsertTextSearch, stepDownViaHeartbeat, postInser
 testTransactionsWithFailover(doInsertTextSearch, stepDownViaCommand, postInsertTextSearch);
 
 replTest.stopSet();
-})();

@@ -1,14 +1,12 @@
 /**
  * Tests operations on indexes with the maximum number of compound index fields, 32.
  *
- *  @tags: [
+ * @tags: [
  *   assumes_unsharded_collection,
- *   requires_fcv_49,
  *   requires_non_retryable_writes,
+ *   no_selinux,
  * ]
  */
-(function() {
-
 const collName = jsTestName();
 const coll = db[collName];
 coll.drop();
@@ -54,4 +52,3 @@ for (let i = 0; i < 32; i++) {
     let query = {['f' + i]: 1};
     assert.eq(2, coll.find().hint(spec).itcount(), "failed on query: " + tojson(query));
 }
-})();

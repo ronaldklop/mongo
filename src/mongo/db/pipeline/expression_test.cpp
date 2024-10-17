@@ -27,34 +27,54 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <climits>
+#include <cmath>
+#include <limits>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/config.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/hasher.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_multi.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/name_expression.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/record_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/summation.h"
+#include "mongo/util/time_support.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
 namespace ExpressionTests {
 
 using boost::intrusive_ptr;
 using std::initializer_list;
-using std::list;
 using std::numeric_limits;
 using std::pair;
-using std::set;
 using std::sort;
 using std::string;
 using std::vector;
@@ -123,7 +143,7 @@ static BSONObj toBson(const Value& value) {
 
 /** Convert Expression to BSON. */
 static BSONObj expressionToBson(const intrusive_ptr<Expression>& expression) {
-    return BSON("" << expression->serialize(false)).firstElement().embeddedObject().getOwned();
+    return BSON("" << expression->serialize()).firstElement().embeddedObject().getOwned();
 }
 
 /** Convert Document to BSON. */
@@ -136,10 +156,77 @@ Document fromBson(BSONObj obj) {
     return Document(obj);
 }
 
+Document fromJson(const std::string& json) {
+    return Document(fromjson(json));
+}
+
 /** Create a Value from a BSONObj. */
 Value valueFromBson(BSONObj obj) {
     BSONElement element = obj.firstElement();
     return Value(element);
+}
+
+/** Asserts that the Expression parsed from 'spec' returns a BSONArray and is equal to 'expected'.
+ */
+void assertExpectedArray(const BSONObj& spec, const BSONArray& expected) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    auto expression = Expression::parseExpression(&expCtx, spec, vps);
+    auto result = expression->evaluate({}, &expCtx.variables);
+    ASSERT_EQ(result.getType(), BSONType::Array);
+    ASSERT_VALUE_EQ(result, Value(expected));
+};
+
+/**
+ * Given 'parseFn', parses and evaluates 'spec' and verifies that the result is equal to
+ * 'expected'. Useful when the parser for an expression is unavailable in certain contexts (for
+ * instance, when evaluating an expression that's guarded by a feature flag that's off by default).
+ */
+void parseAndVerifyResults(
+    const std::function<boost::intrusive_ptr<Expression>(
+        ExpressionContext* const, BSONElement, const VariablesParseState&)>& parseFn,
+    const BSONElement& elem,
+    Value expected) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    auto expr = parseFn(&expCtx, elem, vps);
+    ASSERT_VALUE_EQ(expr->evaluate({}, &expCtx.variables), expected);
+}
+
+/**
+ * Generates a random double with a variable number of decimal places between 1 and 15.
+ */
+double randomDouble() {
+    // Create a random number generator engine.
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // Create a distribution and generate a double between -1 and 1.
+    std::uniform_real_distribution<double> dis(-1.0, 1.0);
+    double randomValue = dis(gen);
+
+    std::uniform_int_distribution<int> multiplier(0, 15);
+    int shift = multiplier(gen);
+    double factor = std::pow(10.0, shift);
+
+    // Multiply the random number by the factor to set the decimal places
+    double result = randomValue * factor;
+    return result;
+}
+
+/**
+ * Verifies that a double can correctly convert to a string and round-trip back to the original
+ * double.
+ */
+void verifyStringDoubleConvertRoundtripsCorrectly(double doubleToConvert) {
+    Value doubleConvertedToString = evaluateExpression("$toString", {doubleToConvert});
+    ASSERT_EQ(doubleConvertedToString.getType(), BSONType::String);
+
+    Value stringConvertedToDouble = evaluateExpression("$toDouble", {doubleConvertedToString});
+    ASSERT_EQ(stringConvertedToDouble.getType(), BSONType::NumberDouble);
+
+    // Verify the conversion round-trips correctly.
+    ASSERT_VALUE_EQ(stringConvertedToDouble, Value(doubleToConvert));
 }
 
 /* ------------------------- ExpressionArrayToObject -------------------------- */
@@ -235,6 +322,79 @@ TEST(ExpressionReverseArrayTest, ReturnsNullWithNullishInput) {
         {{{Value(BSONNULL)}, Value(BSONNULL)}, {{Value(BSONUndefined)}, Value(BSONNULL)}});
 }
 
+/* ------------------------ ExpressionSortArray -------------------- */
+
+TEST(ExpressionSortArrayTest, SortsNormalArrayForwards) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: [ 2, 1, 3 ] }, sortBy: 1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_EQ(val.getType(), BSONType::Array);
+    ASSERT_VALUE_EQ(val, Value(BSON_ARRAY(1 << 2 << 3)));
+}
+
+
+TEST(ExpressionSortArrayTest, SortsNormalArrayBackwards) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: [ 2, 1, 3 ] }, sortBy: -1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_EQ(val.getType(), BSONType::Array);
+    ASSERT_VALUE_EQ(val, Value(BSON_ARRAY(3 << 2 << 1)));
+}
+
+TEST(ExpressionSortArrayTest, SortsEmptyArray) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: [ ] }, sortBy: -1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_EQ(val.getType(), BSONType::Array);
+    ASSERT_VALUE_EQ(val, Value(std::vector<Value>()));
+}
+
+TEST(ExpressionSortArrayTest, SortsOneElementArray) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: [ 1 ] }, sortBy: -1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_EQ(val.getType(), BSONType::Array);
+    ASSERT_VALUE_EQ(val, Value(BSON_ARRAY(1)));
+}
+
+TEST(ExpressionSortArrayTest, ReturnsNullWithNullInput) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: null }, sortBy: -1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_VALUE_EQ(val, Value(BSONNULL));
+}
+
+TEST(ExpressionSortArrayTest, ReturnsNullWithUndefinedInput) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{ $sortArray: { input: { $literal: undefined }, sortBy: -1 } }");
+
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    Value val = expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables);
+
+    ASSERT_VALUE_EQ(val, Value(BSONNULL));
+}
+
 /* ------------------------- Old-style tests -------------------------- */
 
 namespace Add {
@@ -268,8 +428,8 @@ public:
 
 /** $add without operands. */
 class NoOperands : public ExpectedResultBase {
-    void populateOperands(intrusive_ptr<ExpressionNary>& expression) {}
-    virtual BSONObj expectedResult() {
+    void populateOperands(intrusive_ptr<ExpressionNary>& expression) override {}
+    BSONObj expectedResult() override {
         return BSON("" << 0);
     }
 };
@@ -297,10 +457,10 @@ public:
 };
 
 class SingleOperandBase : public ExpectedResultBase {
-    void populateOperands(intrusive_ptr<ExpressionNary>& expression) {
+    void populateOperands(intrusive_ptr<ExpressionNary>& expression) override {
         expression->addOperand(ExpressionConstant::create(&expCtx, valueFromBson(operand())));
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return operand();
     }
 
@@ -311,48 +471,48 @@ protected:
 
 /** Single int argument. */
 class Int : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return BSON("" << 1);
     }
 };
 
 /** Single long argument. */
 class Long : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return BSON("" << 5555LL);
     }
 };
 
 /** Single double argument. */
 class Double : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return BSON("" << 99.99);
     }
 };
 
 /** Single Date argument. */
 class Date : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return BSON("" << Date_t::fromMillisSinceEpoch(12345));
     }
 };
 
 /** Single null argument. */
 class Null : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return BSON("" << BSONNULL);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << BSONNULL);
     }
 };
 
 /** Single undefined argument. */
 class Undefined : public SingleOperandBase {
-    BSONObj operand() {
+    BSONObj operand() override {
         return fromjson("{'':undefined}");
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << BSONNULL);
     }
 };
@@ -368,7 +528,7 @@ public:
     }
 
 protected:
-    void populateOperands(intrusive_ptr<ExpressionNary>& expression) {
+    void populateOperands(intrusive_ptr<ExpressionNary>& expression) override {
         auto expCtx = ExpressionContextForTest{};
         expression->addOperand(
             ExpressionConstant::create(&expCtx, valueFromBson(_reverse ? operand2() : operand1())));
@@ -384,52 +544,52 @@ private:
 
 /** Add two ints. */
 class IntInt : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 1);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << 5);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << 6);
     }
 };
 
 /** Adding two large ints produces a long, not an overflowed int. */
 class IntIntNoOverflow : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << numeric_limits<int>::max());
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << numeric_limits<int>::max());
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << ((long long)(numeric_limits<int>::max()) + numeric_limits<int>::max()));
     }
 };
 
 /** Adding an int and a long produces a long. */
 class IntLong : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 1);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << 9LL);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << 10LL);
     }
 };
 
 /** Adding an int and a long produces a double. */
 class IntLongOverflowToDouble : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << numeric_limits<int>::max());
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << numeric_limits<long long>::max());
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         // When the result cannot be represented in a NumberLong, a NumberDouble is returned.
         const auto im = numeric_limits<int>::max();
         const auto llm = numeric_limits<long long>::max();
@@ -440,79 +600,79 @@ class IntLongOverflowToDouble : public TwoOperandBase {
 
 /** Adding an int and a double produces a double. */
 class IntDouble : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 9);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << 1.1);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << 10.1);
     }
 };
 
 /** Adding an int and a Date produces a Date. */
 class IntDate : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 6);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << Date_t::fromMillisSinceEpoch(123450));
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << Date_t::fromMillisSinceEpoch(123456));
     }
 };
 
 /** Adding a long and a double produces a double. */
 class LongDouble : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 9LL);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << 1.1);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << 10.1);
     }
 };
 
 /** Adding a long and a double does not overflow. */
 class LongDoubleNoOverflow : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << numeric_limits<long long>::max());
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << double(numeric_limits<long long>::max()));
     }
-    BSONObj expectedResult() {
-        return BSON("" << numeric_limits<long long>::max() +
-                        double(numeric_limits<long long>::max()));
+    BSONObj expectedResult() override {
+        return BSON("" << static_cast<double>(numeric_limits<long long>::max()) +
+                        static_cast<double>(numeric_limits<long long>::max()));
     }
 };
 
 /** Adding an int and null. */
 class IntNull : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 1);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return BSON("" << BSONNULL);
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << BSONNULL);
     }
 };
 
 /** Adding a long and undefined. */
 class LongUndefined : public TwoOperandBase {
-    BSONObj operand1() {
+    BSONObj operand1() override {
         return BSON("" << 5LL);
     }
-    BSONObj operand2() {
+    BSONObj operand2() override {
         return fromjson("{'':undefined}");
     }
-    BSONObj expectedResult() {
+    BSONObj expectedResult() override {
         return BSON("" << BSONNULL);
     }
 };
@@ -551,7 +711,7 @@ public:
         intrusive_ptr<Expression> nested = ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
         intrusive_ptr<Expression> expression = ExpressionCoerceToBool::create(&expCtx, nested);
         DepsTracker dependencies;
-        expression->addDependencies(&dependencies);
+        expression::addDependencies(expression.get(), &dependencies);
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(1U, dependencies.fields.count("a.b"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
@@ -573,7 +733,7 @@ public:
 
 private:
     static BSONObj toBsonObj(const intrusive_ptr<Expression>& expression) {
-        return BSON("field" << expression->serialize(false));
+        return BSON("field" << expression->serialize());
     }
 };
 
@@ -592,7 +752,7 @@ public:
 private:
     static BSONArray toBsonArray(const intrusive_ptr<Expression>& expression) {
         BSONArrayBuilder bab;
-        bab << expression->serialize(false);
+        bab << expression->serialize();
         return bab.arr();
     }
 };
@@ -649,7 +809,7 @@ public:
         auto expCtx = ExpressionContextForTest{};
         intrusive_ptr<Expression> expression = ExpressionConstant::create(&expCtx, Value(5));
         DepsTracker dependencies;
-        expression->addDependencies(&dependencies);
+        expression::addDependencies(expression.get(), &dependencies);
         ASSERT_EQUALS(0U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
         ASSERT_EQUALS(false, dependencies.getNeedsAnyMetadata());
@@ -668,7 +828,7 @@ public:
 
 private:
     static BSONObj toBsonObj(const intrusive_ptr<Expression>& expression) {
-        return BSON("field" << expression->serialize(false));
+        return BSON("field" << expression->serialize());
     }
 };
 
@@ -685,7 +845,7 @@ public:
 private:
     static BSONObj toBsonArray(const intrusive_ptr<Expression>& expression) {
         BSONArrayBuilder bab;
-        bab << expression->serialize(false);
+        bab << expression->serialize();
         return bab.obj();
     }
 };
@@ -703,7 +863,26 @@ TEST(ExpressionConstantTest, ConstantOfValueMissingSerializesToRemoveSystemVar) 
     intrusive_ptr<Expression> expression = ExpressionConstant::create(&expCtx, Value());
     ASSERT_BSONOBJ_BINARY_EQ(BSON("field"
                                   << "$$REMOVE"),
-                             BSON("field" << expression->serialize(false)));
+                             BSON("field" << expression->serialize()));
+}
+
+TEST(ExpressionConstantTest, ConstantRedaction) {
+    SerializationOptions options;
+    options.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString;
+
+    // Test that a constant is replaced.
+    auto expCtx = ExpressionContextForTest{};
+    intrusive_ptr<Expression> expression = ExpressionConstant::create(&expCtx, Value("my_ssn"_sd));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"field":"?string"})",
+        BSON("field" << expression->serialize(options)));
+
+    auto expressionBSON = BSON("$and" << BSON_ARRAY(BSON("$gt" << BSON_ARRAY("$foo" << 5))
+                                                    << BSON("$lt" << BSON_ARRAY("$foo" << 10))));
+    expression = Expression::parseExpression(&expCtx, expressionBSON, expCtx.variablesParseState);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"field":{"$and":[{"$gt":["$foo","?number"]},{"$lt":["$foo","?number"]}]}})",
+        BSON("field" << expression->serialize(options)));
 }
 
 }  // namespace Constant
@@ -716,6 +895,41 @@ TEST(ExpressionFromAccumulators, Avg) {
                            {{Value(10LL), Value(20LL)}, Value(15.0)},
                            // $avg returns null when no arguments are provided.
                            {{}, Value(BSONNULL)}});
+}
+
+TEST(ExpressionFromAccumulators, FirstNLastN) {
+    using Sense = AccumulatorFirstLastN::Sense;
+
+    // $firstN
+    auto firstNFn = [&](const BSONObj& spec, const BSONArray& expected) {
+        parseAndVerifyResults(AccumulatorFirstLastN::parseExpression<Sense::kFirst>,
+                              spec.firstElement(),
+                              Value(expected));
+    };
+    firstNFn(fromjson("{$firstN: {n: 3, input: [19, 7, 28, 3, 5]}}"),
+             BSONArray(fromjson("[19, 7, 28]")));
+    firstNFn(fromjson("{$firstN: {n: 6, input: [19, 7, 28, 3, 5]}}"),
+             BSONArray(fromjson("[19, 7, 28, 3, 5]")));
+    firstNFn(fromjson("{$firstN: {n: 3, input: [1,2,3,4,5,6]}}"), BSONArray(fromjson("[1,2,3]")));
+    firstNFn(fromjson("{$firstN: {n: 3, input: [1,2,null,null]}}"),
+             BSONArray(fromjson("[1,2,null]")));
+    firstNFn(fromjson("{$firstN: {n: 3, input: [1.1, 2.713, 3, 3.4]}}"),
+             BSONArray(fromjson("[1.1, 2.713, 3]")));
+
+    // $lastN
+    auto lastNFn = [&](const BSONObj& spec, const BSONArray& expected) {
+        parseAndVerifyResults(AccumulatorFirstLastN::parseExpression<Sense::kLast>,
+                              spec.firstElement(),
+                              Value(expected));
+    };
+    lastNFn(fromjson("{$lastN: {n: 3, input: [19, 7, 28, 3, 5]}}"),
+            BSONArray(fromjson("[28,3,5]")));
+    lastNFn(fromjson("{$lastN: {n: 6, input: [19, 7, 28, 3, 5]}}"),
+            BSONArray(fromjson("[19, 7, 28, 3, 5]")));
+    lastNFn(fromjson("{$lastN: {n: 3, input: [3,2,1,4,5,6]}}"), BSONArray(fromjson("[4,5,6]")));
+    lastNFn(fromjson("{$lastN: {n: 3, input: [1,2,null,3]}}"), BSONArray(fromjson("[2,null,3]")));
+    lastNFn(fromjson("{$lastN: {n: 3, input: [3, 2.713, 1.1, 2.7]}}"),
+            BSONArray(fromjson("[2.713, 1.1, 2.7]")));
 }
 
 TEST(ExpressionFromAccumulators, Max) {
@@ -739,6 +953,38 @@ TEST(ExpressionFromAccumulators, Min) {
                            {{Value(0LL), Value(20.0), Value(10)}, Value(0LL)},
                            // $min returns null when no arguments are provided.
                            {{}, Value(BSONNULL)}});
+}
+
+TEST(ExpressionFromAccumulators, MinNMaxN) {
+    using Sense = AccumulatorMinMax::Sense;
+    auto maxNFn = [&](const BSONObj& spec, const BSONArray& expected) {
+        parseAndVerifyResults(
+            AccumulatorMinMaxN::parseExpression<Sense::kMax>, spec.firstElement(), Value(expected));
+    };
+
+    // $maxN
+    maxNFn(fromjson("{$maxN: {n: 3, input: [19, 7, 28, 3, 5]}}"),
+           BSONArray(fromjson("[28, 19, 7]")));
+    maxNFn(fromjson("{$maxN: {n: 6, input: [19, 7, 28, 3, 5]}}"),
+           BSONArray(fromjson("[28, 19, 7, 5, 3]")));
+    maxNFn(fromjson("{$maxN: {n: 3, input: [1,2,3]}}"), BSONArray(fromjson("[3,2,1]")));
+    maxNFn(fromjson("{$maxN: {n: 3, input: [1,2,null]}}"), BSONArray(fromjson("[2,1]")));
+    maxNFn(fromjson("{$maxN: {n: 3, input: [1.1, 2.713, 3]}}"),
+           BSONArray(fromjson("[3, 2.713, 1.1]")));
+
+    auto minNFn = [&](const BSONObj& spec, const BSONArray& expected) {
+        parseAndVerifyResults(
+            AccumulatorMinMaxN::parseExpression<Sense::kMin>, spec.firstElement(), Value(expected));
+    };
+
+    // $minN
+    minNFn(fromjson("{$minN: {n: 3, input: [19, 7, 28, 3, 5]}}"), BSONArray(fromjson("[3,5,7]")));
+    minNFn(fromjson("{$minN: {n: 6, input: [19, 7, 28, 3, 5]}}"),
+           BSONArray(fromjson("[3,5,7,19, 28]")));
+    minNFn(fromjson("{$minN: {n: 3, input: [3,2,1]}}"), BSONArray(fromjson("[1,2,3]")));
+    minNFn(fromjson("{$minN: {n: 3, input: [1,2,null]}}"), BSONArray(fromjson("[1,2]")));
+    minNFn(fromjson("{$minN: {n: 3, input: [3, 2.713, 1.1]}}"),
+           BSONArray(fromjson("[1.1, 2.713, 3]")));
 }
 
 TEST(ExpressionFromAccumulators, Sum) {
@@ -815,11 +1061,19 @@ TEST(ExpressionPowTest, ThrowsWhenBaseZeroAndExpNegative) {
 
     const auto expr =
         Expression::parseExpression(&expCtx, BSON("$pow" << BSON_ARRAY(0 << -5)), vps);
-    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx.variables); }(), AssertionException);
+    ASSERT_THROWS(
+        [&] {
+            expr->evaluate({}, &expCtx.variables);
+        }(),
+        AssertionException);
 
     const auto exprWithLong =
         Expression::parseExpression(&expCtx, BSON("$pow" << BSON_ARRAY(0LL << -5LL)), vps);
-    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx.variables); }(), AssertionException);
+    ASSERT_THROWS(
+        [&] {
+            expr->evaluate({}, &expCtx.variables);
+        }(),
+        AssertionException);
 }
 
 TEST(ExpressionPowTest, LargeExponentValuesWithBaseOfOne) {
@@ -900,6 +1154,225 @@ TEST(ExpressionArray, ExpressionArrayWithAllConstantValuesShouldOptimizeToExpres
     auto notOptimized = expressionArrNotConstant->optimize();
     auto notExprConstant = dynamic_cast<ExpressionConstant*>(notOptimized.get());
     ASSERT_FALSE(notExprConstant);
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchShouldFilterOutConstantFalsesWhenOptimized) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: 1}, {case: { $const: false}, then: 2}, {case: "
+        "\"$y\", then: 3}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstF = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedRemovedConstF.get());
+    ASSERT_FALSE(notExprConstant);
+
+    BSONObj switchOptResult = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 1 }}, {case: \"$y\", then: { $const: "
+        "3 }}], default: { $const: 4 }}}");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstF));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchShouldFilterOutMultipleConstantFalsesWhenOptimized) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: { $const: false}, then: 5}, {case: \"$x\", then: 1}, {case: "
+        "{ $const: false}, then: 2}, {case: { $const: false}, then: 2}, {case: \"$y\", then: 3}, "
+        "{case: { $const: false}, then: 2}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstF = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedRemovedConstF.get());
+    ASSERT_FALSE(notExprConstant);
+
+    BSONObj switchOptResult = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 1 }}, {case: \"$y\", then: { $const: "
+        "3 }}], default: { $const: 4 }}}");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstF));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithAllConstantFalsesAndNoDefaultErrors) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: { $const: false}, then: 5}, {case: { $const: false}, then: "
+        "1}, {case: "
+        "{ $const: false}, then: 2}]}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    ASSERT_THROWS_CODE(switchExp->optimize(), AssertionException, 40069);
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithZeroAsConstantFalseAndNoDefaultErrors) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: { $const: 0}, then: 5}, {case: { $const: false}, then: 1}, "
+        "{case: "
+        "{ $const: false}, then: 2}]}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    ASSERT_THROWS_CODE(switchExp->optimize(), AssertionException, 40069);
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchShouldMakeConstTrueDefaultAndRemoveRest) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: 1}, {case: { $const: true}, then: 2}, {case: "
+        "\"$y\", then: 3}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstT = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedRemovedConstT.get());
+    ASSERT_FALSE(notExprConstant);
+
+    BSONObj switchOptResult = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 1 }}], default: { $const: 2 }}}");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstT));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchShouldOptimizeThensCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: {$add: [2, 4]}}, {case: { $const: true}, then: "
+        "{$add: [3, 4]}}, {case: "
+        "\"$y\", then: 3}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstT = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedRemovedConstT.get());
+    ASSERT_FALSE(notExprConstant);
+
+    BSONObj switchOptResult = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 6 }}], default: { $const: 7 }}}");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstT));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithFirstCaseTrueShouldReturnFirstThenExpression) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: { $const: true}, then: 3}, {case: "
+        "\"$y\", then: 4}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstT = switchExp->optimize();
+
+    BSONObj switchOptResult = fromjson("{ $const: 3 }");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstT));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithNoDefaultShouldMakeConstTrueDefaultAndRemoveRest) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: 1}, {case: { $const: true}, then: 2}, {case: "
+        "\"$y\", then: 3}]}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedRemovedConstT = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedRemovedConstT.get());
+    ASSERT_FALSE(notExprConstant);
+
+    BSONObj switchOptResult = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 1 }}], default: { $const: 2 }}}");
+    ASSERT_BSONOBJ_BINARY_EQ(switchOptResult, expressionToBson(optimizedRemovedConstT));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithNoCasesShouldReturnDefault) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: { $const: false}, then: 1}, {case: { $const: false}, then: "
+        "2}], default: 4}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedDefault = switchExp->optimize();
+
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedDefault.get());
+    ASSERT_TRUE(exprConstant);
+    ASSERT_VALUE_EQ(exprConstant->getValue(), Value(4));
+}
+
+TEST(ExpressionSwitch, ExpressionSwitchWithNoConstantsShouldStayTheSame) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(
+        "{$switch: {branches: [{case: \"$x\", then: { $const: 1 }}, {case: \"$z\", then: { $const: "
+        "2 }}, {case: \"$y\", then: { $const: 3 }}], default: { $const: 4 }}}");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedStaySame = switchExp->optimize();
+
+    auto notExprConstant = dynamic_cast<ExpressionConstant*>(optimizedStaySame.get());
+    ASSERT_FALSE(notExprConstant);
+
+    ASSERT_BSONOBJ_BINARY_EQ(switchQ, expressionToBson(optimizedStaySame));
+}
+
+// This test was designed to provide coverage for SERVER-70190, a bug in which optimizing a $switch
+// expression could leave its children vector in a bad state. By walking the tree after optimizing
+// we make sure that the expected children are found.
+TEST(ExpressionSwitch, CaseEliminationShouldLeaveTreeInWalkableState) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj switchQ = fromjson(R"(
+        {$switch: {
+            branches: [
+                {case: false, then: {$const: 0}},
+                {case: "$z", then: {$const: 1}},
+                {case: "$y", then: {$const: 3}},
+                {case: true, then: {$const: 4}},
+                {case: "$a", then: {$const: 5}},
+                {case: "$b", then: {$const: 6}},
+                {case: "$c", then: {$const: 7}}
+            ],
+            default: {$const: 8}
+        }}
+    )");
+    auto switchExp = ExpressionSwitch::parse(&expCtx, switchQ.firstElement(), vps);
+    auto optimizedExpr = switchExp->optimize();
+
+    BSONObj optimizedQ = fromjson(R"(
+        {$switch: {
+            branches: [
+                {case: "$z", then: {$const: 1}},
+                {case: "$y", then: {$const: 3}}
+            ],
+            default: {$const: 4}
+        }}
+    )");
+
+    ASSERT_BSONOBJ_BINARY_EQ(optimizedQ, expressionToBson(optimizedExpr));
+
+    // Make sure that the expression tree appears as expected when the children are traversed using
+    // a for-each loop.
+    int childNum = 0;
+    int numConstants = 0;
+    for (auto&& child : optimizedExpr->getChildren()) {
+        // Children 0 and 2 are field path expressions, whereas 1, 3, and 4 are constants.
+        auto constExpr = dynamic_cast<ExpressionConstant*>(child.get());
+        if (constExpr) {
+            ASSERT_VALUE_EQ(constExpr->getValue(), Value{childNum});
+            ++numConstants;
+        } else {
+            ASSERT(dynamic_cast<ExpressionFieldPath*>(child.get()));
+        }
+        ++childNum;
+    }
+    // We should have seen 5 children total, 3 of which are constants.
+    ASSERT_EQ(childNum, 5);
+    ASSERT_EQ(numConstants, 3);
 }
 
 TEST(ExpressionArray, ExpressionArrayShouldOptimizeSubExpressionToExpressionConstant) {
@@ -1045,6 +1518,70 @@ TEST(ExpressionIndexOfArray,
         optimizedIndexInRangeWithDuplcateValues->evaluate(Document{{"x", 2}}, &expCtx.variables));
 }
 
+TEST(ExpressionInternalFindAllValuesAtPath, PreservesSimpleArray) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    const BSONObj obj = BSON("$_internalFindAllValuesAtPath" << Value("a"_sd));
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    auto result =
+        expression->evaluate(Document{{"a", Value({Value(1), Value(2)})}}, &expCtx.variables);
+    ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2)), result);
+}
+
+TEST(ExpressionInternalFindAllValuesAtPath, PreservesSimpleNestedArray) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    const BSONObj obj = BSON("$_internalFindAllValuesAtPath" << Value("a.b"_sd));
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    auto doc = Document{{"a", Value(Document{{"b", Value({Value(1), Value(2)})}})}};
+    auto result = expression->evaluate(doc, &expCtx.variables);
+    ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2)), result);
+}
+
+TEST(ExpressionInternalFindAllValuesAtPath, DescendsThroughSingleArrayAndObject) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    const BSONObj obj = BSON("$_internalFindAllValuesAtPath" << Value("a.b"_sd));
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    Document doc = Document{
+        {"a",
+         Value({Document{{"b", Value(1)}}, Document{{"b", Value(2)}}, Document{{"b", Value(3)}}})}};
+    auto result = expression->evaluate(doc, &expCtx.variables);
+    ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2 << 3)), result);
+}
+
+TEST(ExpressionInternalFindAllValuesAtPath, DescendsThroughMultipleObjectArrayPairs) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    const BSONObj obj = BSON("$_internalFindAllValuesAtPath" << Value("a.b"_sd));
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    Document doc = Document{{"a",
+                             Value({Document{{"b", Value({Value(1), Value(2)})}},
+                                    Document{{"b", Value({Value(3), Value(4)})}},
+                                    Document{{"b", Value({Value(5), Value(6)})}}})}};
+    auto result = expression->evaluate(doc, &expCtx.variables);
+    ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2 << 3 << 4 << 5 << 6)), result);
+}
+
+TEST(ExpressionInternalFindAllValuesAtPath, DoesNotDescendThroughDoubleArray) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    const BSONObj obj = BSON("$_internalFindAllValuesAtPath" << Value("a.b"_sd));
+    auto expression = Expression::parseExpression(&expCtx, obj, vps);
+    Document seenDoc1 = Document{{"b", Value({Value(5), Value(6)})}};
+    Document seenDoc2 = Document{{"b", Value({Value(3), Value(4)})}};
+    Document unseenDoc1 = Document{{"b", Value({Value(1), Value(2)})}};
+    Document unseenDoc2 = Document{{"b", Value({Value(7), Value(8)})}};
+
+    Document doc = Document{{"a",
+                             Value({
+                                 Value({unseenDoc1, unseenDoc2}),
+                                 Value(seenDoc1),
+                                 Value(seenDoc2),
+                             })}};
+    auto result = expression->evaluate(doc, &expCtx.variables);
+    ASSERT_VALUE_EQ(Value(BSON_ARRAY(3 << 4 << 5 << 6)), result);
+}
 namespace Parse {
 
 namespace Object {
@@ -1062,11 +1599,10 @@ boost::intrusive_ptr<Expression> parseObject(BSONObj specification) {
 TEST(ParseObject, ShouldAcceptEmptyObject) {
     auto resultExpression = parseObject(BSONObj());
 
-    // Should return an empty ExpressionObject.
-    auto resultObject = dynamic_cast<ExpressionObject*>(resultExpression.get());
+    // Should return an empty object.
+    auto resultObject = dynamic_cast<ExpressionConstant*>(resultExpression.get());
     ASSERT_TRUE(resultObject);
-
-    ASSERT_EQ(resultObject->getChildExpressions().size(), 0UL);
+    ASSERT_VALUE_EQ(resultObject->getValue(), Value(Document{}));
 }
 
 TEST(ParseObject, ShouldRecognizeKnownExpression) {
@@ -1096,7 +1632,7 @@ TEST(ParseExpression, ShouldRecognizeConstExpression) {
     auto resultExpression = parseExpression(BSON("$const" << 5));
     auto constExpression = dynamic_cast<ExpressionConstant*>(resultExpression.get());
     ASSERT_TRUE(constExpression);
-    ASSERT_VALUE_EQ(constExpression->serialize(false), Value(Document{{"$const", 5}}));
+    ASSERT_VALUE_EQ(constExpression->serialize(), Value(Document{{"$const", 5}}));
 }
 
 TEST(ParseExpression, ShouldRejectUnknownExpression) {
@@ -1130,15 +1666,14 @@ TEST(ParseExpression, ShouldParseExpressionWithMultipleArguments) {
     ASSERT_TRUE(strCaseCmpExpression);
     vector<Value> arguments = {Value(Document{{"$const", "foo"_sd}}),
                                Value(Document{{"$const", "FOO"_sd}})};
-    ASSERT_VALUE_EQ(strCaseCmpExpression->serialize(false),
-                    Value(Document{{"$strcasecmp", arguments}}));
+    ASSERT_VALUE_EQ(strCaseCmpExpression->serialize(), Value(Document{{"$strcasecmp", arguments}}));
 }
 
 TEST(ParseExpression, ShouldParseExpressionWithNoArguments) {
     auto resultExpression = parseExpression(BSON("$and" << BSONArray()));
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", vector<Value>{}}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", vector<Value>{}}}));
 }
 
 TEST(ParseExpression, ShouldParseExpressionWithOneArgument) {
@@ -1146,7 +1681,7 @@ TEST(ParseExpression, ShouldParseExpressionWithOneArgument) {
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
     vector<Value> arguments = {Value(Document{{"$const", 1}})};
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", arguments}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", arguments}}));
 }
 
 TEST(ParseExpression, ShouldAcceptArgumentWithoutArrayForVariadicExpressions) {
@@ -1154,7 +1689,7 @@ TEST(ParseExpression, ShouldAcceptArgumentWithoutArrayForVariadicExpressions) {
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
     vector<Value> arguments = {Value(Document{{"$const", 1}})};
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", arguments}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", arguments}}));
 }
 
 TEST(ParseExpression, ShouldAcceptArgumentWithoutArrayAsSingleArgument) {
@@ -1162,7 +1697,7 @@ TEST(ParseExpression, ShouldAcceptArgumentWithoutArrayAsSingleArgument) {
     auto notExpression = dynamic_cast<ExpressionNot*>(resultExpression.get());
     ASSERT_TRUE(notExpression);
     vector<Value> arguments = {Value(Document{{"$const", 1}})};
-    ASSERT_VALUE_EQ(notExpression->serialize(false), Value(Document{{"$not", arguments}}));
+    ASSERT_VALUE_EQ(notExpression->serialize(), Value(Document{{"$not", arguments}}));
 }
 
 TEST(ParseExpression, ShouldAcceptObjectAsSingleArgument) {
@@ -1170,7 +1705,7 @@ TEST(ParseExpression, ShouldAcceptObjectAsSingleArgument) {
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
     vector<Value> arguments = {Value(Document{{"$const", 1}})};
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", arguments}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", arguments}}));
 }
 
 TEST(ParseExpression, ShouldAcceptObjectInsideArrayAsSingleArgument) {
@@ -1178,7 +1713,7 @@ TEST(ParseExpression, ShouldAcceptObjectInsideArrayAsSingleArgument) {
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
     vector<Value> arguments = {Value(Document{{"$const", 1}})};
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", arguments}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", arguments}}));
 }
 
 }  // namespace Expression
@@ -1204,7 +1739,7 @@ TEST(ParseOperand, ShouldRecognizeFieldPath) {
                                               << "$field"));
     auto fieldPathExpression = dynamic_cast<ExpressionFieldPath*>(resultExpression.get());
     ASSERT_TRUE(fieldPathExpression);
-    ASSERT_VALUE_EQ(fieldPathExpression->serialize(false), Value("$field"_sd));
+    ASSERT_VALUE_EQ(fieldPathExpression->serialize(), Value("$field"_sd));
 }
 
 TEST(ParseOperand, ShouldRecognizeStringLiteral) {
@@ -1212,7 +1747,7 @@ TEST(ParseOperand, ShouldRecognizeStringLiteral) {
                                               << "foo"));
     auto constantExpression = dynamic_cast<ExpressionConstant*>(resultExpression.get());
     ASSERT_TRUE(constantExpression);
-    ASSERT_VALUE_EQ(constantExpression->serialize(false), Value(Document{{"$const", "foo"_sd}}));
+    ASSERT_VALUE_EQ(constantExpression->serialize(), Value(Document{{"$const", "foo"_sd}}));
 }
 
 TEST(ParseOperand, ShouldRecognizeNestedArray) {
@@ -1222,21 +1757,21 @@ TEST(ParseOperand, ShouldRecognizeNestedArray) {
     ASSERT_TRUE(arrayExpression);
     vector<Value> expectedSerializedArray = {Value(Document{{"$const", "foo"_sd}}),
                                              Value("$field"_sd)};
-    ASSERT_VALUE_EQ(arrayExpression->serialize(false), Value(expectedSerializedArray));
+    ASSERT_VALUE_EQ(arrayExpression->serialize(), Value(expectedSerializedArray));
 }
 
 TEST(ParseOperand, ShouldRecognizeNumberLiteral) {
     auto resultExpression = parseOperand(BSON("" << 5));
     auto constantExpression = dynamic_cast<ExpressionConstant*>(resultExpression.get());
     ASSERT_TRUE(constantExpression);
-    ASSERT_VALUE_EQ(constantExpression->serialize(false), Value(Document{{"$const", 5}}));
+    ASSERT_VALUE_EQ(constantExpression->serialize(), Value(Document{{"$const", 5}}));
 }
 
 TEST(ParseOperand, ShouldRecognizeNestedExpression) {
     auto resultExpression = parseOperand(BSON("" << BSON("$and" << BSONArray())));
     auto andExpression = dynamic_cast<ExpressionAnd*>(resultExpression.get());
     ASSERT_TRUE(andExpression);
-    ASSERT_VALUE_EQ(andExpression->serialize(false), Value(Document{{"$and", vector<Value>{}}}));
+    ASSERT_VALUE_EQ(andExpression->serialize(), Value(Document{{"$and", vector<Value>{}}}));
 }
 
 }  // namespace Operand
@@ -1277,7 +1812,7 @@ public:
                 if (ValueComparator().evaluate(result != expected)) {
                     string errMsg = str::stream()
                         << "for expression " << field.first.toString() << " with argument "
-                        << args.toString() << " full tree: " << expr->serialize(false).toString()
+                        << args.toString() << " full tree: " << expr->serialize().toString()
                         << " expected: " << expected.toString()
                         << " but got: " << result.toString();
                     FAIL(errMsg);
@@ -1309,7 +1844,7 @@ private:
 };
 
 class Same : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
                                                  << "$setIntersection" << DOC_ARRAY(1 << 2)
@@ -1319,7 +1854,7 @@ class Same : public ExpectedResultBase {
 };
 
 class Redundant : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1 << 2 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
                                                  << "$setIntersection" << DOC_ARRAY(1 << 2)
@@ -1329,7 +1864,7 @@ class Redundant : public ExpectedResultBase {
 };
 
 class DoubleRedundant : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC(
             "input" << DOC_ARRAY(DOC_ARRAY(1 << 1 << 2) << DOC_ARRAY(1 << 2 << 2)) << "expected"
                     << DOC("$setIsSubset" << true << "$setEquals" << true << "$setIntersection"
@@ -1339,7 +1874,7 @@ class DoubleRedundant : public ExpectedResultBase {
 };
 
 class Super : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
                                                  << "$setIntersection" << DOC_ARRAY(1)
@@ -1349,7 +1884,7 @@ class Super : public ExpectedResultBase {
 };
 
 class SuperWithRedundant : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2 << 2) << DOC_ARRAY(1)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
                                                  << "$setIntersection" << DOC_ARRAY(1)
@@ -1359,7 +1894,7 @@ class SuperWithRedundant : public ExpectedResultBase {
 };
 
 class Sub : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << false
                                                  << "$setIntersection" << DOC_ARRAY(1)
@@ -1369,7 +1904,7 @@ class Sub : public ExpectedResultBase {
 };
 
 class SameBackwards : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(2 << 1)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
                                                  << "$setIntersection" << DOC_ARRAY(1 << 2)
@@ -1379,7 +1914,7 @@ class SameBackwards : public ExpectedResultBase {
 };
 
 class NoOverlap : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(8 << 4)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
                                                  << "$setIntersection" << vector<Value>()
@@ -1389,7 +1924,7 @@ class NoOverlap : public ExpectedResultBase {
 };
 
 class Overlap : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(8 << 2 << 4)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
                                                  << "$setIntersection" << DOC_ARRAY(2)
@@ -1399,7 +1934,7 @@ class Overlap : public ExpectedResultBase {
 };
 
 class LastNull : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << Value(BSONNULL)) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
                                                      << "$setDifference" << BSONNULL)
@@ -1410,7 +1945,7 @@ class LastNull : public ExpectedResultBase {
 };
 
 class FirstNull : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(Value(BSONNULL) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
                                                      << "$setDifference" << BSONNULL)
@@ -1421,7 +1956,7 @@ class FirstNull : public ExpectedResultBase {
 };
 
 class LeftNullAndRightEmpty : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(Value(BSONNULL) << vector<Value>()) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
                                                      << "$setDifference" << BSONNULL)
@@ -1432,7 +1967,7 @@ class LeftNullAndRightEmpty : public ExpectedResultBase {
 };
 
 class RightNullAndLeftEmpty : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(vector<Value>() << Value(BSONNULL)) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
                                                      << "$setDifference" << BSONNULL)
@@ -1443,7 +1978,7 @@ class RightNullAndLeftEmpty : public ExpectedResultBase {
 };
 
 class NoArg : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC(
             "input" << vector<Value>() << "expected"
                     << DOC("$setIntersection" << vector<Value>() << "$setUnion" << vector<Value>())
@@ -1455,7 +1990,7 @@ class NoArg : public ExpectedResultBase {
 };
 
 class OneArg : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIntersection" << DOC_ARRAY(1 << 2) << "$setUnion"
                                                      << DOC_ARRAY(1 << 2))
@@ -1467,7 +2002,7 @@ class OneArg : public ExpectedResultBase {
 };
 
 class EmptyArg : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC(
             "input" << DOC_ARRAY(vector<Value>()) << "expected"
                     << DOC("$setIntersection" << vector<Value>() << "$setUnion" << vector<Value>())
@@ -1479,7 +2014,7 @@ class EmptyArg : public ExpectedResultBase {
 };
 
 class LeftArgEmpty : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(vector<Value>() << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIntersection" << vector<Value>() << "$setUnion"
                                                      << DOC_ARRAY(1 << 2) << "$setIsSubset" << true
@@ -1489,7 +2024,7 @@ class LeftArgEmpty : public ExpectedResultBase {
 };
 
 class RightArgEmpty : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << vector<Value>()) << "expected"
                            << DOC("$setIntersection" << vector<Value>() << "$setUnion"
                                                      << DOC_ARRAY(1 << 2) << "$setIsSubset" << false
@@ -1499,7 +2034,7 @@ class RightArgEmpty : public ExpectedResultBase {
 };
 
 class ManyArgs : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(8 << 3)
                                         << DOC_ARRAY("asdf"_sd
                                                      << "foo"_sd)
@@ -1518,7 +2053,7 @@ class ManyArgs : public ExpectedResultBase {
 };
 
 class ManyArgsEqual : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2 << 4)
                                         << DOC_ARRAY(1 << 2 << 2 << 4) << DOC_ARRAY(4 << 1 << 2)
                                         << DOC_ARRAY(2 << 1 << 1 << 4))
@@ -1568,61 +2103,61 @@ private:
 };
 
 class NullBegin : public ExpectedResultBase {
-    string a() {
+    string a() override {
         return string("\0ab", 3);
     }
-    string b() {
+    string b() override {
         return string("\0AB", 3);
     }
-    int expectedResult() {
+    int expectedResult() override {
         return 0;
     }
 };
 
 class NullEnd : public ExpectedResultBase {
-    string a() {
+    string a() override {
         return string("ab\0", 3);
     }
-    string b() {
+    string b() override {
         return string("aB\0", 3);
     }
-    int expectedResult() {
+    int expectedResult() override {
         return 0;
     }
 };
 
 class NullMiddleLt : public ExpectedResultBase {
-    string a() {
+    string a() override {
         return string("a\0a", 3);
     }
-    string b() {
+    string b() override {
         return string("a\0B", 3);
     }
-    int expectedResult() {
+    int expectedResult() override {
         return -1;
     }
 };
 
 class NullMiddleEq : public ExpectedResultBase {
-    string a() {
+    string a() override {
         return string("a\0b", 3);
     }
-    string b() {
+    string b() override {
         return string("a\0B", 3);
     }
-    int expectedResult() {
+    int expectedResult() override {
         return 0;
     }
 };
 
 class NullMiddleGt : public ExpectedResultBase {
-    string a() {
+    string a() override {
         return string("a\0c", 3);
     }
-    string b() {
+    string b() override {
         return string("a\0B", 3);
     }
-    int expectedResult() {
+    int expectedResult() override {
         return 1;
     }
 };
@@ -1707,96 +2242,96 @@ private:
 
 /** Retrieve a full string containing a null character. */
 class FullNull : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0b", 3);
     }
-    int offset() {
+    int offset() override {
         return 0;
     }
-    int length() {
+    int length() override {
         return 3;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return str();
     }
 };
 
 /** Retrieve a substring beginning with a null character. */
 class BeginAtNull : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0b", 3);
     }
-    int offset() {
+    int offset() override {
         return 1;
     }
-    int length() {
+    int length() override {
         return 2;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("\0b", 2);
     }
 };
 
 /** Retrieve a substring ending with a null character. */
 class EndAtNull : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0b", 3);
     }
-    int offset() {
+    int offset() override {
         return 0;
     }
-    int length() {
+    int length() override {
         return 2;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("a\0", 2);
     }
 };
 
 /** Drop a beginning null character. */
 class DropBeginningNull : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("\0b", 2);
     }
-    int offset() {
+    int offset() override {
         return 1;
     }
-    int length() {
+    int length() override {
         return 1;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return "b";
     }
 };
 
 /** Drop an ending null character. */
 class DropEndingNull : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0", 2);
     }
-    int offset() {
+    int offset() override {
         return 0;
     }
-    int length() {
+    int length() override {
         return 1;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return "a";
     }
 };
 
 /** When length is negative, the remainder of the string should be returned. */
 class NegativeLength : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("abcdefghij");
     }
-    int offset() {
+    int offset() override {
         return 2;
     }
-    int length() {
+    int length() override {
         return -1;
     }
-    string expectedResult() {
+    string expectedResult() override {
         return "cdefghij";
     }
 };
@@ -1808,7 +2343,11 @@ TEST(ExpressionSubstrTest, ThrowsWithNegativeStart) {
     const auto str = "abcdef"_sd;
     const auto expr =
         Expression::parseExpression(&expCtx, BSON("$substrCP" << BSON_ARRAY(str << -5 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx.variables); }(), AssertionException);
+    ASSERT_THROWS(
+        [&] {
+            expr->evaluate({}, &expCtx.variables);
+        }(),
+        AssertionException);
 }
 
 }  // namespace SubstrBytes
@@ -1822,7 +2361,11 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithBadContinuationByte) {
     const auto continuationByte = "\x80\x00"_sd;
     const auto expr = Expression::parseExpression(
         &expCtx, BSON("$substrCP" << BSON_ARRAY(continuationByte << 0 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx.variables); }(), AssertionException);
+    ASSERT_THROWS(
+        [&] {
+            expr->evaluate({}, &expCtx.variables);
+        }(),
+        AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
@@ -1832,7 +2375,11 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
     const auto leadingByte = "\xFF\x00"_sd;
     const auto expr = Expression::parseExpression(
         &expCtx, BSON("$substrCP" << BSON_ARRAY(leadingByte << 0 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx.variables); }(), AssertionException);
+    ASSERT_THROWS(
+        [&] {
+            expr->evaluate({}, &expCtx.variables);
+        }(),
+        AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, WithStandardValue) {
@@ -2089,7 +2636,7 @@ TEST(BuiltinRemoveVariableTest, RemoveSerializesCorrectly) {
     auto expression = ExpressionFieldPath::parse(&expCtx, "$$REMOVE", vps);
     ASSERT_BSONOBJ_EQ(BSON("foo"
                            << "$$REMOVE"),
-                      BSON("foo" << expression->serialize(false)));
+                      BSON("foo" << expression->serialize()));
 }
 
 TEST(BuiltinRemoveVariableTest, RemoveSerializesCorrectlyWithTrailingPath) {
@@ -2098,7 +2645,7 @@ TEST(BuiltinRemoveVariableTest, RemoveSerializesCorrectlyWithTrailingPath) {
     auto expression = ExpressionFieldPath::parse(&expCtx, "$$REMOVE.a.b", vps);
     ASSERT_BSONOBJ_EQ(BSON("foo"
                            << "$$REMOVE.a.b"),
-                      BSON("foo" << expression->serialize(false)));
+                      BSON("foo" << expression->serialize()));
 }
 
 TEST(BuiltinRemoveVariableTest, RemoveSerializesCorrectlyAfterOptimization) {
@@ -2109,7 +2656,7 @@ TEST(BuiltinRemoveVariableTest, RemoveSerializesCorrectlyAfterOptimization) {
     ASSERT(dynamic_cast<ExpressionConstant*>(optimizedExpression.get()));
     ASSERT_BSONOBJ_EQ(BSON("foo"
                            << "$$REMOVE"),
-                      BSON("foo" << optimizedExpression->serialize(false)));
+                      BSON("foo" << optimizedExpression->serialize()));
 }
 
 }  // namespace BuiltinRemoveVariable
@@ -2218,30 +2765,30 @@ private:
 
 /** String beginning with a null character. */
 class NullBegin : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("\0aB", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("\0ab", 3);
     }
 };
 
 /** String containing a null character. */
 class NullMiddle : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0B", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("a\0b", 3);
     }
 };
 
 /** String ending with a null character. */
 class NullEnd : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("aB\0", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("ab\0", 3);
     }
 };
@@ -2276,30 +2823,30 @@ private:
 
 /** String beginning with a null character. */
 class NullBegin : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("\0aB", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("\0AB", 3);
     }
 };
 
 /** String containing a null character. */
 class NullMiddle : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("a\0B", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("A\0B", 3);
     }
 };
 
 /** String ending with a null character. */
 class NullEnd : public ExpectedResultBase {
-    string str() {
+    string str() override {
         return string("aB\0", 3);
     }
-    string expectedResult() {
+    string expectedResult() override {
         return string("AB\0", 3);
     }
 };
@@ -2327,7 +2874,7 @@ public:
                 if (ValueComparator().evaluate(result != expected)) {
                     string errMsg = str::stream()
                         << "for expression " << field.first.toString() << " with argument "
-                        << args.toString() << " full tree: " << expr->serialize(false).toString()
+                        << args.toString() << " full tree: " << expr->serialize().toString()
                         << " expected: " << expected.toString()
                         << " but got: " << result.toString();
                     FAIL(errMsg);
@@ -2359,49 +2906,49 @@ private:
 };
 
 class JustFalse : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(false)) << "expected"
                            << DOC("$allElementsTrue" << false << "$anyElementTrue" << false));
     }
 };
 
 class JustTrue : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(true)) << "expected"
                            << DOC("$allElementsTrue" << true << "$anyElementTrue" << true));
     }
 };
 
 class OneTrueOneFalse : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(true << false)) << "expected"
                            << DOC("$allElementsTrue" << false << "$anyElementTrue" << true));
     }
 };
 
 class Empty : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(vector<Value>()) << "expected"
                            << DOC("$allElementsTrue" << true << "$anyElementTrue" << false));
     }
 };
 
 class TrueViaInt : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1)) << "expected"
                            << DOC("$allElementsTrue" << true << "$anyElementTrue" << true));
     }
 };
 
 class FalseViaInt : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(0)) << "expected"
                            << DOC("$allElementsTrue" << false << "$anyElementTrue" << false));
     }
 };
 
 class Null : public ExpectedResultBase {
-    Document getSpec() {
+    Document getSpec() override {
         return DOC("input" << DOC_ARRAY(BSONNULL) << "error"
                            << DOC_ARRAY("$allElementsTrue"_sd
                                         << "$anyElementTrue"_sd));
@@ -2589,11 +3136,20 @@ TEST(ExpressionMetaTest, ExpressionMetaSearchScore) {
     VariablesParseState vps = expCtx.variablesParseState;
     BSONObj expr = fromjson("{$meta: \"searchScore\"}");
     auto expressionMeta = ExpressionMeta::parse(&expCtx, expr.firstElement(), vps);
-
     MutableDocument doc;
     doc.metadata().setSearchScore(1.234);
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
     ASSERT_EQ(val.getDouble(), 1.234);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaSearchScoreAPIStrict) {
+    auto expCtx = ExpressionContextForTest{};
+    APIParameters::get(expCtx.opCtx).setAPIStrict(true);
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"searchScore\"}");
+    ASSERT_THROWS_CODE(ExpressionMeta::parse(&expCtx, expr.firstElement(), vps),
+                       AssertionException,
+                       ErrorCodes::APIStrictError);
 }
 
 TEST(ExpressionMetaTest, ExpressionMetaSearchHighlights) {
@@ -2608,6 +3164,16 @@ TEST(ExpressionMetaTest, ExpressionMetaSearchHighlights) {
 
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
     ASSERT_DOCUMENT_EQ(val.getDocument(), highlights);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetasearchHighlightsAPIStrict) {
+    auto expCtx = ExpressionContextForTest{};
+    APIParameters::get(expCtx.opCtx).setAPIStrict(true);
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"searchHighlights\"}");
+    ASSERT_THROWS_CODE(ExpressionMeta::parse(&expCtx, expr.firstElement(), vps),
+                       AssertionException,
+                       ErrorCodes::APIStrictError);
 }
 
 TEST(ExpressionMetaTest, ExpressionMetaGeoNearDistance) {
@@ -2646,6 +3212,16 @@ TEST(ExpressionMetaTest, ExpressionMetaIndexKey) {
     doc.metadata().setIndexKey(ixKey);
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
     ASSERT_DOCUMENT_EQ(val.getDocument(), Document(ixKey));
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaIndexKeyAPIStrict) {
+    auto expCtx = ExpressionContextForTest{};
+    APIParameters::get(expCtx.opCtx).setAPIStrict(true);
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"indexKey\"}");
+    ASSERT_THROWS_CODE(ExpressionMeta::parse(&expCtx, expr.firstElement(), vps),
+                       AssertionException,
+                       ErrorCodes::APIStrictError);
 }
 
 TEST(ExpressionMetaTest, ExpressionMetaRecordId) {
@@ -2697,6 +3273,16 @@ TEST(ExpressionMetaTest, ExpressionMetaTextScore) {
     ASSERT_EQ(val.getDouble(), 1.23);
 }
 
+TEST(ExpressionMetaTest, ExpressionMetaTextScoreAPIStrict) {
+    auto expCtx = ExpressionContextForTest{};
+    APIParameters::get(expCtx.opCtx).setAPIStrict(true);
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"textScore\"}");
+    ASSERT_THROWS_CODE(ExpressionMeta::parse(&expCtx, expr.firstElement(), vps),
+                       AssertionException,
+                       ErrorCodes::APIStrictError);
+}
+
 TEST(ExpressionMetaTest, ExpressionMetaSearchScoreDetails) {
     auto expCtx = ExpressionContextForTest{};
     BSONObj expr = fromjson("{$meta: \"searchScoreDetails\"}");
@@ -2709,6 +3295,29 @@ TEST(ExpressionMetaTest, ExpressionMetaSearchScoreDetails) {
     doc.metadata().setSearchScoreDetails(details);
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
     ASSERT_DOCUMENT_EQ(val.getDocument(), Document(details));
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaVectorSearchScore) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{$meta: \"vectorSearchScore\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+
+    MutableDocument doc;
+    doc.metadata().setVectorSearchScore(1.23);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
+    ASSERT_EQ(val.getDouble(), 1.23);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaScore) {
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr = fromjson("{$meta: \"score\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+    MutableDocument doc;
+    doc.metadata().setScore(1.23);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx.variables);
+    ASSERT_EQ(val.getDouble(), 1.23);
 }
 }  // namespace expression_meta_test
 
@@ -2848,11 +3457,11 @@ TEST(ExpressionRegexTest, InvalidUTF8InRegex) {
 
 }  // namespace ExpressionRegexTest
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("expression") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Add::NullDocument>();
         add<Add::NoOperands>();
         add<Add::Date>();
@@ -2938,7 +3547,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myAll;
+unittest::OldStyleSuiteInitializer<All> myAll;
 
 namespace NowAndClusterTime {
 TEST(NowAndClusterTime, BasicTest) {
@@ -3006,7 +3615,7 @@ TEST(ExpressionRandom, Basic) {
     intrusive_ptr<Expression> expression =
         Expression::parseExpression(&expCtx, fromjson("{ $rand: {} }"), vps);
 
-    const std::string& serialized = expression->serialize(false).getDocument().toString();
+    const std::string& serialized = expression->serialize().getDocument().toString();
     ASSERT_EQ("{$rand: {}}", serialized);
 
     const auto randFn = [&expression, &expCtx]() -> double {
@@ -3091,6 +3700,17 @@ TEST(ExpressionToHashedIndexKeyTest, UndefinedInputSucceeds) {
     ASSERT_VALUE_EQ(result, Value::createIntOrLong(40158834000849533LL));
 }
 
+TEST(ExpressionToHashedIndexKeyTest, DoesAddInputDependencies) {
+    auto expCtx = ExpressionContextForTest{};
+    const BSONObj obj = BSON("$toHashedIndexKey"
+                             << "$someValue");
+    auto expression = Expression::parseExpression(&expCtx, obj, expCtx.variablesParseState);
+
+    DepsTracker deps;
+    expression::addDependencies(expression.get(), &deps);
+    ASSERT_EQ(deps.fields.count("someValue"), 1u);
+    ASSERT_EQ(deps.fields.size(), 1u);
+}
 }  // namespace ExpressionToHashedIndexKeyTest
 
 TEST(ExpressionSubtractTest, OverflowLong) {
@@ -3109,7 +3729,7 @@ TEST(ExpressionSubtractTest, OverflowLong) {
     expression = Expression::parseExpression(&expCtx, obj, expCtx.variablesParseState);
     result = expression->evaluate({}, &expCtx.variables);
     ASSERT_EQ(result.getType(), BSONType::NumberDouble);
-    ASSERT_EQ(result.getDouble(), static_cast<double>(minLong) - maxLong);
+    ASSERT_EQ(result.getDouble(), static_cast<double>(minLong) - static_cast<double>(maxLong));
 
     // minLong = -1 - maxLong. The below subtraction should fit into long long data type.
     obj = BSON("$subtract" << BSON_ARRAY(-1 << maxLong));
@@ -3127,4 +3747,1510 @@ TEST(ExpressionSubtractTest, OverflowLong) {
     ASSERT_EQ(result.getDouble(), static_cast<double>(minLong) * -1);
 }
 
+TEST(ExpressionGetFieldTest, GetFieldSerializesStringArgumentCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"foo\"}");
+    auto expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$const": "foo"
+                    },
+                    "input": "$$CURRENT"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+}
+
+TEST(ExpressionGetFieldTest, GetFieldSerializesCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: {\"field\": \"foo\", \"input\": {a: 1}}}");
+    auto expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$const": "foo"
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    expr = fromjson("{$meta: {\"field\": {$const: \"$foo\"}, \"input\": {a: 1}}}");
+    expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$const": "$foo"
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$const": "$foo"
+                    },
+                    input: {
+                        $const: {"?": "?"}
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$const": "$foo"
+                    },
+                    "input": "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+}
+
+TEST(ExpressionGetFieldTest, GetFieldWithDynamicFieldExpressionSerializesCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: {\"field\": {$toString: \"$foo\"}, \"input\": {a: 1}}}");
+    auto expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        $convert: {
+                            input: "$foo",
+                            to: {
+                                $const: "string"
+                            },
+                            format: {
+                                $const: "auto"
+                            }
+                        }
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$convert": {
+                            "input": "$foo",
+                            "to": {
+                                "$const": "string"
+                            },
+                            "format": {"$const": "?"}
+                        }
+                    },
+                    "input": {
+                        "$const": {
+                            "?": "?"
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                $getField: {
+                    field: {
+                        $convert: {
+                            input: "$foo",
+                            to: "string",
+                            format: "?string"
+                        }
+                    },
+                    input: "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+
+    expr = fromjson("{$meta: {\"field\": {$toBool: \"$foo\"}, \"input\": {a: 1}}}");
+    expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        $convert: {
+                            input: "$foo",
+                            to: {
+                                $const: "bool"
+                            }
+                        }
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                $getField: {
+                    field: {
+                        $convert: {
+                            input: "$foo",
+                            to: {
+                                $const: "bool"
+                            }
+                        }
+                    },
+                    input: {
+                        $const: {"?": "?"}
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                $getField: {
+                    field: {
+                        $convert: {
+                            input: "$foo",
+                            to: "bool"
+                        }
+                    },
+                    input: "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+
+    expr = fromjson(
+        "{$meta: {\"field\": {$convert: {\"input\": \"$foo\", \"to\": \"bool\"}}, \"input\": {a: "
+        "1}}}");
+    expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        $convert: {
+                            input: "$foo",
+                            to: {
+                                $const: "bool"
+                            }
+                        }
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                $getField: {
+                    field: {
+                        $convert: {
+                            input: "$foo",
+                            to: {
+                                $const: "bool"
+                            }
+                        }
+                    },
+                    input: {
+                        $const: {"?": "?"}
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                $getField: {
+                    field: {
+                        $convert: {
+                            input: "$foo",
+                            to: "bool"
+                        }
+                    },
+                    input: "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+
+    expr = fromjson(
+        "{$meta: {\"field\": {$convert: {\"input\": \"$foo\", \"to\": {\"$add\": [7, 2]}}}, "
+        "\"input\": {a: "
+        "1}}}");
+    expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$convert": {
+                            "input": "$foo",
+                            "to": {
+                                "$add": [
+                                    {
+                                        "$const": 7
+                                    },
+                                    {
+                                        "$const": 2
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$convert": {
+                            "input": "$foo",
+                            "to": {
+                                "$add": [1, 1]
+                            }
+                        }
+                    },
+                    input: {
+                        $const: {"?": "?"}
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": {
+                        "$convert": {
+                            "input": "$foo",
+                            "to": {
+                                "$add": "?array<?number>"
+                            }
+                        }
+                    },
+                    "input": "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+
+    expr = fromjson("{$meta: {\"field\": \"$foo\", \"input\": {a: 1}}}");
+    expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": "$foo",
+                    "input": {
+                        "a": {
+                            "$const": 1
+                        }
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize()));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": "$foo",
+                    input: {
+                        $const: {"?": "?"}
+                    }
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kRepresentativeQueryShapeSerializeOptions)));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "ignoredField": {
+                "$getField": {
+                    "field": "$foo",
+                    "input": "?object"
+                }
+            }
+        })",
+        BSON("ignoredField" << expression->serialize(
+                 SerializationOptions::kDebugQueryShapeSerializeOptions)));
+}
+
+TEST(ExpressionGetFieldTest, GetFieldSerializesAndRedactsCorrectly) {
+    SerializationOptions options = SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST;
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    BSONObj expressionBSON = BSON("$getField" << BSON("field"
+                                                      << "a"
+                                                      << "input"
+                                                      << "$b"));
+
+    auto expression = ExpressionGetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"field":{"$getField":{"field":"HASH<a>","input":"$HASH<b>"}}})",
+        BSON("field" << expression->serialize(options)));
+
+    // Test the shorthand syntax.
+    expressionBSON = BSON("$getField"
+                          << "a");
+
+    expression = ExpressionGetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"field":{"$getField":{"field":"HASH<a>","input":"$$CURRENT"}}})",
+        BSON("field" << expression->serialize(options)));
+
+    // Test a field with '.' characters.
+    expressionBSON = BSON("$getField"
+                          << "a.b.c");
+
+    expression = ExpressionGetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$getField": {
+                    "field": "HASH<a>.HASH<b>.HASH<c>",
+                    "input": "$$CURRENT"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Test a field with a '$' character.
+    expressionBSON = BSON("$getField"
+                          << "a.$b.c");
+
+    expression = ExpressionGetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$getField": {
+                    "field": "HASH<a>.HASH<$b>.HASH<c>",
+                    "input": "$$CURRENT"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Test a field with a trailing '.' character (invalid FieldPath).
+    expressionBSON = BSON("$getField"
+                          << "a.b.c.");
+
+    expression = ExpressionGetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$getField": {
+                    "field": "HASH<invalidFieldPathPlaceholder>",
+                    "input": "$$CURRENT"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+}
+
+TEST(ExpressionSetFieldTest, SetFieldRedactsCorrectly) {
+    SerializationOptions options = SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST;
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+
+    // Test that a set field redacts properly.
+    BSONObj expressionBSON = BSON("$setField" << BSON("field"
+                                                      << "a"
+                                                      << "input"
+                                                      << "$b"
+                                                      << "value"
+                                                      << "$c"));
+    auto expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": "$HASH<b>",
+                    "value": "$HASH<c>"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Object as input.
+    expressionBSON = BSON("$setField" << BSON("field"
+                                              << "a"
+                                              << "input" << BSON("a" << true) << "value" << 10));
+    expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": "?object",
+                    "value": "?number"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Nested object as input.
+    expressionBSON =
+        BSON("$setField" << BSON("field"
+                                 << "a"
+                                 << "input" << BSON("a" << BSON("b" << 5)) << "value" << 10));
+    expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": "?object",
+                    "value": "?number"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Object with field path in input.
+    expressionBSON = BSON("$setField" << BSON("field"
+                                              << "a"
+                                              << "input"
+                                              << BSON("a"
+                                                      << "$field")
+                                              << "value" << 10));
+    expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": {
+                        "HASH<a>": "$HASH<field>"
+                    },
+                    "value": "?number"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Object with field path in value.
+    expressionBSON = BSON("$setField" << BSON("field"
+                                              << "a"
+                                              << "input"
+                                              << BSON("a"
+                                                      << "b")
+                                              << "value"
+                                              << BSON("c"
+                                                      << "$d")));
+    expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": "?object",
+                    "value": {
+                        "HASH<c>": "$HASH<d>"
+                    }
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+
+    // Array as input.
+    expressionBSON = BSON("$setField" << BSON("field"
+                                              << "a"
+                                              << "input" << BSON("a" << BSON_ARRAY(3 << 4 << 5))
+                                              << "value" << 10));
+    expression = ExpressionSetField::parse(&expCtx, expressionBSON.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "field": {
+                "$setField": {
+                    "field": "HASH<a>",
+                    "input": "?object",
+                    "value": "?number"
+                }
+            }
+        })",
+        BSON("field" << expression->serialize(options)));
+}
+
+TEST(ExpressionSetFieldTest, SetFieldSerializesCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: {\"field\": \"foo\", \"input\": {a: 1}, \"value\": 24}}");
+    auto expression = ExpressionSetField::parse(&expCtx, expr.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ(
+        BSON("ignoredField" << BSON("$setField"
+                                    << BSON("field" << BSON("$const"
+                                                            << "foo")
+                                                    << "input" << BSON("a" << BSON("$const" << 1))
+                                                    << "value" << BSON("$const" << 24)))),
+        BSON("ignoredField" << expression->serialize()));
+}
+
+TEST(ExpressionSetFieldTest, SetFieldRejectsNullCharInFieldArgument) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    auto fieldExpr = make_intrusive<ExpressionConstant>(&expCtx, Value("ab\0c"_sd));
+    auto inputExpr = make_intrusive<ExpressionConstant>(&expCtx, Value(BSON("a" << 1)));
+    auto valueExpr = make_intrusive<ExpressionConstant>(&expCtx, Value(true));
+    ASSERT_THROWS_CODE(
+        make_intrusive<ExpressionSetField>(
+            &expCtx, std::move(fieldExpr), std::move(inputExpr), std::move(valueExpr)),
+        AssertionException,
+        9534700);
+}
+
+TEST(ExpressionIfNullTest, OptimizedExpressionIfNullShouldRemoveNullConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\", \"$b\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$ifNull: [\"$a\", \"$b\"]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest,
+     OptimizedExpressionIfNullShouldRemoveNullConstantAndReturnSingleExpression) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    ASSERT_VALUE_EQ(optimizedNullRemoved->serialize(), Value("$a"_sd));
+}
+
+TEST(ExpressionIfNullTest, OptimizedExpressionIfNullShouldRemoveAllNullConstantsButLast) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\", null, null]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$ifNull: [\"$a\", {$const: null}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest,
+     OptimizedExpressionIfNullShouldRemoveAllNullConstantsUnlessItIsOnlyChild) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, null]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$const: null}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest, ExpressionIfNullWithAllConstantsShouldOptimizeToExpressionConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [1, 2]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNonNullConstantFirstShouldOptimizeByReturningConstantExpression) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [1, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNonNullConstantShouldOptimizeByRemovingFollowingOperands) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [\"$a\", 5, \"$b\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$ifNull: [\"$a\", {$const: 5}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNullConstantAndNonNullConstantShouldOptimizeToFirstNonNullConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, 1, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
+}
+
+TEST(ExpressionCondTest, ExpressionIfConstantTrueShouldOptimizeToThenClause) {
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$cond: [true, {$add: [1, 2]}, 2]}");
+    auto exprCond = ExpressionCond::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprCond = exprCond->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprCond.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 3}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprCond));
+}
+
+TEST(ExpressionCondTest, ExpressionIfConstantFalseShouldOptimizeToElseClause) {
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$cond: [{$gt: [1, 2]}, {$add: [1, 2]}, {$subtract: [3, 1]}]}");
+    auto exprCond = ExpressionCond::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprCond = exprCond->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprCond.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 2}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprCond));
+}
+
+TEST(ExpressionCondTest, ExpressionIfNotConstantShouldNotOptimize) {
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$cond: [\"$a\", 1, 2]}");
+    auto exprCond = ExpressionCond::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprCond = exprCond->optimize();
+    auto expectedResult = fromjson("{$cond: [\"$a\", {$const: 1}, {$const: 2}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprCond));
+}
+
+TEST(ExpressionCondTest, ExpressionIfNotConstantShouldOptimizeBranches) {
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$cond: [\"$a\", {$multiply: [5, 7]}, {$add: [7, 2]}]}");
+    auto exprCond = ExpressionCond::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprCond = exprCond->optimize();
+    auto expectedResult = fromjson("{$cond: [\"$a\", {$const: 35}, {$const: 9}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprCond));
+}
+
+TEST(ExpressionCondTest, ConstantCondShouldOptimizeWithNonConstantBranches) {
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$cond: [{$eq: [1, 1]}, {$add: [\"$a\", 2]}, {$subtract: [3, \"$b\"]}]}");
+    auto exprCond = ExpressionCond::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprCond = exprCond->optimize();
+    auto expectedResult = fromjson("{$add: [\"$a\", {$const: 2}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprCond));
+}
+
+TEST(ExpressionAddTest, Integers) {
+    assertExpectedResults("$add",
+                          {
+                              // Empty case.
+                              {{}, 0},
+                              // Singleton case.
+                              {{1}, 1},
+                              // Integer addition.
+                              {{1, 2, 3}, 6},
+                              // Adding negative numbers
+                              {{6, -3, 2}, 5},
+                              // Getting a negative result
+                              {{-6, -3, 2}, -7},
+                              // Min/max ints are not promoted to longs.
+                              {{INT_MAX}, INT_MAX},
+                              {{INT_MAX, -1}, Value(INT_MAX - 1)},
+                              {{INT_MIN}, INT_MIN},
+                              {{INT_MIN, 1}, Value(INT_MIN + 1)},
+                              // Integer overflow is promoted to a long.
+                              {{INT_MAX, 1}, Value((long long)INT_MAX + 1LL)},
+                              {{INT_MIN, -1}, Value((long long)INT_MIN - 1LL)},
+                          });
+}
+
+
+TEST(ExpressionAddTest, Longs) {
+    assertExpectedResults(
+        "$add",
+        {
+            // Singleton case.
+            {{1LL}, 1LL},
+            // Long addition.
+            {{1LL, 2LL, 3LL}, 6LL},
+            // Adding negative numbers
+            {{6LL, -3LL, 2LL}, 5LL},
+            // Getting a negative result
+            {{-6LL, -3LL, 2LL}, -7LL},
+            // Confirm that NumberLong is wider than NumberInt, and the output
+            // will be a long if any operand is a long.
+            {{1LL, 2, 3LL}, 6LL},
+            {{1LL, 2, 3}, 6LL},
+            {{1, 2, 3LL}, 6LL},
+            {{1, 2LL, 3LL}, 6LL},
+            {{6, -3LL, 2}, 5LL},
+            {{-6LL, -3, 2}, -7LL},
+            // Min/max longs are not promoted to double.
+            {{LLONG_MAX}, LLONG_MAX},
+            {{LLONG_MAX, -1LL}, Value(LLONG_MAX - 1LL)},
+            {{LLONG_MIN}, LLONG_MIN},
+            {{LLONG_MIN, 1LL}, Value(LLONG_MIN + 1LL)},
+            // Long overflow is promoted to a double.
+            {{LLONG_MAX, 1LL}, Value((double)LLONG_MAX + 1.0)},
+            // The result is "incorrect" here due to floating-point rounding errors.
+            {{LLONG_MIN, -1LL}, Value((double)LLONG_MIN)},
+        });
+}
+
+TEST(ExpressionAddTest, Doubles) {
+    assertExpectedResults("$add",
+                          {
+                              // Singleton case.
+                              {{1.0}, 1.0},
+                              // Double addition.
+                              {{1.0, 2.0, 3.0}, 6.0},
+                              // Adding negative numbers
+                              {{6.0, -3.0, 2.0}, 5.0},
+                              // Getting a negative result
+                              {{-6.0, -3.0, 2.0}, -7.0},
+                              // Confirm that doubles are wider than ints and longs, and the output
+                              // will be a double if any operand is a double.
+                              {{1, 2, 3.0}, 6.0},
+                              {{1LL, 2LL, 3.0}, 6.0},
+                              {{3.0, 2, 1LL}, 6.0},
+                              {{3, 2.0, 1LL}, 6.0},
+                              {{-3, 2.0, 1LL}, 0.0},
+                              {{-6LL, 2LL, 3.0}, -1.0},
+                              {{-6.0, 2LL, 3.0}, -1.0},
+                              // Confirm floating point arithmetic has rounding errors.
+                              {{0.1, 0.2}, 0.30000000000000004},
+                          });
+}
+
+TEST(ExpressionAddTest, Decimals) {
+    assertExpectedResults(
+        "$add",
+        {
+            // Singleton case.
+            {{Decimal128(1)}, Decimal128(1)},
+            // Decimal addition.
+            {{Decimal128(1.0), Decimal128(2.0), Decimal128(3.0)}, Decimal128(6.0)},
+            {{Decimal128(-6.0), Decimal128(2.0), Decimal128(3.0)}, Decimal128(-1.0)},
+            // Confirm that decimals are wider than all other types, and the output
+            // will be a double if any operand is a double.
+            {{Decimal128(1), 2LL, 3}, Decimal128(6.0)},
+            {{Decimal128(3), 2.0, 1LL}, Decimal128(6.0)},
+            {{Decimal128(3), 2, 1.0}, Decimal128(6.0)},
+            {{1, 2, Decimal128(3.0)}, Decimal128(6.0)},
+            {{1LL, Decimal128(2.0), 3.0}, Decimal128(6.0)},
+            {{1.0, 2.0, Decimal128(3.0)}, Decimal128(6.0)},
+            {{1, Decimal128(2.0), 3.0}, Decimal128(6.0)},
+            {{1LL, Decimal128(2.0), 3.0, 2}, Decimal128(8.0)},
+            {{1LL, Decimal128(2.0), 3, 2.0}, Decimal128(8.0)},
+            {{1, Decimal128(2.0), 3LL, 2.0}, Decimal128(8.0)},
+            {{3.0, Decimal128(0.0), 2, 1LL}, Decimal128(6.0)},
+            {{1, 3LL, 2.0, Decimal128(2.0)}, Decimal128(8.0)},
+            {{3.0, 2, 1LL, Decimal128(0.0)}, Decimal128(6.0)},
+            {{Decimal128(-6.0), 2.0, 3LL}, Decimal128(-1.0)},
+        });
+}
+
+TEST(ExpressionAddTest, DatesNonDecimal) {
+    assertExpectedResults(
+        "$add",
+        {
+            {{1, 2, 3, Date_t::fromMillisSinceEpoch(100)}, Date_t::fromMillisSinceEpoch(106)},
+            {{1LL, 2LL, 3LL, Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(106)},
+            {{1.0, 2.0, 3.0, Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(106)},
+            {{1.0, 2.0, Value(Date_t::fromMillisSinceEpoch(100)), 3.0},
+             Date_t::fromMillisSinceEpoch(106)},
+            {{1.0, 2.2, 3.5, Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(107)},
+            {{1, 2.2, 3.5, Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(107)},
+            {{1, Date_t::fromMillisSinceEpoch(100), 2.2, 3.5}, Date_t::fromMillisSinceEpoch(107)},
+            {{Date_t::fromMillisSinceEpoch(100), 1, 2.2, 3.5}, Date_t::fromMillisSinceEpoch(107)},
+            {{-6, Date_t::fromMillisSinceEpoch(100)}, Date_t::fromMillisSinceEpoch(94)},
+            {{-200, Date_t::fromMillisSinceEpoch(100)}, Date_t::fromMillisSinceEpoch(-100)},
+            {{1, 2, 3, Date_t::fromMillisSinceEpoch(-100)}, Date_t::fromMillisSinceEpoch(-94)},
+        });
+}
+
+TEST(ExpressionAddTest, DatesDecimal) {
+    assertExpectedResults(
+        "$add",
+        {
+            {{1, Decimal128(2), 3, Date_t::fromMillisSinceEpoch(100)},
+             Date_t::fromMillisSinceEpoch(106)},
+            {{1LL, 2LL, Decimal128(3LL), Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(106)},
+            {{1, Decimal128(2.2), 3.5, Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(107)},
+            {{1, Decimal128(2.2), Decimal128(3.5), Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(107)},
+            {{1.0, Decimal128(2.2), Decimal128(3.5), Value(Date_t::fromMillisSinceEpoch(100))},
+             Date_t::fromMillisSinceEpoch(107)},
+            {{Decimal128(-6), Date_t::fromMillisSinceEpoch(100)}, Date_t::fromMillisSinceEpoch(94)},
+            {{Decimal128(-200), Date_t::fromMillisSinceEpoch(100)},
+             Date_t::fromMillisSinceEpoch(-100)},
+            {{1, Decimal128(2), 3, Date_t::fromMillisSinceEpoch(-100)},
+             Date_t::fromMillisSinceEpoch(-94)},
+        });
+}
+
+TEST(ExpressionAddTest, Assertions) {
+    // Date addition must fit in a NumberLong from a double.
+    ASSERT_THROWS_CODE(
+        evaluateExpression("$add", {Date_t::fromMillisSinceEpoch(100), (double)LLONG_MAX}),
+        AssertionException,
+        ErrorCodes::Overflow);
+
+    // Only one date allowed in an $add expression.
+    ASSERT_THROWS_CODE(
+        evaluateExpression(
+            "$add", {Date_t::fromMillisSinceEpoch(100), 1, Date_t::fromMillisSinceEpoch(100)}),
+        AssertionException,
+        16612);
+
+    // Only numeric types are allowed in a $add.
+    ASSERT_THROWS_CODE(evaluateExpression("$add", {1, 2, "not numeric!"_sd, 3}),
+                       AssertionException,
+                       ErrorCodes::TypeMismatch);
+}
+
+
+TEST(ExpressionAddTest, VerifyNoDoubleDoubleSummation) {
+    // Confirm that we're not using DoubleDoubleSummation for $add expression with a set of double
+    // values from mongo/util/summation_test.cpp.
+    std::vector<ImplicitValue> doubleValues = {
+        1.4831356930199802e-05,  -3.121724665346865,     3041897608700.073,
+        1001318343149.7166,      -1714.6229586696593,    1731390114894580.8,
+        6.256645803154374e-08,   -107144114533844.25,    -0.08839485091750919,
+        -265119153.02185738,     -0.02450615965231944,   0.0002684331017079073,
+        32079040427.68358,       -0.04733295911845742,   0.061381859083076085,
+        -25329.59126796951,      -0.0009567520620034965, -1553879364344.9932,
+        -2.1101077525869814e-08, -298421079729.5547,     0.03182394834273594,
+        22.201944843278916,      -33.35667991109125,     11496013.960449915,
+        -40652595.33210472,      3.8496066090328163,     2.5074042398147304e-08,
+        -0.02208724071782122,    -134211.37290639878,    0.17640433666616578,
+        4.463787499171126,       9.959669945399718,      129265976.35224283,
+        1.5865526187526546e-07,  -4746011.710555799,     -712048598925.0789,
+        582214206210.4034,       0.025236204812875362,   530078170.91147506,
+        -14.865307666195053,     1.6727994895185032e-05, -113386276.03121366,
+        -6.135827207137054,      10644945799901.145,     -100848907797.1582,
+        2.2404406961625282e-08,  1.315662618424494e-09,  -0.832190208349044,
+        -9.779323414999364,      -546522170658.2997};
+    double straightSum = 0.0;
+    DoubleDoubleSummation compensatedSum;
+    for (const auto& x : doubleValues) {
+        compensatedSum.addDouble(x.getDouble());
+        straightSum += x.getDouble();
+    }
+    ASSERT_NE(straightSum, compensatedSum.getDouble());
+
+    Value result = evaluateExpression("$add", doubleValues);
+    ASSERT_VALUE_EQ(result, Value(straightSum));
+    ASSERT_VALUE_NE(result, Value(compensatedSum.getDouble()));
+}
+TEST(ExpressionFLETest, BadInputs) {
+
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+    {
+        auto expr = fromjson("{$_internalFleEq: 12}");
+        ASSERT_THROWS_CODE(ExpressionInternalFLEEqual::parse(&expCtx, expr.firstElement(), vps),
+                           DBException,
+                           10065);
+    }
+}
+
+// Test we return true if it matches
+TEST(ExpressionFLETest, TestBinData) {
+
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+
+    {
+        auto expr = fromjson(R"({$_internalFleEq: {
+        field: {
+            "$binary": {
+                "base64":
+                "DpmKcmnbZ0q1pl/PVwNUh2kCFxinumXuHn6hOSbp+cge6qsJsh7GhSCgRen8HT9JkOZSkZQlSn4IU1vqmTdKRtpk/xX2YJdG76qRYahnyLhl44xjm5Nw1TTMTxAYW3/F0ZTZeWRb2vsU8ICPlHh4xn7isVzmp/0G9k19x67xzboc57gvFXpmCJ3i2qcDAJwaN1fVL/4+S0jJYje8HwgS6qXXaJBCyiZzd31LDXZLWMYkiDvrJBZEMeAnu8gATM5Hg+9Hfte7/C37QED8jjxmAoVB",
+                    "subType": "6"
+            }
+        },
+        server: {
+            "$binary": {
+                "base64": "CPFLfo1iUCYtRSLiuB+Bt5d1tAe/BCfIfAoGmQLBqBhO",
+                "subType": "6"
+            }
+        }    } })");
+
+        auto exprFle = ExpressionInternalFLEEqual::parse(&expCtx, expr.firstElement(), vps);
+
+        ASSERT_VALUE_EQ(exprFle->evaluate({}, &expCtx.variables), Value(true));
+    }
+
+    {
+        auto expr = fromjson(R"({$_internalFleEq: {
+        field: {
+            "$binary": {
+                "base64":
+                "DpmKcmnbZ0q1pl/PVwNUh2kCFxinumXuHn6hOSbp+cge6qsJsh7GhSCgRen8HT9JkOZSkZQlSn4IU1vqmTdKRtpk/xX2YJdG76qRYahnyLhl44xjm5Nw1TTMTxAYW3/F0ZTZeWRb2vsU8ICPlHh4xn7isVzmp/0G9k19x67xzboc57gvFXpmCJ3i2qcDAJwaN1fVL/4+S0jJYje8HwgS6qXXaJBCyiZzd31LDXZLWMYkiDvrJBZEMeAnu8gATM5Hg+9Hfte7/C37QED8jjxmAoVB",
+                    "subType": "6"
+            }
+        },
+        server: {
+            "$binary": {
+                "base64": "CEWSmQID7SfwyAUI3ZkSFkATKryDQfnxXEOGad5d4Rsg",
+                "subType": "6"
+            }
+        }    } })");
+
+        auto exprFle = ExpressionInternalFLEEqual::parse(&expCtx, expr.firstElement(), vps);
+
+        ASSERT_VALUE_EQ(exprFle->evaluate({}, &expCtx.variables), Value(false));
+    }
+}
+
+TEST(ExpressionFLETest, TestBinData_RoundTrip) {
+
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+
+    auto expr = fromjson(R"({$_internalFleEq: {
+    field: {
+        "$binary": {
+            "base64":
+            "DpmKcmnbZ0q1pl/PVwNUh2kCFxinumXuHn6hOSbp+cge6qsJsh7GhSCgRen8HT9JkOZSkZQlSn4IU1vqmTdKRtpk/xX2YJdG76qRYahnyLhl44xjm5Nw1TTMTxAYW3/F0ZTZeWRb2vsU8ICPlHh4xn7isVzmp/0G9k19x67xzboc57gvFXpmCJ3i2qcDAJwaN1fVL/4+S0jJYje8HwgS6qXXaJBCyiZzd31LDXZLWMYkiDvrJBZEMeAnu8gATM5Hg+9Hfte7/C37QED8jjxmAoVB",
+                "subType": "6"
+        }
+    },
+    server: {
+        "$binary": {
+            "base64": "CPFLfo1iUCYtRSLiuB+Bt5d1tAe/BCfIfAoGmQLBqBhO",
+            "subType": "6"
+        }
+    }    } })");
+
+    auto exprFle = ExpressionInternalFLEEqual::parse(&expCtx, expr.firstElement(), vps);
+
+    ASSERT_VALUE_EQ(exprFle->evaluate({}, &expCtx.variables), Value(true));
+
+    auto value = exprFle->serialize();
+
+    auto roundTripExpr = fromjson(R"({$_internalFleEq: {
+    field: {
+        "$const" : { "$binary": {
+            "base64":
+            "DpmKcmnbZ0q1pl/PVwNUh2kCFxinumXuHn6hOSbp+cge6qsJsh7GhSCgRen8HT9JkOZSkZQlSn4IU1vqmTdKRtpk/xX2YJdG76qRYahnyLhl44xjm5Nw1TTMTxAYW3/F0ZTZeWRb2vsU8ICPlHh4xn7isVzmp/0G9k19x67xzboc57gvFXpmCJ3i2qcDAJwaN1fVL/4+S0jJYje8HwgS6qXXaJBCyiZzd31LDXZLWMYkiDvrJBZEMeAnu8gATM5Hg+9Hfte7/C37QED8jjxmAoVB",
+                "subType": "6"
+        }}
+    },
+    server: {
+        "$binary": {
+            "base64": "CPFLfo1iUCYtRSLiuB+Bt5d1tAe/BCfIfAoGmQLBqBhO",
+            "subType": "6"
+        }
+    }    } })");
+
+    ASSERT_BSONOBJ_EQ(value.getDocument().toBson(), roundTripExpr);
+}
+
+TEST(ExpressionFLETest, ParseAndSerializeBetween) {
+
+    auto expCtx = ExpressionContextForTest();
+    auto vps = expCtx.variablesParseState;
+
+    auto expr = fromjson(R"({$_internalFleBetween: {
+    field: {
+        "$binary": {
+            "base64":
+            "BxI0VngSNJh2EjQSNFZ4kBIQ0JE8aMUFkPk5sSTVqfdNNfjqUfQQ1Uoj0BBcthrWoe9wyU3cN6zmWaQBPJ97t0ZPbecnMsU736yXre6cBO4Zdt/wThtY+v5+7vFgNnWpgRP0e+vam6QPmLvbBrO0LdsvAPTGW4yqwnzCIXCoEg7QPGfbfAXKPDTNenBfRlawiblmTOhO/6ljKotWsMp22q/rpHrn9IEIeJmecwuuPIJ7EA+XYQ3hOKVccYf2ogoK73+8xD/Vul83Qvr84Q8afc4QUMVs8A==",
+                "subType": "6"
+        }
+    },
+    server: [{
+        "$binary": {
+            "base64": "COuac/eRLYakKX6B0vZ1r3QodOQFfjqJD+xlGiPu4/Ps",
+            "subType": "6"
+        }
+    }]
+    } })");
+
+    auto exprFle = ExpressionInternalFLEBetween::parse(&expCtx, expr.firstElement(), vps);
+    auto value = exprFle->serialize();
+
+    auto roundTripExpr = fromjson(R"({$_internalFleBetween: {
+    field: {
+        "$const" : { "$binary": {
+            "base64":
+            "BxI0VngSNJh2EjQSNFZ4kBIQ0JE8aMUFkPk5sSTVqfdNNfjqUfQQ1Uoj0BBcthrWoe9wyU3cN6zmWaQBPJ97t0ZPbecnMsU736yXre6cBO4Zdt/wThtY+v5+7vFgNnWpgRP0e+vam6QPmLvbBrO0LdsvAPTGW4yqwnzCIXCoEg7QPGfbfAXKPDTNenBfRlawiblmTOhO/6ljKotWsMp22q/rpHrn9IEIeJmecwuuPIJ7EA+XYQ3hOKVccYf2ogoK73+8xD/Vul83Qvr84Q8afc4QUMVs8A==",
+                "subType": "6"
+        }}
+    },
+    server: [{
+        "$binary": {
+            "base64": "COuac/eRLYakKX6B0vZ1r3QodOQFfjqJD+xlGiPu4/Ps",
+            "subType": "6"
+        }
+    }]
+        } })");
+    ASSERT_BSONOBJ_EQ(value.getDocument().toBson(), roundTripExpr);
+}
+
+/**
+ * Expressions registered with REGISTER_EXPRESSION_WITH_FEATURE_FLAG with feature flags that are not
+ * active by default are not available for parsing in unit tests, since at MONGO_INITIALIZER-time,
+ * the feature flag is false, so the expression isn't registered. This function calls the parse
+ * function on an expression class directly to bypass the global parser map.
+ */
+template <typename T>
+Value evaluateUnregisteredExpression(vector<ImplicitValue> operands) {
+    auto expCtx = ExpressionContextForTest{};
+    auto val = Value(ImplicitValue::convertToValues(operands));
+    const BSONObj obj = BSON("" << val);
+    auto expr = T::parse(&expCtx, obj.firstElement(), expCtx.variablesParseState);
+    return expr->evaluate({}, &expCtx.variables);
+}
+
+/**
+ * Version of assertExpectedResults() that bypasses the global parser map and always parses
+ * expressions of the templated type.
+ */
+template <typename T>
+void assertExpectedResultsUnregistered(
+    initializer_list<pair<initializer_list<ImplicitValue>, ImplicitValue>> operations) {
+    for (auto&& op : operations) {
+        try {
+            Value result = evaluateUnregisteredExpression<T>(op.first);
+            ASSERT_VALUE_EQ(op.second, result);
+            ASSERT_EQUALS(op.second.getType(), result.getType());
+        } catch (...) {
+            LOGV2(6688000, "failed", "argument"_attr = ImplicitValue::convertToValues(op.first));
+            throw;
+        }
+    }
+}
+
+TEST(ExpressionBitAndTest, BitAndCorrectness) {
+    assertExpectedResultsUnregistered<ExpressionBitAnd>({
+        // Explicit correctness cases.
+        {{0b0, 0b0}, 0b0},
+        {{0b0, 0b1}, 0b0},
+        {{0b1, 0b0}, 0b0},
+        {{0b1, 0b1}, 0b1},
+
+        {{0b00, 0b00}, 0b00},
+        {{0b00, 0b01}, 0b00},
+        {{0b01, 0b00}, 0b00},
+        {{0b01, 0b01}, 0b01},
+
+        {{0b00, 0b00}, 0b00},
+        {{0b00, 0b11}, 0b00},
+        {{0b11, 0b00}, 0b00},
+        {{0b11, 0b11}, 0b11},
+    });
+}
+
+TEST(ExpressionBitAndTest, BitAndInt) {
+    assertExpectedResultsUnregistered<ExpressionBitAnd>({
+        // Empty operand list should evaluate to the identity for the operation.
+        {{}, -1},
+        // Singleton cases.
+        {{0}, 0},
+        {{256}, 256},
+        // Binary cases
+        {{5, 2}, 5 & 2},
+        {{255, 0}, 255 & 0},
+        // Ternary cases
+        {{5, 2, 10}, 5 & 2 & 10},
+    });
+}
+
+TEST(ExpressionBitAndTest, BitAndLong) {
+    assertExpectedResultsUnregistered<ExpressionBitAnd>({
+        // Singleton cases.
+        {{0LL}, 0LL},
+        {{1LL << 40}, 1LL << 40},
+        {{256LL}, 256LL},
+        // Binary cases.
+        {{5LL, 2LL}, 5LL & 2LL},
+        {{255LL, 0LL}, 255LL & 0LL},
+        // Ternary cases.
+        {{5, 2, 10}, 5 & 2 & 10},
+    });
+}
+
+TEST(ExpressionBitAndTest, BitAndMixedTypes) {
+    // Any NumberLong widens the resulting type to NumberLong.
+    assertExpectedResultsUnregistered<ExpressionBitAnd>({
+        // Binary cases
+        {{5LL, 2}, 5LL & 2},
+        {{5, 2LL}, 5 & 2LL},
+        {{255LL, 0}, 255LL & 0},
+        {{255, 0LL}, 255 & 0LL},
+    });
+}
+
+TEST(ExpressionBitOrTest, BitOrInt) {
+    assertExpectedResultsUnregistered<ExpressionBitOr>({
+        {{}, 0},
+        // Singleton cases.
+        {{0}, 0},
+        {{256}, 256},
+        // Binary cases
+        {{5, 2}, 5 | 2},
+        {{255, 0}, 255 | 0},
+        // Ternary cases
+        {{5, 2, 10}, 5 | 2 | 10},
+    });
+}
+
+TEST(ExpressionBitOrTest, BitOrLong) {
+    assertExpectedResultsUnregistered<ExpressionBitOr>({
+        // Singleton cases.
+        {{0LL}, 0LL},
+        {{256LL}, 256LL},
+        // Binary cases.
+        {{5LL, 2LL}, 5LL | 2LL},
+        {{255LL, 0LL}, 255LL | 0LL},
+        // Ternary cases.
+        {{5, 2, 10}, 5 | 2 | 10},
+    });
+}
+
+TEST(ExpressionBitOrTest, BitOrMixedTypes) {
+    // Any NumberLong widens the resulting type to NumberLong.
+    assertExpectedResultsUnregistered<ExpressionBitOr>({
+        // Binary cases
+        {{5LL, 2}, 5LL | 2},
+        {{5, 2LL}, 5 | 2LL},
+        {{255LL, 0}, 255LL | 0},
+        {{255, 0LL}, 255 | 0LL},
+    });
+}
+
+TEST(ExpressionBitXorTest, BitXorInt) {
+    assertExpectedResultsUnregistered<ExpressionBitXor>({
+        {{}, 0},
+        // Singleton cases.
+        {{0}, 0},
+        {{256}, 256},
+        // Binary cases
+        {{5, 2}, 5 ^ 2},
+        {{255, 0}, 255 ^ 0},
+        // Ternary cases
+        {{5, 2, 10}, 5 ^ 2 ^ 10},
+    });
+}
+
+TEST(ExpressionBitXorTest, BitXorLong) {
+    assertExpectedResultsUnregistered<ExpressionBitXor>({
+        // Singleton cases.
+        {{0LL}, 0LL},
+        {{256LL}, 256LL},
+        // Binary cases.
+        {{5LL, 2LL}, 5LL ^ 2LL},
+        {{255LL, 0LL}, 255LL ^ 0LL},
+        // Ternary cases.
+        {{5, 2, 10}, 5 ^ 2 ^ 10},
+    });
+}
+
+TEST(ExpressionBitXorTest, BitXorMixedTypes) {
+    // Any NumberLong widens the resulting type to NumberLong.
+    assertExpectedResultsUnregistered<ExpressionBitXor>({
+        // Binary cases
+        {{5LL, 2}, 5LL ^ 2},
+        {{5, 2LL}, 5 ^ 2LL},
+        {{255LL, 0}, 255LL ^ 0},
+        {{255, 0LL}, 255 ^ 0LL},
+    });
+}
+
+
+TEST(ExpressionBitNotTest, Int) {
+    int min = numeric_limits<int>::min();
+    int max = numeric_limits<int>::max();
+    assertExpectedResultsUnregistered<ExpressionBitNot>({
+        {{0}, -1},
+        {{-1}, 0},
+        {{1}, -2},
+        {{3}, -4},
+        {{100}, -101},
+        {{min}, ~min},
+        {{max}, ~max},
+        {{max}, min},
+        {{min}, max},
+    });
+}
+
+TEST(ExpressionBitNotTest, Long) {
+    long long min = numeric_limits<long long>::min();
+    long long max = numeric_limits<long long>::max();
+    assertExpectedResultsUnregistered<ExpressionBitNot>({
+        {{0LL}, -1LL},
+        {{-1LL}, 0LL},
+        {{1LL}, -2LL},
+        {{3LL}, -4LL},
+        {{100LL}, -101LL},
+        {{2147483649LL}, ~2147483649LL},
+        {{-2147483655LL}, ~(-2147483655LL)},
+        {{min}, ~min},
+        {{max}, ~max},
+        {{max}, min},
+        {{min}, max},
+    });
+}
+
+TEST(ExpressionBitNotTest, OtherNumerics) {
+    ASSERT_THROWS_CODE(evaluateUnregisteredExpression<ExpressionBitNot>({1.5}),
+                       AssertionException,
+                       ErrorCodes::TypeMismatch);
+    ASSERT_THROWS_CODE(evaluateUnregisteredExpression<ExpressionBitNot>({Decimal128("0")}),
+                       AssertionException,
+                       ErrorCodes::TypeMismatch);
+}
+
+TEST(ExpressionBitNotTest, NonNumerics) {
+    ASSERT_THROWS_CODE(
+        evaluateUnregisteredExpression<ExpressionBitNot>({"hi"_sd}), AssertionException, 28765);
+    ASSERT_THROWS_CODE(
+        evaluateUnregisteredExpression<ExpressionBitNot>({true}), AssertionException, 28765);
+}
+
+TEST(ExpressionBitNotTest, Arrays) {
+    ASSERT_THROWS_CODE(
+        evaluateUnregisteredExpression<ExpressionBitNot>({1, 2, 3}), AssertionException, 16020);
+    ASSERT_THROWS_CODE(evaluateUnregisteredExpression<ExpressionBitNot>({1LL, 2LL, 3LL}),
+                       AssertionException,
+                       16020);
+}
+
+TEST(ExpressionParseParenthesisExpressionObjTest, MultipleExprSimplification) {
+    auto expCtx = ExpressionContextForTest{};
+    auto specObject = fromjson(
+        "{input: {$expr: {$expr: {$expr: "
+        "{$eq: [123,123]}}}}}");
+    auto expr = Expression::parseObject(&expCtx, specObject, expCtx.variablesParseState);
+    ASSERT_EQ(expr->serialize().toString(), "{input: {$eq: [{$const: 123}, {$const: 123}]}}");
+}
+
+TEST(ExpressionParseParenthesisExpressionObjTest, SetSingleExprSimplification) {
+    auto expCtx = ExpressionContextForTest{};
+    auto specObject = fromjson("{input: {a: {$expr: {b: 1}}}}");
+    auto expr = Expression::parseObject(&expCtx, specObject, expCtx.variablesParseState);
+    ASSERT_EQ(expr->serialize().toString(), "{input: {a: {b: {$const: 1}}}}");
+}
+
+TEST(ExpressionParseParenthesisExpressionObjTest, MatchSingleExprSimplification) {
+
+    auto expCtx = ExpressionContextForTest{};
+    auto specObject = fromjson("{input: {$expr: [false]}}");
+    auto expr = Expression::parseObject(&expCtx, specObject, expCtx.variablesParseState);
+    ASSERT_EQ(expr->serialize().toString(), "{input: [{$const: false}]}");
+}
+
+TEST(ExpressionParseParenthesisExpressionObjTest, SingleExprSimplification) {
+    auto expCtx = ExpressionContextForTest{};
+    auto specObject = fromjson("{$expr: [123]}");
+    auto expr = Expression::parseObject(&expCtx, specObject, expCtx.variablesParseState);
+    ASSERT_EQ(expr->serialize().toString(), "[{$const: 123}]");
+}
+
+TEST(ExpressionParseParenthesisExpressionObjTest, EmptyObject) {
+    auto expCtx = ExpressionContextForTest{};
+    auto specObject = fromjson("{$expr: {}}");
+    auto expr = Expression::parseObject(&expCtx, specObject, expCtx.variablesParseState);
+    ASSERT_EQ(expr->serialize().toString(), "{$const: {}}");
+}
+
+/**
+ * Test case for round-trip conversion of random double using $convert.
+ *
+ * Generates 1000 random doubles and verifies they can be correctly converted to string values and
+ * back to double.
+ */
+TEST(ExpressionConvert, StringToDouble) {
+    for (int i = 0; i < 1000; ++i) {
+        verifyStringDoubleConvertRoundtripsCorrectly(randomDouble());
+    }
+}
+
+TEST(NameExpression, Literal) {
+    auto expCtx = ExpressionContextForTest{};
+    auto nameExprObj = fromjson(R"({db: "abc"})");
+    auto nameExpr = NameExpression::parseFromBSON(nameExprObj["db"]);
+    ASSERT_TRUE(nameExpr.isLiteral());
+    ASSERT_EQ("abc", nameExpr.getLiteral());
+
+    auto serializedStr = nameExpr.toString();
+    ASSERT_EQ(nameExprObj.toString(), serializedStr);
+}
+
+TEST(NameExpression, SimplePath) {
+    auto expCtx = ExpressionContextForTest{};
+    auto nameExprObj = fromjson(R"({coll: "$apath"})");
+    auto nameExpr = NameExpression::parseFromBSON(nameExprObj["coll"]);
+    ASSERT_FALSE(nameExpr.isLiteral());
+    ASSERT_EQ("ljk", nameExpr.evaluate(&expCtx, fromJson(R"({apath: "ljk"})")));
+
+    auto serializedStr = nameExpr.toString();
+    ASSERT_EQ(nameExprObj.toString(), serializedStr);
+}
+
+TEST(NameExpression, Expression) {
+    auto expCtx = ExpressionContextForTest{};
+    auto nameExprObj =
+        fromjson(R"({fullName: {$concat: ["$customer.firstname", " ", "$customer.surname"]}})");
+    auto nameExpr = NameExpression::parseFromBSON(nameExprObj["fullName"]);
+    ASSERT_FALSE(nameExpr.isLiteral());
+    ASSERT_EQ("Firstname Lastname", nameExpr.evaluate(&expCtx, fromJson(R"(
+                                    {
+                                        customer: {
+                                            firstname: "Firstname",
+                                            surname: "Lastname"
+                                        }
+                                    }
+                                )")));
+
+    auto serializedStr = nameExpr.toString();
+    ASSERT_EQ(nameExprObj.toString(), serializedStr);
+}
+
+TEST(NameExpression, NonStringValue) {
+    auto expCtx = ExpressionContextForTest{};
+    auto nameExprObj = fromjson(R"({fullName: {$add: ["$customer.id", 10]}})");
+    auto nameExpr = NameExpression::parseFromBSON(nameExprObj["fullName"]);
+    ASSERT_FALSE(nameExpr.isLiteral());
+    ASSERT_THROWS_CODE(
+        nameExpr.evaluate(&expCtx, fromJson(R"({customer: {id: 10}})")), DBException, 8117101);
+}
+
+TEST(NameExpression, InvalidInput) {
+    auto expCtx = ExpressionContextForTest{};
+    auto nameExprObj =
+        fromjson(R"({fullName: {$concat: ["$customer.firstname", " ", "$customer.surname"]}})");
+    auto nameExpr = NameExpression::parseFromBSON(nameExprObj["fullName"]);
+    ASSERT_FALSE(nameExpr.isLiteral());
+    ASSERT_THROWS_CODE(
+        nameExpr.evaluate(&expCtx, fromJson(R"({customer: {id: 10}})")), DBException, 8117101);
+}
+
+TEST(ExpressionModTest, ModWithDoubleDoubleTypeButIntegralValues) {
+    // Test that $mod with args of type double/double returns a value with type double,
+    // _even_ if the values happen to be an integral number (could be converted to an int with no
+    // rounding error).
+    using namespace mongo::literals;
+    assertExpectedResults(
+        "$mod", {{{Value(1.0), Value(2.0)}, Value(1.0)}, {{Value(3.0), Value(2.0)}, Value(1.0)}});
+}
+
+TEST(ExpressionModTest, ModWithDoubleLongTypeButIntegralValues) {
+    // As above, for double/long.
+    using namespace mongo::literals;
+    assertExpectedResults("$mod",
+                          {{{Value(3ll), Value(2.0)}, Value(1.0)},
+                           {{Value(3.0), Value(2.0)}, Value(1.0)},
+                           {{Value(3.0), Value(2ll)}, Value(1.0)}});
+}
+
+TEST(ExpressionModTest, ModWithDoubleIntTypeButIntegralValues) {
+    // As above, for double/int.
+    using namespace mongo::literals;
+    assertExpectedResults("$mod",
+                          {{{Value(3), Value(2.0)}, Value(1.0)},
+                           {{Value(3.0), Value(2.0)}, Value(1.0)},
+                           {{Value(3.0), Value(2)}, Value(1.0)}});
+}
+
 }  // namespace ExpressionTests
+}  // namespace mongo

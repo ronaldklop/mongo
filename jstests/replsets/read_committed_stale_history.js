@@ -4,12 +4,10 @@
  *
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");  // for reconnect.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 var name = "readCommittedStaleHistory";
 var dbName = "wMajorityCheck";
@@ -22,7 +20,6 @@ var rst = new ReplSetTest({
         {},
         {rsConfig: {priority: 0}},
     ],
-    nodeOptions: {enableMajorityReadConcern: ""},
     useBridge: true
 });
 
@@ -52,6 +49,11 @@ function checkDocNotCommitted(node, doc) {
 jsTestLog("Make sure node 0 is primary.");
 var primary = rst.getPrimary();
 var secondaries = rst.getSecondaries();
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+rst.awaitReplication();
 assert.eq(nodes[0], primary);
 // Wait for all data bearing nodes to get up to date.
 assert.commandWorked(nodes[0].getDB(dbName).getCollection(collName).insert(
@@ -137,4 +139,3 @@ assert.neq(
     nodes[0].getDB(dbName).getCollection(collName).find({a: 3}).readConcern('majority').next());
 
 rst.stopSet();
-}());

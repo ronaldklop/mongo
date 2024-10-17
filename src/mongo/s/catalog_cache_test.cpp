@@ -27,17 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+// IWYU pragma: no_include "cxxabi.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <system_error>
+#include <tuple>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
-
-#include "mongo/s/catalog/type_database.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
-#include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/s/stale_exception.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -48,12 +82,11 @@ protected:
         ShardingTestFixture::setUp();
 
         // Setup dummy config server
-        setRemote(kConfigHostAndPort);
         configTargeter()->setFindHostReturnValue(kConfigHostAndPort);
 
         // Setup catalogCache with mock loader
         _catalogCacheLoader = std::make_shared<CatalogCacheLoaderMock>();
-        _catalogCache = std::make_unique<CatalogCache>(getServiceContext(), *_catalogCacheLoader);
+        _catalogCache = std::make_unique<CatalogCache>(getServiceContext(), _catalogCacheLoader);
 
         // Populate the shardRegistry with the shards from kShards vector
         std::vector<std::tuple<ShardId, HostAndPort>> shardInfos;
@@ -125,32 +158,38 @@ protected:
     void loadDatabases(const std::vector<DatabaseType>& databases) {
         for (const auto& db : databases) {
             const auto scopedDbProvider = scopedDatabaseProvider(db);
-            const auto swDatabase = _catalogCache->getDatabase(operationContext(), db.getName());
+            const auto swDatabase = _catalogCache->getDatabase(operationContext(), db.getDbName());
             ASSERT_OK(swDatabase.getStatus());
         }
     }
 
-    void loadCollection(const ChunkVersion& version) {
-        const auto coll = makeCollectionType(version);
+    CollectionType loadCollection(const ShardVersion& version) {
+        auto coll = makeCollectionType(version);
         const auto scopedCollProv = scopedCollectionProvider(coll);
-        const auto scopedChunksProv = scopedChunksProvider(makeChunks(version));
+        const auto scopedChunksProv = scopedChunksProvider(makeChunks(version.placementVersion()));
+        auto future = launchAsync([&] {
+            onCommand([&](const executor::RemoteCommandRequest& request) {
+                return makeCollectionAndIndexesAggregationResponse(coll, std::vector<BSONObj>());
+            });
+        });
 
-        const auto swChunkManager =
+        const auto swCri =
             _catalogCache->getCollectionRoutingInfo(operationContext(), coll.getNss());
-        ASSERT_OK(swChunkManager.getStatus());
+        ASSERT_OK(swCri.getStatus());
+        future.default_timed_get();
+        return coll;
     }
 
     void loadUnshardedCollection(const NamespaceString& nss) {
         const auto scopedCollProvider =
             scopedCollectionProvider(Status(ErrorCodes::NamespaceNotFound, "collection not found"));
 
-        const auto swChunkManager =
-            _catalogCache->getCollectionRoutingInfo(operationContext(), nss);
-        ASSERT_OK(swChunkManager.getStatus());
+        const auto swCri = _catalogCache->getCollectionRoutingInfo(operationContext(), nss);
+        ASSERT_OK(swCri.getStatus());
     }
 
     std::vector<ChunkType> makeChunks(ChunkVersion version) {
-        ChunkType chunk(kNss,
+        ChunkType chunk(kUUID,
                         {kShardKeyPattern.getKeyPattern().globalMin(),
                          kShardKeyPattern.getKeyPattern().globalMax()},
                         version,
@@ -159,268 +198,439 @@ protected:
         return {chunk};
     }
 
-    CollectionType makeCollectionType(const ChunkVersion& collVersion) {
-        CollectionType coll(kNss, collVersion.epoch(), Date_t::now(), UUID::gen());
-        coll.setKeyPattern(kShardKeyPattern.getKeyPattern());
-        coll.setUnique(false);
+    CollectionType makeCollectionType(const ShardVersion& collPlacementVersion) {
+        CollectionType coll{kNss,
+                            collPlacementVersion.placementVersion().epoch(),
+                            collPlacementVersion.placementVersion().getTimestamp(),
+                            Date_t::now(),
+                            kUUID,
+                            kShardKeyPattern.getKeyPattern()};
+        if (collPlacementVersion.indexVersion()) {
+            coll.setIndexVersion(CollectionIndexes(kUUID, *collPlacementVersion.indexVersion()));
+        }
         return coll;
     }
 
-    const NamespaceString kNss{"catalgoCacheTestDB.foo"};
+    BSONObj makeCollectionAndIndexesAggregationResponse(const CollectionType& coll,
+                                                        const std::vector<BSONObj>& indexes) {
+        BSONObj obj = coll.toBSON();
+        BSONObjBuilder indexField;
+        indexField.append("indexes", indexes);
+        BSONObj newObj = obj.addField(indexField.obj().firstElement());
+        return CursorResponse(CollectionType::ConfigNS, CursorId{0}, {newObj})
+            .toBSON(CursorResponse::ResponseType::InitialResponse);
+    }
+
+    const NamespaceString kNss =
+        NamespaceString::createNamespaceString_forTest("catalgoCacheTestDB.foo");
+    const UUID kUUID = UUID::gen();
     const std::string kPattern{"_id"};
     const ShardKeyPattern kShardKeyPattern{BSON(kPattern << 1)};
     const int kDummyPort{12345};
     const HostAndPort kConfigHostAndPort{"DummyConfig", kDummyPort};
     const std::vector<ShardId> kShards{{"0"}, {"1"}};
+    RAIIServerParameterControllerForTest featureFlagController{
+        "featureFlagGlobalIndexesShardingCatalog", true};
 
     std::shared_ptr<CatalogCacheLoaderMock> _catalogCacheLoader;
     std::unique_ptr<CatalogCache> _catalogCache;
 };
 
-TEST_F(CatalogCacheTest, GetDatabase) {
-    const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    _catalogCacheLoader->setDatabaseRefreshReturnValue(
-        DatabaseType(dbName, kShards[0], true, dbVersion));
+const DatabaseName kDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testDB");
 
-    const auto swDatabase = _catalogCache->getDatabase(operationContext(), dbName);
+TEST_F(CatalogCacheTest, GetDatabase) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    _catalogCacheLoader->setDatabaseRefreshReturnValue(
+        DatabaseType(kDbName, kShards[0], dbVersion));
+
+    const auto swDatabase = _catalogCache->getDatabase(operationContext(), kDbName);
 
     ASSERT_OK(swDatabase.getStatus());
     const auto cachedDb = swDatabase.getValue();
-    ASSERT_TRUE(cachedDb.shardingEnabled());
-    ASSERT_EQ(cachedDb.primaryId(), kShards[0]);
-    ASSERT_EQ(cachedDb.databaseVersion().getUuid(), dbVersion.getUuid());
-    ASSERT_EQ(cachedDb.databaseVersion().getLastMod(), dbVersion.getLastMod());
+    ASSERT_EQ(cachedDb->getPrimary(), kShards[0]);
+    ASSERT_EQ(cachedDb->getVersion().getUuid(), dbVersion.getUuid());
+    ASSERT_EQ(cachedDb->getVersion().getLastMod(), dbVersion.getLastMod());
 }
 
 TEST_F(CatalogCacheTest, GetCachedDatabase) {
-    const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    loadDatabases({DatabaseType(dbName, kShards[0], true, dbVersion)});
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    loadDatabases({DatabaseType(kDbName, kShards[0], dbVersion)});
 
-    const auto swDatabase = _catalogCache->getDatabase(operationContext(), dbName);
+    const auto swDatabase = _catalogCache->getDatabase(operationContext(), kDbName);
 
     ASSERT_OK(swDatabase.getStatus());
     const auto cachedDb = swDatabase.getValue();
-    ASSERT_TRUE(cachedDb.shardingEnabled());
-    ASSERT_EQ(cachedDb.primaryId(), kShards[0]);
-    ASSERT_EQ(cachedDb.databaseVersion().getUuid(), dbVersion.getUuid());
-    ASSERT_EQ(cachedDb.databaseVersion().getLastMod(), dbVersion.getLastMod());
+    ASSERT_EQ(cachedDb->getPrimary(), kShards[0]);
+    ASSERT_EQ(cachedDb->getVersion().getUuid(), dbVersion.getUuid());
+    ASSERT_EQ(cachedDb->getVersion().getLastMod(), dbVersion.getLastMod());
+}
+
+TEST_F(CatalogCacheTest, GetDatabaseDrop) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+
+    _catalogCacheLoader->setDatabaseRefreshReturnValue(
+        DatabaseType(kDbName, kShards[0], dbVersion));
+
+    // The CatalogCache doesn't have any valid info about this DB and finds a new DatabaseType
+    auto swDatabase = _catalogCache->getDatabase(operationContext(), kDbName);
+    ASSERT_OK(swDatabase.getStatus());
+    const auto cachedDb = swDatabase.getValue();
+    ASSERT_EQ(cachedDb->getVersion().getUuid(), dbVersion.getUuid());
+    ASSERT_EQ(cachedDb->getVersion().getLastMod(), dbVersion.getLastMod());
+
+    // Advancing the timeInStore, e.g. because of a movePrimary
+    _catalogCache->onStaleDatabaseVersion(kDbName, dbVersion.makeUpdated());
+
+    // However, when this CatalogCache asks to the loader for the new info associated to dbName it
+    // didn't find any (i.e. the database was dropped)
+    _catalogCacheLoader->setDatabaseRefreshReturnValue(
+        Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
+
+    // Finally, the CatalogCache shouldn't find the Database
+    swDatabase = _catalogCache->getDatabase(operationContext(), kDbName);
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, swDatabase.getStatus());
 }
 
 TEST_F(CatalogCacheTest, InvalidateSingleDbOnShardRemoval) {
-    const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    loadDatabases({DatabaseType(dbName, kShards[0], true, dbVersion)});
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    loadDatabases({DatabaseType(kDbName, kShards[0], dbVersion)});
 
     _catalogCache->invalidateEntriesThatReferenceShard(kShards[0]);
     _catalogCacheLoader->setDatabaseRefreshReturnValue(
-        DatabaseType(dbName, kShards[1], true, dbVersion));
-    const auto swDatabase = _catalogCache->getDatabase(operationContext(), dbName);
+        DatabaseType(kDbName, kShards[1], dbVersion));
+    const auto swDatabase = _catalogCache->getDatabase(operationContext(), kDbName);
 
     ASSERT_OK(swDatabase.getStatus());
     auto cachedDb = swDatabase.getValue();
-    ASSERT_EQ(cachedDb.primaryId(), kShards[1]);
+    ASSERT_EQ(cachedDb->getPrimary(), kShards[1]);
 }
 
 TEST_F(CatalogCacheTest, OnStaleDatabaseVersionNoVersion) {
     // onStaleDatabaseVesrsion must invalidate the database entry if invoked with no version
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
 
-    _catalogCache->onStaleDatabaseVersion(kNss.db(), boost::none);
+    _catalogCache->onStaleDatabaseVersion(kNss.dbName(), boost::none);
 
-    const auto status = _catalogCache->getDatabase(operationContext(), kNss.db()).getStatus();
+    const auto status = _catalogCache->getDatabase(operationContext(), kNss.dbName()).getStatus();
     ASSERT(status == ErrorCodes::InternalError);
 }
 
 TEST_F(CatalogCacheTest, OnStaleShardVersionWithSameVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
     loadCollection(cachedCollVersion);
-    _catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        kNss, cachedCollVersion, kShards[0]);
+    _catalogCache->onStaleCollectionVersion(kNss, cachedCollVersion);
     ASSERT_OK(_catalogCache->getCollectionRoutingInfo(operationContext(), kNss).getStatus());
 }
 
 TEST_F(CatalogCacheTest, OnStaleShardVersionWithNoVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
     loadCollection(cachedCollVersion);
-    _catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        kNss, boost::none, kShards[0]);
+    _catalogCache->onStaleCollectionVersion(kNss, boost::none);
     const auto status =
         _catalogCache->getCollectionRoutingInfo(operationContext(), kNss).getStatus();
     ASSERT(status == ErrorCodes::InternalError);
 }
 
-TEST_F(CatalogCacheTest, OnStaleShardVersionWithGraterVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
-    const auto wantedCollVersion =
-        ChunkVersion(2, 0, cachedCollVersion.epoch(), cachedCollVersion.getTimestamp());
+TEST_F(CatalogCacheTest, OnStaleShardVersionWithGreaterPlacementVersion) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    const auto wantedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {2, 0}), boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
     loadCollection(cachedCollVersion);
-    _catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        kNss, wantedCollVersion, kShards[0]);
+    _catalogCache->onStaleCollectionVersion(kNss, wantedCollVersion);
     const auto status =
         _catalogCache->getCollectionRoutingInfo(operationContext(), kNss).getStatus();
     ASSERT(status == ErrorCodes::InternalError);
 }
 
-TEST_F(CatalogCacheTest, CheckEpochNoDatabase) {
-    const auto collVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
-    ASSERT_THROWS_WITH_CHECK(_catalogCache->checkEpochOrThrow(kNss, collVersion, kShards[0]),
-                             StaleConfigException,
-                             [&](const StaleConfigException& ex) {
-                                 const auto staleInfo = ex.extraInfo<StaleConfigInfo>();
-                                 ASSERT(staleInfo);
-                                 ASSERT_EQ(staleInfo->getNss(), kNss);
-                                 ASSERT_EQ(staleInfo->getVersionReceived(), collVersion);
-                                 ASSERT_EQ(staleInfo->getShardId(), kShards[0]);
-                                 ASSERT(staleInfo->getVersionWanted() == boost::none);
-                             });
+TEST_F(CatalogCacheTest, GetCollectionRoutingInfoAllowLocksReturnsImmediately) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    auto coll = loadCollection(cachedCollVersion);
+
+    const auto swCri = _catalogCache->getCollectionRoutingInfo(
+        operationContext(), coll.getNss(), true /* allowLocks */);
+    ASSERT_OK(swCri.getStatus());
+
+    ASSERT(swCri.getValue().getCollectionVersion() == cachedCollVersion);
 }
 
-TEST_F(CatalogCacheTest, CheckEpochNoCollection) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto collVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+TEST_F(CatalogCacheTest, GetCollectionRoutingInfoAllowLocksNeedsToFetchNewCollInfo) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    const auto wantedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {2, 0}), boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
-    ASSERT_THROWS_WITH_CHECK(_catalogCache->checkEpochOrThrow(kNss, collVersion, kShards[0]),
-                             StaleConfigException,
-                             [&](const StaleConfigException& ex) {
-                                 const auto staleInfo = ex.extraInfo<StaleConfigInfo>();
-                                 ASSERT(staleInfo);
-                                 ASSERT_EQ(staleInfo->getNss(), kNss);
-                                 ASSERT_EQ(staleInfo->getVersionReceived(), collVersion);
-                                 ASSERT_EQ(staleInfo->getShardId(), kShards[0]);
-                                 ASSERT(staleInfo->getVersionWanted() == boost::none);
-                             });
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    loadCollection(cachedCollVersion);
+    _catalogCache->onStaleCollectionVersion(kNss, wantedCollVersion);
+
+    {
+        FailPointEnableBlock failPoint("blockCollectionCacheLookup");
+
+        const auto status =
+            _catalogCache->getCollectionRoutingInfo(operationContext(), kNss, true /* allowLocks */)
+                .getStatus();
+
+        ASSERT(status == ErrorCodes::ShardCannotRefreshDueToLocksHeld);
+        auto refreshInfo = status.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+        ASSERT(refreshInfo);
+    }
+    // Cancel ongoing refresh
+    _catalogCache->invalidateCollectionEntry_LINEARIZABLE(kNss);
 }
 
-TEST_F(CatalogCacheTest, CheckEpochUnshardedCollection) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto collVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+TEST_F(CatalogCacheTest, GetCollectionRoutingInfoAllowLocksNeedsToFetchNewDBInfo) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    const auto wantedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {2, 0}), boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
-    loadUnshardedCollection(kNss);
-    ASSERT_THROWS_WITH_CHECK(_catalogCache->checkEpochOrThrow(kNss, collVersion, kShards[0]),
-                             StaleConfigException,
-                             [&](const StaleConfigException& ex) {
-                                 const auto staleInfo = ex.extraInfo<StaleConfigInfo>();
-                                 ASSERT(staleInfo);
-                                 ASSERT_EQ(staleInfo->getNss(), kNss);
-                                 ASSERT_EQ(staleInfo->getVersionReceived(), collVersion);
-                                 ASSERT_EQ(staleInfo->getShardId(), kShards[0]);
-                                 ASSERT(staleInfo->getVersionWanted() == boost::none);
-                             });
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    loadCollection(cachedCollVersion);
+    _catalogCache->invalidateDatabaseEntry_LINEARIZABLE(kNss.dbName());
+
+    {
+        FailPointEnableBlock failPoint("blockDatabaseCacheLookup");
+
+        const auto status =
+            _catalogCache->getCollectionRoutingInfo(operationContext(), kNss, true /* allowLocks */)
+                .getStatus();
+
+        ASSERT(status == ErrorCodes::ShardCannotRefreshDueToLocksHeld);
+        auto refreshInfo = status.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+        ASSERT(refreshInfo);
+    }
+    // Cancel ongoing refresh
+    _catalogCache->invalidateDatabaseEntry_LINEARIZABLE(kNss.dbName());
 }
 
-TEST_F(CatalogCacheTest, CheckEpochWithMismatch) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto wantedCollVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
-    const auto receivedCollVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+TEST_F(CatalogCacheTest, TimeseriesFieldsAreProperlyPropagatedOnCC) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const auto gen = CollectionGeneration(OID::gen(), Timestamp(42));
+    const auto version = ShardVersionFactory::make(ChunkVersion(gen, {1, 0}),
+                                                   boost::optional<CollectionIndexes>(boost::none));
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
-    loadCollection(wantedCollVersion);
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
 
-    ASSERT_THROWS_WITH_CHECK(
-        _catalogCache->checkEpochOrThrow(kNss, receivedCollVersion, kShards[0]),
-        StaleConfigException,
-        [&](const StaleConfigException& ex) {
-            const auto staleInfo = ex.extraInfo<StaleConfigInfo>();
-            ASSERT(staleInfo);
-            ASSERT_EQ(staleInfo->getNss(), kNss);
-            ASSERT_EQ(staleInfo->getVersionReceived(), receivedCollVersion);
-            ASSERT(staleInfo->getVersionWanted() != boost::none);
-            ASSERT_EQ(*(staleInfo->getVersionWanted()), wantedCollVersion);
-            ASSERT_EQ(staleInfo->getShardId(), kShards[0]);
-        });
-}
+    auto coll = makeCollectionType(version);
+    auto chunks = makeChunks(version.placementVersion());
+    auto timeseriesOptions = TimeseriesOptions("fieldName");
 
-TEST_F(CatalogCacheTest, CheckEpochWithMatch) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto collVersion = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+    // 1st refresh: we should find a bucket granularity of seconds
+    {
+        TypeCollectionTimeseriesFields tsFields;
+        timeseriesOptions.setGranularity(BucketGranularityEnum::Seconds);
+        tsFields.setTimeseriesOptions(timeseriesOptions);
+        coll.setTimeseriesFields(tsFields);
 
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
-    loadCollection(collVersion);
-
-    _catalogCache->checkEpochOrThrow(kNss, collVersion, kShards[0]);
-}
-
-
-TEST_F(CatalogCacheTest, GetDatabaseWithMetadataFormatChange) {
-    const auto dbName = "testDB";
-    const auto uuid = UUID::gen();
-    const DatabaseVersion versionWithoutTimestamp(uuid);
-    const DatabaseVersion versionWithTimestamp(uuid, Timestamp(42));
-
-    auto getDatabaseWithRefreshAndCheckResults = [&](const DatabaseVersion& version) {
-        _catalogCacheLoader->setDatabaseRefreshReturnValue(
-            DatabaseType(dbName, kShards[0], true, version));
-        const auto cachedDb =
-            _catalogCache->getDatabaseWithRefresh(operationContext(), dbName).getValue();
-        const auto cachedDbVersion = cachedDb.databaseVersion();
-        ASSERT_EQ(cachedDbVersion.getTimestamp(), version.getTimestamp());
-    };
-
-    // The CatalogCache is refreshed and it finds a DatabaseType using uuids.
-    getDatabaseWithRefreshAndCheckResults(versionWithoutTimestamp);
-    // The CatalogCache is forced to refresh and it finds a metadata format missmatch: we are using
-    // uuids locally but the loader returns a version with uuid and timestamp. The catalog cache
-    // returns a new DatabaseType with the new format.
-    getDatabaseWithRefreshAndCheckResults(versionWithTimestamp);
-    // The CatalogCache is forced to refresh and it finds a metadata format missmatch: we are using
-    // uuids and timestamps locally but the loader returns a version with only uuid. The catalog
-    // cache returns a new DatabaseType with the new format.
-    getDatabaseWithRefreshAndCheckResults(versionWithoutTimestamp);
-}
-
-
-TEST_F(CatalogCacheTest, GetCollectionWithMetadataFormatChange) {
-    const auto dbVersion = DatabaseVersion(UUID::gen());
-    const auto epoch = OID::gen();
-    const auto collVersionWithoutTimestamp = ChunkVersion(1, 0, epoch, boost::none /* timestamp */);
-    const auto collVersionWithTimestamp = ChunkVersion(1, 0, epoch, Timestamp(42));
-
-    loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
-
-    auto getCollectionWithRefreshAndCheckResults = [this](const ChunkVersion& version) {
-        const auto coll = makeCollectionType(version);
         const auto scopedCollProv = scopedCollectionProvider(coll);
-        const auto scopedChunksProv = scopedChunksProvider(makeChunks(version));
-
-        const auto swChunkManager =
-            _catalogCache->getCollectionRoutingInfoWithRefresh(operationContext(), coll.getNss());
-        ASSERT_OK(swChunkManager.getStatus());
-
-        const auto& chunkManager = swChunkManager.getValue();
-        const auto collectionVersion = chunkManager.getVersion();
-
-        ASSERT_EQ(collectionVersion.getTimestamp(), version.getTimestamp());
-        chunkManager.forEachChunk([&](const Chunk& chunk) {
-            ASSERT_EQ(chunk.getLastmod().getTimestamp(), version.getTimestamp());
-            return true;
+        const auto scopedChunksProv = scopedChunksProvider(chunks);
+        auto future = launchAsync([&] {
+            onCommand([&](const executor::RemoteCommandRequest& request) {
+                return makeCollectionAndIndexesAggregationResponse(coll, std::vector<BSONObj>());
+            });
         });
-    };
-    // The CatalogCache is refreshed and it finds a Collection using epochs.
-    getCollectionWithRefreshAndCheckResults(collVersionWithoutTimestamp);
-    // The CatalogCache is forced to refresh and it finds a metadata format mismatch: we are using
-    // epochs locally but the loader returns a version with uuid and timestamp. The catalog cache
-    // returns a new ChunkManager with the new format.
-    getCollectionWithRefreshAndCheckResults(collVersionWithTimestamp);
-    // The CatalogCache is forced to refresh and it finds a metadata format mismatch: we are using
-    // epochs and timestamps locally but the loader returns a version with just epochs. The catalog
-    // cache returns a new ChunkManager with the new format.
-    getCollectionWithRefreshAndCheckResults(collVersionWithoutTimestamp);
+
+        const auto swCri =
+            _catalogCache->getCollectionRoutingInfoWithRefresh(operationContext(), coll.getNss());
+        ASSERT_OK(swCri.getStatus());
+        future.default_timed_get();
+
+        const auto& chunkManager = swCri.getValue().cm;
+        ASSERT(chunkManager.getTimeseriesFields().has_value());
+        ASSERT(chunkManager.getTimeseriesFields()->getGranularity() ==
+               BucketGranularityEnum::Seconds);
+    }
+
+    // 2nd refresh: we should find a bucket granularity of hours
+    {
+        TypeCollectionTimeseriesFields tsFields;
+        timeseriesOptions.setGranularity(BucketGranularityEnum::Hours);
+        tsFields.setTimeseriesOptions(timeseriesOptions);
+        coll.setTimeseriesFields(tsFields);
+
+        auto& lastChunk = chunks.back();
+        ChunkVersion newCollectionPlacementVersion = lastChunk.getVersion();
+        newCollectionPlacementVersion.incMinor();
+        lastChunk.setVersion(newCollectionPlacementVersion);
+
+        const auto scopedCollProv = scopedCollectionProvider(coll);
+        const auto scopedChunksProv = scopedChunksProvider(std::vector{lastChunk});
+        auto future = launchAsync([&] {
+            onCommand([&](const executor::RemoteCommandRequest& request) {
+                return makeCollectionAndIndexesAggregationResponse(coll, std::vector<BSONObj>());
+            });
+        });
+
+        const auto swCri =
+            _catalogCache->getCollectionRoutingInfoWithRefresh(operationContext(), coll.getNss());
+        ASSERT_OK(swCri.getStatus());
+        future.default_timed_get();
+
+        const auto& chunkManager = swCri.getValue().cm;
+        ASSERT(chunkManager.getTimeseriesFields().has_value());
+        ASSERT(chunkManager.getTimeseriesFields()->getGranularity() ==
+               BucketGranularityEnum::Hours);
+    }
 }
 
+TEST_F(CatalogCacheTest, LookupCollectionWithInvalidOptions) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const auto gen = CollectionGeneration(OID::gen(), Timestamp(42));
+    const auto version = ShardVersionFactory::make(ChunkVersion(gen, {1, 0}),
+                                                   boost::optional<CollectionIndexes>(boost::none));
+
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+
+    auto coll = makeCollectionType(version);
+
+    const auto scopedCollProv = scopedCollectionProvider(coll);
+    const auto scopedChunksProv = scopedChunksProvider(StatusWith<std::vector<ChunkType>>(
+        ErrorCodes::InvalidOptions, "Testing error with invalid options"));
+
+    const auto swCri =
+        _catalogCache->getCollectionRoutingInfoWithRefresh(operationContext(), coll.getNss());
+
+    ASSERT_EQUALS(swCri.getStatus(), ErrorCodes::InvalidOptions);
+}
+
+
+TEST_F(CatalogCacheTest, OnStaleShardVersionWithGreaterIndexVersion) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    const auto wantedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), CollectionIndexes(kUUID, Timestamp(1, 0)));
+
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    CollectionType coll = loadCollection(cachedCollVersion);
+    _catalogCache->onStaleCollectionVersion(kNss, wantedCollVersion);
+
+    auto future = launchAsync([&] {
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            coll.setIndexVersion({coll.getUuid(), Timestamp(1, 0)});
+            return makeCollectionAndIndexesAggregationResponse(
+                coll,
+                {IndexCatalogType("x_1", BSON("x" << 1), BSONObj(), Timestamp(1, 0), coll.getUuid())
+                     .toBSON()});
+        });
+    });
+
+    const auto routingInfo = _catalogCache->getCollectionRoutingInfo(operationContext(), kNss);
+    future.default_timed_get();
+}
+
+TEST_F(CatalogCacheTest, OnStaleShardVersionIndexVersionBumpNotNone) {
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), CollectionIndexes(kUUID, Timestamp(1, 0)));
+    const auto wantedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), CollectionIndexes(kUUID, Timestamp(2, 0)));
+
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    CollectionType coll = loadCollection(cachedCollVersion);
+    _catalogCache->onStaleCollectionVersion(kNss, wantedCollVersion);
+
+    auto future = launchAsync([&] {
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            coll.setIndexVersion({coll.getUuid(), Timestamp(2, 0)});
+            return makeCollectionAndIndexesAggregationResponse(
+                coll,
+                {IndexCatalogType("x_1", BSON("x" << 1), BSONObj(), Timestamp(2, 0), coll.getUuid())
+                     .toBSON()});
+        });
+    });
+
+    const auto routingInfo = _catalogCache->getCollectionRoutingInfo(operationContext(), kNss);
+    future.default_timed_get();
+}
+
+TEST_F(CatalogCacheTest, PeekCollectionCacheVersion) {
+    // Nothing cached, then peek returns boost::none. Does not attempt to refresh.
+    ASSERT_EQ(boost::none, _catalogCache->peekCollectionCacheVersion(kNss));
+
+    // Now force the cache to refresh. Now peek returns the version of whatever has been cached.
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    loadCollection(cachedCollVersion);
+
+    ASSERT_EQ(cachedCollVersion.placementVersion(),
+              _catalogCache->peekCollectionCacheVersion(kNss));
+
+    // If we have cached an untracked collection, then peek returns boost::none.
+    _catalogCache->onStaleCollectionVersion(kNss, boost::none);
+    loadUnshardedCollection(kNss);
+
+    ASSERT_EQ(boost::none, _catalogCache->peekCollectionCacheVersion(kNss));
+}
+
+TEST_F(CatalogCacheTest, AdvanceCollectionTimeInStore) {
+    // Cache something.
+    const auto dbVersion = DatabaseVersion(UUID::gen(), Timestamp(1, 1));
+    const CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+    const auto cachedCollVersion = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
+    loadDatabases({DatabaseType(kNss.dbName(), kShards[0], dbVersion)});
+    const auto coll = loadCollection(cachedCollVersion);
+
+    ASSERT_EQ(cachedCollVersion,
+              uassertStatusOK(_catalogCache->getCollectionRoutingInfo(operationContext(), kNss))
+                  .getCollectionVersion());
+
+    // Advance the time-in-store of the cache.
+    auto newCollectionVersion = cachedCollVersion;
+    newCollectionVersion.placementVersion().incMajor();
+    _catalogCache->advanceCollectionTimeInStore(kNss, newCollectionVersion.placementVersion());
+
+    // getCollectionRoutingInfo should return the new version, because the cache has been notified
+    // that it is stale.
+    {
+        // Put the new version on the loader.
+        const auto scopedCollProv = scopedCollectionProvider(coll);
+        const auto scopedChunksProv =
+            scopedChunksProvider(makeChunks(newCollectionVersion.placementVersion()));
+
+        // getCollectionRoutingInfo will trigger a refresh and see the new version
+        ASSERT_EQ(newCollectionVersion,
+                  uassertStatusOK(_catalogCache->getCollectionRoutingInfo(operationContext(), kNss))
+                      .getCollectionVersion());
+    }
+
+    // Call 'advanceCollectionTimeInStore' but with an older version. This should be a no-op.
+    _catalogCache->advanceCollectionTimeInStore(kNss, cachedCollVersion.placementVersion());
+    ASSERT_EQ(newCollectionVersion,
+              uassertStatusOK(_catalogCache->getCollectionRoutingInfo(operationContext(), kNss))
+                  .getCollectionVersion());
+}
 
 }  // namespace
 }  // namespace mongo

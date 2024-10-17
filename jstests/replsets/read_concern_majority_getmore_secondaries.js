@@ -1,9 +1,7 @@
 // Test that getMore for a majority read on a secondary only reads committed data.
 // @tags: [requires_majority_read_concern]
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartReplSetReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const name = "read_concern_majority_getmore_secondaries";
 const replSet = new ReplSetTest({
@@ -23,6 +21,10 @@ const secondary = secondaries[0];
 
 const primaryDB = primary.getDB(dbName);
 const secondaryDB = secondary.getDB(dbName);
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Insert data on primary and allow it to become committed.
 for (let i = 0; i < 4; i++) {
@@ -59,4 +61,3 @@ assert.docEq([{_id: 0}, {_id: 1}, {_id: 2}, {_id: 3}], res.toArray());
 // Disable failpoints and shutdown.
 restartReplSetReplication(replSet);
 replSet.stopSet();
-}());

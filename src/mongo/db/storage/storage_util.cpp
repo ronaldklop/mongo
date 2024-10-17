@@ -27,78 +27,103 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
-#include <string>
 
 #include <boost/filesystem/operations.hpp>
+#include <string>
+#include <utility>
 
-#include "mongo/db/storage/storage_util.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_util.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 namespace catalog {
 namespace {
-auto removeEmptyDirectory =
-    [](ServiceContext* svcCtx, StorageEngine* storageEngine, const NamespaceString& ns) {
-        // Nothing to do if not using directoryperdb or there are still collections in the database.
-        // If we don't support supportsPendingDrops then this is executing before the collection is
-        // removed from the catalog. In that case, just blindly attempt to delete the directory, it
-        // will only succeed if it is empty which is the behavior we want.
-        auto collectionCatalog = CollectionCatalog::get(svcCtx);
-        if (!storageEngine->isUsingDirectoryPerDb() ||
-            (storageEngine->supportsPendingDrops() &&
-             collectionCatalog->begin(nullptr, ns.db()) != collectionCatalog->end(nullptr))) {
-            return;
-        }
+auto removeEmptyDirectory = [](ServiceContext* svcCtx,
+                               StorageEngine* storageEngine,
+                               const NamespaceString& ns) {
+    // Nothing to do if not using directoryperdb or there are still collections in the database.
+    auto collectionCatalog = CollectionCatalog::latest(svcCtx);
+    const DatabaseName& dbName = ns.dbName();
+    if (!storageEngine->isUsingDirectoryPerDb() || (!collectionCatalog->range(dbName).empty())) {
+        return;
+    }
 
-        boost::system::error_code ec;
-        boost::filesystem::remove(storageEngine->getFilesystemPathForDb(ns.db().toString()), ec);
+    boost::system::error_code ec;
+    boost::filesystem::remove(storageEngine->getFilesystemPathForDb(dbName), ec);
 
-        if (!ec) {
-            LOGV2(4888200, "Removed empty database directory", "db"_attr = ns.db());
-        } else if (collectionCatalog->begin(nullptr, ns.db()) == collectionCatalog->end(nullptr)) {
-            // It is possible for a new collection to be created in the database between when we
-            // check whether the database is empty and actually attempting to remove the directory.
-            // In this case, don't log that the removal failed because it is expected. However,
-            // since we attempt to remove the directory for both the collection and index ident
-            // drops, once the database is empty it will be still logged until the final of these
-            // ident drops occurs.
-            LOGV2_DEBUG(4888201,
-                        1,
-                        "Failed to remove database directory",
-                        "db"_attr = ns.db(),
-                        "error"_attr = ec.message());
-        }
-    };
+    if (!ec) {
+        LOGV2(4888200, "Removed empty database directory", logAttrs(dbName));
+    } else if (collectionCatalog->range(dbName).empty()) {
+        // It is possible for a new collection to be created in the database between when we
+        // check whether the database is empty and actually attempting to remove the directory.
+        // In this case, don't log that the removal failed because it is expected. However,
+        // since we attempt to remove the directory for both the collection and index ident
+        // drops, once the database is empty it will be still logged until the final of these
+        // ident drops occurs.
+        LOGV2_DEBUG(4888201,
+                    1,
+                    "Failed to remove database directory",
+                    logAttrs(dbName),
+                    "error"_attr = ec.message());
+    }
+};
+
+BSONObj toBSON(const std::variant<Timestamp, StorageEngine::CheckpointIteration>& x) {
+    return visit(OverloadedVisitor{[](const Timestamp& ts) { return ts.toBSON(); },
+                                   [](const StorageEngine::CheckpointIteration& iter) {
+                                       auto underlyingValue = uint64_t{iter};
+                                       return BSON("checkpointIteration"
+                                                   << std::to_string(underlyingValue));
+                                   }},
+                 x);
+}
 }  // namespace
 
 void removeIndex(OperationContext* opCtx,
                  StringData indexName,
-                 RecordId collectionCatalogId,
-                 UUID collectionUUID,
-                 const NamespaceString& nss,
-                 std::shared_ptr<Ident> ident) {
+                 Collection* collection,
+                 std::shared_ptr<IndexCatalogEntry> entry,
+                 DataRemoval dataRemoval) {
     auto durableCatalog = DurableCatalog::get(opCtx);
 
-    // If a nullptr was passed in for 'ident', then there is no in-memory state. In that case,
-    // create an otherwise unreferenced Ident for the ident reaper to use: the reaper will not need
-    // to wait for existing users to finish.
+    std::shared_ptr<Ident> ident = [&]() -> std::shared_ptr<Ident> {
+        if (!entry) {
+            return nullptr;
+        }
+        return entry->getSharedIdent();
+    }();
+
+    // If 'ident' is a nullptr, then there is no in-memory state. In that case, create an otherwise
+    // unreferenced Ident for the ident reaper to use: the reaper will not need to wait for existing
+    // users to finish.
     if (!ident) {
         ident = std::make_shared<Ident>(
-            durableCatalog->getIndexIdent(opCtx, collectionCatalogId, indexName));
+            durableCatalog->getIndexIdent(opCtx, collection->getCatalogId(), indexName));
     }
 
     // Run the first phase of drop to remove the catalog entry.
-    durableCatalog->removeIndex(opCtx, collectionCatalogId, indexName);
+    collection->removeIndex(opCtx, indexName);
 
     // The OperationContext may not be valid when the RecoveryUnit executes the onCommit handlers.
     // Therefore, anything that would normally be fetched from the opCtx must be passed in
@@ -106,43 +131,69 @@ void removeIndex(OperationContext* opCtx,
     //
     // Index creation (and deletion) are allowed in multi-document transactions that use the same
     // RecoveryUnit throughout but not the same OperationContext.
-    auto recoveryUnit = opCtx->recoveryUnit();
+    auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    const bool isTwoPhaseDrop = dataRemoval == DataRemoval::kTwoPhase;
+
+    if (isTwoPhaseDrop) {
+        invariant(entry);
+        CollectionCatalog::get(opCtx)->dropIndex(
+            opCtx, collection->ns(), entry, /*isDropPending=*/true);
+    }
 
     // Schedule the second phase of drop to delete the data when it is no longer in use, if the
     // first phase is successfully committed.
-    opCtx->recoveryUnit()->onCommit([svcCtx = opCtx->getServiceContext(),
-                                     recoveryUnit,
-                                     storageEngine,
-                                     collectionUUID,
-                                     nss,
-                                     indexNameStr = indexName.toString(),
-                                     ident](boost::optional<Timestamp> commitTimestamp) {
-        StorageEngine::DropIdentCallback onDrop = [svcCtx, storageEngine, nss] {
-            removeEmptyDirectory(svcCtx, storageEngine, nss);
-        };
+    shard_role_details::getRecoveryUnit(opCtx)->onCommitForTwoPhaseDrop(
+        [svcCtx = opCtx->getServiceContext(),
+         recoveryUnit,
+         storageEngine,
+         uuid = collection->uuid(),
+         nss = collection->ns(),
+         indexNameStr = indexName.toString(),
+         ident,
+         isTwoPhaseDrop](OperationContext*, boost::optional<Timestamp> commitTimestamp) {
+            StorageEngine::DropIdentCallback onDrop =
+                [svcCtx, storageEngine, nss, ident = ident->getIdent(), isTwoPhaseDrop] {
+                    removeEmptyDirectory(svcCtx, storageEngine, nss);
 
-        if (storageEngine->supportsPendingDrops()) {
-            if (!commitTimestamp) {
-                // Standalone mode will not provide a timestamp.
-                commitTimestamp = Timestamp::min();
+                    if (isTwoPhaseDrop) {
+                        CollectionCatalog::write(svcCtx, [&](CollectionCatalog& catalog) {
+                            catalog.notifyIdentDropped(ident);
+                        });
+                    }
+                };
+
+            if (isTwoPhaseDrop) {
+                std::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
+                if (!commitTimestamp) {
+                    // Standalone mode and unreplicated drops will not provide a timestamp. Use the
+                    // checkpoint iteration instead.
+                    dropTime = storageEngine->getEngine()->getCheckpointIteration();
+                } else {
+                    dropTime = *commitTimestamp;
+                }
+                LOGV2(22206,
+                      "Deferring table drop for index",
+                      "index"_attr = indexNameStr,
+                      logAttrs(nss),
+                      "uuid"_attr = uuid,
+                      "ident"_attr = ident->getIdent(),
+                      "dropTime"_attr = toBSON(dropTime));
+                storageEngine->addDropPendingIdent(dropTime, ident, std::move(onDrop));
+            } else {
+                LOGV2(6361201,
+                      "Completing drop for index table immediately",
+                      "ident"_attr = ident->getIdent(),
+                      "index"_attr = indexNameStr,
+                      logAttrs(nss));
+                // Intentionally ignoring failure here. Since we've removed the metadata pointing to
+                // the collection, we should never see it again anyway.
+                storageEngine->getEngine()
+                    ->dropIdent(recoveryUnit, ident->getIdent(), std::move(onDrop))
+                    .ignore();
             }
-            LOGV2(22206,
-                  "Deferring table drop for index",
-                  "index"_attr = indexNameStr,
-                  logAttrs(nss),
-                  "uuid"_attr = collectionUUID,
-                  "ident"_attr = ident->getIdent(),
-                  "commitTimestamp"_attr = commitTimestamp);
-            storageEngine->addDropPendingIdent(*commitTimestamp, nss, ident, std::move(onDrop));
-        } else {
-            // Intentionally ignoring failure here. Since we've removed the metadata pointing to
-            // the collection, we should never see it again anyway.
-            storageEngine->getEngine()
-                ->dropIdent(recoveryUnit, ident->getIdent(), std::move(onDrop))
-                .ignore();
-        }
-    });
+        });
 }
 
 Status dropCollection(OperationContext* opCtx,
@@ -163,37 +214,38 @@ Status dropCollection(OperationContext* opCtx,
     //
     // Create (and drop) collection are allowed in multi-document transactions that use the same
     // RecoveryUnit throughout but not the same OperationContext.
-    auto recoveryUnit = opCtx->recoveryUnit();
+    auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
 
     // Schedule the second phase of drop to delete the data when it is no longer in use, if the
     // first phase is successfully committed.
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommitForTwoPhaseDrop(
         [svcCtx = opCtx->getServiceContext(), recoveryUnit, storageEngine, nss, ident](
-            boost::optional<Timestamp> commitTimestamp) {
-            StorageEngine::DropIdentCallback onDrop = [svcCtx, storageEngine, nss] {
-                removeEmptyDirectory(svcCtx, storageEngine, nss);
-            };
+            OperationContext*, boost::optional<Timestamp> commitTimestamp) {
+            StorageEngine::DropIdentCallback onDrop =
+                [svcCtx, storageEngine, nss, ident = ident->getIdent()] {
+                    removeEmptyDirectory(svcCtx, storageEngine, nss);
 
-            if (storageEngine->supportsPendingDrops()) {
-                if (!commitTimestamp) {
-                    // Standalone mode will not provide a timestamp.
-                    commitTimestamp = Timestamp::min();
-                }
-                LOGV2(22214,
-                      "Deferring table drop for collection",
-                      logAttrs(nss),
-                      "ident"_attr = ident->getIdent(),
-                      "commitTimestamp"_attr = commitTimestamp);
-                storageEngine->addDropPendingIdent(*commitTimestamp, nss, ident, std::move(onDrop));
+                    CollectionCatalog::write(svcCtx, [&](CollectionCatalog& catalog) {
+                        catalog.notifyIdentDropped(ident);
+                    });
+                };
+
+            std::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
+            if (!commitTimestamp) {
+                // Standalone mode and unreplicated drops will not provide a timestamp. Use the
+                // checkpoint iteration instead.
+                dropTime = storageEngine->getEngine()->getCheckpointIteration();
             } else {
-                // Intentionally ignoring failure here. Since we've removed the metadata pointing to
-                // the collection, we should never see it again anyway.
-                storageEngine->getEngine()
-                    ->dropIdent(recoveryUnit, ident->getIdent(), std::move(onDrop))
-                    .ignore();
+                dropTime = *commitTimestamp;
             }
+            LOGV2(22214,
+                  "Deferring table drop for collection",
+                  logAttrs(nss),
+                  "ident"_attr = ident->getIdent(),
+                  "dropTime"_attr = toBSON(dropTime));
+            storageEngine->addDropPendingIdent(dropTime, ident, std::move(onDrop));
         });
 
     return Status::OK();

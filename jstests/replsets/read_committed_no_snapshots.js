@@ -7,10 +7,8 @@
  * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/replsets/rslib.js");  // For reconfig.
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 // Set up a set and grab things for later.
 var name = "read_committed_no_snapshots";
@@ -24,7 +22,6 @@ var replTest = new ReplSetTest({
             rsConfig: {priority: 0}
         }
     ],
-    nodeOptions: {enableMajorityReadConcern: ''},
     settings: {protocolVersion: 1}
 });
 
@@ -43,18 +40,18 @@ var noSnapshotSecondary = secondaries[1];
 noSnapshotSecondary.setSecondaryOk();
 
 // Do a write, wait for it to replicate, and ensure it is visible.
-var res = primary.getDB(name).runCommandWithMetadata(  //
+var res = primary.getDB(name).runCommand(  //
     {
         insert: "foo",
         documents: [{_id: 1, state: 0}],
-        writeConcern: {w: "majority", wtimeout: ReplSetTest.kDefaultTimeoutMS}
-    },
-    {"$replData": 1});
-assert.commandWorked(res.commandReply);
+        writeConcern: {w: "majority", wtimeout: ReplSetTest.kDefaultTimeoutMS},
+        $replData: 1
+    });
+assert.commandWorked(res);
 
 // We need to propagate the lastOpVisible from the primary as afterOpTime in the secondaries to
 // ensure we wait for the write to be in the majority committed view.
-var lastOp = res.commandReply["$replData"].lastOpVisible;
+var lastOp = res["$replData"].lastOpVisible;
 
 // Timeout is based on heartbeat timeout.
 assert.commandWorked(healthySecondary.getDB(name).foo.runCommand(
@@ -77,4 +74,3 @@ assert.commandFailedWithCode(primary.getSiblingDB(name).foo.runCommand(
                                  'find', {"readConcern": {"level": "majority"}, "maxTimeMS": 1000}),
                              ErrorCodes.MaxTimeMSExpired);
 replTest.stopSet();
-})();

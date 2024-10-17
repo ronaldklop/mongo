@@ -29,8 +29,26 @@
 
 #pragma once
 
+#include <memory>
+#include <set>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
@@ -52,6 +70,10 @@ public:
         return kStageName.rawData();
     }
 
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kInternalShardFilter;
+    }
+
     StageConstraints constraints(Pipeline::SplitState pipeState) const override {
         return StageConstraints(StreamType::kStreaming,
                                 PositionRequirement::kNone,
@@ -61,11 +83,11 @@ public:
                                 TransactionRequirement::kNotAllowed,
                                 LookupRequirement::kNotAllowed,
                                 UnionRequirement::kNotAllowed,
-                                ChangeStreamRequirement::kBlacklist);
+                                ChangeStreamRequirement::kDenylist);
     }
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
@@ -73,6 +95,19 @@ public:
 
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) override;
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const override {
+        // This stage doesn't use any variables.
+        if (_shardFilterer->isCollectionSharded()) {
+            const BSONObj& keyPattern = _shardFilterer->getKeyPattern().toBSON();
+            for (BSONElement elem : keyPattern) {
+                deps->fields.insert(elem.fieldName());
+            }
+        }
+        return DepsTracker::State::SEE_NEXT;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     GetNextResult doGetNext() override;

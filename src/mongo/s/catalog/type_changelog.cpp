@@ -27,15 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/s/catalog/type_changelog.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/s/catalog/type_changelog.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -48,6 +53,8 @@ const BSONField<Date_t> ChangeLogType::time("time");
 const BSONField<std::string> ChangeLogType::what("what");
 const BSONField<std::string> ChangeLogType::ns("ns");
 const BSONField<BSONObj> ChangeLogType::details("details");
+
+const NamespaceString ChangeLogType::ConfigNS(NamespaceString::kConfigChangelogNamespace);
 
 StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
     ChangeLogType changeLog;
@@ -106,7 +113,8 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
         Status status = bsonExtractStringFieldWithDefault(source, ns.name(), "", &changeLogNs);
         if (!status.isOK())
             return status;
-        changeLog._ns = changeLogNs;
+        changeLog._ns = NamespaceStringUtil::deserialize(
+            boost::none, changeLogNs, SerializationContext::stateDefault());
     }
 
     {
@@ -122,23 +130,23 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
 }
 
 Status ChangeLogType::validate() const {
-    if (!_changeId.is_initialized() || _changeId->empty())
+    if (!_changeId.has_value() || _changeId->empty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << changeId.name() << " field"};
 
-    if (!_server.is_initialized() || _server->empty())
+    if (!_server.has_value() || _server->empty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << server.name() << " field"};
 
-    if (!_clientAddr.is_initialized() || _clientAddr->empty())
+    if (!_clientAddr.has_value() || _clientAddr->empty())
         return {ErrorCodes::NoSuchKey,
                 str::stream() << "missing " << clientAddr.name() << " field"};
 
-    if (!_time.is_initialized())
+    if (!_time.has_value())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << time.name() << " field"};
 
-    if (!_what.is_initialized() || _what->empty())
+    if (!_what.has_value() || _what->empty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << what.name() << " field"};
 
-    if (!_details.is_initialized() || _details->isEmpty())
+    if (!_details.has_value() || _details->isEmpty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << details.name() << " field"};
 
     return Status::OK();
@@ -160,7 +168,9 @@ BSONObj ChangeLogType::toBSON() const {
     if (_what)
         builder.append(what.name(), getWhat());
     if (_ns)
-        builder.append(ns.name(), getNS());
+        builder.append(
+            ns.name(),
+            NamespaceStringUtil::serialize(getNS(), SerializationContext::stateDefault()));
     if (_details)
         builder.append(details.name(), getDetails());
 
@@ -192,7 +202,7 @@ void ChangeLogType::setWhat(const std::string& what) {
     _what = what;
 }
 
-void ChangeLogType::setNS(const std::string& ns) {
+void ChangeLogType::setNS(const NamespaceString& ns) {
     _ns = ns;
 }
 

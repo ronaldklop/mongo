@@ -29,22 +29,38 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/platform/random.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/timer.h"
-
-namespace pcrecpp {
-class RE;
-}  // namespace pcrecpp
 
 namespace mongo {
 
@@ -62,6 +78,14 @@ enum class OpType {
     LET,
     CPULOAD
 };
+
+inline bool isReadOp(OpType opType) {
+    return opType == OpType::FINDONE || opType == OpType::FIND;
+}
+
+inline bool isWriteOp(OpType opType) {
+    return opType == OpType::UPDATE || opType == OpType::INSERT || opType == OpType::REMOVE;
+}
 
 class BenchRunConfig;
 struct BenchRunStats;
@@ -110,11 +134,9 @@ struct BenchRunOp {
     int options = 0;
     BSONObj projection;
     BSONObj query;
-    bool safe = false;
     int skip = 0;
     BSONObj sort;
     bool showError = false;
-    bool showResult = false;
     std::string target;
     bool throwGLE = false;
     write_ops::UpdateModification update;
@@ -124,6 +146,8 @@ struct BenchRunOp {
     bool useWriteCmd = false;
     BSONObj writeConcern;
     BSONObj value;
+    BSONObj expectedDoc;
+    boost::optional<TenantId> tenantId;
 
     // Only used for find cmds when set greater than 0. A find operation will retrieve the latest
     // cluster time from the oplog and randomly chooses a time between that timestamp and
@@ -138,6 +162,8 @@ struct BenchRunOp {
     // for keeping a snapshot read open for a longer time duration, say to simulate the basic
     // resources that a snapshot transaction would hold for a time.
     int maxRandomMillisecondDelayBeforeGetMore{0};
+
+    boost::optional<ReadPreferenceSetting> readPref;
 
     // This is an owned copy of the raw operation. All unowned members point into this.
     BSONObj myBsonOp;
@@ -226,14 +252,13 @@ public:
     /// Base random seed for threads
     int64_t randomSeed;
 
-    bool hideResults;
     bool handleErrors;
     bool hideErrors;
 
-    std::shared_ptr<pcrecpp::RE> trapPattern;
-    std::shared_ptr<pcrecpp::RE> noTrapPattern;
-    std::shared_ptr<pcrecpp::RE> watchPattern;
-    std::shared_ptr<pcrecpp::RE> noWatchPattern;
+    std::shared_ptr<pcre::Regex> trapPattern;
+    std::shared_ptr<pcre::Regex> noTrapPattern;
+    std::shared_ptr<pcre::Regex> watchPattern;
+    std::shared_ptr<pcre::Regex> noWatchPattern;
 
     /**
      * Operation description. A list of BenchRunOps, each describing a single
@@ -248,6 +273,7 @@ public:
 
     bool throwGLE;
     bool breakOnTrap;
+    bool benchRunOnce;  // is this a call of benchRunOnce() instead of benchRunSync(), etc.?
 
 private:
     static std::function<std::unique_ptr<DBClientBase>(const BenchRunConfig&)> _factory;
@@ -448,7 +474,7 @@ public:
     void onWorkerFinished();
 
 private:
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("BenchRunState::_mutex");
+    mutable stdx::mutex _mutex;
 
     stdx::condition_variable _stateChangeCondition;
 
@@ -511,7 +537,7 @@ private:
 
     stdx::thread _thread;
 
-    const size_t _id;
+    const size_t _id;  // 0-based ID of this worker instance
 
     const BenchRunConfig* _config;
 
@@ -595,10 +621,11 @@ public:
     static BSONObj benchFinish(const BSONObj& argsFake, void* data);
     static BSONObj benchStart(const BSONObj& argsFake, void* data);
     static BSONObj benchRunSync(const BSONObj& argsFake, void* data);
+    static BSONObj benchRunOnce(const BSONObj& argsFake, void* data);
 
 private:
     // TODO: Same as for createWithConfig.
-    static Mutex _staticMutex;
+    static stdx::mutex _staticMutex;
     static std::map<OID, BenchRunner*> _activeRuns;
 
     OID _oid;

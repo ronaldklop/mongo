@@ -3,17 +3,16 @@
  * idempotent.
  *
  * This test only makes sense for storage engines that support recover to stable timestamp.
- * @tags: [requires_wiredtiger, requires_persistence, requires_journaling, requires_replication,
+ * @tags: [requires_persistence, requires_replication,
  * requires_majority_read_concern, uses_transactions, uses_prepare_transaction,
  * # Restarting as a standalone is not supported in multiversion tests.
  * multiversion_incompatible]
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const dbName = name;
@@ -57,6 +56,10 @@ let node = nodes[0];
 let secondary = nodes[1];
 rst.initiate(
     {_id: name, members: [{_id: 0, host: node.host}, {_id: 1, host: secondary.host, priority: 0}]});
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // Create two collections with w:majority and then perform a clean restart to ensure that
 // the collections are in a stable checkpoint.
@@ -163,4 +166,3 @@ assert.commandWorked(node.adminCommand({
 assert.sameMembers(getColl2(node).find().toArray(), [{_id: 1, a: 1}]);
 
 rst.stopSet();
-})();

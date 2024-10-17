@@ -30,7 +30,6 @@
 #pragma once
 
 #include "mongo/db/client.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
@@ -45,15 +44,14 @@ public:
     QueryTestServiceContext();
     ~QueryTestServiceContext();
 
-    ServiceContext::UniqueOperationContext makeOperationContext();
-
-    ServiceContext::UniqueOperationContext makeOperationContext(LogicalSessionId lsid);
+    ServiceContext* getServiceContext() const;
 
     Client* getClient() const;
-    ServiceContext* getServiceContext();
+
+    ServiceContext::UniqueOperationContext makeOperationContext();
 
 private:
-    ServiceContext::UniqueServiceContext _service;
+    ServiceContext::UniqueServiceContext _serviceContext;
     ServiceContext::UniqueClient _client;
 };
 

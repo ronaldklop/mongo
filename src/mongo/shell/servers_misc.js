@@ -77,6 +77,10 @@ var allocatePort;
  */
 var resetAllocatedPorts;
 
+var uncheckedParallelShellPids;
+
+var startParallelShell;
+
 (function() {
 // Defer initializing these variables until the first call, as TestData attributes may be
 // initialized as part of the --eval argument (e.g. by resmoke.py), which will not be evaluated
@@ -100,32 +104,23 @@ resetAllocatedPorts = function() {
     jsTest.log("Resetting the range of allocated ports");
     maxPort = nextPort = undefined;
 };
-})();
 
-/**
- * Returns a list of 'numPorts' port numbers that have not been given out to any other caller from
- * the same mongo shell.
- */
-allocatePorts = function(numPorts) {
-    var ports = [];
-    for (var i = 0; i < numPorts; i++) {
-        ports.push(allocatePort());
-    }
-
-    return ports;
+var parallelShellPids = [];
+uncheckedParallelShellPidsString = function() {
+    return parallelShellPids.join(", ");
 };
 
-function startParallelShell(jsCode, port, noConnect, ...optionArgs) {
-    var shellPath = MongoRunner.mongoShellPath;
+startParallelShell = function(jsCode, port, noConnect, ...optionArgs) {
+    var shellPath = MongoRunner.getMongoShellPath();
     var args = [shellPath];
 
-    if (typeof db == "object") {
+    if (typeof globalThis.db === "object") {
         if (!port) {
             // If no port override specified, just passthrough connect string.
-            args.push("--host", db.getMongo().host);
+            args.push("--host", globalThis.db.getMongo().host);
         } else {
             // Strip port numbers from connect string.
-            const uri = new MongoURI(db.getMongo().host);
+            const uri = new MongoURI(globalThis.db.getMongo().host);
             var connString = uri.servers
                                  .map(function(server) {
                                      return server.host;
@@ -143,18 +138,24 @@ function startParallelShell(jsCode, port, noConnect, ...optionArgs) {
 
     // Convert function into call-string
     if (typeof (jsCode) == "function") {
-        jsCode = "(" + jsCode.toString() + ")();";
+        if (jsCode.constructor.name === 'AsyncFunction') {
+            jsCode = `await (${jsCode.toString()})();`;
+        } else {
+            jsCode = `(${jsCode.toString()})();`;
+        }
     } else if (typeof (jsCode) == "string") {
-    }
-    // do nothing
-    else {
+        // do nothing
+    } else {
         throw Error("bad first argument to startParallelShell");
     }
 
     if (noConnect) {
         args.push("--nodb");
-    } else if (typeof (db) == "object") {
-        jsCode = "db = db.getSiblingDB('" + db.getName() + "');" + jsCode;
+    } else if (typeof (globalThis.db) == "object") {
+        if (globalThis.db.getMongo().isGRPC()) {
+            args.push("--gRPC");
+        }
+        jsCode = "db = db.getSiblingDB('" + globalThis.db.getName() + "');" + jsCode;
     }
 
     if (TestData) {
@@ -165,6 +166,7 @@ function startParallelShell(jsCode, port, noConnect, ...optionArgs) {
     args.push("--eval", jsCode);
 
     var pid = startMongoProgramNoConnect.apply(null, args);
+    parallelShellPids.push(pid);
 
     // Returns a function that when called waits for the parallel shell to exit and returns the exit
     // code of the process. By default an error is thrown if the parallel shell exits with a nonzero
@@ -179,11 +181,27 @@ function startParallelShell(jsCode, port, noConnect, ...optionArgs) {
             }
         }
         var exitCode = waitProgram(pid);
+        var pidIndex = parallelShellPids.indexOf(pid);
+        parallelShellPids.splice(pidIndex);
         if (arguments.length === 0 || options.checkExitSuccess) {
             assert.eq(0, exitCode, "encountered an error in the parallel shell");
         }
         return exitCode;
     };
-}
+};
+})();
+
+/**
+ * Returns a list of 'numPorts' port numbers that have not been given out to any other caller from
+ * the same mongo shell.
+ */
+allocatePorts = function(numPorts) {
+    var ports = [];
+    for (var i = 0; i < numPorts; i++) {
+        ports.push(allocatePort());
+    }
+
+    return ports;
+};
 
 var testingReplication = false;

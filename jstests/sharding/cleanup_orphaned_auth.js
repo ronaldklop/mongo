@@ -2,8 +2,7 @@
 // Tests of cleanupOrphaned command permissions.
 //
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
@@ -26,14 +25,26 @@ function assertUnauthorized(res, msg) {
 var st = new ShardingTest({auth: true, other: {keyFile: 'jstests/libs/key1', useHostname: false}});
 
 var shardAdmin = st.shard0.getDB('admin');
-shardAdmin.createUser({user: 'admin', pwd: 'x', roles: ['clusterAdmin', 'userAdminAnyDatabase']});
-shardAdmin.auth('admin', 'x');
+if (!TestData.configShard) {
+    // In config shard mode, this will create a user on the config server, which we already do
+    // below.
+    shardAdmin.createUser({
+        user: 'admin',
+        pwd: 'x',
+        roles: ['clusterAdmin', 'userAdminAnyDatabase', 'directShardOperations']
+    });
+    shardAdmin.auth('admin', 'x');
+}
 
 var mongos = st.s0;
 var mongosAdmin = mongos.getDB('admin');
 var coll = mongos.getCollection('foo.bar');
 
-mongosAdmin.createUser({user: 'admin', pwd: 'x', roles: ['clusterAdmin', 'userAdminAnyDatabase']});
+mongosAdmin.createUser({
+    user: 'admin',
+    pwd: 'x',
+    roles: ['clusterAdmin', 'userAdminAnyDatabase', 'directShardOperations']
+});
 mongosAdmin.auth('admin', 'x');
 
 assert.commandWorked(mongosAdmin.runCommand({enableSharding: coll.getDB().getName()}));
@@ -42,7 +53,9 @@ assert.commandWorked(
     mongosAdmin.runCommand({shardCollection: coll.getFullName(), key: {_id: 'hashed'}}));
 
 // cleanupOrphaned requires auth as admin user.
-assert.commandWorked(shardAdmin.logout());
+if (!TestData.configShard) {
+    assert.commandWorked(shardAdmin.logout());
+}
 assertUnauthorized(shardAdmin.runCommand({cleanupOrphaned: 'foo.bar'}));
 
 var fooDB = st.shard0.getDB('foo');
@@ -53,4 +66,3 @@ fooDB.auth('user', 'x');
 assertUnauthorized(shardAdmin.runCommand({cleanupOrphaned: 'foo.bar'}));
 
 st.stop();
-})();

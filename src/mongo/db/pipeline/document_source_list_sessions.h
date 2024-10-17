@@ -29,12 +29,32 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_list_local_sessions.h"
+#include "mongo/db/pipeline/document_source_list_sessions_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -50,11 +70,13 @@ namespace mongo {
  */
 class DocumentSourceListSessions final : public DocumentSourceMatch {
 public:
-    DocumentSourceListSessions(const DocumentSourceListSessions& other)
-        : DocumentSourceMatch(other), _allUsers(other._allUsers), _users(other._users) {}
+    DocumentSourceListSessions(const DocumentSourceListSessions& other,
+                               const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
+        : DocumentSourceMatch(other, newExpCtx), _allUsers(other._allUsers), _users(other._users) {}
 
-    virtual boost::intrusive_ptr<DocumentSourceMatch> clone() const {
-        return make_intrusive<std::decay_t<decltype(*this)>>(*this);
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const override {
+        return make_intrusive<std::decay_t<decltype(*this)>>(*this, newExpCtx);
     }
 
     static constexpr StringData kStageName = "$listSessions"_sd;
@@ -65,11 +87,16 @@ public:
                                                  const BSONElement& spec) {
             return std::make_unique<LiteParsed>(
                 spec.fieldName(),
+                nss.tenantId(),
                 listSessionsParseSpec(DocumentSourceListSessions::kStageName, spec));
         }
 
-        explicit LiteParsed(std::string parseTimeName, const ListSessionsSpec& spec)
-            : LiteParsedDocumentSource(std::move(parseTimeName)), _spec(spec) {}
+        explicit LiteParsed(std::string parseTimeName,
+                            const boost::optional<TenantId>& tenantId,
+                            const ListSessionsSpec& spec)
+            : LiteParsedDocumentSource(std::move(parseTimeName)),
+              _spec(spec),
+              _privileges(listSessionsRequiredPrivileges(_spec, tenantId)) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -77,26 +104,23 @@ public:
 
         PrivilegeVector requiredPrivileges(bool isMongos,
                                            bool bypassDocumentValidation) const final {
-            return listSessionsRequiredPrivileges(_spec);
+            return _privileges;
         }
 
         bool isInitialSource() const final {
             return true;
         }
 
-        bool allowedToPassthroughFromMongos() const final {
-            return _spec.getAllUsers();
-        }
-
     private:
         const ListSessionsSpec _spec;
+        const PrivilegeVector _privileges;
     };
 
     const char* getSourceName() const final {
         return DocumentSourceListSessions::kStageName.rawData();
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,

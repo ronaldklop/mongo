@@ -26,10 +26,20 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/client/sdam/topology_listener.h"
+
+#include <algorithm>
+#include <iterator>
+#include <mutex>
+#include <utility>
+
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo::sdam {
 
@@ -40,6 +50,8 @@ void TopologyEventsPublisher::registerListener(TopologyListenerPtr listener) {
         return;
     }
     stdx::lock_guard lock(_mutex);
+    // Make sure we're not re-registering a listener. This is a linear scan of a vector, but there
+    // are only a few calls to registerListener in the codebase so this shouldn't be a problem.
     if (std::find_if(_listeners.begin(),
                      _listeners.end(),
                      [&locked_listener](const TopologyListenerPtr& ptr) {
@@ -52,10 +64,10 @@ void TopologyEventsPublisher::registerListener(TopologyListenerPtr listener) {
 void TopologyEventsPublisher::removeListener(TopologyListenerPtr listener) {
     auto locked_listener = listener.lock();
     if (!locked_listener) {
-        LOGV2_WARNING(5148002,
-                      "Trying to unregister an empty listener from TopologyEventsPublisher");
+        LOGV2_WARNING(6142505, "Trying to remove an empty listener with TopologyEventsPublisher");
         return;
     }
+
     stdx::lock_guard lock(_mutex);
     _listeners.erase(std::remove_if(_listeners.begin(),
                                     _listeners.end(),
@@ -88,7 +100,7 @@ void TopologyEventsPublisher::onServerHandshakeCompleteEvent(HelloRTT duration,
                                                              const HostAndPort& address,
                                                              const BSONObj reply) {
     {
-        stdx::lock_guard<Mutex> lock(_eventQueueMutex);
+        stdx::lock_guard<stdx::mutex> lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HANDSHAKE_COMPLETE;
         event->duration = duration;
@@ -103,7 +115,7 @@ void TopologyEventsPublisher::onServerHandshakeFailedEvent(const HostAndPort& ad
                                                            const Status& status,
                                                            const BSONObj reply) {
     {
-        stdx::lock_guard<Mutex> lock(_eventQueueMutex);
+        stdx::lock_guard<stdx::mutex> lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HANDSHAKE_FAILURE;
         event->hostAndPort = address;
@@ -214,7 +226,7 @@ void TopologyEventsPublisher::_nextDelivery() {
     }
 
     // send to the listeners outside of the lock.
-    for (auto listener : listeners) {
+    for (const auto& listener : listeners) {
         // The copy logic above guaranteed that only non-empty elements are in the vector.
         _sendEvent(listener.get(), *nextEvent);
     }

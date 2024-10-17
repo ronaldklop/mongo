@@ -29,11 +29,19 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <queue>
+
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/pipeline/window_function/window_function.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -52,31 +60,29 @@ public:
     WindowFunctionExecRemovableDocument(PartitionIterator* iter,
                                         boost::intrusive_ptr<Expression> input,
                                         std::unique_ptr<WindowFunctionState> function,
-                                        WindowBounds::DocumentBased bounds);
-
-    void reset() final {
-        _function->reset();
-        _values = std::queue<Value>();
-        _initialized = false;
-    }
+                                        WindowBounds::DocumentBased bounds,
+                                        MemoryUsageTracker::Impl* memTracker);
 
 private:
-    void processDocumentsToUpperBound() final;
+    void update() final;
+    void initialize();
 
-    void removeDocumentsUnderLowerBound() final;
-
-    void initialize() final;
+    void doReset() final {
+        _initialized = false;
+    }
 
     void removeFirstValueIfExists() {
         if (_values.size() == 0) {
             return;
         }
-        _memUsageBytes -= _values.front().getApproximateSize();
-        _function->remove(_values.front());
-        _values.pop();
+        removeValue();
     }
 
-    int _lowerBound;
+    // In one of two states: either the initial window has not been populated or we are sliding and
+    // accumulating/removing values.
+    bool _initialized = false;
+
+    int _lowerBound = 0;
     // Will stay boost::none if right unbounded.
     boost::optional<int> _upperBound = boost::none;
 };

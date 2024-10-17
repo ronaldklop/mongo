@@ -27,33 +27,51 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/split_vector.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss = NamespaceString("foo", "bar");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("foo", "bar");
 const std::string kPattern = "_id";
 
 void setUnshardedFilteringMetadata(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+    AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-    CollectionShardingRuntime::get(opCtx, nss)->setFilteringMetadata(opCtx, CollectionMetadata());
+    CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss)
+        ->setFilteringMetadata(opCtx, CollectionMetadata());
 }
 
 class SplitVectorTest : public ShardServerTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixture::setUp();
 
         auto opCtx = operationContext();
@@ -61,12 +79,12 @@ public:
         {
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(opCtx);
-            uassertStatusOK(createCollection(
-                operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+            uassertStatusOK(
+                createCollection(operationContext(), kNss.dbName(), BSON("create" << kNss.coll())));
         }
         setUnshardedFilteringMetadata(opCtx, kNss);
         DBDirectClient client(opCtx);
-        client.createIndex(kNss.ns(), BSON(kPattern << 1));
+        client.createIndex(kNss, BSON(kPattern << 1));
 
         // Insert 100 documents into the collection so the tests can test splitting with different
         // constraints.
@@ -74,7 +92,7 @@ public:
             BSONObjBuilder builder;
             builder.append(kPattern, i);
             BSONObj obj = builder.obj();
-            client.insert(kNss.toString(), obj);
+            client.insert(kNss, obj);
         }
         ASSERT_EQUALS(100ULL, client.count(kNss));
     }
@@ -251,17 +269,18 @@ TEST_F(SplitVectorTest, NoSplit) {
 }
 
 TEST_F(SplitVectorTest, NoCollection) {
-    ASSERT_THROWS_CODE(splitVector(operationContext(),
-                                   NamespaceString("dummy", "collection"),
-                                   BSON(kPattern << 1),
-                                   BSON(kPattern << 0),
-                                   BSON(kPattern << 100),
-                                   false,
-                                   boost::none,
-                                   boost::none,
-                                   boost::none),
-                       DBException,
-                       ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(
+        splitVector(operationContext(),
+                    NamespaceString::createNamespaceString_forTest("dummy", "collection"),
+                    BSON(kPattern << 1),
+                    BSON(kPattern << 0),
+                    BSON(kPattern << 100),
+                    false,
+                    boost::none,
+                    boost::none,
+                    boost::none),
+        DBException,
+        ErrorCodes::NamespaceNotFound);
 }
 
 TEST_F(SplitVectorTest, NoIndex) {
@@ -292,12 +311,12 @@ TEST_F(SplitVectorTest, NoMaxChunkSize) {
                        ErrorCodes::InvalidOptions);
 }
 
-const NamespaceString kJumboNss = NamespaceString("foo", "bar2");
+const NamespaceString kJumboNss = NamespaceString::createNamespaceString_forTest("foo", "bar2");
 const std::string kJumboPattern = "a";
 
 class SplitVectorJumboTest : public ShardServerTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixture::setUp();
 
         auto opCtx = operationContext();
@@ -306,18 +325,18 @@ public:
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(opCtx);
             uassertStatusOK(createCollection(
-                operationContext(), kJumboNss.db().toString(), BSON("create" << kJumboNss.coll())));
+                operationContext(), kJumboNss.dbName(), BSON("create" << kJumboNss.coll())));
         }
         setUnshardedFilteringMetadata(opCtx, kJumboNss);
         DBDirectClient client(opCtx);
-        client.createIndex(kJumboNss.ns(), BSON(kJumboPattern << 1));
+        client.createIndex(kJumboNss, BSON(kJumboPattern << 1));
 
         // Insert 10000 documents into the collection with the same shard key value.
         BSONObjBuilder builder;
         builder.append(kJumboPattern, 1);
         BSONObj obj = builder.obj();
         for (int i = 0; i < 1000; i++) {
-            client.insert(kJumboNss.toString(), obj);
+            client.insert(kJumboNss, obj);
         }
         ASSERT_EQUALS(1000ULL, client.count(kJumboNss));
     }
@@ -345,7 +364,8 @@ TEST_F(SplitVectorJumboTest, JumboChunk) {
     ASSERT_EQUALS(splitKeys.size(), 0UL);
 }
 
-const NamespaceString kMaxResponseNss = NamespaceString("foo", "bar3");
+const NamespaceString kMaxResponseNss =
+    NamespaceString::createNamespaceString_forTest("foo", "bar3");
 
 // This is not the actual max bytes size -- we are rounding down from 512000.
 int maxShardingUnitTestOplogDocSize = 510000;
@@ -360,7 +380,7 @@ int numDocs = (BSONObjMaxUserSize / maxShardingUnitTestOplogDocSize) + 2;
  */
 class SplitVectorMaxResponseSizeTest : public ShardServerTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixture::setUp();
 
         auto opCtx = operationContext();
@@ -369,12 +389,12 @@ public:
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(opCtx);
             uassertStatusOK(createCollection(operationContext(),
-                                             kMaxResponseNss.db().toString(),
+                                             kMaxResponseNss.dbName(),
                                              BSON("create" << kMaxResponseNss.coll())));
         }
         setUnshardedFilteringMetadata(opCtx, kMaxResponseNss);
         DBDirectClient client(opCtx);
-        client.createIndex(kMaxResponseNss.ns(), BSON("a" << 1));
+        client.createIndex(kMaxResponseNss, BSON("a" << 1));
 
         for (int i = 0; i < numDocs; ++i) {
             BSONObjBuilder builder;
@@ -382,7 +402,7 @@ public:
             // ensure that our documents are unique.
             builder.append("a", createUniqueHalfMegabyteString(i));
             BSONObj obj = builder.obj();
-            client.insert(kMaxResponseNss.toString(), obj);
+            client.insert(kMaxResponseNss, obj);
         }
         ASSERT_EQUALS(numDocs, (int)client.count(kMaxResponseNss));
     }

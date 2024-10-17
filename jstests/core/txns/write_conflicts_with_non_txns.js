@@ -17,11 +17,8 @@
  * @tags: [uses_transactions]
  */
 
-(function() {
-
-"use strict";
-
-load('jstests/libs/parallelTester.js');  // for Thread.
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
 const dbName = "test";
 const collName = "write_conflicts_with_non_txns";
@@ -137,16 +134,22 @@ assert.commandWorked(testColl.remove({}));
  */
 
 jsTestLog("Start a multi-document transaction.");
-session.startTransaction();
-assert.commandWorked(sessionColl.runCommand({find: collName}));
+withRetryOnTransientTxnError(
+    () => {
+        session.startTransaction();
+        assert.commandWorked(sessionColl.runCommand({find: collName}));
 
-jsTestLog("Do a single document insert outside of the transaction.");
-assert.commandWorked(testColl.insert(nonTxnDoc));
+        jsTestLog("Do a single document insert outside of the transaction.");
+        assert.commandWorked(testColl.insert(nonTxnDoc));
 
-jsTestLog("Insert a conflicting document inside the multi-document transaction.");
-assert.commandFailedWithCode(sessionColl.insert(txnDoc), ErrorCodes.WriteConflict);
-assert.commandFailedWithCode(session.commitTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
+        jsTestLog("Insert a conflicting document inside the multi-document transaction.");
+        assert.commandFailedWithCode(sessionColl.insert(txnDoc), ErrorCodes.WriteConflict);
+        assert.commandFailedWithCode(session.commitTransaction_forTesting(),
+                                     ErrorCodes.NoSuchTransaction);
+    },
+    () => {
+        session.abortTransaction_forTesting();
+    });
 
 // Check the final documents.
 assert.sameMembers([nonTxnDoc], testColl.find().toArray());
-}());

@@ -2,8 +2,8 @@
  * Tests readConcern: afterClusterTime behavior in a sharded cluster.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function assertAfterClusterTimeReadFailsWithCode(db, readConcernObj, errorCode) {
     return assert.commandFailedWithCode(
@@ -21,7 +21,6 @@ function assertAfterClusterTimeReadSucceeds(db, readConcernObj) {
 const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
-        enableMajorityReadConcern: "",
         shardsvr: "",
     }
 });
@@ -31,6 +30,9 @@ rst.initiate();
 
 // Start the sharding test and add the majority read concern enabled replica set.
 const st = new ShardingTest({manualAddShard: true});
+if (TestData.configShard) {
+    assert.commandWorked(st.s.adminCommand({transitionFromDedicatedConfigServer: 1}));
+}
 assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
 const testDB = st.s.getDB("test");
@@ -109,6 +111,5 @@ assertAfterClusterTimeReadFailsWithCode(
 assertAfterClusterTimeReadFailsWithCode(
     testDB, {level: "majority", afterClusterTime: Timestamp(0, 0)}, ErrorCodes.InvalidOptions);
 
-rst.stopSet();
 st.stop();
-})();
+rst.stopSet();

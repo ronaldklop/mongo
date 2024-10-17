@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
@@ -90,7 +91,7 @@ public:
      * Forwards the parsed metadata in the query results to the replication system.
      */
     virtual void processMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                 rpc::OplogQueryMetadata oqMetadata) = 0;
+                                 const rpc::OplogQueryMetadata& oqMetadata) = 0;
 
     /**
      * Evaluates quality of sync source. Accepts the current sync source; the last optime on this
@@ -101,7 +102,14 @@ public:
                                                       const rpc::ReplSetMetadata& replMetadata,
                                                       const rpc::OplogQueryMetadata& oqMetadata,
                                                       const OpTime& previousOpTimeFetched,
-                                                      const OpTime& lastOpTimeFetched) = 0;
+                                                      const OpTime& lastOpTimeFetched) const = 0;
+
+    /**
+     * Evaluates quality of sync source. This is intended to be called on error when no
+     * current metadata is available.
+     */
+    virtual ChangeSyncSourceAction shouldStopFetchingOnError(
+        const HostAndPort& source, const OpTime& lastOpTimeFetched) const = 0;
 
     /**
      * This function creates an oplog buffer of the type specified at server startup.
@@ -118,12 +126,34 @@ public:
         ReplicationConsistencyMarkers* consistencyMarkers,
         StorageInterface* storageInterface,
         const OplogApplier::Options& options,
-        ThreadPool* writerPool) = 0;
+        ThreadPool* workerPool) = 0;
 
     /**
-     * Returns the current replica set config if there is one, or an error why there isn't.
+     * Returns the current in-memory replica set config if there is one, or an error why there
+     * isn't.
      */
     virtual StatusWith<ReplSetConfig> getCurrentConfig() const = 0;
+
+    /**
+     * Returns the current stored replica set config if there is one, or an error why there isn't.
+     */
+    virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) const = 0;
+
+    /**
+     * Stores the replica set config document in local storage, or returns an error.
+     */
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Returns the current stored replica set "last vote" if there is one, or an error why there
+     * isn't.
+     */
+    virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the replication journal listener.
+     */
+    virtual JournalListener* getReplicationJournalListener() = 0;
 };
 
 }  // namespace repl

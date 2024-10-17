@@ -6,18 +6,17 @@
  * @tags: [requires_persistence, requires_replication]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: 3,
     waitForKeys: false,
     nodeOptions: {
-        sslMode: "preferSSL",
+        tlsMode: "preferTLS",
         clusterAuthMode: "x509",
-        sslPEMKeyFile: "jstests/libs/server.pem",
-        sslCAFile: "jstests/libs/ca.pem",
-        sslAllowInvalidHostnames: ""
+        tlsCertificateKeyFile: "jstests/libs/server.pem",
+        tlsCAFile: "jstests/libs/ca.pem",
+        tlsAllowInvalidHostnames: ""
     }
 });
 rst.startSet();
@@ -30,6 +29,14 @@ rst.getPrimary().getDB('admin').createUser({user: 'root', pwd: 'root', roles: ['
 rst.nodes.forEach((node) => {
     assert(node.getDB("admin").auth("root", "root"));
 });
+
+// Future connections should authenticate immediately on connecting so that replSet actions succeed.
+const originalAwaitConnection = MongoRunner.awaitConnection;
+MongoRunner.awaitConnection = function(args) {
+    const conn = originalAwaitConnection(args);
+    assert(conn.getDB('admin').auth('root', 'root'));
+    return conn;
+};
 
 // All the certificates' DNs share this base
 const dnBase = "C=US, ST=New York, L=New York,";
@@ -46,8 +53,8 @@ const rolloverConfig = function(newConfig) {
         rst.stop(nodeId);
         const configId = "n" + nodeId;
         rst.nodeOptions[configId] = Object.merge(rst.nodeOptions[configId], newConfig, true);
-        const newNode = rst.start(nodeId, {}, true, true);
-        assert(newNode.getDB("admin").auth("root", "root"));
+        rst.start(nodeId, {}, true, true);
+        rst.awaitSecondaryNodes();
     };
 
     rst.nodes.forEach(function(node) {
@@ -67,11 +74,11 @@ const rolloverConfig = function(newConfig) {
             '--eval',
             ';',
             '--ssl',
-            '--sslAllowInvalidHostnames',
-            '--sslCAFile',
-            newConfig['sslCAFile'],
-            '--sslPEMKeyFile',
-            newConfig['sslPEMKeyFile'],
+            '--tlsAllowInvalidHostnames',
+            '--tlsCAFile',
+            newConfig['tlsCAFile'],
+            '--tlsCertificateKeyFile',
+            newConfig['tlsCertificateKeyFile'],
             '--authenticationDatabase=$external',
             '--authenticationMechanism=MONGODB-X509'
         ];
@@ -83,8 +90,8 @@ const rolloverConfig = function(newConfig) {
 
 jsTestLog("Rolling over CA certificate to combined old and new CA's");
 rolloverConfig({
-    sslPEMKeyFile: "jstests/libs/server.pem",
-    sslCAFile: "jstests/libs/rollover_ca_merged.pem",
+    tlsCertificateKeyFile: "jstests/libs/server.pem",
+    tlsCAFile: "jstests/libs/rollover_ca_merged.pem",
     setParameter: {
         tlsX509ClusterAuthDNOverride: rolloverDN,
     }
@@ -92,8 +99,8 @@ rolloverConfig({
 
 jsTestLog("Rolling over to new certificate with new cluster DN and new CA");
 rolloverConfig({
-    sslPEMKeyFile: "jstests/libs/rollover_server.pem",
-    sslCAFile: "jstests/libs/rollover_ca_merged.pem",
+    tlsCertificateKeyFile: "jstests/libs/rollover_server.pem",
+    tlsCAFile: "jstests/libs/rollover_ca_merged.pem",
     setParameter: {
         tlsX509ClusterAuthDNOverride: originalDN,
     }
@@ -101,9 +108,8 @@ rolloverConfig({
 
 jsTestLog("Rolling over to new CA only");
 rolloverConfig({
-    sslPEMKeyFile: "jstests/libs/rollover_server.pem",
-    sslCAFile: "jstests/libs/rollover_ca.pem",
+    tlsCertificateKeyFile: "jstests/libs/rollover_server.pem",
+    tlsCAFile: "jstests/libs/rollover_ca.pem",
 });
 
 rst.stopSet();
-})();

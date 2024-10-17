@@ -2,13 +2,9 @@
  * Test that an index build aborted due to rollback restarts correctly, even if the none of the
  * associated oplog entries are rolled-back.
  */
-(function() {
-"use strict";
+import {RollbackIndexBuildsTest} from "jstests/replsets/libs/rollback_index_builds_test.js";
 
-// For RollbackIndexBuildsTest
-load('jstests/replsets/libs/rollback_index_builds_test.js');
-
-const rollbackIndexTest = new RollbackIndexBuildsTest();
+const rollbackIndexTest = new RollbackIndexBuildsTest([ErrorCodes.InterruptedDueToReplStateChange]);
 
 const schedule = [
     // Start an index build.
@@ -27,4 +23,3 @@ const schedule = [
 
 rollbackIndexTest.runSchedules([schedule]);
 rollbackIndexTest.stop();
-})();

@@ -29,10 +29,19 @@
 
 #include "mongo/db/geo/big_polygon.h"
 
-#include <map>
 #include <memory>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2loop.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <s2region.h>
+#include <util/math/vector3-inl.h>
+#include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
+#include <s2latlngrect.h>
+
 #include "mongo/util/assert_util.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 

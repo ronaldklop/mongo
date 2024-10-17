@@ -29,13 +29,32 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/stdx/variant.h"
+#include "mongo/bson/mutable/element.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/itoa.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/visit_helper.h"
 
 // This file contains classes for serializing document diffs to a format that can be stored in the
 // oplog. Any code/machinery which manipulates document diffs should do so through these classes.
@@ -54,6 +73,7 @@ constexpr StringData kArrayHeader = "a"_sd;
 constexpr StringData kDeleteSectionFieldName = "d"_sd;
 constexpr StringData kInsertSectionFieldName = "i"_sd;
 constexpr StringData kUpdateSectionFieldName = "u"_sd;
+constexpr StringData kBinarySectionFieldName = "b"_sd;
 constexpr char kSubDiffSectionFieldPrefix = 's';
 // 'l' for length.
 constexpr StringData kResizeSectionFieldName = "l"_sd;
@@ -71,7 +91,7 @@ class DocumentDiffReader;
 
 class ArrayDiffReader {
 public:
-    using ArrayModification = stdx::variant<BSONElement, DocumentDiffReader, ArrayDiffReader>;
+    using ArrayModification = std::variant<BSONElement, DocumentDiffReader, ArrayDiffReader>;
 
     explicit ArrayDiffReader(const Diff& diff);
 
@@ -113,7 +133,8 @@ public:
     boost::optional<StringData> nextDelete();
     boost::optional<BSONElement> nextUpdate();
     boost::optional<BSONElement> nextInsert();
-    boost::optional<std::pair<StringData, stdx::variant<DocumentDiffReader, ArrayDiffReader>>>
+    boost::optional<BSONElement> nextBinary();
+    boost::optional<std::pair<StringData, std::variant<DocumentDiffReader, ArrayDiffReader>>>
     nextSubDiff();
 
 private:
@@ -122,6 +143,7 @@ private:
     boost::optional<BSONObjIterator> _deletes;
     boost::optional<BSONObjIterator> _inserts;
     boost::optional<BSONObjIterator> _updates;
+    boost::optional<BSONObjIterator> _binaries;
     boost::optional<BSONObjIterator> _subDiffs;
 };
 }  // namespace doc_diff
@@ -134,7 +156,15 @@ namespace diff_tree {
  *
  * When the update is complete, the diff tree is converted into a $v: 2 oplog entry.
  */
-enum class NodeType { kDocumentSubDiff, kDocumentInsert, kArray, kDelete, kUpdate, kInsert };
+enum class NodeType {
+    kDocumentSubDiff,
+    kDocumentInsert,
+    kArray,
+    kDelete,
+    kUpdate,
+    kInsert,
+    kBinary
+};
 
 /**
  * Base class to represents a node in the diff tree.
@@ -146,8 +176,8 @@ struct Node {
 
 /**
  * This class represents insertion of a BSONElement or mutablebson Element. Note that
- * 'DocumentInsertionNode' also repesent an insert for the cases where an object is created
- * implicity.
+ * 'DocumentInsertionNode' also represent an insert for the cases where an object is created
+ * implicitly.
  */
 struct InsertNode : public Node {
     InsertNode(mutablebson::Element el) : elt(el) {}
@@ -156,7 +186,7 @@ struct InsertNode : public Node {
     NodeType type() const override {
         return NodeType::kInsert;
     }
-    stdx::variant<mutablebson::Element, BSONElement> elt;
+    std::variant<mutablebson::Element, BSONElement> elt;
 };
 
 /**
@@ -169,7 +199,7 @@ struct UpdateNode : public Node {
     NodeType type() const override {
         return NodeType::kUpdate;
     }
-    stdx::variant<mutablebson::Element, BSONElement> elt;
+    std::variant<mutablebson::Element, BSONElement> elt;
 };
 
 /**
@@ -179,6 +209,19 @@ struct DeleteNode : public Node {
     NodeType type() const override {
         return NodeType::kDelete;
     }
+};
+
+/**
+ * Structure to represent a field binary node.
+ */
+struct BinaryNode : public Node {
+    BinaryNode(mutablebson::Element el) : elt(el) {}
+    BinaryNode(BSONElement el) : elt(el) {}
+
+    NodeType type() const override {
+        return NodeType::kBinary;
+    }
+    std::variant<mutablebson::Element, BSONElement> elt;
 };
 
 /**
@@ -250,6 +293,9 @@ public:
     void addDelete(StringData fieldName) {
         addChild(fieldName, std::make_unique<DeleteNode>());
     }
+    void addBinary(StringData fieldName, BSONElement value) {
+        addChild(fieldName, std::make_unique<BinaryNode>(value));
+    }
     NodeType type() const override {
         return NodeType::kDocumentSubDiff;
     }
@@ -261,6 +307,9 @@ public:
     }
     const ModificationEntries<DeleteNode*>& getDeletes() const {
         return deletes;
+    }
+    const ModificationEntries<BinaryNode*>& getBinaries() const {
+        return binaries;
     }
     const ModificationEntries<Node*>& getInserts() const {
         return inserts;
@@ -281,6 +330,7 @@ private:
     // map, where they are owned.
     ModificationEntries<UpdateNode*> updates;
     ModificationEntries<DeleteNode*> deletes;
+    ModificationEntries<BinaryNode*> binaries;
     ModificationEntries<Node*> inserts;
     ModificationEntries<InternalNode*> subDiffs;
 
@@ -342,10 +392,9 @@ public:
     ArrayNode() : InternalNode(doc_diff::kSizeOfEmptyArrayDiffBuilder){};
 
     Node* addChild(size_t idx, std::unique_ptr<Node> node) {
-        sizeTracker.addEntry(
-            1 /* modification type */ + 1 +
-                (idx ? static_cast<int>(std::log10(idx)) : 0) /* Count the number of digits */,
-            node.get());
+        sizeTracker.addEntry(1 /* modification type */ +
+                                 StringData(ItoA(idx)).size() /* Count the number of digits */,
+                             node.get());
         auto itr = children.insert({idx, std::move(node)});
         invariant(itr.second);
         return itr.first->second.get();
@@ -361,7 +410,7 @@ public:
         addChild(idx, std::make_unique<UpdateNode>(value));
     }
 
-    virtual Node* getChild(StringData fieldName) const override {
+    Node* getChild(StringData fieldName) const override {
         auto idx = str::parseUnsignedBase10Integer(fieldName);
         invariant(idx);
         auto it = children.find(*idx);

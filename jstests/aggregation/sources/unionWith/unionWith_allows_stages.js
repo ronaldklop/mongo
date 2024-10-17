@@ -2,14 +2,14 @@
  * Test that $unionWith works with $geoNear, $text, and $indexStats
  * Some of these stages cannot be used in facets.
  * @tags: [
+ *   # Asserts on the output of $indexStats.
+ *   assumes_no_implicit_index_creation,
  *   do_not_wrap_aggregations_in_facets,
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/aggregation/extras/utils.js");  // arrayEq
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers
+import {arrayEq, documentEq} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 const collA = testDB.A;
@@ -24,6 +24,7 @@ function buildErrorString(expected, found) {
     return "Expected:\n" + tojson(expected) + "\nGot:\n" + tojson(found);
 }
 function checkResults(resObj, expectedResult) {
+    assert.commandWorked(resObj);
     assert(arrayEq(resObj.cursor.firstBatch, expectedResult),
            buildErrorString(expectedResult, resObj.cursor.firstBatch));
 }
@@ -77,7 +78,7 @@ if (FixtureHelpers.isMongos(testDB) && FixtureHelpers.isSharded(collA)) {
 }
 
 // Test that $unionWith fails if $indexStats is not first stage in the sub-pipeline.
-var resObj = testDB.runCommand({
+resObj = testDB.runCommand({
     aggregate: collA.getName(),
     pipeline: [
         {$match: {val: {$exists: false}}},
@@ -154,5 +155,4 @@ resObj = testDB.runCommand({
     }],
     cursor: {}
 });
-assert.eq(resObj.code, 40602, resObj);
-})();
+assert.eq(resObj.code, 40603, resObj);

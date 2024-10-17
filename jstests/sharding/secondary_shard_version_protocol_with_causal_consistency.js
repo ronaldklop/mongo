@@ -3,11 +3,13 @@
  * read concern level 'available' and afterClusterTime specified should error because they ensure
  * contradictory things. A secondary request with afterClusterTime specified and no read concern
  * level should default to 'local' read concern level, using the shard version protocol.
+ * @tags: [
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/profiler.js');  // for profilerHasSingleMatchingEntryOrThrow()
+import {profilerHasSingleMatchingEntryOrThrow} from "jstests/libs/profiler.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Set the secondaries to priority 0 to prevent the primaries from stepping down.
 let rsOpts = {nodes: [{}, {rsConfig: {priority: 0}}]};
@@ -15,8 +17,8 @@ let st =
     new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}, causallyConsistent: true});
 let dbName = 'test', collName = 'foo', ns = 'test.foo';
 
-assert.commandWorked(st.s0.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(st.s0.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: ns, middle: {x: 0}}));
@@ -96,4 +98,3 @@ profilerHasSingleMatchingEntryOrThrow({
 });
 
 st.stop();
-})();

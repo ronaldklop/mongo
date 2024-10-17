@@ -1,7 +1,11 @@
 // Tests that killSessions kills inactive transactions.
-// @tags: [uses_transactions, uses_parallel_shell]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession, killSessions.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions,
+//   uses_parallel_shell
+// ]
 
 const dbName = "test";
 const collName = "kill_sessions_kills_transaction";
@@ -56,14 +60,13 @@ assert.soon(
                        {
                            $match: {
                                $or: [
-                                   {'command.drop': collName},
-                                   {'command._shardsvrDropCollectionParticipant': collName}
-                               ],
-                               waitingForLock: true
+                                   {'command.drop': collName, waitingForLock: true},
+                                   {'command._shardsvrParticipantBlock': collName},
+                               ]
                            }
                        }
                    ])
-                   .itcount() === 1;
+                   .itcount() > 0;
     },
     function() {
         return "Failed to find drop in currentOp output: " +
@@ -82,4 +85,3 @@ awaitDrop();
 assert.commandFailedWithCode(session.commitTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 session.endSession();
-}());

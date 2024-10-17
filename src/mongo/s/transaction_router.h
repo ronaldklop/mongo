@@ -29,19 +29,39 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/api_parameters.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/stats/single_transaction_stats.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/string_map.h"
+#include "mongo/util/tick_source.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -71,6 +91,9 @@ public:
         kRecoverWithToken,
     };
 
+    // The reason why TransactionRouter::Router::stash() is called.
+    enum class StashReason { kDone, kYield };
+
     // The default value to use as the statement id of the first command in the transaction if none
     // was sent.
     static const StmtId kDefaultFirstStmtId = 0;
@@ -82,12 +105,16 @@ public:
      */
     struct SharedTransactionOptions {
         // Set for all distributed transactions.
-        TxnNumber txnNumber;
+        TxnNumberAndRetryCounter txnNumberAndRetryCounter;
         APIParameters apiParameters;
         repl::ReadConcernArgs readConcernArgs;
 
         // Only set for transactions with snapshot level read concern.
-        boost::optional<LogicalTime> atClusterTime;
+        boost::optional<LogicalTime> atClusterTimeForSnapshotReadConcern;
+
+        boost::optional<LogicalTime> placementConflictTimeForNonSnapshotReadConcern;
+
+        bool isInternalTransactionForRetryableWrite;
     };
 
     /**
@@ -105,7 +132,11 @@ public:
         /**
          * Attaches necessary fields if this is participating in a multi statement transaction.
          */
-        BSONObj attachTxnFieldsIfNeeded(BSONObj cmd, bool isFirstStatementInThisParticipant) const;
+        BSONObj attachTxnFieldsIfNeeded(OperationContext* opCtx,
+                                        BSONObj cmd,
+                                        bool isFirstStatementInThisParticipant,
+                                        bool addingParticipantViaSubRouter,
+                                        bool hasTxnCreatedAnyDatabase) const;
 
         // True if the participant has been chosen as the coordinator for its transaction
         const bool isCoordinator{false};
@@ -175,7 +206,7 @@ public:
         TickSource::Tick lastTimeActiveStart{0};
     };
 
-    enum class TransactionActions { kStart, kContinue, kCommit };
+    enum class TransactionActions { kStart, kContinue, kStartOrContinue, kCommit };
 
     // Reason a transaction terminated.
     enum class TerminationCause {
@@ -261,44 +292,6 @@ public:
     };
 
     /**
-     * Encapsulates the logic around selecting a global read timestamp for a sharded transaction at
-     * snapshot level read concern.
-     *
-     * The first command in a transaction to target at least one shard must select a cluster time
-     * timestamp before targeting, but may change the timestamp before contacting any shards to
-     * allow optimizing the timestamp based on the targeted shards. If the first command encounters
-     * a retryable error, e.g. StaleShardVersion or SnapshotTooOld, the retry may also select a new
-     * timestamp. Once the first command has successfully completed, the timestamp cannot be
-     * changed.
-     */
-    class AtClusterTime {
-    public:
-        /**
-         * Cannot be called until a timestamp has been set.
-         */
-        LogicalTime getTime() const;
-
-        /**
-         * Returns true if the _atClusterTime has been changed from the default uninitialized value.
-         */
-        bool timeHasBeenSet() const;
-
-        /**
-         * Sets the timestamp and remembers the statement id of the command that set it.
-         */
-        void setTime(LogicalTime atClusterTime, StmtId currentStmtId);
-
-        /**
-         * True if the timestamp can be changed by a command running at the given statement id.
-         */
-        bool canChange(StmtId currentStmtId) const;
-
-    private:
-        boost::optional<StmtId> _stmtIdSelectedAt;
-        LogicalTime _atClusterTime;
-    };
-
-    /**
      * Class used by observers to examine the state of a TransactionRouter.
      */
     class Observer {
@@ -320,8 +313,17 @@ public:
         /**
          * Returns if the router has received at least one request for a transaction.
          */
-        auto isInitialized() {
-            return o().txnNumber != kUninitializedTxnNumber;
+        auto isInitialized() const {
+            return o().txnNumberAndRetryCounter.getTxnNumber() != kUninitializedTxnNumber;
+        }
+
+        /**
+         * Returns if this TransactionRouter instance can be reaped. Always true unless an operation
+         * has yielded the router and has not unyielded yet. We cannot reap the instance in that
+         * case or the unyield would check out a different TransactionRouter than it yielded.
+         */
+        auto canBeReaped() const {
+            return o().activeYields == 0;
         }
 
     protected:
@@ -370,9 +372,15 @@ public:
                                 TransactionActions action);
 
         /**
-         * Updates transaction diagnostics when the transaction's session is checked in.
+         * Updates transaction diagnostics and, if necessary, the number of active yielders when the
+         * transaction's session is checked in.
          */
-        void stash(OperationContext* opCtx);
+        void stash(OperationContext* opCtx, StashReason reason);
+
+        /**
+         * Validates transaction state is still compatible after a yield.
+         */
+        void unstash(OperationContext* opCtx);
 
         /**
          * Attaches the required transaction related fields for a request to be sent to the given
@@ -394,7 +402,8 @@ public:
          */
         void processParticipantResponse(OperationContext* opCtx,
                                         const ShardId& shardId,
-                                        const BSONObj& responseObj);
+                                        const BSONObj& responseObj,
+                                        bool forAsyncGetMore = false);
 
         /**
          * Returns true if the current transaction can retry on a stale version error from a
@@ -442,15 +451,10 @@ public:
         void onViewResolutionError(OperationContext* opCtx, const NamespaceString& nss);
 
         /**
-         * Returns true if the associated transaction is running at snapshot level read concern.
+         * If the transaction is not running at a read concern snapshot, returns boost::none.
+         * Otherwise returns the timestamps that has been selected for the transaction.
          */
-        bool mustUseAtClusterTime() const;
-
-        /**
-         * Returns the read timestamp for this transaction. Callers must verify that the read
-         * timestamp has been selected for this transaction before calling this function.
-         */
-        LogicalTime getSelectedAtClusterTime() const;
+        boost::optional<LogicalTime> getSelectedAtClusterTime() const;
 
         /**
          * Sets the atClusterTime for the current transaction to the latest time in the router's
@@ -458,6 +462,18 @@ public:
          * atClusterTime has already been selected and cannot be changed.
          */
         void setDefaultAtClusterTime(OperationContext* opCtx);
+
+        /**
+         * Sets the atClusterTime for starting a transaction in a sub-router using opCtx
+         * atClusterTime. This should only be called when the TransactionAction is kStartOrContinue.
+         */
+        void setAtClusterTimeForStartOrContinue(OperationContext* opCtx);
+
+        /**
+         * If the transaction has specified a placementConflictTime returns the value, otherwise
+         * returns boost::none.
+         */
+        boost::optional<LogicalTime> getPlacementConflictTime() const;
 
         /**
          * If a coordinator has been selected for the current transaction, returns its id.
@@ -468,6 +484,24 @@ public:
          * If a recovery shard has been selected for the current transaction, returns its id.
          */
         const boost::optional<ShardId>& getRecoveryShardId() const;
+
+        /**
+         * If this router is a sub-router and the txnNumber and retryCounter match that on the
+         * opCtx, returns a map containing {participantShardId : readOnly} for each participant
+         * added by this router. It's possible that readOnly is not set if either an error occured
+         * before receiving a response from a particular shard, or a shard returned an error.
+         *
+         * Returns boost::none if this router is not a sub-router, or if the txnNumber or
+         * retryCounter on this router do not match that on the opCtx.
+         */
+        boost::optional<StringMap<boost::optional<bool>>> getAdditionalParticipantsForResponse(
+            OperationContext* opCtx);
+
+        /**
+         * Returns whether it is safe to retry a command that failed with a stale error. It is not
+         * safe to retry if this router is a sub-router.
+         */
+        bool isSafeToRetryStaleErrors(OperationContext* opCtx);
 
         /**
          * Commits the transaction.
@@ -528,20 +562,72 @@ public:
             return o().metricsTracker->getTimingStats();
         }
 
+        /**
+         * Returns if the router is not currently tracking an active transaction.
+         */
+        bool isTrackingOver() {
+            if (o().metricsTracker)
+                return o().metricsTracker->isTrackingOver();
+            return true;
+        }
+
+        /**
+         * Annotate that this transaction has attempted to create database 'dbName'.
+         */
+        void annotateCreatedDatabase(DatabaseName dbName) {
+            p().createdDatabases.insert(dbName);
+        }
+
+        void disallowSingleWriteShardCommit() {
+            p().disallowSingleWriteShardCommit = true;
+        }
+
     private:
         /**
          * Resets the router's state. Used when the router sees a new transaction for the first
          * time. This is required because we don't create a new router object for each transaction,
          * but instead reuse the same object across different transactions.
          */
-        void _resetRouterState(OperationContext* opCtx, const TxnNumber& txnNumber);
+        void _resetRouterState(OperationContext* opCtx,
+                               const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
+
+        /**
+         * Calls _resetRouterState and then resets the read concern and the cluster time of the
+         * timestamp that all participant shards in the current transaction with snapshot level read
+         * concern must read from.
+         */
+        void _resetRouterStateForStartTransaction(
+            OperationContext* opCtx, const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
+
+        /**
+         * Calls _resetRouterStateForStartTransaction and then resets the cluster time using the
+         * readConcern on the opCtx and resets the subRouter flag.
+         */
+        void _resetRouterStateForStartOrContinueTransaction(
+            OperationContext* opCtx, const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
+
+        /**
+         * Continues or restarts the currently active transaction.
+         */
+        void _continueTxn(OperationContext* opCtx,
+                          TxnNumberAndRetryCounter txnNumberAndRetryCounter,
+                          TransactionActions action);
+
+        /**
+         * Starts a new transaction or continues a transaction started by a different router to
+         * recover the commit decision.
+         */
+        void _beginTxn(OperationContext* opCtx,
+                       TxnNumberAndRetryCounter txnNumberAndRetryCounter,
+                       TransactionActions action);
 
         /**
          * Internal method for committing a transaction. Should only throw on failure to send
          * commit.
          */
         BSONObj _commitTransaction(OperationContext* opCtx,
-                                   const boost::optional<TxnRecoveryToken>& recoveryToken);
+                                   const boost::optional<TxnRecoveryToken>& recoveryToken,
+                                   bool isFirstCommitAttempt);
 
         /**
          * Retrieves the transaction's outcome from the shard specified in the recovery token.
@@ -556,25 +642,11 @@ public:
         BSONObj _handOffCommitToCoordinator(OperationContext* opCtx);
 
         /**
-         * Sets the given logical time as the atClusterTime for the transaction to be the greater of
-         * the given time and the user's afterClusterTime, if one was provided.
-         */
-        void _setAtClusterTime(OperationContext* opCtx,
-                               const boost::optional<LogicalTime>& afterClusterTime,
-                               LogicalTime candidateTime);
-
-        /**
          * Throws NoSuchTransaction if the response from abortTransaction failed with a code other
          * than NoSuchTransaction. Does not check for write concern errors.
          */
         void _assertAbortStatusIsOkOrNoSuchTransaction(
             const AsyncRequestsSender::Response& response) const;
-
-        /**
-         * If the transaction's read concern level is snapshot, asserts the participant's
-         * atClusterTime matches the transaction's.
-         */
-        void _verifyParticipantAtClusterTime(const Participant& participant);
 
         /**
          * Removes all participants created during the current statement from the participant list
@@ -594,7 +666,7 @@ public:
          */
         void _setReadOnlyForParticipant(OperationContext* opCtx,
                                         const ShardId& shard,
-                                        const Participant::ReadOnly readOnly);
+                                        Participant::ReadOnly readOnly);
 
         /**
          * Updates relevant metrics when the router receives an explicit abort from the client.
@@ -663,6 +735,12 @@ public:
          */
         bool _errorAllowsRetryOnStaleShardOrDb(const Status& status) const;
 
+        /**
+         * Returns true if the router is currently processing a retryable statement in a retryable
+         * internal transaction.
+         */
+        bool _isRetryableStmtInARetryableInternalTxn(const BSONObj& cmdObj) const;
+
         TransactionRouter::PrivateState& p() {
             return _tr->_p;
         }
@@ -684,6 +762,52 @@ public:
         return Observer(osession);
     }
 
+    /**
+     * Takes a cmdObj which could have come from one of the two paths:
+     *  1. Verbatim taken from the user's request (and therefore *may contain* read concern
+     *     arguments) or
+     *  2. Newly generated by the feature based on a user's request (and *doesn't contain* read
+     *     concern arguments)
+     *
+     * AND outputs a new request that contains the original fields of the request along with the
+     * respective readConcernArgs augmented with atClusterTimeForSnapshotReadConcern if the request
+     * asks for a snapshot level.
+     *
+     * The 'atClusterTimeForSnapshotReadConcern' will be boost::none in all cases except when the
+     * read concern level is 'snapshot' or the caller provided `atClusterTime`.
+     *
+     * TODO (SERVER-80526): This code re-checks that the input cmdObj is in sync with the parsed
+     * readConcernArgs (i.e., that we didn't swap majority for local or snapshot somewhere along the
+     * command execution path). This is very error prone and wasteful and a better architecture
+     * would be if cmdObj was not allowed to contain any read concern arguments so that we can just
+     * append the ones passed to the function.
+     */
+    static BSONObj appendFieldsForStartTransaction(
+        BSONObj cmdObj,
+        const repl::ReadConcernArgs& readConcernArgs,
+        const boost::optional<LogicalTime>& atClusterTimeForSnapshotReadConcern,
+        const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern,
+        bool doAppendStartTransaction,
+        bool startOrContinueTransaction,
+        bool hasTxnCreatedAnyDatabase);
+
+    /**
+     * Appends the needed fields when continuing a transaction on a participant.
+     */
+    static BSONObj appendFieldsForContinueTransaction(
+        BSONObj cmdObj,
+        const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern,
+        bool hasTxnCreatedAnyDatabase);
+
+    /**
+     * Returns a new read concern settings object by combining the input settings.
+     */
+    static repl::ReadConcernArgs reconcileReadConcern(
+        const boost::optional<repl::ReadConcernArgs>& cmdLevelReadConcern,
+        const repl::ReadConcernArgs& txnLevelReadConcern,
+        const boost::optional<LogicalTime>& atClusterTimeForSnapshotReadConcern,
+        const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern);
+
 private:
     /**
      * State in this struct may be read by methods of Observer or Router, and may be written by
@@ -692,9 +816,13 @@ private:
      * o(WithLock) method for writing.
      */
     struct ObservableState {
-        // The currently active transaction number on this router, if beginOrContinueTxn has been
-        // called. Otherwise set to kUninitializedTxnNumber.
-        TxnNumber txnNumber{kUninitializedTxnNumber};
+
+        // Struct with fields txnNumber and txnRetryCounter.
+        // If beginOrContinueTxn has been called, txnNumber and txnRetryCounter reflect
+        // the router's currently active transaction. Otherwise, they are set to
+        // kUninitializedTxnNumber and kUninitializedTxnRetryCounter by default.
+        TxnNumberAndRetryCounter txnNumberAndRetryCounter{kUninitializedTxnNumber,
+                                                          kUninitializedTxnRetryCounter};
 
         // Is updated at commit time to reflect which commit path was taken.
         CommitType commitType{CommitType::kNotInitiated};
@@ -717,7 +845,8 @@ private:
         // The cluster time of the timestamp all participant shards in the current transaction with
         // snapshot level read concern must read from. Only set for transactions running with
         // snapshot level read concern.
-        boost::optional<AtClusterTime> atClusterTime;
+        boost::optional<LogicalTime> atClusterTimeForSnapshotReadConcern;
+        boost::optional<LogicalTime> placementConflictTimeForNonSnapshotReadConcern;
 
         // String representing the reason a transaction aborted. Either the string name of the error
         // code that led to an implicit abort or "abort" if the client sent abortTransaction.
@@ -731,6 +860,15 @@ private:
         // certain transaction events. Unset until the transaction router has processed at least one
         // transaction command.
         boost::optional<MetricsTracker> metricsTracker;
+
+        // How many operations that checked out the router's session have currently yielded it. The
+        // transaction number cannot be changed until this returns to 0, otherwise we cannot
+        // guarantee that unyielding the session cannot fail.
+        int32_t activeYields{0};
+
+        // Indicates whether the router was created by a shard that is an active transaction
+        // participant.
+        bool subRouter{false};
     } _o;
 
     /**
@@ -761,6 +899,13 @@ private:
 
         // Track whether commit or abort have been initiated.
         bool terminationInitiated{false};
+
+        // Tracks databases that this transaction has attempted to create.
+        std::set<DatabaseName> createdDatabases;
+
+        // Set true to prevent using the single write shard commit optimization. Only for updates to
+        // a document's shard key value that use the legacy protocol.
+        bool disallowSingleWriteShardCommit{false};
     } _p;
 };
 

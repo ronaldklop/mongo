@@ -27,41 +27,84 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/forwardable_operation_metadata.h"
 
+#include <boost/optional.hpp>
+#include <mutex>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/client.h"
+#include "mongo/db/write_block_bypass.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata_gen.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 ForwardableOperationMetadata::ForwardableOperationMetadata(const BSONObj& obj) {
     ForwardableOperationMetadataBase::parseProtected(
-        IDLParserErrorContext("ForwardableOperationMetadataBase"), obj);
+        IDLParserContext("ForwardableOperationMetadataBase"), obj);
 }
 
 ForwardableOperationMetadata::ForwardableOperationMetadata(OperationContext* opCtx) {
     if (auto optComment = opCtx->getComment()) {
         setComment(optComment->wrap());
     }
+
     if (const auto authMetadata = rpc::getImpersonatedUserMetadata(opCtx)) {
-        setImpersonatedUserMetadata({{authMetadata->getUsers(), authMetadata->getRoles()}});
+        if (authMetadata->getUser()) {
+            AuthenticationMetadata metadata;
+            metadata.setUser(authMetadata->getUser().get());
+            metadata.setRoles(authMetadata->getRoles());
+            setImpersonatedUserMetadata(metadata);
+        }
     }
+    boost::optional<StringData> originalSecurityToken = boost::none;
+    const auto vts = auth::ValidatedTenancyScope::get(opCtx);
+    if (vts != boost::none && !vts->getOriginalToken().empty()) {
+        originalSecurityToken = vts->getOriginalToken();
+    }
+    setValidatedTenancyScopeToken(originalSecurityToken);
+
+    setMayBypassWriteBlocking(WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled());
 }
 
 void ForwardableOperationMetadata::setOn(OperationContext* opCtx) const {
+    Client* client = opCtx->getClient();
     if (const auto& comment = getComment()) {
-        opCtx->setComment(comment.get());
+        stdx::lock_guard<Client> lk(*client);
+        opCtx->setComment(comment.value());
     }
 
     if (const auto& optAuthMetadata = getImpersonatedUserMetadata()) {
-        const auto& authMetadata = optAuthMetadata.get();
-        if (!authMetadata.getUsers().empty() || !authMetadata.getRoles().empty()) {
-            AuthorizationSession::get(opCtx->getClient())
-                ->setImpersonatedUserData(authMetadata.getUsers(), authMetadata.getRoles());
+        const auto& authMetadata = optAuthMetadata.value();
+        UserName username(authMetadata.getUser().value_or(UserName()));
+
+        if (!authMetadata.getRoles().empty()) {
+            AuthorizationSession::get(client)->setImpersonatedUserData(username,
+                                                                       authMetadata.getRoles());
         }
     }
+
+    WriteBlockBypass::get(opCtx).set(getMayBypassWriteBlocking());
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope = boost::none;
+    const auto originalToken = getValidatedTenancyScopeToken();
+    if (originalToken != boost::none && !originalToken->empty()) {
+        validatedTenancyScope = auth::ValidatedTenancyScopeFactory::parse(client, *originalToken);
+    }
+    auth::ValidatedTenancyScope::set(opCtx, validatedTenancyScope);
 }
 
 }  // namespace mongo

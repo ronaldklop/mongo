@@ -27,25 +27,49 @@
  *    it in the license file.
  */
 
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <js/Array.h>
+#include <js/CallArgs.h>
+#include <js/Object.h>
+#include <js/RootingAPI.h>
+#include <js/ValueArray.h>
+#include <jsapi.h>
+#include <jsfriendapi.h>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include <js/PropertyAndElement.h>
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/engine.h"
+#include "mongo/scripting/mozjs/exception.h"
+#include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/internedstring.h"
+#include "mongo/scripting/mozjs/jsthread.h"
+#include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/valuereader.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/jsthread.h"
-
-#include <cstdio>
-#include <memory>
-#include <vm/PosixNSPR.h>
-
-#include "mongo/db/jsobj.h"
-#include "mongo/logv2/log.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/util/stacktrace.h"
 
 namespace mongo {
 namespace mozjs {
@@ -87,11 +111,11 @@ public:
         uassert(ErrorCodes::JSInterpreterFailure, "need at least one argument", args.length() > 0);
         uassert(ErrorCodes::JSInterpreterFailure,
                 "first argument must be a function",
-                args.get(0).isObject() && JS_ObjectIsFunction(cx, args.get(0).toObjectOrNull()));
+                args.get(0).isObject() && js::IsFunctionObject(args.get(0).toObjectOrNull()));
 
-        JS::RootedObject robj(cx, JS_NewArrayObject(cx, args));
+        JS::RootedObject robj(cx, JS::NewArrayObject(cx, args));
         if (!robj) {
-            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewArrayObject");
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS::NewArrayObject");
         }
 
         _sharedData->_args = ObjectWrapper(cx, robj).toBSON();
@@ -150,12 +174,12 @@ private:
         SharedData() = default;
 
         void setErrorStatus(Status status) {
-            stdx::lock_guard<Latch> lck(_statusMutex);
+            stdx::lock_guard<stdx::mutex> lck(_statusMutex);
             _status = std::move(status);
         }
 
         Status getErrorStatus() {
-            stdx::lock_guard<Latch> lck(_statusMutex);
+            stdx::lock_guard<stdx::mutex> lck(_statusMutex);
             return _status;
         }
 
@@ -169,7 +193,7 @@ private:
         std::string _stack;
 
     private:
-        Mutex _statusMutex = MONGO_MAKE_LATCH("SharedData::_statusMutex");
+        stdx::mutex _statusMutex;
         Status _status = Status::OK();
     };
 
@@ -186,7 +210,7 @@ private:
             try {
                 MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()),
                                      boost::none /* Don't override global jsHeapLimitMB */);
-
+                Client::initThread("js", getGlobalServiceContext()->getService());
                 scope.setParentStack(thisv->_sharedData->_stack);
                 thisv->_sharedData->_returnData = scope.callThreadArgs(thisv->_sharedData->_args);
             } catch (...) {
@@ -222,18 +246,19 @@ JSThreadConfig* getConfig(JSContext* cx, JS::CallArgs args) {
     if (!getScope(cx)->getProto<JSThreadInfo>().instanceOf(value))
         uasserted(ErrorCodes::BadValue, "_JSThreadConfig is not a JSThread");
 
-    return static_cast<JSThreadConfig*>(JS_GetPrivate(value.toObjectOrNull()));
+    return JS::GetMaybePtrFromReservedSlot<JSThreadConfig>(value.toObjectOrNull(),
+                                                           JSThreadInfo::JSThreadConfigSlot);
 }
 
 }  // namespace
 
-void JSThreadInfo::finalize(js::FreeOp* fop, JSObject* obj) {
-    auto config = static_cast<JSThreadConfig*>(JS_GetPrivate(obj));
+void JSThreadInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto config = JS::GetMaybePtrFromReservedSlot<JSThreadConfig>(obj, JSThreadConfigSlot);
 
     if (!config)
         return;
 
-    getScope(fop)->trackedDelete(config);
+    getScope(gcCtx)->trackedDelete(config);
 }
 
 void JSThreadInfo::Functions::init::call(JSContext* cx, JS::CallArgs args) {
@@ -242,7 +267,7 @@ void JSThreadInfo::Functions::init::call(JSContext* cx, JS::CallArgs args) {
     JS::RootedObject obj(cx);
     scope->getProto<JSThreadInfo>().newObject(&obj);
     JSThreadConfig* config = scope->trackedNew<JSThreadConfig>(cx, args);
-    JS_SetPrivate(obj, config);
+    JS::SetReservedSlot(obj, JSThreadConfigSlot, JS::PrivateValue(config));
 
     ObjectWrapper(cx, args.thisv()).setObject(InternedString::_JSThreadConfig, obj);
 

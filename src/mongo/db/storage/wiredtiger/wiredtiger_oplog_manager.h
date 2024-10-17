@@ -29,15 +29,20 @@
 
 #pragma once
 
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/platform/mutex.h"
+#include <cstdint>
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
-class WiredTigerRecordStore;
+class RecordStore;
 class WiredTigerSessionCache;
 
 /**
@@ -66,12 +71,11 @@ public:
     /*
      * Initializes the oplog read timestamp and start the update visibility thread.
      */
-    void startVisibilityThread(OperationContext* opCtx, WiredTigerRecordStore* oplogRecordStore);
+    void startVisibilityThread(OperationContext* opCtx, RecordStore* oplogRecordStore);
     void haltVisibilityThread();
 
     bool isRunning() {
-        stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
-        return _isRunning && !_shuttingDown;
+        return _isRunning.load();
     }
 
     /**
@@ -83,7 +87,7 @@ public:
      * Waits for all committed writes at this time to become visible (that is, until no holes exist
      * in the oplog up to the time we start waiting.)
      */
-    void waitForAllEarlierOplogWritesToBeVisible(const WiredTigerRecordStore* oplogRecordStore,
+    void waitForAllEarlierOplogWritesToBeVisible(const RecordStore* oplogRecordStore,
                                                  OperationContext* opCtx);
 
     /**
@@ -104,7 +108,7 @@ private:
      * _shuttingDown is set to true.
      */
     void _updateOplogVisibilityLoop(WiredTigerSessionCache* sessionCache,
-                                    WiredTigerRecordStore* oplogRecordStore);
+                                    RecordStore* oplogRecordStore);
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
@@ -119,10 +123,10 @@ private:
     mutable stdx::condition_variable _oplogEntriesBecameVisibleCV;
 
     // Protects the state below.
-    mutable Mutex _oplogVisibilityStateMutex =
-        MONGO_MAKE_LATCH("WiredTigerOplogManager::_oplogVisibilityStateMutex");
+    mutable stdx::mutex _oplogVisibilityStateMutex;
 
-    bool _isRunning = false;
+    AtomicWord<bool> _isRunning{false};
+
     bool _shuttingDown = false;
 
     // Triggers an oplog visibility update -- can be delayed if no callers are waiting for an

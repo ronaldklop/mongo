@@ -1,11 +1,5 @@
 // Test X509 auth with custom OIDs.
 
-(function() {
-'use strict';
-
-const SERVER_CERT = 'jstests/libs/server.pem';
-const CA_CERT = 'jstests/libs/ca.pem';
-
 function testClient(conn, name) {
     let auth = {mechanism: 'MONGODB-X509'};
     if (name !== null) {
@@ -14,12 +8,12 @@ function testClient(conn, name) {
     const script = 'assert(db.getSiblingDB(\'$external\').auth(' + tojson(auth) + '));';
     clearRawMongoProgramOutput();
     const exitCode = runMongoProgram('mongo',
-                                     '--ssl',
-                                     '--sslAllowInvalidHostnames',
-                                     '--sslPEMKeyFile',
+                                     '--tls',
+                                     '--tlsAllowInvalidHostnames',
+                                     '--tlsCertificateKeyFile',
                                      'jstests/libs/client-custom-oids.pem',
-                                     '--sslCAFile',
-                                     CA_CERT,
+                                     '--tlsCAFile',
+                                     'jstests/libs/ca.pem',
                                      '--port',
                                      conn.port,
                                      '--eval',
@@ -45,11 +39,12 @@ function runTest(conn) {
 // Standalone.
 const mongod = MongoRunner.runMongod({
     auth: '',
-    sslMode: 'requireSSL',
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT,
-    sslAllowInvalidCertificates: '',
+    tlsMode: 'requireTLS',
+    // Server PEM file is server.pem to match the shell's ca.pem.
+    tlsCertificateKeyFile: 'jstests/libs/server.pem',
+    // Server CA file is non-expiring-ca.pem to match the shell's client-custom-oids.pem.
+    tlsCAFile: 'jstests/libs/non-expiring-ca.pem',
+    tlsAllowInvalidCertificates: '',
 });
 runTest(mongod);
 MongoRunner.stopMongod(mongod);
-})();

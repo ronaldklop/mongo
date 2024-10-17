@@ -1,8 +1,7 @@
-(function() {
-'use strict';
-
-load('jstests/concurrency/fsm_libs/runner.js');  // for runner.internals
-load('jstests/libs/discover_topology.js');       // For Topology and DiscoverTopology.
+import {Cluster} from "jstests/concurrency/fsm_libs/cluster.js";
+import {runner} from "jstests/concurrency/fsm_libs/runner.js";
+import {ThreadManager} from "jstests/concurrency/fsm_libs/thread_mgr.js";
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
 
 const validateExecutionOptions = runner.internals.validateExecutionOptions;
 const prepareCollections = runner.internals.prepareCollections;
@@ -16,8 +15,6 @@ const loadWorkloadContext = runner.internals.loadWorkloadContext;
 
 // Returns true if the workload's teardown succeeds and false if the workload's teardown fails.
 function cleanupWorkload(workload, context, cluster, errors, header) {
-    const phase = 'before workload ' + workload + ' teardown';
-
     try {
         teardownWorkload(workload, context, cluster);
     } catch (e) {
@@ -28,39 +25,43 @@ function cleanupWorkload(workload, context, cluster, errors, header) {
     return true;
 }
 
-function runWorkloads(workloads,
-                      {cluster: clusterOptions = {}, execution: executionOptions = {}} = {}) {
+// Writes to the specified FSM synchronization files, suffixed by the
+// hook name for each hook.
+function writeFiles(file) {
+    for (const hook of TestData.useActionPermittedFile) {
+        const path = file + '_' + hook;
+        writeFile(path, '');
+    }
+}
+
+// Attempts to 'cat' the acknowledgement file produced by each hook
+// following the FSM synchronization protocol.
+function readAcks(file) {
+    for (const hook of TestData.useActionPermittedFile) {
+        const path = file + '_' + hook;
+        // The cat() function throws if the file isn't found.
+        cat(path);
+    }
+}
+
+async function runWorkloads(workloads,
+                            {cluster: clusterOptions = {}, execution: executionOptions = {}} = {}) {
     assert.gt(workloads.length, 0, 'need at least one workload to run');
 
     const executionMode = {serial: true};
     validateExecutionOptions(executionMode, executionOptions);
     Object.freeze(executionOptions);  // immutable after validation (and normalization)
 
-    // Determine how strong to make assertions while simultaneously executing different
-    // workloads.
-    let assertLevel = AssertLevel.OWN_DB;
-    if (clusterOptions.sameDB) {
-        // The database is shared by multiple workloads, so only make the asserts that apply
-        // when the collection is owned by an individual workload.
-        assertLevel = AssertLevel.OWN_COLL;
-    }
-    if (clusterOptions.sameCollection) {
-        // The collection is shared by multiple workloads, so only make the asserts that always
-        // apply.
-        assertLevel = AssertLevel.ALWAYS;
-    }
-    globalAssertLevel = assertLevel;
-
     const context = {};
     const applyMultipliers = true;
-    loadWorkloadContext(workloads, context, executionOptions, applyMultipliers);
+    await loadWorkloadContext(workloads, context, executionOptions, applyMultipliers);
 
     // Constructing a Cluster instance calls its internal validateClusterOptions() function,
     // which fills in any properties that aren't explicitly present in 'clusterOptions'. We do
     // this before constructing a ThreadManager instance to make its dependency on the
     // 'clusterOptions' being filled in explicit.
-    const cluster = new Cluster(clusterOptions);
-    const threadMgr = new ThreadManager(clusterOptions, executionMode);
+    const cluster = new Cluster(clusterOptions, executionOptions.sessionOptions);
+    const threadMgr = new ThreadManager(clusterOptions);
 
     Random.setRandomSeed(clusterOptions.seed);
 
@@ -70,7 +71,13 @@ function runWorkloads(workloads,
     let startTime = Date.now();  // Initialize in case setupWorkload fails below.
     let totalTime;
 
-    cluster.setup();
+    await cluster.setup();
+
+    if (typeof executionOptions.tenantId !== 'undefined') {
+        // Import simulate_atlas_proxy.js to override requests for tenant during preparing
+        // collections, setup and teardown of workloads.
+        await import("jstests/libs/override_methods/simulate_atlas_proxy.js");
+    }
 
     jsTest.log('Workload(s) started: ' + workloads.join(' '));
 
@@ -98,36 +105,28 @@ function runWorkloads(workloads,
             cleanup.push(workload);
         });
 
-        // Await replication after running the $config.setup() function when stepdowns are
+        // Await replication after running the $config.setup() function when actions are
         // permitted to ensure its effects aren't rolled back.
-        if (cluster.isReplication() && executionOptions.stepdownFiles !== undefined) {
+        if (cluster.isReplication() && executionOptions.actionFiles !== undefined) {
             cluster.awaitReplication();
         }
 
-        // Transactions run at snapshot read concern unless defaultTransactionReadConcernLevel
-        // is set to another level.
-        const transactionsWouldUseSnapshotReadConcern =
-            !TestData.hasOwnProperty("defaultTransactionReadConcernLevel") ||
-            TestData.defaultTransactionReadConcernLevel === "snapshot";
-
-        // Synchronize the cluster times across all routers if the tests will be overriden to
-        // use transactions, so the earliest global snapshots chosen by each router will include
-        // the effects of each setup function. This is only required for snapshot read concern.
-        if (cluster.isSharded() && TestData.runInsideTransaction &&
-            transactionsWouldUseSnapshotReadConcern) {
+        // Synchronize the cluster times across all routers, so the earliest global snapshots chosen
+        // by each router will include the effects of each setup function.
+        if (cluster.isSharded()) {
             cluster.synchronizeMongosClusterTimes();
         }
 
-        // After the $config.setup() function has been called, it is safe for the stepdown
-        // thread to start running. The main thread won't attempt to interact with the cluster
-        // until all of the spawned worker threads have finished.
+        // After the $config.setup() function has been called, it is safe for the hook thread
+        // to start running. The main thread won't attempt to interact with the cluster until
+        // all of the spawned worker threads have finished.
         //
 
-        // Indicate that the stepdown thread can run. It is unnecessary for the stepdown thread
-        // to indicate that it is going to start running because it will eventually after the
+        // Indicate that the hook thread can run. It is unnecessary for the hook thread to
+        // indicate that it is going to start running because it will eventually after the
         // worker threads have started.
-        if (executionOptions.stepdownFiles !== undefined) {
-            writeFile(executionOptions.stepdownFiles.permitted, '');
+        if (executionOptions.actionFiles !== undefined) {
+            writeFiles(executionOptions.actionFiles.permitted);
         }
 
         // Since the worker threads may be running with causal consistency enabled, we set the
@@ -167,21 +166,31 @@ function runWorkloads(workloads,
                         e.err, e.stack, e.tid, 'Foreground ' + e.workloads.join(' '))));
             }
         } finally {
-            // Until we are guaranteed that the stepdown thread isn't running, it isn't safe for
+            // Until we are guaranteed that the hook thread isn't running, it isn't safe for
             // the $config.teardown() function to be called. We should signal to resmoke.py that
-            // the stepdown thread should stop running and wait for the stepdown thread to
-            // signal that it has stopped.
+            // the hook thread should stop running and wait for the hook thread to signal that
+            // it has stopped.
             //
-            // Signal to the stepdown thread to stop stepping down the cluster.
-            if (executionOptions.stepdownFiles !== undefined) {
-                writeFile(executionOptions.stepdownFiles.idleRequest, '');
+            // Signal to the hook thread to stop any actions.
+            if (executionOptions.actionFiles !== undefined) {
+                writeFiles(executionOptions.actionFiles.idleRequest);
 
-                // Wait for the acknowledgement file to be created by the stepdown thread.
+                // Wait for the acknowledgement file to be created by the hook thread.
                 assert.soonNoExcept(function() {
-                    // The cat() function will throw an exception if the file isn't found.
-                    cat(executionOptions.stepdownFiles.idleAck);
+                    try {
+                        // The readAcks() function will throw an exception if any hook hasn't
+                        // provided an acknowledgement.
+                        readAcks(executionOptions.actionFiles.idleAck);
+                    } catch (ex) {
+                        if (ex.code == 13300 /* CANT_OPEN_FILE */) {
+                            // capture this exception to prevent soonNoExcept polluting the
+                            // logs with errors
+                            return false;
+                        }
+                        throw ex;
+                    }
                     return true;
-                }, "stepdown still in progress");
+                }, "thread action still in progress");
             }
         }
     } finally {
@@ -225,8 +234,6 @@ if (TestData.discoverTopology !== false) {
     } else if (topology.type === Topology.kShardedCluster) {
         clusterOptions.replication.enabled = true;
         clusterOptions.sharded.enabled = true;
-        clusterOptions.sharded.enableAutoSplit =
-            TestData.hasOwnProperty('runningWithAutoSplit') ? TestData.runningWithAutoSplit : true;
         clusterOptions.sharded.enableBalancer =
             TestData.hasOwnProperty('runningWithBalancer') ? TestData.runningWithBalancer : true;
         clusterOptions.sharded.numMongos = topology.mongos.nodes.length;
@@ -262,14 +269,19 @@ if (TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns) {
 }
 
 const executionOptions = {
-    dbNamePrefix: TestData.dbNamePrefix || ""
+    dbNamePrefix: TestData.dbNamePrefix || "",
+    tenantId: TestData.tenantId
 };
 const resmokeDbPathPrefix = TestData.resmokeDbPathPrefix || ".";
 
-// The stepdown file names need to match the same construction as found in
-// buildscripts/resmokelib/testing/hooks/stepdown.py.
-if (TestData.useStepdownPermittedFile) {
-    executionOptions.stepdownFiles = {
+// The action file names need to match the same construction as found in
+// buildscripts/resmokelib/testing/hooks/lifecycle.py.
+if (TestData.useActionPermittedFile) {
+    assert(
+        Array.isArray(TestData.useActionPermittedFile),
+        `TestData.useActionPermittedFile needs to be a list of hooks use action files. Current value: '${
+            tojson()}'`);
+    executionOptions.actionFiles = {
         permitted: resmokeDbPathPrefix + '/permitted',
         idleRequest: resmokeDbPathPrefix + '/idle_request',
         idleAck: resmokeDbPathPrefix + '/idle_ack',
@@ -280,5 +292,4 @@ if (Object.keys(sessionOptions).length > 0 || TestData.runningWithSessions) {
     executionOptions.sessionOptions = sessionOptions;
 }
 
-runWorkloads(workloads, {cluster: clusterOptions, execution: executionOptions});
-})();
+await runWorkloads(workloads, {cluster: clusterOptions, execution: executionOptions});

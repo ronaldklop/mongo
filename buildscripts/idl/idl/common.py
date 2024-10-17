@@ -33,12 +33,13 @@ Classes which are shared among both the IDL idl.syntax and idl.AST trees.
 
 import os
 import string
-from typing import Mapping
 
 COMMAND_NAMESPACE_CONCATENATE_WITH_DB = "concatenate_with_db"
 COMMAND_NAMESPACE_CONCATENATE_WITH_DB_OR_UUID = "concatenate_with_db_or_uuid"
 COMMAND_NAMESPACE_IGNORED = "ignored"
 COMMAND_NAMESPACE_TYPE = "type"
+
+GENERIC_ARGS_FILENAME = "mongo/idl/generic_argument.idl"
 
 
 def title_case(name):
@@ -48,7 +49,7 @@ def title_case(name):
     # Only capitalize the last part of a fully-qualified name
     pos = name.rfind("::")
     if pos > -1:
-        return name[:pos + 2] + name[pos + 2:pos + 3].upper() + name[pos + 3:]
+        return name[: pos + 2] + name[pos + 2 : pos + 3].upper() + name[pos + 3 :]
 
     return name[0:1].upper() + name[1:]
 
@@ -72,9 +73,9 @@ def _escape_template_string(template):
     # type: (str) -> str
     """Escape the '$' in template strings unless followed by '{'."""
     # See https://docs.python.org/2/library/string.html#template-strings
-    template = template.replace('${', '#{')
-    template = template.replace('$', '$$')
-    return template.replace('#{', '${')
+    template = template.replace("${", "#{")
+    template = template.replace("$", "$$")
+    return template.replace("#{", "${")
 
 
 def template_format(template, template_params=None):
@@ -84,7 +85,6 @@ def template_format(template, template_params=None):
     # str.
     # See https://docs.python.org/2/library/string.html#template-strings
     template = _escape_template_string(template)
-    # pylint: disable=too-many-function-args
     return string.Template(template).substitute(template_params)  # type: ignore
 
 
@@ -95,7 +95,6 @@ def template_args(template, **kwargs):
     # str.
     # See https://docs.python.org/2/library/string.html#template-strings
     template = _escape_template_string(template)
-    # pylint: disable=too-many-function-args
     return string.Template(template).substitute(kwargs)  # type: ignore
 
 

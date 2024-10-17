@@ -1,7 +1,9 @@
 // Basic test of sharding with a hashed shard key
 //  - Test basic migrations with moveChunk, using different chunk specification methods
 
-load("jstests/sharding/libs/find_chunks_util.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var s = new ShardingTest({name: jsTestName(), shards: 3, mongos: 1, verbose: 1});
 var dbname = "test";
@@ -9,8 +11,7 @@ var coll = "foo";
 var ns = dbname + "." + coll;
 var db = s.getDB(dbname);
 var t = db.getCollection(coll);
-db.adminCommand({enablesharding: dbname});
-s.ensurePrimaryShard(dbname, s.shard1.shardName);
+db.adminCommand({enablesharding: dbname, primaryShard: s.shard1.shardName});
 
 // for simplicity start by turning off balancer
 s.stopBalancer();
@@ -18,13 +19,20 @@ s.stopBalancer();
 // shard a fresh collection using a hashed shard key
 t.drop();
 var res = db.adminCommand({shardcollection: ns, key: {a: "hashed"}});
-assert.gt(findChunksUtil.countChunksForNs(s.config, ns), 3);
+
+let expectedChunkCount = 3;
+// TODO SERVER-81884: update once 8.0 becomes last LTS.
+if (!FeatureFlagUtil.isPresentAndEnabled(db, "OneChunkPerShardEmptyCollectionWithHashedShardKey")) {
+    expectedChunkCount = 6;
+}
+assert.eq(expectedChunkCount, findChunksUtil.countChunksForNs(s.config, ns));
+
 assert.eq(res.ok, 1, "shardcollection didn't work");
 s.printShardingStatus();
 
 // insert stuff
 var numitems = 1000;
-for (i = 0; i < numitems; i++) {
+for (let i = 0; i < numitems; i++) {
     t.insert({a: i});
 }
 // check they all got inserted
@@ -32,7 +40,8 @@ assert.eq(t.find().count(), numitems, "count off after inserts");
 printjson(t.find().explain());
 
 // find a chunk that's not on s.shard0.shardName
-var chunk = s.config.chunks.findOne({shard: {$ne: s.shard0.shardName}});
+let collEntry = s.config.collections.findOne({_id: ns});
+var chunk = s.config.chunks.findOne({uuid: collEntry.uuid, shard: {$ne: s.shard0.shardName}});
 assert.neq(chunk, null, "all chunks on s.shard0.shardName!");
 printjson(chunk);
 

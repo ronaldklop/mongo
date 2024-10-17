@@ -29,12 +29,25 @@
 
 #pragma once
 
+#include <absl/container/node_hash_set.h>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
+
+#include "mongo/base/status.h"
+#include "mongo/crypto/hash_block.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_liaison.h"
+#include "mongo/db/session/kill_sessions_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/service_liaison.h"
+#include "mongo/db/session/session_killer.h"
 #include "mongo/executor/async_timer_mock.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/time_support.h"
 
@@ -78,8 +91,8 @@ public:
     int jobs();
 
     const KillAllSessionsByPattern* matchKilled(const LogicalSessionId& lsid);
-    std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
-                                                           const SessionKiller::Matcher& matcher);
+    int killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                        const SessionKiller::Matcher& matcher);
 
 private:
     std::unique_ptr<executor::AsyncTimerFactoryMock> _timerFactory;
@@ -87,7 +100,7 @@ private:
 
     boost::optional<SessionKiller::Matcher> _matcher;
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("MockServiceLiaisonImpl::_mutex");
+    mutable stdx::mutex _mutex;
     LogicalSessionIdSet _activeSessions;
     LogicalSessionIdSet _cursorSessions;
 };
@@ -120,8 +133,8 @@ public:
         return _impl->join();
     }
 
-    std::pair<Status, int> killCursorsWithMatchingSessions(
-        OperationContext* opCtx, const SessionKiller::Matcher& matcher) override {
+    int killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                        const SessionKiller::Matcher& matcher) override {
         return _impl->killCursorsWithMatchingSessions(opCtx, matcher);
     }
 

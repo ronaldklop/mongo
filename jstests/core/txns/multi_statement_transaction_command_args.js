@@ -1,13 +1,17 @@
 /**
  * Verify that multi-statement transaction command arguments behave correctly.
  *
- * @tags: [uses_transactions, uses_snapshot_read_concern]
+ * @tags: [
+ *  uses_transactions,
+ *  uses_snapshot_read_concern,
+ *  # Retrying an aborted transaction is allowed on shardsvrs.
+ *  # TODO SERVER-64484: Remove this tag as shardsvrs running in serverless mode will error on an
+ *  # attempt to retry an aborted transaction as mongods do when not running as a shardsvr.
+ *  directly_against_shardsvrs_incompatible,
+ * ]
  */
 
-(function() {
-"use strict";
-load('jstests/libs/uuid_util.js');
-load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // Makes assertions on commands run without logical session ids.
 TestData.disableImplicitSessions = true;
@@ -177,8 +181,9 @@ assert.commandFailedWithCode(sessionDb.runCommand({
 }),
                              ErrorCodes.InvalidOptions);
 
-// Mongos has special handling for commitTransaction to support commit recovery.
-if (!FixtureHelpers.isMongos(sessionDb)) {
+// The command above was run with autocommit: true, and commit recovery on a router requires
+// "recoveryToken".
+if (!FixtureHelpers.isMongos(sessionDb) && !TestData.testingReplicaSetEndpoint) {
     // Committing the transaction should fail.
     assert.commandFailedWithCode(sessionDb.adminCommand({
         commitTransaction: 1,
@@ -312,4 +317,3 @@ assert.commandFailedWithCode(
 // Aborting the transaction should succeed.
 assert.commandWorked(sessionDb.adminCommand(
     {abortTransaction: 1, txnNumber: NumberLong(txnNumber), autocommit: false}));
-}());

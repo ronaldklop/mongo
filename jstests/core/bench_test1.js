@@ -1,24 +1,26 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
+//
 // @tags: [
 //   assumes_no_implicit_index_creation,
 //   uses_multiple_connections,
+//   # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+//   simulate_atlas_proxy_incompatible,
+//   # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+//   grpc_incompatible,
 // ]
-(function() {
-"use strict";
-
 const t = db.bench_test1;
 t.drop();
 
-t.insert({_id: 1, x: 1});
-t.insert({_id: 2, x: 1});
+assert.commandWorked(t.insert({_id: 1, x: 1}));
+assert.commandWorked(t.insert({_id: 2, x: 1}));
 
 const ops = [
-    {op: "findOne", ns: t.getFullName(), query: {_id: 1}},
-    {op: "update", ns: t.getFullName(), query: {_id: 1}, update: {$inc: {x: 1}}}
+    {op: "findOne", ns: t.getFullName(), query: {_id: 1}, readCmd: true},
+    {op: "update", ns: t.getFullName(), query: {_id: 1}, update: {$inc: {x: 1}}, writeCmd: true}
 ];
 
-const seconds = 10;
+const seconds = 2;
 
 const benchArgs = {
     ops: ops,
@@ -46,4 +48,3 @@ benchRun(benchArgs);
 assert.soon(function() {
     return t.getIndexes().length == 1;
 });
-}());

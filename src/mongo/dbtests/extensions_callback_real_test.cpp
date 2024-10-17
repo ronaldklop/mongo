@@ -27,17 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+#include <memory>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/json.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/fts/fts_query.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_text.h"
+#include "mongo/db/matcher/expression_text_base.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -48,13 +70,15 @@ namespace {
 
 class ExtensionsCallbackRealTest : public unittest::Test {
 public:
-    ExtensionsCallbackRealTest() : _nss("unittests.extensions_callback_real_test") {
+    ExtensionsCallbackRealTest()
+        : _nss(NamespaceString::createNamespaceString_forTest(
+              "unittests.extensions_callback_real_test")) {
         _isDesugarWhereToFunctionOn = internalQueryDesugarWhereToFunction.load();
     }
 
     void setUp() final {
-        AutoGetOrCreateDb autoDb(&_opCtx, _nss.db(), MODE_X);
-        Database* database = autoDb.getDb();
+        AutoGetDb autoDb(&_opCtx, _nss.dbName(), MODE_X);
+        auto database = autoDb.ensureDbExists(&_opCtx);
         {
             WriteUnitOfWork wunit(&_opCtx);
             ASSERT(database->createCollection(&_opCtx, _nss));
@@ -63,7 +87,7 @@ public:
     }
 
     void tearDown() final {
-        AutoGetDb autoDb(&_opCtx, _nss.db(), MODE_X);
+        AutoGetDb autoDb(&_opCtx, _nss.dbName(), MODE_X);
         Database* database = autoDb.getDb();
         if (!database) {
             return;
@@ -92,7 +116,7 @@ TEST_F(ExtensionsCallbackRealTest, TextNoIndex) {
 
 TEST_F(ExtensionsCallbackRealTest, TextBasic) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -114,7 +138,7 @@ TEST_F(ExtensionsCallbackRealTest, TextBasic) {
 
 TEST_F(ExtensionsCallbackRealTest, TextLanguageError) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -128,7 +152,7 @@ TEST_F(ExtensionsCallbackRealTest, TextLanguageError) {
 
 TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveTrue) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -145,7 +169,7 @@ TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveTrue) {
 
 TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveFalse) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -162,7 +186,7 @@ TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveFalse) {
 
 TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveError) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -176,7 +200,7 @@ TEST_F(ExtensionsCallbackRealTest, TextCaseSensitiveError) {
 
 TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveTrue) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -193,7 +217,7 @@ TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveTrue) {
 
 TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveFalse) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -210,7 +234,7 @@ TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveFalse) {
 
 TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveError) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -224,7 +248,7 @@ TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveError) {
 
 TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveAndCaseSensitiveTrue) {
     ASSERT_OK(dbtests::createIndex(&_opCtx,
-                                   _nss.ns(),
+                                   _nss.ns_forTest(),
                                    BSON("a"
                                         << "text"),
                                    false));  // isUnique
@@ -244,7 +268,7 @@ TEST_F(ExtensionsCallbackRealTest, TextDiacriticSensitiveAndCaseSensitiveTrue) {
 //
 // $where parsing tests.
 //
-const NamespaceString kTestNss = NamespaceString("db.dummy");
+const NamespaceString kTestNss = NamespaceString::createNamespaceString_forTest("db.dummy");
 
 TEST_F(ExtensionsCallbackRealTest, WhereExpressionDesugarsToExprAndInternalJs) {
     if (_isDesugarWhereToFunctionOn) {
@@ -255,13 +279,10 @@ TEST_F(ExtensionsCallbackRealTest, WhereExpressionDesugarsToExprAndInternalJs) {
         auto expr1 = unittest::assertGet(
             ExtensionsCallbackReal(&_opCtx, &_nss).parseWhere(expCtx, query1.firstElement()));
 
-        BSONObjBuilder gotMatch;
-        expr1->serialize(&gotMatch);
-
         auto expectedMatch = fromjson(
             "{$expr: {$function: {'body': 'function() { return this.x == 10; }', 'args': "
             "['$$CURRENT'], 'lang': 'js', '_internalSetObjToThis': true}}}");
-        ASSERT_BSONOBJ_EQ(gotMatch.obj(), expectedMatch);
+        ASSERT_BSONOBJ_EQ(expr1->serialize(), expectedMatch);
     }
 }
 

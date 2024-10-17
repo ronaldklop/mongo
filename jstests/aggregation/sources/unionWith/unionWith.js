@@ -1,11 +1,16 @@
 /**
  * Tests $unionWith with various levels of nesting and stages.
+ *
+ * @tags: [
+ *   not_allowed_with_signed_security_token,
+ * ]
  */
 
-(function() {
-"use strict";
-load("jstests/aggregation/extras/utils.js");  // arrayEq
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers.
+import "jstests/libs/query/sbe_assert_error_override.js";
+
+import {anyEq} from "jstests/aggregation/extras/utils.js";
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 const collA = testDB.A;
@@ -125,29 +130,63 @@ checkResults(testDB.runCommand({
     cursor: {}
 }),
              resSet);
-// Test with $group. Set MaxMemory low to force spillToDisk.
-FixtureHelpers.runCommandOnEachPrimary({
-    db: testDB.getSiblingDB("admin"),
-    cmdObj: {
-        setParameter: 1,
-        "internalDocumentSourceGroupMaxMemoryBytes": 1,
+
+function setHashAggParameters(memoryLimit, atLeast) {
+    FixtureHelpers.runCommandOnEachPrimary({
+        db: testDB.getSiblingDB("admin"),
+        cmdObj: {
+            setParameter: 1,
+            "internalDocumentSourceGroupMaxMemoryBytes": memoryLimit,
+        }
+    });
+
+    FixtureHelpers.runCommandOnEachPrimary({
+        db: testDB.getSiblingDB("admin"),
+        cmdObj: {
+            setParameter: 1,
+            "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill": memoryLimit,
+        }
+    });
+
+    FixtureHelpers.runCommandOnEachPrimary({
+        db: testDB.getSiblingDB("admin"),
+        cmdObj: {
+            setParameter: 1,
+            "internalQuerySlotBasedExecutionHashAggMemoryCheckPerAdvanceAtLeast": atLeast,
+        }
+    });
+}
+
+function testWithHashAggMemoryLimit(command, resSet, memoryLimit, expectedError) {
+    try {
+        setHashAggParameters(memoryLimit, 1 /*atLeast*/);
+        if (!expectedError) {
+            checkResults(testDB.runCommand(command), resSet);
+        } else {
+            assert.commandFailedWithCode(testDB.runCommand(command), expectedError);
+        }
+    } finally {
+        setHashAggParameters(100 * 1024 * 1024 /* memoryLimit */, 1024 /* atLeast */);
     }
-});
+}
+
 resSet =
     [{_id: 0, sum: 0}, {_id: 1, sum: 3}, {_id: 2, sum: 6}, {_id: 3, sum: 9}, {_id: 4, sum: 12}];
-checkResults(testDB.runCommand({
+testWithHashAggMemoryLimit({
     aggregate: collA.getName(),
     pipeline: [{$unionWith: collB.getName()}, {"$group": {_id: "$groupKey", sum: {$sum: "$val"}}}],
     cursor: {},
     // we allow disk use to test the case where the pipeline must run on a shard in the sharded
     // passthrough.
     allowDiskUse: true
-}),
-             resSet);
+},
+                           resSet,
+                           1 /* 1MB memory limit */);
+
 // Test a $group that sums in both the inner and outer pipeline.
 resSet =
     [{_id: 0, sum: 0}, {_id: 1, sum: 21}, {_id: 2, sum: 2}, {_id: 3, sum: 3}, {_id: 4, sum: 4}];
-checkResults(testDB.runCommand({
+testWithHashAggMemoryLimit({
     aggregate: collA.getName(),
     pipeline: [
         {
@@ -163,12 +202,14 @@ checkResults(testDB.runCommand({
     ],
     allowDiskUse: true,
     cursor: {}
-}),
-             resSet);
+},
+                           resSet,
+                           1 /* 1MB memory limit */);
+
+// Test a $group in the inner pipeline.
 resSet = getDocsFromCollection(collA).concat(
     [{_id: 0, sum: 0}, {_id: 1, sum: 2}, {_id: 2, sum: 4}, {_id: 3, sum: 6}, {_id: 4, sum: 8}]);
-// Test a $group in the inner pipeline.
-checkResults(testDB.runCommand({
+testWithHashAggMemoryLimit({
     aggregate: collA.getName(),
     pipeline: [
         {
@@ -182,19 +223,20 @@ checkResults(testDB.runCommand({
     ],
     allowDiskUse: true,
     cursor: {}
-}),
-             resSet);
+},
+                           resSet,
+                           1 /* 1MB memory limit */);
 
 // Test that a $group within a $unionWith sub-pipeline correctly fails if it needs to spill but
 // 'allowDiskUse' is false.
-assert.commandFailedWithCode(testDB.runCommand({
+testWithHashAggMemoryLimit({
     aggregate: collA.getName(),
     pipeline: [
         {
             $unionWith: {
                 coll: collB.getName(),
                 pipeline: [
-                    {"$group": {_id: "$groupKey", val: {$sum: "$val"}}},
+                    {"$group": {_id: "$groupKey", val: {$min: "$val"}}},
                     {"$addFields": {groupKey: 1}}
                 ]
             }
@@ -202,17 +244,10 @@ assert.commandFailedWithCode(testDB.runCommand({
     ],
     allowDiskUse: false,
     cursor: {}
-}),
-                             ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed);
-
-// Reset to default value.
-FixtureHelpers.runCommandOnEachPrimary({
-    db: testDB.getSiblingDB("admin"),
-    cmdObj: {
-        setParameter: 1,
-        "internalDocumentSourceGroupMaxMemoryBytes": 100 * 1024 * 1024,
-    }
-});
+},
+                           {} /* resSet */,
+                           1 /* 1MB memory limit */,
+                           ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed);
 
 // Test with $limit and sort in a sub-pipeline.
 const setBResult = collB.find().sort({b: 1}).limit(2).toArray();
@@ -267,14 +302,30 @@ checkResults(testDB.runCommand({
 checkResults(testDB.runCommand({
     aggregate: collA.getName(),
     pipeline:
-        [{$unionWith: {coll: "nonExistentCollectionAlpha", pipeline: [{"$addFields": {ted: 5}}]}}],
+        [{$unionWith: {coll: "nonExistentCollectionBeta", pipeline: [{"$addFields": {ted: 5}}]}}],
     cursor: {}
 }),
              resSet);
 checkResults(testDB.runCommand({
-    aggregate: "nonExistentCollectionAlpha",
+    aggregate: "nonExistentCollectionCharlie",
     pipeline: [{$unionWith: collA.getName()}],
     cursor: {}
 }),
              resSet);
-})();
+
+// Test that $unionWith on an empty collection succeeds.
+assertDropAndRecreateCollection(testDB, "emptyCollection");
+checkResults(
+    testDB.runCommand(
+        {aggregate: "emptyCollection", pipeline: [{$unionWith: collA.getName()}], cursor: {}}),
+    resSet);
+checkResults(testDB.runCommand({
+    aggregate: collA.getName(),
+    pipeline: [{$unionWith: {coll: "emptyCollection", pipeline: [{"$addFields": {ted: 5}}]}}],
+    cursor: {}
+}),
+             resSet);
+checkResults(
+    testDB.runCommand(
+        {aggregate: "emptyCollection", pipeline: [{$unionWith: collA.getName()}], cursor: {}}),
+    resSet);

@@ -29,10 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstring>
-#include <stddef.h>
 
 #include "mongo/base/data_type.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 
 #ifndef MONGO_BASE_DATA_TYPE_H_INCLUDE_HANDSHAKE_
@@ -56,11 +57,8 @@ struct DataType::Handler<StringData> {
     // Copies `sdata` fully into the [ptr,ptr+length) range.
     // Does nothing and returns an Overflow status if
     // `sdata` doesn't fit.
-    static Status store(const StringData& sdata,
-                        char* ptr,
-                        size_t length,
-                        size_t* advanced,
-                        std::ptrdiff_t debug_offset);
+    static Status store(
+        StringData sdata, char* ptr, size_t length, size_t* advanced, std::ptrdiff_t debug_offset);
 
     static StringData defaultConstruct() {
         return StringData();

@@ -27,11 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/db/mongod_options.h"
-
 #include <iostream>
+#include <string>
+#include <vector>
 
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/db/mongod_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/quick_exit.h"
@@ -46,7 +52,7 @@ MONGO_INITIALIZER_GENERAL(MongodOptions,
                           ("EndStartupOptionValidation"))
 (InitializerContext* context) {
     if (!handlePreValidationMongodOptions(moe::startupOptionsParsed, context->args())) {
-        quickExit(EXIT_SUCCESS);
+        quickExit(ExitCode::clean);
     }
     // Run validation, but tell the Environment that we don't want it to be set as "valid",
     // since we may be making it invalid in the canonicalization process.
@@ -64,7 +70,7 @@ MONGO_INITIALIZER_GENERAL(CoreOptions_Store,
     if (!ret.isOK()) {
         std::cerr << ret.toString() << std::endl;
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
-        quickExit(EXIT_BADOPTIONS);
+        quickExit(ExitCode::badOptions);
     }
 }
 

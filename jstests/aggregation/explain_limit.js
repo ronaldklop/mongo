@@ -5,31 +5,24 @@
 // @tags: [
 //   do_not_wrap_aggregations_in_facets,
 //   requires_pipeline_optimization,
+//   # Implicit index creation may change the plan/engine used.
+//   assumes_no_implicit_index_creation,
 // ]
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For getAggPlanStages().
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
 
 let coll = db.explain_limit;
 
 const kCollSize = 105;
 const kLimit = 10;
-
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSbeFullyEnabled = checkSbeFullyEnabled(db);
 
 // Return whether or explain() was successful and contained the appropriate fields given the
 // requested verbosity. Checks that the number of documents examined and returned are correct given
 // the value of the limit.
 function checkResults({results, verbosity}) {
     const [cursorSubdocs, limitAmount] = (() => {
-        if (verbosity != "queryPlanner" && isSBEEnabled) {
+        if (verbosity != "queryPlanner" && isSbeFullyEnabled) {
             // We cannot use the "executionStats" section for SBE plans without some pre-processing,
             // since it has different explain format. To find execution stats for the LIMIT stages
             // from the "queryPlanner" section (there could be multiple of such stages if we're in a
@@ -104,4 +97,3 @@ checkResults({results: execLevel, verbosity: "executionStats"});
 
 allPlansExecLevel = coll.explain("allPlansExecution").aggregate(pipeline);
 checkResults({results: allPlansExecLevel, verbosity: "allPlansExecution"});
-})();

@@ -28,11 +28,28 @@
  */
 #pragma once
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <set>
+#include <utility>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 class SortPattern {
@@ -55,21 +72,30 @@ public:
             return isAscending == other.isAscending && fieldPath == other.fieldPath &&
                 expression == other.expression;
         }
+        bool operator!=(const SortPatternPart& other) const {
+            return !(*this == other);
+        }
     };
 
     SortPattern(const BSONObj&, const boost::intrusive_ptr<ExpressionContext>&);
 
     SortPattern(std::vector<SortPatternPart> patterns) : _sortPattern(std::move(patterns)) {
         for (auto&& patternPart : _sortPattern) {
-            if (patternPart.fieldPath)
-                _paths.insert(patternPart.fieldPath->fullPath());
+            if (patternPart.fieldPath) {
+                const auto [_, inserted] = _paths.insert(patternPart.fieldPath->fullPath());
+                uassert(7472501,
+                        str::stream() << "$sort key must not contain duplicate keys (field: '"
+                                      << patternPart.fieldPath->fullPath() << "')",
+                        inserted);
+            }
         }
     }
 
     /**
      * Write out a Document whose contents are the sort key pattern.
      */
-    Document serialize(SortKeySerialization) const;
+    Document serialize(SortKeySerialization serializationMode,
+                       const SerializationOptions& options = {}) const;
 
     /**
      * Serializes the document to BSON, only keeping the paths specified in the sort pattern.
@@ -86,6 +112,8 @@ public:
         return _sortPattern.empty();
     }
 
+    void addDependencies(DepsTracker* deps) const;
+
     /**
      * Singleton sort patterns are a special case. In memory, sort keys for singleton patterns get
      * stored as a single Value, corresponding to the single component of the sort pattern. By
@@ -100,8 +128,17 @@ public:
         return _sortPattern[idx];
     }
 
+    /**
+     * Returns true if this SortPattern is an extension of the other.
+     */
+    bool isExtensionOf(const SortPattern& other) const;
+
     bool operator==(const SortPattern& other) const {
         return _sortPattern == other._sortPattern && _paths == other._paths;
+    }
+
+    bool operator!=(const SortPattern& other) const {
+        return !(*this == other);
     }
 
     std::vector<SortPatternPart>::const_iterator begin() const {
@@ -110,6 +147,13 @@ public:
 
     std::vector<SortPatternPart>::const_iterator end() const {
         return _sortPattern.cend();
+    }
+
+    SortPatternPart front() const {
+        return _sortPattern.front();
+    }
+    SortPatternPart back() const {
+        return _sortPattern.back();
     }
 
     /**
@@ -126,6 +170,6 @@ private:
     std::vector<SortPatternPart> _sortPattern;
 
     // The set of paths on which we're sorting.
-    std::set<std::string> _paths;
+    OrderedPathSet _paths;
 };
 }  // namespace mongo

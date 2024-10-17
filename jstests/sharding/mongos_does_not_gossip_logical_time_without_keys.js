@@ -1,13 +1,15 @@
 /**
  * Tests that mongos does not gossip cluster time metadata until at least one key is created on the
  * config server, and that it does not block waiting for keys at startup.
+ * @tags: [
+ *    # TODO (SERVER-88122): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
+import "jstests/multiVersion/libs/multi_rs.js";
+import "jstests/multiVersion/libs/multi_cluster.js";
 
-(function() {
-"use strict";
-
-load("jstests/multiVersion/libs/multi_rs.js");
-load("jstests/multiVersion/libs/multi_cluster.js");  // For restartMongoses.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function assertContainsValidLogicalTime(res, check) {
     assert.hasFields(res, ["$clusterTime"]);
@@ -80,4 +82,3 @@ assert(st.s.getDB("admin").system.keys.count() >= 1,
        "expected there to be at least one generation of keys on the config server");
 
 st.stop();
-})();

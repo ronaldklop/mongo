@@ -27,12 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/sort.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/stats/resource_consumption_metrics.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -80,16 +85,10 @@ PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
 
 void SortStageDefault::loadingDone() {
     _sortExecutor.loadingDone();
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(expCtx()->opCtx);
-    metricsCollector.incrementKeysSorted(_sortExecutor.stats().keysSorted);
-    metricsCollector.incrementSorterSpills(_sortExecutor.stats().spills);
 }
 
 void SortStageSimple::loadingDone() {
     _sortExecutor.loadingDone();
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(expCtx()->opCtx);
-    metricsCollector.incrementKeysSorted(_sortExecutor.stats().keysSorted);
-    metricsCollector.incrementSorterSpills(_sortExecutor.stats().spills);
 }
 
 std::unique_ptr<PlanStageStats> SortStage::getStats() {
@@ -159,7 +158,7 @@ void SortStageSimple::spool(WorkingSetID wsid) {
 
     auto sortKey = _sortKeyGen.computeSortKeyFromDocument(member->doc.value());
 
-    _sortExecutor.add(std::move(sortKey), member->doc.value().toBson());
+    _sortExecutor.add(sortKey, member->doc.value().toBson());
     _ws->free(wsid);
 }
 

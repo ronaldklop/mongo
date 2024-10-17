@@ -4,14 +4,12 @@
  * replica set, where one of the secondaries has a higher priority than the other. The test
  * expects that that secondary gets chosen as the election handoff candidate.
  */
-
-(function() {
-"use strict";
-load("jstests/replsets/libs/election_handoff.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ElectionHandoffTest} from "jstests/replsets/libs/election_handoff.js";
 
 const testName = "election_handoff_higher_priority";
 const numNodes = 3;
-const rst = ReplSetTest({name: testName, nodes: numNodes});
+const rst = new ReplSetTest({name: testName, nodes: numNodes});
 const nodes = rst.nodeList();
 rst.startSet();
 
@@ -30,4 +28,3 @@ rst.initiate(config);
 ElectionHandoffTest.testElectionHandoff(rst, 0, 2);
 
 rst.stopSet();
-})();

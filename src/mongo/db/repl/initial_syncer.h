@@ -30,41 +30,54 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/callback_completion_guard.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/initial_sync_shared_data.h"
+#include "mongo/db/repl/initial_syncer_interface.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rollback_checker.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/executor/scoped_task_executor.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
-
-// TODO: Remove forward declares once we remove rs_initialsync.cpp and other dependents.
-// Failpoint which fails initial sync and leaves an oplog entry in the buffer.
-extern FailPoint failInitSyncWithBufferedEntriesLeft;
 
 // Failpoint which causes the initial sync function to hang before copying databases.
 extern FailPoint initialSyncHangBeforeCopyingDatabases;
@@ -77,49 +90,6 @@ struct MemberState;
 class ReplicationProcess;
 class StorageInterface;
 
-struct InitialSyncerOptions {
-    /** Function to return optime of last operation applied on this node */
-    using GetMyLastOptimeFn = std::function<OpTime()>;
-
-    /** Function to update optime of last operation applied on this node */
-    using SetMyLastOptimeFn = std::function<void(const OpTimeAndWallTime&)>;
-
-    /** Function to reset all optimes on this node (e.g. applied & durable). */
-    using ResetOptimesFn = std::function<void()>;
-
-    /** Function to sets this node into a specific follower mode. */
-    using SetFollowerModeFn = std::function<bool(const MemberState&)>;
-
-    // Retry values
-    Milliseconds syncSourceRetryWait{1000};
-    Milliseconds initialSyncRetryWait{1000};
-
-    // InitialSyncer waits this long before retrying getApplierBatchCallback() if there are
-    // currently no operations available to apply or if the 'rsSyncApplyStop' failpoint is active.
-    // This default value is based on the duration in OplogBatcher::run().
-    Milliseconds getApplierBatchCallbackRetryWait{1000};
-
-    // Replication settings
-    NamespaceString localOplogNS = NamespaceString::kRsOplogNamespace;
-    NamespaceString remoteOplogNS = NamespaceString::kRsOplogNamespace;
-
-    GetMyLastOptimeFn getMyLastOptime;
-    SetMyLastOptimeFn setMyLastOptime;
-    ResetOptimesFn resetOptimes;
-
-    SyncSourceSelector* syncSourceSelector = nullptr;
-
-    // The oplog fetcher will restart the oplog tailing query this many times on non-cancellation
-    // failures.
-    std::uint32_t oplogFetcherMaxFetcherRestarts = 0;
-
-    std::string toString() const {
-        return str::stream() << "InitialSyncerOptions -- "
-                             << " localOplogNs: " << localOplogNS.toString()
-                             << " remoteOplogNS: " << remoteOplogNS.toString();
-    }
-};
-
 /**
  * The initial syncer provides services to keep collection in sync by replicating
  * changes via an oplog source to the local system storage.
@@ -131,27 +101,15 @@ struct InitialSyncerOptions {
  * Entry Points:
  *      -- startup: Start initial sync.
  */
-class InitialSyncer {
+class InitialSyncer : public InitialSyncerInterface {
     InitialSyncer(const InitialSyncer&) = delete;
     InitialSyncer& operator=(const InitialSyncer&) = delete;
 
 public:
     /**
-     * Callback function to report last applied optime of initial sync.
-     */
-    typedef std::function<void(const StatusWith<OpTimeAndWallTime>& lastApplied)> OnCompletionFn;
-
-    /**
      * Callback completion guard for initial syncer.
      */
     using OnCompletionGuard = CallbackCompletionGuard<StatusWith<OpTimeAndWallTime>>;
-
-    /**
-     * Type of function to create a database client
-     *
-     * Used for testing only.
-     */
-    using CreateClientFn = std::function<std::unique_ptr<DBClientConnection>()>;
 
     struct InitialSyncAttemptInfo {
         int durationMillis;
@@ -194,56 +152,47 @@ public:
         Date_t initialSyncStart;
         Date_t initialSyncEnd;
         std::vector<InitialSyncer::InitialSyncAttemptInfo> initialSyncAttemptInfos;
+        std::weak_ptr<executor::TaskExecutor> exec;
 
         std::string toString() const;
         BSONObj toBSON() const;
         void append(BSONObjBuilder* builder) const;
     };
 
-    InitialSyncer(InitialSyncerOptions opts,
+    InitialSyncer(InitialSyncerInterface::Options opts,
                   std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-                  ThreadPool* writerPool,
+                  ThreadPool* workerPool,
                   StorageInterface* storage,
                   ReplicationProcess* replicationProcess,
                   const OnCompletionFn& onCompletion);
 
-    virtual ~InitialSyncer();
+    ~InitialSyncer() override;
 
     /**
      * Returns true if an initial sync is currently running or in the process of shutting down.
      */
     bool isActive() const;
 
-    /**
-     * Starts initial sync process, with the provided number of attempts
-     */
-    Status startup(OperationContext* opCtx, std::uint32_t maxAttempts) noexcept;
+    std::string getInitialSyncMethod() const final;
 
-    /**
-     * Shuts down replication if "start" has been called, and blocks until shutdown has completed.
-     */
-    Status shutdown();
+    bool allowLocalDbAccess() const final {
+        return true;
+    }
 
-    /**
-     * Block until inactive.
-     */
-    void join();
+    Status startup(OperationContext* opCtx, std::uint32_t maxAttempts) noexcept final;
+
+    Status shutdown() final;
+
+    void join() final;
 
     /**
      * Returns internal state in a loggable format.
      */
     std::string getDiagnosticString() const;
 
-    /**
-     * Returns stats about the progress of initial sync. If initial sync is not in progress it
-     * returns an empty BSON object.
-     */
-    BSONObj getInitialSyncProgress() const;
+    BSONObj getInitialSyncProgress() const final;
 
-    /**
-     * Cancels the current initial sync attempt if the initial syncer is active.
-     */
-    void cancelCurrentAttempt();
+    void cancelCurrentAttempt() final;
 
     /**
      *
@@ -323,19 +272,19 @@ private:
      * Returns true if we are still processing initial sync tasks (_state is either Running or
      * Shutdown).
      */
-    bool _isActive_inlock() const;
+    bool _isActive(WithLock lk) const;
 
     /**
      * Cancels all outstanding work.
      * Used by shutdown() and CompletionGuard::setResultAndCancelRemainingWork().
      */
-    void _cancelRemainingWork_inlock();
+    void _cancelRemainingWork(WithLock lk);
 
     /**
      * Returns true if the initial syncer has received a shutdown request (_state is ShuttingDown).
      */
     bool _isShuttingDown() const;
-    bool _isShuttingDown_inlock() const;
+    bool _isShuttingDown(WithLock lk) const;
 
     /**
      * Initial sync flowchart:
@@ -344,7 +293,7 @@ private:
      *         |
      *         |
      *         V
-     *     _setUp_inlock()
+     *     _setUp()
      *         |
      *         |
      *         V
@@ -429,13 +378,14 @@ private:
     /**
      * Sets up internal state to begin initial sync.
      */
-    void _setUp_inlock(OperationContext* opCtx, std::uint32_t initialSyncMaxAttempts);
+    void _setUp(WithLock lk, OperationContext* opCtx, std::uint32_t initialSyncMaxAttempts);
 
     /**
      * Tears down internal state before reporting final status to caller.
      */
-    void _tearDown_inlock(OperationContext* opCtx,
-                          const StatusWith<OpTimeAndWallTime>& lastApplied);
+    void _tearDown(WithLock lk,
+                   OperationContext* opCtx,
+                   const StatusWith<OpTimeAndWallTime>& lastApplied);
 
     /**
      * Callback to start a single initial sync attempt.
@@ -483,9 +433,9 @@ private:
      * will get us the optime of the oldest active transaction on that node. It will be used as the
      * beginFetchingTimestamp.
      */
-    Status _scheduleGetBeginFetchingOpTime_inlock(
-        std::shared_ptr<OnCompletionGuard> onCompletionGuard,
-        const OpTime& defaultBeginFetchingOpTime);
+    Status _scheduleGetBeginFetchingOpTime(WithLock lk,
+                                           std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+                                           const OpTime& defaultBeginFetchingOpTime);
 
     /**
      * Callback that gets the optime of the oldest active transaction in the sync source's
@@ -572,7 +522,7 @@ private:
 
     // Obtains a valid sync source from the sync source selector.
     // Returns error if a sync source cannot be found.
-    StatusWith<HostAndPort> _chooseSyncSource_inlock();
+    StatusWith<HostAndPort> _chooseSyncSource(WithLock lk);
 
     /**
      * Pushes documents from oplog fetcher to blocking queue for
@@ -585,10 +535,10 @@ private:
                              OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
-    void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;
-    BSONObj _getInitialSyncProgress_inlock() const;
+    void _appendInitialSyncProgressMinimal(WithLock lk, BSONObjBuilder* bob) const;
+    BSONObj _getInitialSyncProgress(WithLock lk) const;
 
-    StatusWith<std::vector<OplogEntry>> _getNextApplierBatch_inlock();
+    StatusWith<OplogApplierBatch> _getNextApplierBatch(WithLock lk);
 
     /**
      * Schedules a fetcher to get the last oplog entry from the sync source.
@@ -597,8 +547,9 @@ private:
      * parameter 'numInitialSyncOplogFindAttempts' times. Otherwise any failures must be handled by
      * the caller.
      */
-    Status _scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback,
-                                                 LastOplogEntryFetcherRetryStrategy retryStrategy);
+    Status _scheduleLastOplogEntryFetcher(WithLock lk,
+                                          Fetcher::CallbackFn callback,
+                                          LastOplogEntryFetcherRetryStrategy retryStrategy);
 
     /**
      * Checks the current oplog application progress (begin and end timestamps).
@@ -607,8 +558,9 @@ private:
      * we set the error status in 'onCompletionGuard' and shut down the OplogFetcher.
      * Passes 'lock' through to completion guard.
      */
-    void _checkApplierProgressAndScheduleGetNextApplierBatch_inlock(
-        const stdx::lock_guard<Latch>& lock, std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+    void _checkApplierProgressAndScheduleGetNextApplierBatch(
+        const stdx::lock_guard<stdx::mutex>& lock,
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Schedules a rollback checker to get the rollback ID after data cloning or applying. This
@@ -617,8 +569,9 @@ private:
      * and shut down the OplogFetcher.
      * Passes 'lock' through to completion guard.
      */
-    void _scheduleRollbackCheckerCheckForRollback_inlock(
-        const stdx::lock_guard<Latch>& lock, std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+    void _scheduleRollbackCheckerCheckForRollback(
+        const stdx::lock_guard<stdx::mutex>& lock,
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Check if a status is one which means there's a retriable error and we should retry the
@@ -640,28 +593,33 @@ private:
      * status will include 'message'.
      * Otherwise, returns Status::OK().
      */
-    Status _checkForShutdownAndConvertStatus_inlock(
-        const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message);
-    Status _checkForShutdownAndConvertStatus_inlock(const Status& status,
-                                                    const std::string& message);
+    Status _checkForShutdownAndConvertStatus(
+        WithLock lk,
+        const executor::TaskExecutor::CallbackArgs& callbackArgs,
+        const std::string& message);
+    Status _checkForShutdownAndConvertStatus(WithLock lk,
+                                             const Status& status,
+                                             const std::string& message);
 
     /**
      * Schedules work to be run by the task executor.
      * Saves handle if work was successfully scheduled.
      * Returns scheduleWork status (without the handle).
      */
-    Status _scheduleWorkAndSaveHandle_inlock(executor::TaskExecutor::CallbackFn work,
-                                             executor::TaskExecutor::CallbackHandle* handle,
-                                             const std::string& name);
-    Status _scheduleWorkAtAndSaveHandle_inlock(Date_t when,
-                                               executor::TaskExecutor::CallbackFn work,
-                                               executor::TaskExecutor::CallbackHandle* handle,
-                                               const std::string& name);
+    Status _scheduleWorkAndSaveHandle(WithLock lk,
+                                      executor::TaskExecutor::CallbackFn work,
+                                      executor::TaskExecutor::CallbackHandle* handle,
+                                      const std::string& name);
+    Status _scheduleWorkAtAndSaveHandle(WithLock lk,
+                                        Date_t when,
+                                        executor::TaskExecutor::CallbackFn work,
+                                        executor::TaskExecutor::CallbackHandle* handle,
+                                        const std::string& name);
 
     /**
      * Cancels task executor callback handle if not null.
      */
-    void _cancelHandle_inlock(executor::TaskExecutor::CallbackHandle handle);
+    void _cancelHandle(WithLock lk, executor::TaskExecutor::CallbackHandle handle);
 
     /**
      * Starts up component and checks initial syncer's shutdown state at the same time.
@@ -669,13 +627,13 @@ private:
      * to the component type).
      */
     template <typename Component>
-    Status _startupComponent_inlock(Component& component);
+    Status _startupComponent(WithLock lk, Component& component);
 
     /**
      * Shuts down component if not null.
      */
     template <typename Component>
-    void _shutdownComponent_inlock(Component& component);
+    void _shutdownComponent(WithLock lk, Component& component);
 
     // Counts how many documents have been refetched from the source in the current batch.
     AtomicWord<unsigned> _fetchCount;
@@ -691,8 +649,8 @@ private:
     // (MX) Must hold _mutex and be in a callback in _exec to write; must either hold
     //      _mutex or be in a callback in _exec to read.
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("InitialSyncer::_mutex");           // (S)
-    const InitialSyncerOptions _opts;                                           // (R)
+    mutable stdx::mutex _mutex;                                                 // (S)
+    const InitialSyncerInterface::Options _opts;                                // (R)
     std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (R)
     std::shared_ptr<executor::TaskExecutor> _exec;                              // (R)
     std::unique_ptr<executor::ScopedTaskExecutor> _attemptExec;                 // (X)
@@ -702,7 +660,7 @@ private:
     // NetworkInterfaceMock is unaware of this and this causes our unit tests to deadlock.
     std::shared_ptr<executor::TaskExecutor> _clonerExec;               // (R)
     std::unique_ptr<executor::ScopedTaskExecutor> _clonerAttemptExec;  // (X)
-    ThreadPool* _writerPool;                                           // (R)
+    ThreadPool* _workerPool;                                           // (R)
     StorageInterface* _storage;                                        // (R)
     ReplicationProcess* _replicationProcess;                           // (S)
 

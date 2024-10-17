@@ -3,11 +3,7 @@
  * renameCollection command when dropTarget is set to true.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/logv2_helpers.js");
-load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
+import {TwoPhaseDropCollectionTest} from "jstests/replsets/libs/two_phase_drops.js";
 
 // Return a list of all indexes for a given collection. Use 'args' as the
 // 'listIndexes' command arguments.
@@ -34,7 +30,7 @@ let replTest = twoPhaseDropTest.initReplSet();
 if (!twoPhaseDropTest.supportsDropPendingNamespaces()) {
     jsTestLog('Drop pending namespaces not supported by storage engine. Skipping test.');
     twoPhaseDropTest.stop();
-    return;
+    quit();
 }
 
 // Create the collections that will be renamed and dropped.
@@ -103,11 +99,7 @@ try {
 
     // Confirm in the logs that the renameCollection dropped the target collection on the
     // secondary using two phase collection drop.
-    if (isJsonLog(secondary)) {
-        checkLog.containsJson(secondary, 20315, {namespace: toColl.getFullName()});
-    } else {
-        checkLog.contains(secondary, new RegExp('dropCollection:.*' + toColl.getFullName()));
-    }
+    checkLog.containsJson(secondary, 20315, {namespace: toColl.getFullName()});
 
     // Rename target collection back to source collection. This helps to ensure the collection
     // metadata is updated correctly on both primary and secondary.
@@ -119,4 +111,3 @@ try {
 
     twoPhaseDropTest.stop();
 }
-}());

@@ -3,10 +3,8 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -18,7 +16,7 @@ const primary = rst.getPrimary();
 const primaryDB = primary.getDB(dbName);
 
 // Create a collection.
-assert.commandWorked(primaryDB.createCollection(collName));
+assert.commandWorked(primaryDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
 const session = primary.startSession();
 const sessionDb = session.getDatabase(dbName);
@@ -99,4 +97,3 @@ assert.commandWorked(PrepareHelpers.commitTransaction(session2, commitTs2));
 assert.sameMembers([{_id: 1}, {_id: 2}], sessionColl.find().toArray());
 
 rst.stopSet();
-}());

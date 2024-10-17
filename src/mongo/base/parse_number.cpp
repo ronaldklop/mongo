@@ -27,17 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/parse_number.h"
-
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <string>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/parse_number.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/base/status_with.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/overflow_arithmetic.h"
@@ -149,7 +152,7 @@ inline StatusWith<uint64_t> parseMagnitudeFromStringWithBase(uint64_t base,
         ++charsConsumed;
     }
     if (end)
-        *end = magnitudeStr.begin() + charsConsumed;
+        *end = magnitudeStr.data() + charsConsumed;
     if (!allowTrailingText && charsConsumed != magnitudeStr.size())
         return Status(ErrorCodes::FailedToParse, "Did not consume whole string.");
     if (charsConsumed == 0)
@@ -171,7 +174,7 @@ Status parseNumberFromStringHelper(StringData s,
     typedef ::std::numeric_limits<NumberType> limits;
 
     if (endptr)
-        *endptr = s.begin();
+        *endptr = s.data();
 
     if (parser._base == 1 || parser._base < 0 || parser._base > 36)
         return Status(ErrorCodes::BadValue, "Invalid parser._base");
@@ -215,7 +218,7 @@ Status parseNumberFromStringHelper<double>(StringData stringValue,
                                            const char** endptr,
                                            const NumberParser& parser) {
     if (endptr)
-        *endptr = stringValue.begin();
+        *endptr = stringValue.data();
     if (parser._base != 0) {
         return Status(ErrorCodes::BadValue, "NumberParser::base must be 0 for a double.");
     }
@@ -240,17 +243,17 @@ Status parseNumberFromStringHelper<double>(StringData stringValue,
         if (str == "nan"_sd) {
             *result = std::numeric_limits<double>::quiet_NaN();
             if (endptr)
-                *endptr = stringValue.end();
+                *endptr = stringValue.data() + stringValue.size();
             return Status::OK();
         } else if (str == "+infinity"_sd || str == "infinity"_sd) {
             *result = std::numeric_limits<double>::infinity();
             if (endptr)
-                *endptr = stringValue.end();
+                *endptr = stringValue.data() + stringValue.size();
             return Status::OK();
         } else if (str == "-infinity"_sd) {
             *result = -std::numeric_limits<double>::infinity();
             if (endptr)
-                *endptr = stringValue.end();
+                *endptr = stringValue.data() + stringValue.size();
             return Status::OK();
         }
 #endif  // defined(_WIN32)
@@ -261,7 +264,7 @@ Status parseNumberFromStringHelper<double>(StringData stringValue,
     }
     if (endptr) {
         size_t charsConsumed = endp - cStr;
-        *endptr = stringValue.begin() + charsConsumed;
+        *endptr = stringValue.data() + charsConsumed;
     }
     if (!parser._allowTrailingText && endp != (cStr + str.size()))
         return Status(ErrorCodes::FailedToParse, "Did not consume whole string.");
@@ -275,8 +278,8 @@ Status parseNumberFromStringHelper<Decimal128>(StringData stringValue,
                                                const char** endptr,
                                                const NumberParser& parser) {
     if (endptr)
-        *endptr = stringValue.begin();  // same behavior as strtod: if unable to parse, set end to
-                                        // be the beginning of input str
+        *endptr = stringValue.data();  // same behavior as strtod: if unable to parse, set end to
+                                       // be the beginning of input str
 
     if (parser._base != 0) {
         return Status(ErrorCodes::BadValue,

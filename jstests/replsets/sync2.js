@@ -1,8 +1,7 @@
 // Tests that nodes sync from each other properly and that nodes find new sync sources when they
 // are disconnected from their current sync source.
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var replTest = new ReplSetTest({
     name: 'sync2',
@@ -48,4 +47,3 @@ conns[4].reconnect(conns[3]);
 assert.commandWorked(primary.getDB("foo").bar.insert({x: 1}, option));
 
 replTest.stopSet();
-}());

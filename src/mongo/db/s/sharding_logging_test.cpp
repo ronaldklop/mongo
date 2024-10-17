@@ -27,39 +27,130 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+// IWYU pragma: no_include "cxxabi.h"
+#include <string>
+#include <system_error>
 
-#include "mongo/platform/basic.h"
-
-#include <vector>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_logging.h"
-#include "mongo/executor/task_executor.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/chrono.h"
-#include "mongo/stdx/future.h"
-#include "mongo/util/str.h"
-#include "mongo/util/text.h"
+#include "mongo/s/catalog/type_changelog.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
 
+using executor::RemoteCommandRequest;
 using unittest::assertGet;
 
+const auto kFooBarNss = NamespaceString::createNamespaceString_forTest(boost::none, "foo.bar");
+
 class InfoLoggingTest : public ShardServerTestFixture {
-public:
+protected:
     enum CollType { ActionLog, ChangeLog };
 
     InfoLoggingTest(CollType configCollType, int cappedSize)
         : _configCollType(configCollType), _cappedSize(cappedSize) {}
 
-protected:
+    /**
+     * Waits for an operation which creates a capped config collection with the specified name and
+     * capped size.
+     */
+    void expectConfigCollectionCreate(const HostAndPort& configHost,
+                                      StringData collName,
+                                      int cappedSize,
+                                      const BSONObj& response) {
+        onCommand([&](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS(configHost, request.target);
+            ASSERT_EQUALS(DatabaseName::kConfig, request.dbname);
+
+            BSONObj expectedCreateCmd = BSON("create" << collName << "capped" << true << "size"
+                                                      << cappedSize << "writeConcern"
+                                                      << BSON("w"
+                                                              << "majority"
+                                                              << "wtimeout" << 60000)
+                                                      << "maxTimeMS" << 30000);
+            ASSERT_BSONOBJ_EQ(expectedCreateCmd, request.cmdObj);
+
+            return response;
+        });
+    }
+
+    /**
+     * Wait for a single insert in one of the change or action log collections with the specified
+     * contents and return a successful response.
+     */
+    void expectConfigCollectionInsert(const HostAndPort& configHost,
+                                      StringData collName,
+                                      Date_t timestamp,
+                                      const std::string& what,
+                                      const NamespaceString& ns,
+                                      const BSONObj& detail) {
+        onCommand([&](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS(configHost, request.target);
+            ASSERT_EQUALS(DatabaseName::kConfig, request.dbname);
+
+            const auto opMsg = static_cast<OpMsgRequest>(request);
+            const auto batchRequest(BatchedCommandRequest::parseInsert(opMsg));
+            const auto& insertReq(batchRequest.getInsertRequest());
+
+            ASSERT_EQ(DatabaseName::kConfig.db(omitTenant), insertReq.getNamespace().db_forTest());
+            ASSERT_EQ(collName, insertReq.getNamespace().coll());
+
+            const auto& inserts = insertReq.getDocuments();
+            ASSERT_EQUALS(1U, inserts.size());
+
+            const ChangeLogType& actualChangeLog =
+                assertGet(ChangeLogType::fromBSON(inserts.front()));
+
+            ASSERT_EQUALS(operationContext()->getClient()->clientAddress(true),
+                          actualChangeLog.getClientAddr());
+            ASSERT_BSONOBJ_EQ(detail, actualChangeLog.getDetails());
+            ASSERT_EQUALS(ns, actualChangeLog.getNS());
+            const std::string expectedServer = network()->getHostName();
+            ASSERT_EQUALS(expectedServer, actualChangeLog.getServer());
+            ASSERT_EQUALS(timestamp, actualChangeLog.getTime());
+            ASSERT_EQUALS(what, actualChangeLog.getWhat());
+
+            // Handle changeId specially because there's no way to know what OID was generated
+            std::string changeId = actualChangeLog.getChangeId();
+            size_t firstDash = changeId.find('-');
+            size_t lastDash = changeId.rfind('-');
+
+            const std::string serverPiece = changeId.substr(0, firstDash);
+            const std::string timePiece = changeId.substr(firstDash + 1, lastDash - firstDash - 1);
+            const std::string oidPiece = changeId.substr(lastDash + 1);
+
+            const std::string expectedServerPiece =
+                Grid::get(operationContext())->getNetwork()->getHostName();
+            ASSERT_EQUALS(expectedServerPiece, serverPiece);
+            ASSERT_EQUALS(timestamp.toString(), timePiece);
+
+            OID generatedOID;
+            // Just make sure this doesn't throws and assume the OID is valid
+            generatedOID.init(oidPiece);
+
+            BatchedCommandResponse response;
+            response.setStatus(Status::OK());
+
+            return response.toBSON();
+        });
+    }
+
     void noRetryAfterSuccessfulCreate() {
         auto future = launchAsync([this] {
-            log("moved a chunk", "foo.bar", BSON("min" << 3 << "max" << 4)).transitional_ignore();
+            ASSERT_OK(log("moved a chunk", kFooBarNss, BSON("min" << 3 << "max" << 4)));
         });
 
         expectConfigCollectionCreate(
@@ -68,7 +159,7 @@ protected:
                                      getConfigCollName(),
                                      network()->now(),
                                      "moved a chunk",
-                                     "foo.bar",
+                                     kFooBarNss,
                                      BSON("min" << 3 << "max" << 4));
 
         // Now wait for the logChange call to return
@@ -76,15 +167,14 @@ protected:
 
         // Now log another change and confirm that we don't re-attempt to create the collection
         future = launchAsync([this] {
-            log("moved a second chunk", "foo.bar", BSON("min" << 4 << "max" << 5))
-                .transitional_ignore();
+            ASSERT_OK(log("moved a second chunk", kFooBarNss, BSON("min" << 4 << "max" << 5)));
         });
 
         expectConfigCollectionInsert(kConfigHostAndPort,
                                      getConfigCollName(),
                                      network()->now(),
                                      "moved a second chunk",
-                                     "foo.bar",
+                                     kFooBarNss,
                                      BSON("min" << 4 << "max" << 5));
 
         // Now wait for the logChange call to return
@@ -93,7 +183,7 @@ protected:
 
     void noRetryCreateIfAlreadyExists() {
         auto future = launchAsync([this] {
-            log("moved a chunk", "foo.bar", BSON("min" << 3 << "max" << 4)).transitional_ignore();
+            ASSERT_OK(log("moved a chunk", kFooBarNss, BSON("min" << 3 << "max" << 4)));
         });
 
         BSONObjBuilder createResponseBuilder;
@@ -105,7 +195,7 @@ protected:
                                      getConfigCollName(),
                                      network()->now(),
                                      "moved a chunk",
-                                     "foo.bar",
+                                     kFooBarNss,
                                      BSON("min" << 3 << "max" << 4));
 
         // Now wait for the logAction call to return
@@ -113,7 +203,7 @@ protected:
 
         // Now log another change and confirm that we don't re-attempt to create the collection
         future = launchAsync([this] {
-            log("moved a second chunk", "foo.bar", BSON("min" << 4 << "max" << 5))
+            log("moved a second chunk", kFooBarNss, BSON("min" << 4 << "max" << 5))
                 .transitional_ignore();
         });
 
@@ -121,7 +211,7 @@ protected:
                                      getConfigCollName(),
                                      network()->now(),
                                      "moved a second chunk",
-                                     "foo.bar",
+                                     kFooBarNss,
                                      BSON("min" << 4 << "max" << 5));
 
         // Now wait for the logChange call to return
@@ -130,7 +220,7 @@ protected:
 
     void createFailure() {
         auto future = launchAsync([this] {
-            log("moved a chunk", "foo.bar", BSON("min" << 3 << "max" << 4)).transitional_ignore();
+            log("moved a chunk", kFooBarNss, BSON("min" << 3 << "max" << 4)).transitional_ignore();
         });
 
         BSONObjBuilder createResponseBuilder;
@@ -144,7 +234,7 @@ protected:
 
         // Now log another change and confirm that we *do* attempt to create the collection
         future = launchAsync([this] {
-            log("moved a second chunk", "foo.bar", BSON("min" << 4 << "max" << 5))
+            log("moved a second chunk", kFooBarNss, BSON("min" << 4 << "max" << 5))
                 .transitional_ignore();
         });
 
@@ -154,7 +244,7 @@ protected:
                                      getConfigCollName(),
                                      network()->now(),
                                      "moved a second chunk",
-                                     "foo.bar",
+                                     kFooBarNss,
                                      BSON("min" << 4 << "max" << 5));
 
         // Now wait for the logChange call to return
@@ -165,7 +255,7 @@ protected:
         return (_configCollType == ChangeLog ? "changelog" : "actionlog");
     }
 
-    Status log(const std::string& what, const std::string& ns, const BSONObj& detail) {
+    Status log(const std::string& what, const NamespaceString& ns, const BSONObj& detail) {
         if (_configCollType == ChangeLog) {
             return ShardingLogging::get(operationContext())
                 ->logChangeChecked(operationContext(),
@@ -179,17 +269,18 @@ protected:
         }
     }
 
+private:
     const CollType _configCollType;
     const int _cappedSize;
 };
 
 class ActionLogTest : public InfoLoggingTest {
-public:
+protected:
     ActionLogTest() : InfoLoggingTest(ActionLog, 20 * 1024 * 1024) {}
 };
 
 class ChangeLogTest : public InfoLoggingTest {
-public:
+protected:
     ChangeLogTest() : InfoLoggingTest(ChangeLog, 200 * 1024 * 1024) {}
 };
 

@@ -27,21 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/util/concurrency/thread_pool_test_common.h"
-
+#include <absl/container/node_hash_map.h>
+#include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <cstddef>
 #include <memory>
+#include <mutex>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
+#include "mongo/util/concurrency/thread_pool_test_common.h"
 #include "mongo/util/concurrency/thread_pool_test_fixture.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -78,10 +91,7 @@ public:
     TptRegistrationAgent(const std::string& name, ThreadPoolTestCaseFactory makeTest) {
         auto& entry = threadPoolTestCaseRegistry()[name];
         if (entry) {
-            LOGV2_FATAL(34355,
-                        "Multiple attempts to register ThreadPoolTest named {name}",
-                        "Multiple attempts to register ThreadPoolTest",
-                        "name"_attr = name);
+            LOGV2_FATAL(34355, "Multiple attempts to register ThreadPoolTest", "name"_attr = name);
         }
         entry = std::move(makeTest);
     }
@@ -96,10 +106,8 @@ public:
     TptDeathRegistrationAgent(const std::string& name, ThreadPoolTestCaseFactory makeTest) {
         auto& entry = threadPoolTestCaseRegistry()[name];
         if (entry) {
-            LOGV2_FATAL(34356,
-                        "Multiple attempts to register ThreadPoolDeathTest named {name}",
-                        "Multiple attempts to register ThreadPoolDeathTest",
-                        "name"_attr = name);
+            LOGV2_FATAL(
+                34356, "Multiple attempts to register ThreadPoolDeathTest", "name"_attr = name);
         }
         entry = [makeTest](ThreadPoolFactory makeThreadPool) {
             return std::make_unique<::mongo::unittest::DeathTest<T>>(std::move(makeThreadPool));
@@ -215,10 +223,10 @@ COMMON_THREAD_POOL_TEST(RepeatedScheduleDoesntSmashStack) {
     auto& pool = getThreadPool();
     std::function<void()> func;
     std::size_t n = 0;
-    auto mutex = MONGO_MAKE_LATCH();
+    stdx::mutex mutex;
     stdx::condition_variable condvar;
     func = [&pool, &n, &func, &condvar, &mutex, depth]() {
-        stdx::unique_lock<Latch> lk(mutex);
+        stdx::unique_lock<stdx::mutex> lk(mutex);
         if (n < depth) {
             n++;
             lk.unlock();
@@ -235,7 +243,7 @@ COMMON_THREAD_POOL_TEST(RepeatedScheduleDoesntSmashStack) {
     pool.startup();
     pool.join();
 
-    stdx::unique_lock<Latch> lk(mutex);
+    stdx::unique_lock<stdx::mutex> lk(mutex);
     condvar.wait(lk, [&n, depth] { return n == depth; });
 }
 
@@ -243,7 +251,7 @@ COMMON_THREAD_POOL_TEST(RepeatedScheduleDoesntSmashStack) {
 
 void addTestsForThreadPool(const std::string& suiteName, ThreadPoolFactory makeThreadPool) {
     auto& suite = unittest::Suite::getSuite(suiteName);
-    for (auto testCase : threadPoolTestCaseRegistry()) {
+    for (const auto& testCase : threadPoolTestCaseRegistry()) {
         suite.add(str::stream() << suiteName << "::" << testCase.first,
                   __FILE__,
                   [testCase, makeThreadPool] { testCase.second(makeThreadPool)->run(); });

@@ -5,8 +5,7 @@
  * @tags: [uses_testing_only_commands]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Skip DB hash check in stopSet() since we expect it to fail in this test.
 TestData.skipCheckDBHashes = true;
@@ -20,6 +19,10 @@ const primaryDB0 = primary.getDB("db0");
 const primaryDB1 = primary.getDB("db1");
 const primaryDB2 = primary.getDB("db2");
 const collName = "testColl";
+
+// The default WC is majority and godinsert command on a secondary is incompatible with wc:majority.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const secondary = rst.getSecondary();
 const secondaryDB = secondary.getDB("db0");
@@ -40,4 +43,3 @@ assert(err.message.includes("dbhash mismatch between primary and secondary"),
        `caught error didn't mention dbhash mismatch: ${tojson(err)}`);
 
 rst.stopSet();
-})();

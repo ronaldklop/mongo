@@ -37,6 +37,8 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: "enableIndexBuildCommitQuorum"
     default: true
+    test_only: true
+    redact: false
 
   maxNumActiveUserIndexBuilds:
     description: >
@@ -52,6 +54,7 @@ server_parameters:
     default: 3
     validator:
       gte: 0
+    redact: false
 
   resumableIndexBuildMajorityOpTimeTimeoutMillis:
     description: >
@@ -66,11 +69,16 @@ server_parameters:
     cpp_vartype: long long
     cpp_varname: gResumableIndexBuildMajorityOpTimeTimeoutMillis
     default: 10000
+    redact: false
 
-  enableResumableIndexBuilds:
-    # TODO(SERVER-50745): Remove this feature flag.
-    description: "Support for using resumable index builds."
-    set_at: startup
-    cpp_vartype: bool
-    cpp_varname: "enableResumableIndexBuilds"
-    default: true
+  indexBuildMinAvailableDiskSpaceMB:
+    description: Minimum disk space required to build an index
+    set_at: [ startup, runtime ]
+    cpp_vartype: AtomicWord<long long>
+    cpp_varname: gIndexBuildMinAvailableDiskSpaceMB
+    default: 500
+    validator:
+      gte: 0
+      # This is equal to std::numeric_limits<int64_t>::max() / (1024 * 1024)
+      lte: 8796093022207
+    redact: false

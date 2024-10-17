@@ -31,8 +31,15 @@
 #include <memory>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo::sdam {
 
@@ -68,7 +75,7 @@ public:
     /**
      * Called when a ServerHeartBeatSucceededEvent is published - A heartbeat sent to the server at
      * hostAndPort succeeded. duration is the execution time of the event, including the time it
-     * took to send the message and recieve the reply from the server.
+     * took to send the message and receive the reply from the server.
      */
     virtual void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                  const BSONObj reply){};
@@ -103,19 +110,18 @@ public:
 
     void onTopologyDescriptionChangedEvent(TopologyDescriptionPtr previousDescription,
                                            TopologyDescriptionPtr newDescription) override;
-    virtual void onServerHandshakeCompleteEvent(HelloRTT duration,
-                                                const HostAndPort& address,
-                                                const BSONObj reply = BSONObj()) override;
+    void onServerHandshakeCompleteEvent(HelloRTT duration,
+                                        const HostAndPort& address,
+                                        BSONObj reply = BSONObj()) override;
 
     void onServerHandshakeFailedEvent(const HostAndPort& address,
                                       const Status& status,
-                                      const BSONObj reply);
+                                      BSONObj reply) override;
 
-    void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
-                                         const BSONObj reply) override;
+    void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort, BSONObj reply) override;
     void onServerHeartbeatFailureEvent(Status errorStatus,
                                        const HostAndPort& hostAndPort,
-                                       const BSONObj reply) override;
+                                       BSONObj reply) override;
     void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status) override;
     void onServerPingSucceededEvent(HelloRTT duration, const HostAndPort& hostAndPort) override;
 
@@ -146,15 +152,14 @@ private:
     void _scheduleNextDelivery();
 
     // Lock acquisition order to avoid deadlock is _eventQueueMutex -> _mutex
-    Mutex _eventQueueMutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(6),
-                                              "TopologyEventsPublisher::_eventQueueMutex");
+    stdx::mutex _eventQueueMutex;
     std::deque<EventPtr> _eventQueue;
 
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(5), "TopologyEventsPublisher::_mutex");
+    stdx::mutex _mutex;
     bool _isClosed = false;
     std::shared_ptr<executor::TaskExecutor> _executor;
     std::vector<TopologyListenerPtr> _listeners;
 };
+
 using TopologyEventsPublisherPtr = std::shared_ptr<TopologyEventsPublisher>;
 }  // namespace mongo::sdam

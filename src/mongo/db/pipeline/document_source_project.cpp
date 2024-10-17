@@ -27,17 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_project.h"
-
-#include <boost/optional.hpp>
+#include <algorithm>
+#include <bitset>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/exec/projection_executor.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/projection_ast.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -46,12 +54,12 @@ using boost::intrusive_ptr;
 REGISTER_DOCUMENT_SOURCE(project,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceProject::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 REGISTER_DOCUMENT_SOURCE(unset,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceProject::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 namespace {
 BSONObj buildExclusionProjectionSpecification(const std::vector<BSONElement>& unsetSpec) {

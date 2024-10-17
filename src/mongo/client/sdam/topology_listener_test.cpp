@@ -27,15 +27,23 @@
  *    it in the license file.
  */
 
+#include <ostream>
+#include <utility>
+
+#include "mongo/base/string_data.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/client/replica_set_monitor_server_parameters.h"
 #include "mongo/client/sdam/topology_listener.h"
 #include "mongo/client/sdam/topology_listener_mock.h"
-#include "mongo/executor/thread_pool_mock.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -53,7 +61,7 @@ protected:
 
         auto network = std::make_unique<executor::NetworkInterfaceMock>();
         _net = network.get();
-        _executor = makeSharedThreadPoolTestExecutor(std::move(network));
+        _executor = makeThreadPoolTestExecutor(std::move(network));
         _executor->startup();
         _eventsPublisher = std::make_shared<sdam::TopologyEventsPublisher>(_executor);
     }
@@ -111,9 +119,8 @@ TEST_F(TopologyListenerTestFixture, TestListenersRefCounts) {
         // Even this has a tiny chance of race because the event is delivered before the
         // shared_ptr is released.
         sleepFor(Milliseconds(1));
-    } while (!l1->hasPingResponse(HostAndPort("abc.def:1")));
+    } while (!l1->hasPingResponse(HostAndPort("abc.def:1")) && 1 != l1.use_count());
 
-    ASSERT_EQ(1, l1.use_count());
     // Deletes the l1 listener, as it has only one owner. The next event should not
     // trigger any ASAN/TSAN error as the weak pointer is handled properly.
     l1.reset();

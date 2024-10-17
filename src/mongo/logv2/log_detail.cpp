@@ -27,78 +27,165 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <boost/log/attributes/attribute_value.hpp>
+#include <boost/log/attributes/attribute_value_impl.hpp>
+#include <boost/log/attributes/attribute_value_set.hpp>
+#include <boost/log/core/record.hpp>
+#include <boost/smart_ptr/intrusive_ref_counter.hpp>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <fmt/format.h>
+#include <functional>
+#include <new>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <variant>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
+#ifdef _WIN32
+#include <io.h>
+#endif
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/attributes.h"
-#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_detail.h"
 #include "mongo/logv2/log_domain.h"
 #include "mongo/logv2/log_domain_internal.h"
 #include "mongo/logv2/log_options.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/logv2/log_source.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/static_immortal.h"
 #include "mongo/util/testing_proctor.h"
 
-namespace mongo::logv2::detail {
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
+
+namespace mongo::logv2 {
+namespace {
+thread_local int loggingDepth = 0;
+}  // namespace
+
+bool loggingInProgress() {
+    return loggingDepth > 0;
+}
+
+void signalSafeWriteToStderr(StringData message) {
+    while (!message.empty()) {
+#if defined(_WIN32)
+        auto ret = _write(_fileno(stderr), message.rawData(), message.size());
+#else
+        auto ret = write(STDERR_FILENO, message.rawData(), message.size());
+#endif
+        if (ret == -1) {
+            if (lastPosixError() == posixError(EINTR)) {
+                continue;
+            }
+            return;
+        }
+        message = message.substr(ret);
+    }
+}
+
+namespace detail {
+
+namespace {
+GetTenantIDFn& getTenantID() {
+    // Ensure that we avoid undefined initialization ordering
+    // when logging occurs during process init and shutdown.
+    // See logv2_test.cpp
+    static StaticImmortal<GetTenantIDFn> fn;
+    return *fn;
+}
+}  // namespace
+
+void setGetTenantIDCallback(GetTenantIDFn&& fn) {
+    getTenantID() = std::move(fn);
+}
 
 struct UnstructuredValueExtractor {
-    void operator()(StringData name, CustomAttributeValue const& val) {
+    void operator()(const char* name, CustomAttributeValue const& val) {
         // Prefer string serialization over BSON if available.
         if (val.stringSerialize) {
             fmt::memory_buffer buffer;
             val.stringSerialize(buffer);
-            _storage.push_back(fmt::to_string(buffer));
-            operator()(name, _storage.back());
+            _addString(name, fmt::to_string(buffer));
         } else if (val.toString) {
-            _storage.push_back(val.toString());
-            operator()(name, _storage.back());
+            _addString(name, val.toString());
         } else if (val.BSONAppend) {
             BSONObjBuilder builder;
             val.BSONAppend(builder, name);
-            BSONElement element = builder.done().getField(name);
-            _storage.push_back(element.toString(false));
-            operator()(name, _storage.back());
+            // BSONObj must outlive BSONElement. See BSONElement, BSONObj::getField().
+            auto obj = builder.done();
+            BSONElement element = obj.getField(name);
+            _addString(name, element.toString(false));
         } else if (val.BSONSerialize) {
             BSONObjBuilder builder;
             val.BSONSerialize(builder);
-            operator()(name, builder.done());
+            (*this)(name, builder.done());
         } else if (val.toBSONArray) {
-            operator()(name, val.toBSONArray());
+            (*this)(name, val.toBSONArray());
         }
     }
 
-    void operator()(StringData name, const BSONObj& val) {
+    void operator()(const char* name, const BSONObj& val) {
         StringBuilder ss;
         val.toString(ss, false);
-        _storage.push_back(ss.str());
-        operator()(name, _storage.back());
+        _addString(name, ss.str());
     }
 
-    void operator()(StringData name, const BSONArray& val) {
+    void operator()(const char* name, const BSONArray& val) {
         StringBuilder ss;
         val.toString(ss, true);
-        _storage.push_back(ss.str());
-        operator()(name, _storage.back());
+        _addString(name, ss.str());
     }
 
     template <typename Period>
-    void operator()(StringData name, const Duration<Period>& val) {
-        _storage.push_back(val.toString());
-        operator()(name, _storage.back());
+    void operator()(const char* name, const Duration<Period>& val) {
+        _addString(name, val.toString());
     }
 
     template <typename T>
-    void operator()(StringData name, const T& val) {
-        args.push_back(fmt::internal::make_arg<fmt::format_context>(val));
+    void operator()(const char* name, const T& val) {
+        _args.push_back(fmt::arg(name, std::cref(val)));
     }
 
-    boost::container::small_vector<fmt::basic_format_arg<fmt::format_context>,
-                                   constants::kNumStaticAttrs>
-        args;
+    void reserve(size_t n) {
+        _args.reserve(n, n);
+    }
+
+    const auto& args() const {
+        return _args;
+    }
 
 private:
+    void _addString(const char* name, std::string&& val) {
+        (*this)(name, _storage.emplace_back(std::move(val)));
+    }
+
+    fmt::dynamic_format_arg_store<fmt::format_context> _args;
     std::deque<std::string> _storage;
 };
 
@@ -116,21 +203,28 @@ static void checkUniqueAttrs(int32_t id, const TypeErasedAttributeStorage& attrs
         StringData sep;
         std::string msg;
         for (auto&& a : attrs) {
-            msg.append(sep.rawData(), sep.size())
-                .append("\"")
-                .append(a.name.rawData(), a.name.size())
-                .append("\"");
+            msg.append(format(FMT_STRING(R"({}"{}")"), sep, a.name));
             sep = ","_sd;
         }
         uasserted(4793301, format(FMT_STRING("LOGV2 (id={}) attribute collision: [{}]"), id, msg));
     }
 }
 
-void doLogImpl(int32_t id,
+void doSafeLog(int32_t id,
                LogSeverity const& severity,
                LogOptions const& options,
                StringData message,
                TypeErasedAttributeStorage const& attrs) {
+
+    signalSafeWriteToStderr(
+        format(FMT_STRING("{}({}): {}\n"), severity.toStringData(), id, message));
+}
+
+void _doLogImpl(int32_t id,
+                LogSeverity const& severity,
+                LogOptions const& options,
+                StringData message,
+                TypeErasedAttributeStorage const& attrs) {
     dassert(options.component() != LogComponent::kNumLogComponents);
     // TestingProctor isEnabled cannot be called before it has been
     // initialized. But log statements occurring earlier than that still need
@@ -144,6 +238,7 @@ void doLogImpl(int32_t id,
     auto record = source.open_record(id,
                                      severity,
                                      options.component(),
+                                     options.service(),
                                      options.tags(),
                                      options.truncation(),
                                      options.uassertErrorCode());
@@ -159,7 +254,48 @@ void doLogImpl(int32_t id,
                 new boost::log::attributes::attribute_value_impl<TypeErasedAttributeStorage>(
                     attrs)));
 
+        if (auto fn = getTenantID()) {
+            auto tenant = fn();
+            if (!tenant.empty()) {
+                record.attribute_values().insert(
+                    attributes::tenant(),
+                    boost::log::attribute_value(
+                        new boost::log::attributes::attribute_value_impl<std::string>(tenant)));
+            }
+        }
+
         source.push_record(std::move(record));
+    }
+}
+
+void doLogImpl(int32_t id,
+               LogSeverity const& severity,
+               LogOptions const& options,
+               StringData message,
+               TypeErasedAttributeStorage const& attrs) {
+    if (loggingInProgress()) {
+        doSafeLog(id, severity, options, message, attrs);
+        return;
+    }
+
+    loggingDepth++;
+    ScopeGuard updateDepth = [] {
+        loggingDepth--;
+    };
+
+    try {
+        _doLogImpl(id, severity, options, message, attrs);
+    } catch (const fmt::format_error& ex) {
+        _doLogImpl(4638200,
+                   LogSeverity::Error(),
+                   LogOptions(LogComponent::kAssert),
+                   "Exception during log"_sd,
+                   AttributeStorage{"original_msg"_attr = message, "what"_attr = ex.what()});
+
+        invariant(!kDebugBuild, format(FMT_STRING("Exception during log: {}"), ex.what()));
+    } catch (...) {
+        doSafeLog(id, severity, options, message, attrs);
+        throw;
     }
 }
 
@@ -169,13 +305,14 @@ void doUnstructuredLogImpl(LogSeverity const& severity,  // NOLINT
                            TypeErasedAttributeStorage const& attrs) {
 
     UnstructuredValueExtractor extractor;
-    extractor.args.reserve(attrs.size());
+    extractor.reserve(attrs.size());
     attrs.apply(extractor);
-    auto formatted = fmt::vformat(
-        to_string_view(message),
-        fmt::basic_format_args<fmt::format_context>(extractor.args.data(), extractor.args.size()));
+    auto formatted =
+        fmt::vformat(std::string_view{message.rawData(), message.size()}, extractor.args());
 
     doLogImpl(0, severity, options, formatted, TypeErasedAttributeStorage());
 }
 
-}  // namespace mongo::logv2::detail
+}  // namespace detail
+
+}  // namespace mongo::logv2

@@ -1,13 +1,6 @@
 /**
  * Tests some practical use cases of the $facet stage.
  */
-(function() {
-"use strict";
-
-load("jstests/noPassthrough/libs/server_parameter_helpers.js");  // For setParameterOnAllHosts.
-load("jstests/libs/discover_topology.js");                       // For findDataBearingNodes.
-
-const dbName = "test";
 const collName = jsTest.name();
 
 Random.setRandomSeed();
@@ -123,4 +116,13 @@ assert.eq(facetRes.length, 1);
 const scoreRank = facetRes[0]['scoreRank'];
 assert.eq(scoreRank.length, 1);
 assert.eq(scoreRank[0]['count'], 2);
-}());
+
+// Fix for SERVER-57599. Make sure this facet does not crash.
+coll.drop();
+assert.commandWorked(coll.insert({"_id": 5, "title": "cakes and oranges"}));
+coll.aggregate([{
+    $facet: {
+        "manufacturers": [{"$sortByCount": "$manufacturer"}, {"$sort": {"count": -1, "_id": 1}}],
+        "autoBucketedPrices": [{"$bucketAuto": {"groupBy": "$price", "buckets": 5}}]
+    }
+}]);

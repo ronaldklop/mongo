@@ -4,111 +4,50 @@ Import("env")
 
 env = env.Clone()
 
-env.Library(
-    target='deferred_writer',
+env.CppUnitTest(
+    target="lock_manager_test",
     source=[
-        'deferred_writer.cpp',
+        "fast_map_noalloc_test.cpp",
+        "fill_locker_info_test.cpp",
+        "lock_manager_test.cpp",
+        "lock_stats_test.cpp",
+        "locker_test.cpp",
+        "resource_catalog_test.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/catalog/collection',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        "$BUILD_DIR/mongo/db/auth/authmocks",
+        "$BUILD_DIR/mongo/db/query/query_stats/query_stats",
+        "$BUILD_DIR/mongo/db/service_context_non_d",
+        "$BUILD_DIR/mongo/db/service_context_test_fixture",
+        "$BUILD_DIR/mongo/transport/transport_layer_common",
+        "$BUILD_DIR/mongo/transport/transport_layer_mock",
+        "exception_util",
+        "lock_manager",
     ],
 )
 
-env.Library(
-    target='write_conflict_exception',
+env.CppUnitTest(
+    target="exception_util_test",
     source=[
-        'write_conflict_exception.cpp',
-        'write_conflict_exception.idl',
+        "exception_util_test.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/server_parameter',
-        '$BUILD_DIR/mongo/util/fail_point',
-        '$BUILD_DIR/mongo/util/log_and_backoff',
-    ],
-)
-
-env.Library(
-    target='lock_manager_defs',
-    source=[
-        'lock_manager_defs.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
-    target='lock_manager',
-    source=[
-        'd_concurrency.cpp',
-        'lock_manager.cpp',
-        'lock_state.cpp',
-        'lock_stats.cpp',
-        'replication_state_transition_lock_guard.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/util/background_job',
-        '$BUILD_DIR/mongo/util/concurrency/spin_lock',
-        '$BUILD_DIR/mongo/util/concurrency/ticketholder',
-        '$BUILD_DIR/third_party/shim_boost',
-        'lock_manager_defs',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
-        '$BUILD_DIR/mongo/db/concurrency/flow_control_ticketholder',
-    ],
-)
-
-env.Library(
-    target='flow_control_ticketholder',
-    source=[
-        'flow_control_ticketholder.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_TYPEINFO=[
-        '$BUILD_DIR/mongo/db/service_context',
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
+        "$BUILD_DIR/mongo/transport/transport_layer_mock",
+        "exception_util",
     ],
 )
 
 env.Benchmark(
-    target='lock_manager_bm',
+    target="lock_manager_bm",
     source=[
-        'd_concurrency_bm.cpp',
+        "lock_manager_bm.cpp",
     ],
     LIBDEPS=[
-        'lock_manager',
-    ])
-
-env.CppUnitTest(
-    target='db_concurrency_test',
-    source=[
-        'd_concurrency_test.cpp',
-        'fast_map_noalloc_test.cpp',
-        'lock_manager_test.cpp',
-        'lock_state_test.cpp',
-        'lock_stats_test.cpp',
+        "$BUILD_DIR/mongo/db/service_context_non_d",
+        "lock_manager",
     ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/curop',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-        '$BUILD_DIR/mongo/transport/transport_layer_common',
-        '$BUILD_DIR/mongo/transport/transport_layer_mock',
-        '$BUILD_DIR/mongo/util/progress_meter',
-        'lock_manager',
-        'write_conflict_exception',
-    ]
+    CONSOLIDATED_TARGET="first_half_bm",
 )
+
+env.PrettyPrinterTest(target="lock_gdb_test.py")

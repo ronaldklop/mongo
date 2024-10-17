@@ -9,12 +9,10 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
-load('jstests/noPassthrough/libs/index_build.js');
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -29,6 +27,9 @@ replTest.initiate(config);
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "reconstruct_prepared_transactions_initial_sync_index_build";
@@ -77,7 +78,7 @@ jsTest.log("Hanging index build on the primary node");
 IndexBuildTest.pauseIndexBuilds(primary);
 
 jsTest.log("Beginning index build");
-IndexBuildTest.startIndexBuild(primary, testColl.getFullName(), {a: 1});
+let awaitIndexBuild = IndexBuildTest.startIndexBuild(primary, testColl.getFullName(), {a: 1});
 
 let session = primary.startSession();
 let sessionDB = session.getDatabase(dbName);
@@ -123,9 +124,9 @@ jsTestLog("Committing the transaction");
 
 assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
 replTest.awaitReplication();
+awaitIndexBuild();
 
 // Make sure that we can see the data from the committed transaction on the secondary.
-assert.docEq(secondaryColl.findOne({_id: 1}), {_id: 1, a: 2});
+assert.docEq({_id: 1, a: 2}, secondaryColl.findOne({_id: 1}));
 
 replTest.stopSet();
-})();

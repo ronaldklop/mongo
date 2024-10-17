@@ -27,9 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/mock_ns_targeter.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -66,7 +78,8 @@ MockNSTargeter::MockNSTargeter(const NamespaceString& nss, std::vector<MockRange
     ASSERT(!_mockRanges.empty());
 }
 
-std::vector<ShardEndpoint> MockNSTargeter::_targetQuery(const BSONObj& query) const {
+std::vector<ShardEndpoint> MockNSTargeter::_targetQuery(const BSONObj& query,
+                                                        std::set<ChunkRange>* chunkRanges) const {
     const ChunkRange queryRange(parseRange(query));
 
     std::vector<ShardEndpoint> endpoints;
@@ -74,6 +87,9 @@ std::vector<ShardEndpoint> MockNSTargeter::_targetQuery(const BSONObj& query) co
     for (const auto& range : _mockRanges) {
         if (queryRange.overlapWith(range.range)) {
             endpoints.push_back(range.endpoint);
+            if (chunkRanges) {
+                chunkRanges->emplace(range.range);
+            }
         }
     }
 
@@ -83,8 +99,10 @@ std::vector<ShardEndpoint> MockNSTargeter::_targetQuery(const BSONObj& query) co
 
 void assertEndpointsEqual(const ShardEndpoint& endpointA, const ShardEndpoint& endpointB) {
     ASSERT_EQUALS(endpointA.shardName, endpointB.shardName);
-    ASSERT_EQUALS(endpointA.shardVersion->toLong(), endpointB.shardVersion->toLong());
-    ASSERT_EQUALS(endpointA.shardVersion->epoch(), endpointB.shardVersion->epoch());
+    ASSERT_EQUALS(endpointA.shardVersion->placementVersion().toLong(),
+                  endpointB.shardVersion->placementVersion().toLong());
+    ASSERT_EQUALS(endpointA.shardVersion->placementVersion().epoch(),
+                  endpointB.shardVersion->placementVersion().epoch());
 }
 
 }  // namespace mongo

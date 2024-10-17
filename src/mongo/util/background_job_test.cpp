@@ -27,15 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <mutex>
+#include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -108,13 +110,13 @@ TEST(BackgroundJobLifeCycle, Go) {
     public:
         Job() : _hasRun(false) {}
 
-        virtual std::string name() const {
+        std::string name() const override {
             return "BackgroundLifeCycle::CannotCallGoAgain";
         }
 
-        virtual void run() {
+        void run() override {
             {
-                stdx::lock_guard<Latch> lock(_mutex);
+                stdx::lock_guard<stdx::mutex> lock(_mutex);
                 ASSERT_FALSE(_hasRun);
                 _hasRun = true;
             }
@@ -127,7 +129,7 @@ TEST(BackgroundJobLifeCycle, Go) {
         }
 
     private:
-        Mutex _mutex = MONGO_MAKE_LATCH("Job::_mutex");
+        stdx::mutex _mutex;
         bool _hasRun;
         Notification<void> _n;
     };

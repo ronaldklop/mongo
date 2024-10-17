@@ -27,21 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/drop_database_gen.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -62,22 +79,20 @@ public:
         }
         void doCheckAuthorization(OperationContext* opCtx) const final {
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Not authorized to drop database '" << request().getDbName()
-                                  << "'",
+                    str::stream() << "Not authorized to drop database '"
+                                  << request().getDbName().toStringForErrorMsg() << "'",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnNamespace(NamespaceString(request().getDbName()),
-                                                            ActionType::dropDatabase));
+                        ->isAuthorizedForActionsOnNamespace(ns(), ActionType::dropDatabase));
         }
         Reply typedRun(OperationContext* opCtx) final {
             auto dbName = request().getDbName();
-            auto nss = NamespaceString(dbName);
 
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop the config database",
-                    dbName != NamespaceString::kConfigDb);
+                    dbName != DatabaseName::kConfig);
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop the admin database",
-                    dbName != NamespaceString::kAdminDb);
+                    dbName != DatabaseName::kAdmin);
             uassert(ErrorCodes::BadValue,
                     "Must pass 1 as the 'dropDatabase' parameter",
                     request().getCommandParameter() == 1);
@@ -94,13 +109,14 @@ public:
                 // Send it to the primary shard
                 ShardsvrDropDatabase dropDatabaseCommand;
                 dropDatabaseCommand.setDbName(dbName);
+                generic_argument_util::setMajorityWriteConcern(dropDatabaseCommand,
+                                                               &opCtx->getWriteConcern());
 
-                auto cmdResponse = executeCommandAgainstDatabasePrimary(
+                auto cmdResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
                     opCtx,
                     dbName,
                     dbInfo,
-                    CommandHelpers::appendMajorityWriteConcern(dropDatabaseCommand.toBSON({}),
-                                                               opCtx->getWriteConcern()),
+                    dropDatabaseCommand.toBSON(),
                     ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                     Shard::RetryPolicy::kIdempotent);
 
@@ -112,7 +128,8 @@ public:
             return {};
         }
     };
-} clusterDropDatabaseCmd;
+};
+MONGO_REGISTER_COMMAND(DropDatabaseCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

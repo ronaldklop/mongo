@@ -1,9 +1,8 @@
 // Certain commands should be run-able from arbiters under localhost, but not from
 // any other nodes in the replset.
-// SERVER-48314: Disabled for ephemeralForTest due to lacking timestamp support
-// @tags: [requires_replication, incompatible_with_eft]
+// @tags: [requires_replication]
 
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "arbiter_localhost_test";
 const key = "jstests/libs/key1";
@@ -73,4 +72,3 @@ for (var testCase of testCases) {
 }
 
 replTest.stopSet();
-})();

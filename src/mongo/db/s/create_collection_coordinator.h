@@ -29,109 +29,286 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/create_collection_coordinator_document_gen.h"
+#include "mongo/db/s/participant_block_gen.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class CreateCollectionCoordinator final : public ShardingDDLCoordinator {
-public:
-    using CoordDoc = CreateCollectionCoordinatorDocument;
-    using Phase = CreateCollectionCoordinatorPhaseEnum;
+namespace create_collection_util {
+/**
+ * Returns the optimization strategy for building initial chunks based on the input parameters
+ * and the collection state.
+ *
+ * If dataShard is specified, isUnsplittable must be true, because we can only select the shard
+ * that will hold the data for unsplittable collections.
+ */
+std::unique_ptr<InitialSplitPolicy> createPolicy(
+    OperationContext* opCtx,
+    const ShardKeyPattern& shardKeyPattern,
+    bool presplitHashedZones,
+    std::vector<TagsType> tags,
+    size_t numShards,
+    bool collectionIsEmpty,
+    bool isUnsplittable,
+    boost::optional<ShardId> dataShard,
+    boost::optional<std::vector<ShardId>> availableShardIds = boost::none);
 
-    CreateCollectionCoordinator(const BSONObj& initialState);
-    ~CreateCollectionCoordinator() = default;
+/**
+ * Generates, using a ShardsvrCreateCollectionRequest as source, a CreateCommand that
+ * can be used with the command execution framework to create a collection on this
+ * shard server.
+ *
+ * TODO(SERVER-81447): build CreateCommand by simply extracting CreateCollectionRequest
+ * from ShardsvrCreateCollectionRequest. Also, see SERVER-65865.
+ */
+CreateCommand makeCreateCommand(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const ShardsvrCreateCollectionRequest& request);
+
+}  // namespace create_collection_util
+
+// This interface allows the retrieval of the outcome of a shardCollection request (which may be
+// served by different types of Coordinator)
+class CreateCollectionResponseProvider {
+public:
+    virtual const ShardsvrCreateCollectionRequest& getOriginalRequest() = 0;
+    virtual CreateCollectionResponse getResult(OperationContext* opCtx) = 0;
+    virtual ~CreateCollectionResponseProvider() {}
+};
+
+struct OptionsAndIndexes {
+    BSONObj options;
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+};
+
+// TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
+class CreateCollectionCoordinatorLegacy
+    : public RecoverableShardingDDLCoordinator<CreateCollectionCoordinatorDocumentLegacy,
+                                               CreateCollectionCoordinatorPhaseLegacyEnum>,
+      public CreateCollectionResponseProvider {
+public:
+    using CoordDoc = CreateCollectionCoordinatorDocumentLegacy;
+    using Phase = CreateCollectionCoordinatorPhaseLegacyEnum;
+
+    CreateCollectionCoordinatorLegacy(ShardingDDLCoordinatorService* service,
+                                      const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "CreateCollectionCoordinator", initialState),
+          _request(_doc.getShardsvrCreateCollectionRequest()),
+          _critSecReason(BSON("command"
+                              << "createCollection"
+                              << "ns"
+                              << NamespaceStringUtil::serialize(
+                                     originalNss(), SerializationContext::stateDefault()))) {}
+
+    ~CreateCollectionCoordinatorLegacy() override = default;
 
 
     void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
     /**
      * Waits for the termination of the parent DDLCoordinator (so all the resources are liberated)
      * and then return the
      */
-    CreateCollectionResponse getResult(OperationContext* opCtx) {
-        getCompletionFuture().get(opCtx);
-        invariant(_result.is_initialized());
-        return *_result;
-    }
+    CreateCollectionResponse getResult(OperationContext* opCtx) override;
+
+    const ShardsvrCreateCollectionRequest& getOriginalRequest() override {
+        return _request;
+    };
+
+protected:
+    const NamespaceString& nss() const override;
 
 private:
+    StringData serializePhase(const Phase& phase) const override {
+        return CreateCollectionCoordinatorPhaseLegacy_serializer(phase);
+    }
+
+    OptionsAndIndexes _getCollectionOptionsAndIndexes(OperationContext* opCtx,
+                                                      const NamespaceStringOrUUID& nssOrUUID);
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
+    ExecutorFuture<void> _cleanupOnAbort(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                         const CancellationToken& token,
+                                         const Status& status) noexcept override;
 
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
+    TranslatedRequestParams _translateRequestParameters(OperationContext* opCtx);
+
+    const mongo::ShardsvrCreateCollectionRequest _request;
+
+    const BSONObj _critSecReason;
+
+    // Set on successful completion of the coordinator
+    boost::optional<CreateCollectionResponse> _result;
+
+    // The fields below are only populated if the coordinator enters in the branch where the
+    // collection is not already sharded (i.e., they will not be present on early return)
+
+    boost::optional<UUID> _collectionUUID;
+
+    std::unique_ptr<InitialSplitPolicy> _splitPolicy;
+    boost::optional<InitialSplitPolicy::ShardCollectionConfig> _initialChunks;
+    boost::optional<bool> _collectionEmpty;
+};
+
+class CreateCollectionCoordinator
+    : public RecoverableShardingDDLCoordinator<CreateCollectionCoordinatorDocument,
+                                               CreateCollectionCoordinatorPhaseEnum>,
+      public CreateCollectionResponseProvider {
+public:
+    using CoordDoc = CreateCollectionCoordinatorDocument;
+    using Phase = CreateCollectionCoordinatorPhaseEnum;
+
+    CreateCollectionCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "CreateCollectionCoordinator", initialState),
+          _request(_doc.getShardsvrCreateCollectionRequest()),
+          _critSecReason(BSON("command"
+                              << "createCollection"
+                              << "ns"
+                              << NamespaceStringUtil::serialize(
+                                     originalNss(), SerializationContext::stateDefault()))) {}
+
+    ~CreateCollectionCoordinator() override = default;
+
+
+    void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
+
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
+
+    CreateCollectionResponse getResult(OperationContext* opCtx) override;
+
+    const ShardsvrCreateCollectionRequest& getOriginalRequest() override {
+        return _request;
     };
 
-    void _insertCoordinatorDocument(CoordDoc&& doc);
-    void _updateCoordinatorDocument(CoordDoc&& newStateDoc);
-    void _removeCoordinatorDocument();
-    void _enterPhase(Phase newState);
+protected:
+    const NamespaceString& nss() const override;
 
-    /**
-     * Performs all required checks before holding the critical sections.
-     */
-    void _checkCommandArguments(OperationContext* opCtx);
+private:
+    StringData serializePhase(const Phase& phase) const override {
+        return CreateCollectionCoordinatorPhase_serializer(phase);
+    }
 
-    /**
-     * Ensures the collection is created locally and has the appropiate shard index.
-     */
-    void _createCollectionAndIndexes(OperationContext* opCtx);
+    bool _mustAlwaysMakeProgress() override;
 
-    /**
-     * Given the appropiate split policy, create the initial chunks.
-     */
-    void _createPolicyAndChunks(OperationContext* opCtx);
+    ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                  const CancellationToken& token) noexcept override;
 
-    /**
-     * If the optimized path can be taken, ensure the collection is already created in all the
-     * participant shards.
-     */
-    void _createCollectionOnNonPrimaryShards(OperationContext* opCtx);
+    ExecutorFuture<void> _cleanupOnAbort(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                         const CancellationToken& token,
+                                         const Status& status) noexcept override;
 
-    /**
-     * Does the following writes:
-     * 1. Updates the config.collections entry for the new sharded collection
-     * 2. Updates config.chunks entries for the new sharded collection
-     */
-    void _commit(OperationContext* opCtx);
+    // Check the command arguments passed and validate that the collection has not been tracked from
+    // another request.
+    void _checkPreconditions();
 
-    /**
-     * Refresh all participant shards and log creation.
-     */
-    void _finalize(OperationContext* opCtx) noexcept;
+    // Enter to the critical section on the coordinator for the namespace and its buckets namespace.
+    // Only blocks writes.
+    void _enterWriteCriticalSectionOnCoordinator();
 
-    CreateCollectionCoordinatorDocument _doc;
+    // Translate the request parameters and persist them in the coordinator document.
+    void _translateRequestParameters();
 
-    // Objects generated on each execution.
-    boost::optional<ShardKeyPattern> _shardKeyPattern;
-    boost::optional<BSONObj> _collation;
-    boost::optional<UUID> _collectionUUID;
-    std::unique_ptr<InitialSplitPolicy> _splitPolicy;
-    InitialSplitPolicy::ShardCollectionConfig _initialChunks;
+    // Enter to the critical section on the coordinator for the namespace and its buckets namespace.
+    // Only blocks writes. Additionally, checks if the collection is empty and sets the
+    // collectionExistsAndIsEmpty parameter on the coordiantor document.
+    void _enterWriteCriticalSectionOnDataShardAndCheckCollectionEmpty(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& token);
+
+    // Clone the indexes from the data shard to the coordinator. This ensures that the coordinator
+    // has the most up to date indexes.
+    void _syncIndexesOnCoordinator(const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+                                   const CancellationToken& token);
+
+    // Ensure that the collection is created locally and build the shard key index if necessary.
+    void _createCollectionOnCoordinator(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& token);
+
+    // Enter to the critical section on the specified shards. Blocks writes and reads.
+    void _enterCriticalSectionOnShards(
+        OperationContext* opCtx,
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& token,
+        const NamespaceString& nss,
+        const std::vector<ShardId>& shardIds,
+        CriticalSectionBlockTypeEnum blockType);
+
+    // Enter to the critical section on all the shards. Blocks writes and reads.
+    void _enterCriticalSection(const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+                               const CancellationToken& token);
+
+    // Fetches the collection options and indexes from the specified shard.
+    OptionsAndIndexes _getCollectionOptionsAndIndexes(OperationContext* opCtx,
+                                                      const ShardId& fromShard);
+
+    // Broadcast create collection to the other shards.
+    void _createCollectionOnParticipants(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    // Commits the create collection operation to the sharding catalog within a transaction.
+    void _commitOnShardingCatalog(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    // Ensure that the change stream event gets emitted and install the new filtering metadata.
+    void _setPostCommitMetadata(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    // Exit from the critical section on all the shards, unblocking reads and writes. On the
+    // participant shards, it is set to clear the filtering metadata after exiting the critical
+    // section.
+    void _exitCriticalSection(const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+                              const CancellationToken& token);
+
+    // Exit critical sections on participant shards.
+    void _exitCriticalSectionOnShards(OperationContext* opCtx,
+                                      bool throwIfReasonDiffers,
+                                      std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                      const CancellationToken& token,
+                                      const std::vector<ShardId>& shardIds);
+
+    const mongo::ShardsvrCreateCollectionRequest _request;
+
+    const BSONObj _critSecReason;
+
+    // Set on successful completion of the coordinator
     boost::optional<CreateCollectionResponse> _result;
+
+    // The fields below are populated on the first execution. They will need to be re-calculated on
+    // following executions of the coordinator in case of error.
+    boost::optional<UUID> _uuid;
+    boost::optional<bool> _collectionEmpty;
+    boost::optional<InitialSplitPolicy::ShardCollectionConfig> _initialChunks;
 };
 
 }  // namespace mongo

@@ -27,18 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/pipeline/document_source_internal_convert_bucket_index_stats.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/list_indexes_gen.h"
+#include "mongo/db/pipeline/document_source_internal_convert_bucket_index_stats.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/timeseries/timeseries_field_names.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -79,20 +89,19 @@ BSONObj makeTimeseriesIndexStats(const TimeseriesConversionOptions& bucketSpec,
     BSONObjBuilder builder;
     for (const auto& elem : bucketsIndexStatsBSON) {
         if (elem.fieldNameStringData() == ListIndexesReplyItem::kKeyFieldName) {
-            auto timeseriesKey = timeseries::createTimeseriesIndexSpecFromBucketsIndexSpec(
-                timeseriesOptions, elem.Obj());
-            if (!timeseriesKey) {
-                return {};
-            }
-            builder.append(ListIndexesReplyItem::kKeyFieldName, *timeseriesKey);
+            // This field is appended below.
             continue;
         }
         if (elem.fieldNameStringData() == ListIndexesReplyItem::kSpecFieldName) {
-            auto timeseriesSpec = makeTimeseriesIndexStats(bucketSpec, elem.Obj());
-            if (timeseriesSpec.isEmpty()) {
+            auto timeseriesSpec =
+                timeseries::createTimeseriesIndexFromBucketsIndex(timeseriesOptions, elem.Obj());
+            if (!timeseriesSpec) {
                 return {};
             }
-            builder.append("spec", timeseriesSpec);
+
+            builder.append(ListIndexesReplyItem::kSpecFieldName, *timeseriesSpec);
+            builder.append(ListIndexesReplyItem::kKeyFieldName,
+                           timeseriesSpec->getObjectField(IndexDescriptor::kKeyPatternFieldName));
             continue;
         }
         builder.append(elem);
@@ -105,7 +114,7 @@ BSONObj makeTimeseriesIndexStats(const TimeseriesConversionOptions& bucketSpec,
 REGISTER_DOCUMENT_SOURCE(_internalConvertBucketIndexStats,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceInternalConvertBucketIndexStats::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kInternal);
+                         AllowedWithApiStrict::kInternal);
 
 DocumentSourceInternalConvertBucketIndexStats::DocumentSourceInternalConvertBucketIndexStats(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -147,11 +156,13 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalConvertBucketIndexSta
 }
 
 Value DocumentSourceInternalConvertBucketIndexStats::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+    const SerializationOptions& opts) const {
     MutableDocument out;
-    out.addField(timeseries::kTimeFieldName, Value{_timeseriesOptions.timeField});
+    out.addField(timeseries::kTimeFieldName,
+                 Value{opts.serializeFieldPathFromString(_timeseriesOptions.timeField)});
     if (_timeseriesOptions.metaField) {
-        out.addField(timeseries::kMetaFieldName, Value{*_timeseriesOptions.metaField});
+        out.addField(timeseries::kMetaFieldName,
+                     Value{opts.serializeFieldPathFromString(*_timeseriesOptions.metaField)});
     }
     return Value(DOC(getSourceName() << out.freeze()));
 }

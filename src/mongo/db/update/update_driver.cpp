@@ -29,27 +29,36 @@
 
 #include "mongo/db/update/update_driver.h"
 
+#include <boost/move/utility_core.hpp>
+#include <set>
+#include <string>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/field_ref.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/update/delta_executor.h"
 #include "mongo/db/update/modifier_table.h"
 #include "mongo/db/update/object_replace_executor.h"
+#include "mongo/db/update/object_transform_executor.h"
 #include "mongo/db/update/path_support.h"
-#include "mongo/db/update/storage_validation.h"
-#include "mongo/db/update/update_oplog_entry_version.h"
-#include "mongo/stdx/variant.h"
-#include "mongo/util/embedded_builder.h"
+#include "mongo/db/update/pipeline_executor.h"
+#include "mongo/db/update/update_object_node.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/str.h"
-#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
@@ -85,19 +94,7 @@ bool parseUpdateExpression(
     const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters) {
     bool positional = false;
     std::set<std::string> foundIdentifiers;
-    bool foundVersionField = false;
     for (auto&& mod : updateExpr) {
-        // If there is a "$v" field among the modifiers, it should have already been used by the
-        // caller to determine that this is the correct parsing function.
-        if (mod.fieldNameStringData() == kUpdateOplogEntryVersionFieldName) {
-            uassert(
-                ErrorCodes::BadValue, "Duplicate $v in oplog update document", !foundVersionField);
-            foundVersionField = true;
-            invariant(mod.numberLong() ==
-                      static_cast<long long>(UpdateOplogEntryVersion::kUpdateNodeV1));
-            continue;
-        }
-
         auto modType = validateMod(mod);
         for (auto&& field : mod.Obj()) {
             auto statusWithPositional = UpdateObjectNode::parseAndMerge(
@@ -131,7 +128,7 @@ void UpdateDriver::parse(
 
     if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
         uassert(ErrorCodes::FailedToParse,
-                "arrayFilters may not be specified for pipeline-syle updates",
+                "arrayFilters may not be specified for pipeline-style updates",
                 arrayFilters.empty());
         _updateExecutor =
             std::make_unique<PipelineExecutor>(_expCtx, updateMod.getUpdatePipeline(), constants);
@@ -141,50 +138,60 @@ void UpdateDriver::parse(
 
     if (updateMod.type() == write_ops::UpdateModification::Type::kDelta) {
         uassert(4772603,
-                "arrayFilters may not be specified for delta-syle updates",
+                "arrayFilters may not be specified for delta-style updates",
                 arrayFilters.empty());
 
         _updateType = UpdateType::kDelta;
-        _updateExecutor = std::make_unique<DeltaExecutor>(updateMod.getDiff());
+        _updateExecutor = std::make_unique<DeltaExecutor>(
+            updateMod.getDiff(), updateMod.mustCheckExistenceForInsertOperations());
         return;
     }
 
     uassert(51198, "Constant values may only be specified for pipeline updates", !constants);
 
     // Check if the update expression is a full object replacement.
-    if (isDocReplacement(updateMod)) {
+    if (updateMod.type() == write_ops::UpdateModification::Type::kReplacement) {
         uassert(ErrorCodes::FailedToParse,
                 "multi update is not supported for replacement-style update",
                 !multi);
 
-        _updateExecutor = std::make_unique<ObjectReplaceExecutor>(updateMod.getUpdateClassic());
+        // For updates that originated from the oplog, we're required to apply the update
+        // exactly as it was recorded (even if it contains zero-valued timestamps). Therefore,
+        // we should only replace zero-valued timestamps with the current time when both
+        // '_bypassEmptyTsReplacement' and '_fromOplogApplication' are false.
+        const bool bypassEmptyTsReplacement = _bypassEmptyTsReplacement || _fromOplogApplication;
+
+        _updateExecutor = std::make_unique<ObjectReplaceExecutor>(updateMod.getUpdateReplacement(),
+                                                                  bypassEmptyTsReplacement);
 
         // Register the fact that this driver will only do full object replacements.
         _updateType = UpdateType::kReplacement;
         return;
     }
 
-    invariant(_updateType == UpdateType::kOperator);
+    if (updateMod.type() == write_ops::UpdateModification::Type::kTransform) {
+        uassert(5857811, "multi update is not supported for transform-style update", !multi);
 
-    // By this point we are expecting a "classic" update. This version of mongod only supports $v:
-    // 1 (modifier language) and $v: 2 (delta) (older versions support $v: 0). We've already
-    // checked whether this is a delta update so we check that the $v field isn't present, or has a
-    // value of 1.
+        uassert(5857812,
+                "arrayFilters may not be specified for transform-style updates",
+                arrayFilters.empty());
 
-    auto updateExpr = updateMod.getUpdateClassic();
-    BSONElement versionElement = updateExpr[kUpdateOplogEntryVersionFieldName];
-    if (versionElement) {
-        uassert(ErrorCodes::FailedToParse,
-                "The $v update field is only recognized internally",
-                _fromOplogApplication);
-
-        // The UpdateModification should have verified that the value of $v is valid.
-        invariant(versionElement.numberInt() ==
-                  static_cast<int>(UpdateOplogEntryVersion::kUpdateNodeV1));
+        _updateType = UpdateType::kTransform;
+        _updateExecutor = std::make_unique<ObjectTransformExecutor>(updateMod.getTransform());
+        return;
     }
 
+    invariant(_updateType == UpdateType::kOperator);
+
+    // By this point we are expecting a "kModifier" update. This version of mongod only supports
+    // $v: 2 (delta) (older versions support $v: 0 and $v: 1). We've already checked whether
+    // this is a delta update, so we verify that we're not on the oplog application path.
+    tassert(5030100,
+            "An oplog update can only be of type 'kReplacement' or 'kDelta'",
+            !_fromOplogApplication);
     auto root = std::make_unique<UpdateObjectNode>();
-    _positional = parseUpdateExpression(updateExpr, root.get(), _expCtx, arrayFilters);
+    _positional =
+        parseUpdateExpression(updateMod.getUpdateModifier(), root.get(), _expCtx, arrayFilters);
     _updateExecutor = std::make_unique<UpdateTreeExecutor>(std::move(root));
 }
 
@@ -195,28 +202,24 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     // We canonicalize the query to collapse $and/$or, and the namespace is not needed.  Also,
     // because this is for the upsert case, where we insert a new document if one was not found, the
     // $where/$text clauses do not make sense, hence empty ExtensionsCallback.
-    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString(""));
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString::kEmpty);
     findCommand->setFilter(query);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     // $expr is not allowed in the query for an upsert, since it is not clear what the equality
     // extraction behavior for $expr should be.
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx,
-                                     std::move(findCommand),
-                                     false,
-                                     expCtx,
-                                     ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
+    auto allowedFeatures = MatchExpressionParser::kAllowAllSpecialFeatures &
+        ~MatchExpressionParser::AllowedFeatures::kExpr;
+    auto statusWithCQ = CanonicalQuery::make(
+        {.expCtx = makeExpressionContext(opCtx, *findCommand),
+         .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                               .allowedFeatures = allowedFeatures}});
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
-    std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-    return populateDocumentWithQueryFields(*cq, immutablePaths, doc);
+    auto cq = std::move(statusWithCQ.getValue());
+    return populateDocumentWithQueryFields(*cq->getPrimaryMatchExpression(), immutablePaths, doc);
 }
 
-Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query,
+Status UpdateDriver::populateDocumentWithQueryFields(const MatchExpression& query,
                                                      const FieldRefSet& immutablePaths,
                                                      mutablebson::Document& doc) const {
     EqualityMatches equalities;
@@ -224,11 +227,10 @@ Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query
 
     if (_updateType == UpdateType::kReplacement) {
         // Extract only immutable fields.
-        status =
-            pathsupport::extractFullEqualityMatches(*query.root(), immutablePaths, &equalities);
+        status = pathsupport::extractFullEqualityMatches(query, immutablePaths, &equalities);
     } else {
         // Extract all fields from op-style update.
-        status = pathsupport::extractEqualityMatches(*query.root(), &equalities);
+        status = pathsupport::extractEqualityMatches(query, &equalities);
     }
 
     if (!status.isOK())
@@ -249,35 +251,25 @@ Status UpdateDriver::update(OperationContext* opCtx,
                             FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = _updateType == UpdateType::kReplacement && _indexedFields != nullptr;
-
     _logDoc.reset();
 
     UpdateExecutor::ApplyParams applyParams(doc->root(), immutablePaths);
     applyParams.matchedField = matchedField;
     applyParams.insert = isInsert;
     applyParams.fromOplogApplication = _fromOplogApplication;
+    applyParams.skipDotsDollarsCheck = _skipDotsDollarsCheck;
     applyParams.validateForStorage = validateForStorage;
-    applyParams.indexData = _indexedFields;
     applyParams.modifiedPaths = modifiedPaths;
     // The supplied 'modifiedPaths' must be an empty set.
     invariant(!modifiedPaths || modifiedPaths->empty());
 
+    if (!opCtx->isEnforcingConstraints()) {
+        applyParams.skipDotsDollarsCheck = true;
+        applyParams.validateForStorage = false;
+    }
+
     if (_logOp && logOpRec) {
-        const auto& fcvState = serverGlobalParams.featureCompatibility;
-
-        // Updates may be run as part of the startup sequence, before the global FCV state has been
-        // initialized. We conservatively do not permit the use of $v:2 oplog entries in these
-        // situations.
-
-        // TODO SERVER-51075: Remove FCV check for $v:2 delta oplog entries.
-        const bool fcvAllowsV2Entries = fcvState.isVersionInitialized() &&
-            fcvState.isGreaterThanOrEqualTo(
-                ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
-
-        applyParams.logMode = fcvAllowsV2Entries && internalQueryEnableLoggingV2OplogEntries.load()
-            ? ApplyParams::LogMode::kGenerateOplogEntry
-            : ApplyParams::LogMode::kGenerateOnlyV1OplogEntry;
+        applyParams.logMode = ApplyParams::LogMode::kGenerateOplogEntry;
 
         if (MONGO_unlikely(hangAfterPipelineUpdateFCVCheck.shouldFail()) &&
             type() == UpdateType::kPipeline) {
@@ -288,10 +280,6 @@ Status UpdateDriver::update(OperationContext* opCtx,
 
     invariant(_updateExecutor);
     auto applyResult = _updateExecutor->applyUpdate(applyParams);
-    if (applyResult.indexesAffected) {
-        _affectIndices = true;
-        doc->disableInPlaceUpdates();
-    }
     if (docWasModified) {
         *docWasModified = !applyResult.noop;
     }
@@ -300,6 +288,9 @@ Status UpdateDriver::update(OperationContext* opCtx,
         *logOpRec = applyResult.oplogEntry;
     }
 
+    _containsDotsAndDollarsField =
+        (_containsDotsAndDollarsField || applyResult.containsDotsAndDollarsField);
+
     return Status::OK();
 }
 
@@ -307,12 +298,6 @@ void UpdateDriver::setCollator(const CollatorInterface* collator) {
     if (_updateExecutor) {
         _updateExecutor->setCollator(collator);
     }
-}
-
-bool UpdateDriver::isDocReplacement(const write_ops::UpdateModification& updateMod) {
-    return (updateMod.type() == write_ops::UpdateModification::Type::kClassic &&
-            *updateMod.getUpdateClassic().firstElementFieldName() != '$') ||
-        updateMod.type() == write_ops::UpdateModification::Type::kPipeline;
 }
 
 }  // namespace mongo

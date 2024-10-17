@@ -1,13 +1,14 @@
 """Wrapper for OS Service Wrappers."""
+
 import importlib
 import os
 import sys
 import time
 
-from buildscripts.resmokelib.powercycle.lib.process_control import ProcessControl
 from buildscripts.resmokelib.powercycle.lib import execute_cmd
+from buildscripts.resmokelib.powercycle.lib.process_control import ProcessControl
 
-_IS_WINDOWS = sys.platform == "win32" or sys.platform == "cygwin"
+_IS_WINDOWS = sys.platform in ["win32", "cygwin"]
 
 
 def _try_import(module, name=None):
@@ -24,8 +25,6 @@ def _try_import(module, name=None):
 
 if _IS_WINDOWS:
     # These modules are used on both sides for dumping python stacks.
-    import win32api
-    import win32event
 
     # These modules are used on the 'server' side.
     _try_import("ntsecuritycon")
@@ -37,7 +36,7 @@ if _IS_WINDOWS:
     _try_import("win32serviceutil")
 
 
-# pylint: disable=undefined-variable,unused-variable,too-many-instance-attributes
+# pylint: disable=undefined-variable,unused-variable
 class WindowsService(object):
     """Windows service control class."""
 
@@ -66,9 +65,14 @@ class WindowsService(object):
         if self.status() in list(self._states.values()):
             return 1, "Service '{}' already installed, status: {}".format(self.name, self.status())
         try:
-            win32serviceutil.InstallService(pythonClassString="Service.{}".format(
-                self.name), serviceName=self.name, displayName=self.name, startType=self.start_type,
-                                            exeName=self.bin_path, exeArgs=self.bin_options)
+            win32serviceutil.InstallService(
+                pythonClassString="Service.{}".format(self.name),
+                serviceName=self.name,
+                displayName=self.name,
+                startType=self.start_type,
+                exeName=self.bin_path,
+                exeArgs=self.bin_options,
+            )
             ret = 0
             output = "Service '{}' created".format(self.name)
         except pywintypes.error as err:
@@ -82,9 +86,14 @@ class WindowsService(object):
         if self.status() not in self._states.values():
             return 1, "Service update '{}' status: {}".format(self.name, self.status())
         try:
-            win32serviceutil.ChangeServiceConfig(pythonClassString="Service.{}".format(
-                self.name), serviceName=self.name, displayName=self.name, startType=self.start_type,
-                                                 exeName=self.bin_path, exeArgs=self.bin_options)
+            win32serviceutil.ChangeServiceConfig(
+                pythonClassString="Service.{}".format(self.name),
+                serviceName=self.name,
+                displayName=self.name,
+                startType=self.start_type,
+                exeName=self.bin_path,
+                exeArgs=self.bin_options,
+            )
             ret = 0
             output = "Service '{}' updated".format(self.name)
         except pywintypes.error as err:
@@ -162,7 +171,8 @@ class WindowsService(object):
             #   (scvType, svcState, svcControls, err, svcErr, svcCP, svcWH)
             # See https://msdn.microsoft.com/en-us/library/windows/desktop/ms685996(v=vs.85).aspx
             scv_type, svc_state, svc_controls, err, svc_err, svc_cp, svc_wh = (
-                win32serviceutil.QueryServiceStatus(serviceName=self.name))
+                win32serviceutil.QueryServiceStatus(serviceName=self.name)
+            )
             if svc_state in self._states:
                 return self._states[svc_state]
             return "unknown"
@@ -191,15 +201,15 @@ class PosixService(object):
         self.db_path = db_path
         self.pids = []
 
-    def create(self):  # pylint: disable=no-self-use
+    def create(self):
         """Simulate create service. Returns (code, output) tuple."""
         return 0, None
 
-    def update(self):  # pylint: disable=no-self-use
+    def update(self):
         """Simulate update service. Returns (code, output) tuple."""
         return 0, None
 
-    def delete(self):  # pylint: disable=no-self-use
+    def delete(self):
         """Simulate delete service. Returns (code, output) tuple."""
         return 0, None
 

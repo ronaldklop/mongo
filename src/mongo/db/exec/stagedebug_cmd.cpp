@@ -27,39 +27,60 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/base/init.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/database.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/client.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/delete.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/delete_stage.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/limit.h"
 #include "mongo/db/exec/merge_sort.h"
 #include "mongo/db/exec/or.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/skip.h"
-#include "mongo/db/exec/sort.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index/fts_access_method.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/expression_text_base.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -106,27 +127,30 @@ class StageDebugCmd : public BasicCommand {
 public:
     StageDebugCmd() : BasicCommand("stageDebug") {}
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
+
     std::string help() const override {
         return {};
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        // Command is testing-only, and can only be enabled at command line.  Hence, no auth
-        // check needed.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        // Command is test-only, and can only be enabled on command line. See docs/test_commands.md.
+        // Hence, no auth check needed.
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
+             BSONObjBuilder& result) override {
         BSONElement argElt = cmdObj["stageDebug"];
         if (argElt.eoo() || !argElt.isABSONObj()) {
             return false;
@@ -139,9 +163,9 @@ public:
             return false;
         }
 
-        const NamespaceString nss(dbname, collElt.String());
+        const NamespaceString nss(NamespaceStringUtil::deserialize(dbName, collElt.String()));
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << nss.toString() << " is not a valid namespace",
+                str::stream() << nss.toStringForErrorMsg() << " is not a valid namespace",
                 nss.isValid());
 
         auto expCtx = make_intrusive<ExpressionContext>(
@@ -151,13 +175,15 @@ public:
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
-        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+        const auto collection = acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+            MODE_IX);
 
         // Make sure the collection is valid.
-        const auto& collection = autoColl.getCollection();
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "Couldn't find collection " << nss.ns(),
-                collection);
+                str::stream() << "Couldn't find collection " << nss.toStringForErrorMsg(),
+                collection.exists());
 
         // Pull out the plan
         BSONElement planElt = argObj["plan"];
@@ -182,7 +208,7 @@ public:
             plan_executor_factory::make(expCtx,
                                         std::move(ws),
                                         std::move(rootFetch),
-                                        &collection,
+                                        collection,
                                         PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                         false /* whether owned BSON must be returned */);
         fassert(28536, statusWithPlanExecutor.getStatus());
@@ -201,11 +227,12 @@ public:
     }
 
     PlanStage* parseQuery(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                          const CollectionPtr& collection,
+                          CollectionAcquisition collection,
                           BSONObj obj,
                           WorkingSet* workingSet,
                           const NamespaceString& nss,
                           std::vector<std::unique_ptr<MatchExpression>>* exprs) {
+        const auto& collectionPtr = collection.getCollectionPtr();
         OperationContext* opCtx = expCtx->opCtx;
 
         BSONElement firstElt = obj.firstElement();
@@ -232,7 +259,7 @@ public:
                 auto statusWithMatcher =
                     MatchExpressionParser::parse(argObj,
                                                  expCtx,
-                                                 ExtensionsCallbackReal(opCtx, &collection->ns()),
+                                                 ExtensionsCallbackReal(opCtx, &collection.nss()),
                                                  MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithMatcher.isOK()) {
                     return nullptr;
@@ -240,7 +267,7 @@ public:
                 std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
                 // exprs is what will wind up deleting this.
                 matcher = me.get();
-                verify(nullptr != matcher);
+                MONGO_verify(nullptr != matcher);
                 exprs->push_back(std::move(me));
             } else if (argsTag == e.fieldName()) {
                 nodeArgs = argObj;
@@ -260,8 +287,8 @@ public:
                 // This'll throw if it's not an obj but that's OK.
                 BSONObj keyPatternObj = keyPatternElement.Obj();
                 std::vector<const IndexDescriptor*> indexes;
-                collection->getIndexCatalog()->findIndexesByKeyPattern(
-                    opCtx, keyPatternObj, false, &indexes);
+                collectionPtr->getIndexCatalog()->findIndexesByKeyPattern(
+                    opCtx, keyPatternObj, IndexCatalog::InclusionPolicy::kReady, &indexes);
                 uassert(16890,
                         str::stream() << "Can't find index: " << keyPatternObj,
                         !indexes.empty());
@@ -277,18 +304,18 @@ public:
                         str::stream() << "Index 'name' must be a string in: " << nodeArgs,
                         nodeArgs["name"].type() == BSONType::String);
                 StringData name = nodeArgs["name"].valueStringData();
-                desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
+                desc = collectionPtr->getIndexCatalog()->findIndexByName(opCtx, name);
                 uassert(40223, str::stream() << "Can't find index: " << name.toString(), desc);
             }
 
-            IndexScanParams params(opCtx, desc);
+            IndexScanParams params(opCtx, collectionPtr, desc);
             params.bounds.isSimpleRange = true;
             params.bounds.startKey = BSONObj::stripFieldNames(nodeArgs["startKey"].Obj());
             params.bounds.endKey = BSONObj::stripFieldNames(nodeArgs["endKey"].Obj());
             params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
                 nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
             params.direction = nodeArgs["direction"].numberInt();
-            params.shouldDedup = desc->getEntry()->isMultikey();
+            params.shouldDedup = desc->getEntry()->isMultikey(opCtx, collectionPtr);
 
             return new IndexScan(expCtx.get(), collection, params, workingSet, matcher);
         } else if ("andHash" == nodeName) {
@@ -460,6 +487,6 @@ public:
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(StageDebugCmd);
+MONGO_REGISTER_COMMAND(StageDebugCmd).testOnly().forShard();
 
 }  // namespace mongo

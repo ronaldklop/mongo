@@ -27,18 +27,46 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
@@ -60,11 +88,21 @@ public:
 
         setupShards({shard});
 
-        CollectionType shardedCollection(shardedNS(), OID::gen(), Date_t::now(), UUID::gen());
-        shardedCollection.setKeyPattern(BSON("x" << 1));
+        CollectionType shardedCollection(
+            shardedNS(), OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1));
 
         ASSERT_OK(insertToConfigCollection(
             operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
+
+        CollectionType unsplittableCollection(unshardedNS(),
+                                              OID::gen(),
+                                              Timestamp(1, 2),
+                                              Date_t::now(),
+                                              UUID::gen(),
+                                              BSON("_id" << 1));
+        unsplittableCollection.setUnsplittable(true);
+        ASSERT_OK(insertToConfigCollection(
+            operationContext(), CollectionType::ConfigNS, unsplittableCollection.toBSON()));
     }
 
     /**
@@ -82,7 +120,7 @@ public:
      */
     void assertNoZoneDocWithNamespace(NamespaceString ns) {
         auto findStatus = findOneOnConfigCollection(
-            operationContext(), TagsType::ConfigNS, BSON("ns" << ns.toString()));
+            operationContext(), TagsType::ConfigNS, BSON("ns" << ns.toString_forTest()));
         ASSERT_EQ(ErrorCodes::NoMatchingDocument, findStatus);
     }
 
@@ -116,11 +154,11 @@ public:
     }
 
     NamespaceString shardedNS() const {
-        return NamespaceString("test.foo");
+        return NamespaceString::createNamespaceString_forTest("test.foo");
     }
 
     NamespaceString unshardedNS() const {
-        return NamespaceString("unsharded.coll");
+        return NamespaceString::createNamespaceString_forTest("unsharded.coll");
     }
 
     std::string zoneName() const {
@@ -224,13 +262,14 @@ TEST_F(AssignKeyRangeToZoneTestFixture, RemoveZoneWithDollarPrefixedShardKeysSho
 
     // Manually insert a zone with illegal keys in order to bypass the checks performed by
     // assignKeyRangeToZone
-    BSONObj updateQuery(BSON("_id" << BSON(TagsType::ns(shardedNS().ns())
+    BSONObj updateQuery(BSON("_id" << BSON(TagsType::ns(shardedNS().toString_forTest())
                                            << TagsType::min(zoneWithDollarKeys.getMin()))));
 
     BSONObjBuilder updateBuilder;
-    updateBuilder.append(
-        "_id", BSON(TagsType::ns(shardedNS().ns()) << TagsType::min(zoneWithDollarKeys.getMin())));
-    updateBuilder.append(TagsType::ns(), shardedNS().ns());
+    updateBuilder.append("_id",
+                         BSON(TagsType::ns(shardedNS().toString_forTest())
+                              << TagsType::min(zoneWithDollarKeys.getMin())));
+    updateBuilder.append(TagsType::ns(), shardedNS().ns_forTest());
     updateBuilder.append(TagsType::min(), zoneWithDollarKeys.getMin());
     updateBuilder.append(TagsType::max(), zoneWithDollarKeys.getMax());
     updateBuilder.append(TagsType::tag(), "TestZone");
@@ -257,9 +296,9 @@ TEST_F(AssignKeyRangeToZoneTestFixture, RemoveZoneWithDollarPrefixedShardKeysSho
 }
 
 TEST_F(AssignKeyRangeToZoneTestFixture, MinThatIsAShardKeyPrefixShouldConvertToFullShardKey) {
-    NamespaceString ns("compound.shard");
-    CollectionType shardedCollection(ns, OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1 << "y" << 1));
+    NamespaceString ns = NamespaceString::createNamespaceString_forTest("compound.shard");
+    CollectionType shardedCollection(
+        ns, OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1 << "y" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -274,9 +313,9 @@ TEST_F(AssignKeyRangeToZoneTestFixture, MinThatIsAShardKeyPrefixShouldConvertToF
 }
 
 TEST_F(AssignKeyRangeToZoneTestFixture, MaxThatIsAShardKeyPrefixShouldConvertToFullShardKey) {
-    NamespaceString ns("compound.shard");
-    CollectionType shardedCollection(ns, OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1 << "y" << 1));
+    NamespaceString ns = NamespaceString::createNamespaceString_forTest("compound.shard");
+    CollectionType shardedCollection(
+        ns, OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1 << "y" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -326,9 +365,9 @@ TEST_F(AssignKeyRangeToZoneTestFixture, MinMaxThatIsNotAShardKeyPrefixShouldFail
 }
 
 TEST_F(AssignKeyRangeToZoneTestFixture, MinMaxThatIsAShardKeyPrefixShouldSucceed) {
-    NamespaceString ns("compound.shard");
-    CollectionType shardedCollection(ns, OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1 << "y" << 1));
+    NamespaceString ns = NamespaceString::createNamespaceString_forTest("compound.shard");
+    CollectionType shardedCollection(
+        ns, OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1 << "y" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -361,6 +400,66 @@ TEST_F(AssignKeyRangeToZoneTestFixture, PrefixIsNotAllowedOnUnshardedColl) {
         DBException,
         ErrorCodes::ShardKeyNotFound);
     assertNoZoneDoc();
+}
+
+TEST_F(AssignKeyRangeToZoneTestFixture, TimeseriesCollMustHaveTimeKeyRangeMinKey) {
+    const NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("test.system.buckets.timeseries");
+    const StringData metaField = "meta"_sd;
+    const StringData timeField = "time"_sd;
+    const std::string controlTimeField =
+        timeseries::kControlMinFieldNamePrefix.toString() + timeField;
+    const TimeseriesOptions timeseriesOptions(timeField.toString());
+    CollectionType shardedCollection(ns,
+                                     OID::gen(),
+                                     Timestamp(1, 1),
+                                     Date_t::now(),
+                                     UUID::gen(),
+                                     BSON(metaField << 1 << controlTimeField << 1));
+    TypeCollectionTimeseriesFields timeseriesFields;
+    timeseriesFields.setTimeseriesOptions(timeseriesOptions);
+    shardedCollection.setTimeseriesFields(timeseriesFields);
+
+    ASSERT_OK(insertToConfigCollection(
+        operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
+
+    const ChunkRange newRange1(BSON(metaField << 1 << controlTimeField << 1),
+                               BSON(metaField << 10 << controlTimeField << 10));
+    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
+                           ->assignKeyRangeToZone(operationContext(), ns, newRange1, zoneName()),
+                       DBException,
+                       ErrorCodes::InvalidOptions);
+    assertNoZoneDoc();
+
+    const ChunkRange newRange2(BSON(metaField << 1 << controlTimeField << 1),
+                               BSON(metaField << 10 << controlTimeField << MAXKEY));
+    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
+                           ->assignKeyRangeToZone(operationContext(), ns, newRange2, zoneName()),
+                       DBException,
+                       ErrorCodes::InvalidOptions);
+    assertNoZoneDoc();
+
+    const ChunkRange newRange3(BSON(metaField << 1 << controlTimeField << MINKEY),
+                               BSON(metaField << 10 << controlTimeField << 10));
+    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
+                           ->assignKeyRangeToZone(operationContext(), ns, newRange3, zoneName()),
+                       DBException,
+                       ErrorCodes::InvalidOptions);
+    assertNoZoneDoc();
+
+    const ChunkRange newRange4(BSON(metaField << 1 << controlTimeField << MINKEY),
+                               BSON(metaField << 10 << controlTimeField << MAXKEY));
+    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
+                           ->assignKeyRangeToZone(operationContext(), ns, newRange4, zoneName()),
+                       DBException,
+                       ErrorCodes::InvalidOptions);
+    assertNoZoneDoc();
+
+    const ChunkRange newRange5(BSON(metaField << 1 << controlTimeField << MINKEY),
+                               BSON(metaField << 10 << controlTimeField << MINKEY));
+    ShardingCatalogManager::get(operationContext())
+        ->assignKeyRangeToZone(operationContext(), ns, newRange5, zoneName());
+    assertOnlyZone(ns, newRange5, zoneName());
 }
 
 /**
@@ -465,9 +564,12 @@ TEST_F(AssignKeyRangeWithOneRangeFixture, NewRangeOverlappingInsideExistingShoul
  *           0123456789
  */
 TEST_F(AssignKeyRangeWithOneRangeFixture, NewRangeOverlappingWithDifferentNSShouldSucceed) {
-    CollectionType shardedCollection(
-        NamespaceString("other.coll"), OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1));
+    CollectionType shardedCollection(NamespaceString::createNamespaceString_forTest("other.coll"),
+                                     OID::gen(),
+                                     Timestamp(1, 1),
+                                     Date_t::now(),
+                                     UUID::gen(),
+                                     BSON("x" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -533,7 +635,8 @@ TEST_F(AssignKeyRangeWithOneRangeFixture,
     shard.setHost("b:1234");
     shard.setTags({"y"});
 
-    ASSERT_OK(insertToConfigCollection(operationContext(), ShardType::ConfigNS, shard.toBSON()));
+    ASSERT_OK(insertToConfigCollection(
+        operationContext(), NamespaceString::kConfigsvrShardsNamespace, shard.toBSON()));
 
     ASSERT_THROWS_CODE(
         ShardingCatalogManager::get(operationContext())
@@ -685,9 +788,9 @@ TEST_F(AssignKeyRangeWithOneRangeFixture, RemoveWithInvalidMaxShardKeyShouldFail
 }
 
 TEST_F(AssignKeyRangeWithOneRangeFixture, RemoveWithPartialMinPrefixShouldRemoveRange) {
-    NamespaceString ns("compound.shard");
-    CollectionType shardedCollection(ns, OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1 << "y" << 1));
+    NamespaceString ns = NamespaceString::createNamespaceString_forTest("compound.shard");
+    CollectionType shardedCollection(
+        ns, OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1 << "y" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -708,9 +811,9 @@ TEST_F(AssignKeyRangeWithOneRangeFixture, RemoveWithPartialMinPrefixShouldRemove
 }
 
 TEST_F(AssignKeyRangeWithOneRangeFixture, RemoveWithPartialMaxPrefixShouldRemoveRange) {
-    NamespaceString ns("compound.shard");
-    CollectionType shardedCollection(ns, OID::gen(), Date_t::now(), UUID::gen());
-    shardedCollection.setKeyPattern(BSON("x" << 1 << "y" << 1));
+    NamespaceString ns = NamespaceString::createNamespaceString_forTest("compound.shard");
+    CollectionType shardedCollection(
+        ns, OID::gen(), Timestamp(1, 1), Date_t::now(), UUID::gen(), BSON("x" << 1 << "y" << 1));
 
     ASSERT_OK(insertToConfigCollection(
         operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));

@@ -27,18 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
 
 #include <iostream>
 #include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/set_index_commit_quorum_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -53,9 +77,9 @@ namespace {
  *     commitQuorum: "majority" / 3 / {"replTagName": "replTagValue"},
  * }
  */
-class SetIndexCommitQuorumCommand final : public TypedCommand<SetIndexCommitQuorumCommand> {
+class SetIndexCommitQuorumCommand : public BasicCommand {
 public:
-    using Request = SetIndexCommitQuorum;
+    SetIndexCommitQuorumCommand() : BasicCommand("setIndexCommitQuorum") {}
 
     std::string help() const override {
         std::stringstream ss;
@@ -79,47 +103,59 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    class Invocation final : public InvocationBase {
-    public:
-        using InvocationBase::InvocationBase;
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
+        return true;
+    }
 
-        void typedRun(OperationContext* opCtx) {
-            BSONObj cmdObj = request().toBSON(BSONObj());
-            LOGV2_DEBUG(22757,
-                        1,
-                        "setIndexCommitQuorum",
-                        "namespace"_attr = request().getNamespace(),
-                        "command"_attr = redact(cmdObj));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(nss),
+                                                    ActionType::createIndex)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
 
-            scatterGatherOnlyVersionIfUnsharded(
-                opCtx,
-                request().getNamespace(),
-                applyReadWriteConcern(
-                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
-                ReadPreferenceSetting::get(opCtx),
-                Shard::RetryPolicy::kNotIdempotent);
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+        LOGV2_DEBUG(
+            22757, 1, "setIndexCommitQuorum", logAttrs(nss), "command"_attr = redact(cmdObj));
+
+        auto cri =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
+            opCtx,
+            nss.dbName(),
+            nss,
+            cri,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kNotIdempotent,
+            BSONObj() /*query*/,
+            BSONObj() /*collation*/,
+            boost::none /*letParameters*/,
+            boost::none /*runtimeConstants*/);
+
+        std::string errmsg;
+        const bool ok =
+            appendRawResponses(opCtx, &errmsg, &result, std::move(shardResponses)).responseOK;
+        CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
+
+        if (ok) {
+            LOGV2(5688700, "Index commit quorums set", logAttrs(nss));
         }
 
-    private:
-        NamespaceString ns() const override {
-            return request().getNamespace();
-        }
-
-        bool supportsWriteConcern() const override {
-            return true;
-        }
-
-        void doCheckAuthorization(OperationContext* opCtx) const override {
-            uassert(ErrorCodes::Unauthorized,
-                    "Unauthorized",
-                    AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(
-                            ResourcePattern::forExactNamespace(request().getNamespace()),
-                            ActionType::createIndex));
-        }
-    };
-
-} setCommitQuorumCmd;
+        return ok;
+    }
+};
+MONGO_REGISTER_COMMAND(SetIndexCommitQuorumCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

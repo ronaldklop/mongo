@@ -27,13 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include "mongo/base/init.h"
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/service_context.h"
-#include "mongo/transport/transport_layer_asio.h"
-
-#include <iostream>
+#include "mongo/transport/asio/asio_transport_layer.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager_impl.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -42,12 +45,14 @@ namespace {
 
 ServiceContext::ConstructorActionRegisterer registerEgressTransportLayer{
     "ConfigureEgressTransportLayer", [](ServiceContext* sc) {
-        invariant(!sc->getTransportLayer());
-        transport::TransportLayerASIO::Options opts;
-        opts.mode = transport::TransportLayerASIO::Options::kEgress;
-        sc->setTransportLayer(std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
-        uassertStatusOK(sc->getTransportLayer()->setup());
-        uassertStatusOK(sc->getTransportLayer()->start());
+        invariant(!sc->getTransportLayerManager());
+        transport::AsioTransportLayer::Options opts;
+        opts.mode = transport::AsioTransportLayer::Options::kEgress;
+        auto tl = std::make_unique<transport::AsioTransportLayer>(opts, nullptr);
+        sc->setTransportLayerManager(
+            std::make_unique<transport::TransportLayerManagerImpl>(std::move(tl)));
+        uassertStatusOK(sc->getTransportLayerManager()->setup());
+        uassertStatusOK(sc->getTransportLayerManager()->start());
     }};
 
 }  // namespace

@@ -1,14 +1,5 @@
-load("jstests/sharding/move_chunk_with_session_helper.js");
-
-(function() {
-"use strict";
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {testMoveChunkWithSession} from "jstests/sharding/move_chunk_with_session_helper.js";
 
 // Prevent unnecessary elections in the first shard replica set. Shard 'rs1' shard will need its
 // secondary to get elected, so we don't give it a zero priority.
@@ -19,8 +10,8 @@ var st = new ShardingTest({
         rs1: {nodes: [{rsConfig: {}}, {rsConfig: {}}]}
     }
 });
-assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 
 var coll = 'update';
 var cmd = {
@@ -55,4 +46,3 @@ var checkDocuments = function(coll) {
 testMoveChunkWithSession(st, coll, cmd, setup, checkRetryResult, checkDocuments);
 
 st.stop();
-})();

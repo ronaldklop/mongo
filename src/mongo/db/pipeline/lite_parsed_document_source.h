@@ -29,18 +29,31 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -54,32 +67,6 @@ class LiteParsedPipeline;
  */
 class LiteParsedDocumentSource {
 public:
-    /**
-     * Flags to mark stages with different allowance constrains when API versioning is enabled.
-     */
-    enum class AllowedWithApiStrict {
-        // The stage is always allowed in the pipeline regardless of API versions.
-        kAlways,
-        // This stage can be allowed in a stable API version, depending on the parameters.
-        kSometimes,
-        // The stage is allowed only for internal client when 'apiStrict' is set to true.
-        kInternal,
-        // The stage is never allowed in API version '1' when 'apiStrict' is set to true.
-        kNeverInVersion1
-    };
-
-    /**
-     * Determines the type of client which is permitted to use a particular stage in its command
-     * request. Ensures that only internal clients are permitted to send or deserialize certain
-     * stages.
-     */
-    enum class AllowedWithClientType {
-        // The stage can be specified in the command request of any client.
-        kAny,
-        // The stage can be specified in the command request of an internal client only.
-        kInternal,
-    };
-
     /*
      * This is the type of parser you should register using REGISTER_DOCUMENT_SOURCE. It need not
      * do any validation of options, only enough parsing to be able to implement the interface.
@@ -117,6 +104,19 @@ public:
                                AllowedWithClientType allowedWithClientType);
 
     /**
+     * Function that will be used as an alternate parser for a document source that has been
+     * disabled.
+     */
+    static std::unique_ptr<LiteParsedDocumentSource> parseDisabled(NamespaceString nss,
+                                                                   const BSONElement& spec) {
+        uasserted(
+            ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << spec.fieldName()
+                          << " is not allowed with the current configuration. You may need to "
+                             "enable the corresponding feature flag");
+    }
+
+    /**
      * Returns the 'LiteParserInfo' for the specified stage name.
      */
     static const LiteParserInfo& getInfo(const std::string& stageName);
@@ -132,9 +132,18 @@ public:
                                                            const BSONObj& spec);
 
     /**
-     * Returns the foreign collection(s) referenced by this stage, if any.
+     * Returns the foreign collection(s) referenced by this stage (that is, any collection that
+     * the pipeline references, but doesn't get locked), if any.
      */
     virtual stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const = 0;
+
+    /**
+     * Returns the foreign collections(s) referenced by this stage that potentially will be
+     * involved in query execution (that is, a collection that the pipeline references, and gets
+     * locked for the purposes of query execution), if any.
+     */
+    virtual void getForeignExecutionNamespaces(stdx::unordered_set<NamespaceString>& nssSet) const {
+    }
 
     /**
      * Returns a list of the privileges required for this stage.
@@ -160,9 +169,30 @@ public:
     }
 
     /**
+     * Returns true if this is a $indexStats stage.
+     */
+    virtual bool isIndexStats() const {
+        return false;
+    }
+
+    /**
      * Returns true if this is a $changeStream stage.
      */
     virtual bool isChangeStream() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this is a write stage.
+     */
+    virtual bool isWriteStage() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this desugars to a pipeline starting with a $queue stage.
+     */
+    virtual bool startsWithQueue() const {
         return false;
     }
 
@@ -174,25 +204,39 @@ public:
     }
 
     /**
-     * Returns true if this stage may be forwarded from mongos unmodified.
+     * Returns true if this stage should make the aggregation command exempt from ingress admission
+     * control.
      */
-    virtual bool allowedToPassthroughFromMongos() const {
-        return true;
+    virtual bool isExemptFromIngressAdmissionControl() const {
+        return false;
     }
 
     /**
-     * Returns true if the involved namespace 'nss' is allowed to be sharded. The behavior is to
-     * allow by default and stages should opt-out if foreign collections are not allowed to be
-     * sharded.
+     * Returns true if this stage require knowledge of the collection default collation at parse
+     * time, false otherwise. This is useful to know as it could save a network request to discern
+     * the collation.
+     * TODO SERVER-81991: Delete this function once all unsharded collections are tracked in the
+     * sharding catalog as unsplittable along with their collation.
      */
-    virtual bool allowShardedForeignCollection(NamespaceString nss) const {
-        return true;
+    virtual bool requiresCollationForParsingUnshardedAggregate() const {
+        return false;
+    }
+
+    /**
+     * Returns Status::OK() if the involved namespace 'nss' is allowed to be sharded. The behavior
+     * is to allow by default. Stages should opt-out if foreign collections are not allowed to be
+     * sharded by returning a Status with a message explaining why.
+     */
+    virtual Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                                  bool inMultiDocumentTransaction) const {
+        return Status::OK();
     }
 
     /**
      * Verifies that this stage is allowed to run with the specified read concern level.
      */
-    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                         bool isImplicitDefault) const {
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
@@ -224,11 +268,11 @@ protected:
                                 << "multi-document transaction.");
     }
 
-    ReadConcernSupportResult onlySingleReadConcernSupported(
-        StringData stageName,
-        repl::ReadConcernLevel supportedLevel,
-        repl::ReadConcernLevel candidateLevel) const {
-        return {{candidateLevel != supportedLevel,
+    ReadConcernSupportResult onlySingleReadConcernSupported(StringData stageName,
+                                                            repl::ReadConcernLevel supportedLevel,
+                                                            repl::ReadConcernLevel candidateLevel,
+                                                            bool isImplicitDefault) const {
+        return {{candidateLevel != supportedLevel && !isImplicitDefault,
                  {ErrorCodes::InvalidOptions,
                   str::stream() << "Aggregation stage " << stageName
                                 << " cannot run with a readConcern other than '"
@@ -241,9 +285,10 @@ protected:
     }
 
     ReadConcernSupportResult onlyReadConcernLocalSupported(StringData stageName,
-                                                           repl::ReadConcernLevel level) const {
+                                                           repl::ReadConcernLevel level,
+                                                           bool isImplicitDefault) const {
         return onlySingleReadConcernSupported(
-            stageName, repl::ReadConcernLevel::kLocalReadConcern, level);
+            stageName, repl::ReadConcernLevel::kLocalReadConcern, level, isImplicitDefault);
     }
 
 private:
@@ -274,6 +319,32 @@ public:
     }
 };
 
+class LiteParsedDocumentSourceInternal final : public LiteParsedDocumentSource {
+public:
+    /**
+     * Creates the default LiteParsedDocumentSource for internal document sources. This requires
+     * the privilege on 'internal' action. This should still be used with caution. Make sure your
+     * stage doesn't need to communicate any special behavior before registering a DocumentSource
+     * using this parser.
+     */
+    static std::unique_ptr<LiteParsedDocumentSourceInternal> parse(const NamespaceString& nss,
+                                                                   const BSONElement& spec) {
+        return std::make_unique<LiteParsedDocumentSourceInternal>(spec.fieldName());
+    }
+
+    LiteParsedDocumentSourceInternal(std::string parseTimeName)
+        : LiteParsedDocumentSource(std::move(parseTimeName)) {}
+
+    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
+        return stdx::unordered_set<NamespaceString>();
+    }
+
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const final {
+        return {Privilege(ResourcePattern::forClusterResource(boost::none),
+                          ActionSet{ActionType::internal})};
+    }
+};
+
 /**
  * Helper class for DocumentSources which reference a foreign collection.
  */
@@ -286,8 +357,8 @@ public:
         return {_foreignNss};
     }
 
-    virtual PrivilegeVector requiredPrivileges(bool isMongos,
-                                               bool bypassDocumentValidation) const = 0;
+    PrivilegeVector requiredPrivileges(bool isMongos,
+                                       bool bypassDocumentValidation) const override = 0;
 
 protected:
     NamespaceString _foreignNss;
@@ -306,17 +377,32 @@ public:
                                             boost::optional<NamespaceString> foreignNss,
                                             boost::optional<LiteParsedPipeline> pipeline);
 
-    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final override;
+    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final;
 
-    bool allowedToPassthroughFromMongos() const override;
+    void getForeignExecutionNamespaces(stdx::unordered_set<NamespaceString>& nssSet) const override;
 
-    bool allowShardedForeignCollection(NamespaceString nss) const override;
+    bool isExemptFromIngressAdmissionControl() const override;
+
+    Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                          bool inMultiDocumentTransaction) const override;
 
     const std::vector<LiteParsedPipeline>& getSubPipelines() const override {
         return _pipelines;
     }
 
+    /**
+     * Check the read concern constraints of all sub-pipelines. If the stage that owns the
+     * sub-pipelines has its own constraints this should be overridden to take those into account.
+     */
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override;
+
 protected:
+    /**
+     * Simple implementation that only gets the privileges needed by children pipelines.
+     */
+    PrivilegeVector requiredPrivilegesBasic(bool isMongos, bool bypassDocumentValidation) const;
+
     boost::optional<NamespaceString> _foreignNss;
     std::vector<LiteParsedPipeline> _pipelines;
 };

@@ -27,12 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr.hpp>
+#include <functional>
+#include <mutex>
+#include <string>
 
-#include "mongo/db/exec/sbe/stages/exchange.h"
-
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/exchange.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo::sbe {
 std::unique_ptr<ThreadPool> s_globalThreadPool;
@@ -42,7 +55,9 @@ MONGO_INITIALIZER(s_globalThreadPool)(InitializerContext* context) {
     options.threadNamePrefix = "ExchProd";
     options.minThreads = 0;
     options.maxThreads = 128;
-    options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
+    options.onCreateThread = [](const std::string& name) {
+        Client::initThread(name, getGlobalServiceContext()->getService(ClusterRole::ShardServer));
+    };
     s_globalThreadPool = std::make_unique<ThreadPool>(options);
     s_globalThreadPool->startup();
 }
@@ -132,6 +147,16 @@ ExchangePipe* ExchangeState::pipe(size_t consumerTid, size_t producerTid) {
     return _consumers[consumerTid]->pipe(producerTid);
 }
 
+size_t ExchangeState::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_fields);
+    size += _partition ? _partition->estimateSize() : 0;
+    size += _orderLess ? _orderLess->estimateSize() : 0;
+    size += size_estimator::estimate(_consumers);
+    size += size_estimator::estimate(_producers);
+    return size;
+}
+
 ExchangeBuffer* ExchangeConsumer::getBuffer(size_t producerId) {
     if (_fullBuffers[producerId]) {
         return _fullBuffers[producerId].get();
@@ -159,31 +184,49 @@ ExchangeConsumer::ExchangeConsumer(std::unique_ptr<PlanStage> input,
                                    ExchangePolicy policy,
                                    std::unique_ptr<EExpression> partition,
                                    std::unique_ptr<EExpression> orderLess,
-                                   PlanNodeId planNodeId)
-    : PlanStage("exchange"_sd, planNodeId) {
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage(
+          "exchange"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking) {
     _children.emplace_back(std::move(input));
     _state = std::make_shared<ExchangeState>(
         numOfProducers, std::move(fields), policy, std::move(partition), std::move(orderLess));
 
     _tid = _state->addConsumer(this);
     _orderPreserving = _state->isOrderPreserving();
+
+    if (policy == ExchangePolicy::hashpartition || policy == ExchangePolicy::rangepartition) {
+        uassert(5922201, "partition expression must be present", _state->partitionExpr());
+    } else {
+        uassert(5922202, "partition expression must not be present", !_state->partitionExpr());
+    }
 }
-ExchangeConsumer::ExchangeConsumer(std::shared_ptr<ExchangeState> state, PlanNodeId planNodeId)
-    : PlanStage("exchange"_sd, planNodeId), _state(state) {
+ExchangeConsumer::ExchangeConsumer(std::shared_ptr<ExchangeState> state,
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage(
+          "exchange"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _state(state) {
     _tid = _state->addConsumer(this);
     _orderPreserving = _state->isOrderPreserving();
 }
 std::unique_ptr<PlanStage> ExchangeConsumer::clone() const {
-    return std::make_unique<ExchangeConsumer>(_state, _commonStats.nodeId);
+    return std::make_unique<ExchangeConsumer>(
+        _state, _commonStats.nodeId, participateInTrialRunTracking());
 }
 void ExchangeConsumer::prepare(CompileCtx& ctx) {
     for (size_t idx = 0; idx < _state->fields().size(); ++idx) {
         _outgoing.emplace_back(ExchangeBuffer::Accessor{});
     }
 
-    for (size_t idx = 0; idx < _state->numOfProducers(); ++idx) {
-        _state->producerCompileCtxs().push_back(ctx.makeCopy(true));
+    if (_tid == 0) {
+        // Only consumer ID 0 prepares (copies) the compilation context. Note that we do not have to
+        // lock the shared state here - it is accessed only by consmer ID 0 again in the future.
+        for (size_t idx = 0; idx < _state->numOfProducers(); ++idx) {
+            _state->producerCompileCtxs().push_back(ctx.makeCopyForParallelUse());
+        }
     }
+
     // Compile '<' function once we implement order preserving exchange.
 }
 value::SlotAccessor* ExchangeConsumer::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -327,7 +370,7 @@ PlanState ExchangeConsumer::getNext() {
 void ExchangeConsumer::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 
     {
         stdx::unique_lock lock(_state->consumerCloseMutex());
@@ -367,7 +410,10 @@ void ExchangeConsumer::close() {
 
 std::unique_ptr<PlanStageStats> ExchangeConsumer::getStats(bool includeDebugInfo) const {
     auto ret = std::make_unique<PlanStageStats>(_commonStats);
-    ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
+    if (!_children.empty()) {
+        // TODO: handle empty _children.
+        ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
+    }
     return ret;
 }
 
@@ -396,12 +442,21 @@ std::vector<DebugPrinter::Block> ExchangeConsumer::debugPrint() const {
         case ExchangePolicy::roundrobin:
             DebugPrinter::addKeyword(ret, "round");
             break;
+        case ExchangePolicy::hashpartition:
+            DebugPrinter::addKeyword(ret, "hash");
+            break;
+        case ExchangePolicy::rangepartition:
+            DebugPrinter::addKeyword(ret, "range");
+            break;
         default:
             uasserted(4822835, "policy not yet implemented");
     }
 
-    DebugPrinter::addNewLine(ret);
-    DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
+    if (!_children.empty()) {
+        // TODO: handle empty _children.
+        DebugPrinter::addNewLine(ret);
+        DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
+    }
 
     return ret;
 }
@@ -412,6 +467,13 @@ ExchangePipe* ExchangeConsumer::pipe(size_t producerTid) {
     } else {
         return _pipes[0].get();
     }
+}
+
+size_t ExchangeConsumer::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += _state->estimateCompileTimeSize();
+    return size;
 }
 
 ExchangeBuffer* ExchangeProducer::getBuffer(size_t consumerId) {
@@ -444,8 +506,11 @@ void ExchangeProducer::closePipes() {
 
 ExchangeProducer::ExchangeProducer(std::unique_ptr<PlanStage> input,
                                    std::shared_ptr<ExchangeState> state,
-                                   PlanNodeId planNodeId)
-    : PlanStage("exchangep"_sd, planNodeId), _state(state) {
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage(
+          "exchangep"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _state(state) {
     _children.emplace_back(std::move(input));
 
     _tid = _state->addProducer(this);
@@ -461,6 +526,12 @@ void ExchangeProducer::start(OperationContext* opCtx,
                              CompileCtx& ctx,
                              std::unique_ptr<PlanStage> producer) {
     ExchangeProducer* p = static_cast<ExchangeProducer*>(producer.get());
+
+    // TODO: SERVER-62925. Rationalize this lock.
+    // Also review if the threads should remain killable. Currently threads with IS mode global
+    // lock would not be made kill target but if this lock mode changes, the initialization of
+    // s_globalThreadPool should be reviewed.
+    Lock::GlobalLock lock(opCtx, MODE_IS);
 
     p->attachToOperationContext(opCtx);
 
@@ -490,6 +561,10 @@ void ExchangeProducer::prepare(CompileCtx& ctx) {
 
     for (auto& f : _state->fields()) {
         _incoming.emplace_back(_children[0]->getAccessor(ctx, f));
+    }
+
+    if (auto partition = _state->partitionExpr(); partition) {
+        _partition = partition->compile(ctx);
     }
 }
 value::SlotAccessor* ExchangeProducer::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -541,8 +616,34 @@ PlanState ExchangeProducer::getNext() {
                 }
                 _roundRobinCounter = (_roundRobinCounter + 1) % _pipes.size();
             } break;
-            case ExchangePolicy::partition: {
-                uasserted(4822840, "policy not yet implemented");
+            case ExchangePolicy::hashpartition: {
+                auto [owned, tag, val] = _bytecode.run(_partition.get());
+                if (owned) {
+                    value::releaseValue(tag, val);
+                }
+
+                uassert(4822840, "wrong partitioning", tag == sbe::value::TypeTags::NumberInt64);
+                size_t idx = sbe::value::bitcastTo<size_t>(val) % _pipes.size();
+
+                // Detect early out in the loop.
+                if (!appendData(idx)) {
+                    return trackPlanState(PlanState::IS_EOF);
+                }
+            } break;
+            case ExchangePolicy::rangepartition: {
+                auto [owned, tag, val] = _bytecode.run(_partition.get());
+                if (owned) {
+                    value::releaseValue(tag, val);
+                }
+
+                uassert(5922203, "wrong partitioning", tag == sbe::value::TypeTags::NumberInt64);
+                size_t idx = sbe::value::bitcastTo<size_t>(val);
+                uassert(5922204, "wrong partitioning", idx < _pipes.size());
+
+                // Detect early out in the loop.
+                if (!appendData(idx)) {
+                    return trackPlanState(PlanState::IS_EOF);
+                }
             } break;
             default:
                 MONGO_UNREACHABLE;
@@ -566,7 +667,7 @@ PlanState ExchangeProducer::getNext() {
 void ExchangeProducer::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _children[0]->close();
 }
 
@@ -583,7 +684,7 @@ const SpecificStats* ExchangeProducer::getSpecificStats() const {
 bool ExchangeBuffer::appendData(std::vector<value::SlotAccessor*>& data) {
     ++_count;
     for (auto accesor : data) {
-        auto [tag, val] = accesor->copyOrMoveValue();
+        auto [tag, val] = accesor->getCopyOfValue();
         value::ValueGuard guard{tag, val};
         _typeTags.push_back(tag);
         _values.push_back(val);

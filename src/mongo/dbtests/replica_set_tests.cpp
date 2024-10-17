@@ -27,19 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/concurrency/admission_context.h"
 
 namespace mongo {
 namespace {
@@ -50,7 +61,7 @@ ServiceContext::UniqueOperationContext makeOpCtx() {
 
 class ReplicaSetTest : public mongo::unittest::Test {
 protected:
-    void setUp() {
+    void setUp() override {
         auto opCtx = makeOpCtx();
         _storageInterface = std::make_unique<repl::StorageInterfaceImpl>();
         _dropPendingCollectionReaper =
@@ -69,10 +80,10 @@ protected:
         ASSERT_OK(_replCoordExternalState->createLocalLastVoteCollection(opCtx.get()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         auto opCtx = makeOpCtx();
         DBDirectClient client(opCtx.get());
-        client.dropCollection("local.replset.election");
+        client.dropCollection(NamespaceString::kLastVoteNamespace);
 
         _replCoordExternalState.reset();
         _dropPendingCollectionReaper.reset();
@@ -97,8 +108,9 @@ private:
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx.get(), AdmissionContext::Priority::kExempt);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -120,8 +132,9 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx.get(), AdmissionContext::Priority::kExempt);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -143,8 +156,9 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithEqualTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx.get(), AdmissionContext::Priority::kExempt);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})

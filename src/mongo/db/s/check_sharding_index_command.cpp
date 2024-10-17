@@ -27,16 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -57,24 +72,30 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
+                   const DatabaseName& dbName,
                    const BSONObj& jsobj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        const NamespaceString nss = NamespaceString(parseNs(dbname, jsobj));
+        const NamespaceString nss(parseNs(dbName, jsobj));
 
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");
         if (keyPattern.isEmpty()) {
@@ -93,19 +114,19 @@ public:
             return false;
         }
 
-        const IndexDescriptor* idx =
-            collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx,
-                                                                     keyPattern,
-                                                                     true);  // requireSingleKey
-        if (idx == nullptr) {
-            errmsg = "couldn't find valid index for shard key";
-            return false;
-        }
+        std::string tmpErrMsg = "couldn't find valid index for shard key";
+        const auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
+                                                           *collection,
+                                                           keyPattern,
+                                                           /*requireSingleKey=*/true,
+                                                           &tmpErrMsg);
+
+        uassert(ErrorCodes::InvalidOptions, str::stream() << tmpErrMsg, shardKeyIdx);
 
         return true;
     }
-
-} cmdCheckShardingIndex;
+};
+MONGO_REGISTER_COMMAND(CheckShardingIndex).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -29,12 +29,26 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <memory>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/s/resharding/resume_token_gen.h"
 
 namespace mongo {
@@ -52,10 +66,8 @@ class OperationContext;
  */
 class CollectionScan final : public RequiresCollectionStage {
 public:
-    static const char* kStageType;
-
     CollectionScan(ExpressionContext* expCtx,
-                   const CollectionPtr& collection,
+                   VariantCollectionPtrOrAcquisition collection,
                    const CollectionScanParams& params,
                    WorkingSet* workingSet,
                    const MatchExpression* filter);
@@ -74,25 +86,15 @@ public:
         return _latestOplogEntryTimestamp;
     }
 
-    BSONObj getPostBatchResumeToken() const {
-        // Return a resume token compatible with resumable initial sync.
-        if (_params.requestResumeToken) {
-            return _lastSeenId.withFormat(
-                [](RecordId::Null n) { return BSON("$recordId" << NullLabeler{}); },
-                [](int64_t rid) { return BSON("$recordId" << rid); },
-                [](const char* str, int size) { return BSON("$recordId" << OID::from(str)); });
-        }
-        // Return a resume token compatible with resharding oplog sync.
-        if (_params.shouldTrackLatestOplogTimestamp) {
-            return ResumeTokenOplogTimestamp{_latestOplogEntryTimestamp}.toBSON();
-        }
-
-        return {};
-    }
+    BSONObj getPostBatchResumeToken() const;
 
     std::unique_ptr<PlanStageStats> getStats() final;
 
     const SpecificStats* getSpecificStats() const final;
+
+    CollectionScanParams::Direction getDirection() const {
+        return _params.direction;
+    }
 
 protected:
     void doSaveStateRequiresCollection() final;
@@ -107,6 +109,12 @@ private:
     StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
     /**
+     * Sets '_latestOplogEntryTimestamp' to the current read timestamp, if available. This is
+     * equivalent to the latest visible timestamp in the oplog.
+     */
+    void setLatestOplogEntryTimestampToReadTimestamp();
+
+    /**
      * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
      * to that time if it isn't already greater. Throws an exception if the 'ts' field cannot be
      * extracted.
@@ -114,9 +122,9 @@ private:
     void setLatestOplogEntryTimestamp(const Record& record);
 
     /**
-     * Asserts that the minimum timestamp in the query filter has not already fallen off the oplog.
+     * Set up the cursor.
      */
-    void assertTsHasNotFallenOffOplog(const Record& record);
+    void initCursor(OperationContext* opCtx, const CollectionPtr& collPtr, bool forward);
 
     // WorkingSet is not owned by us.
     WorkingSet* _workingSet;
@@ -130,12 +138,17 @@ private:
 
     RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog, the latest
-    // timestamp seen in the collection.  Otherwise, this is a null timestamp.
+    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog or a change
+    // collection, this is the latest timestamp seen by the collection scan. For change collections,
+    // on EOF we advance this timestamp to the latest timestamp in the global oplog.
     Timestamp _latestOplogEntryTimestamp;
+
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> _priority;
 
     // Stats
     CollectionScanStats _specificStats;
+
+    bool _useSeek = false;
 };
 
 }  // namespace mongo

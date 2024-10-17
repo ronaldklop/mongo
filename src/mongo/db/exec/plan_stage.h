@@ -29,14 +29,26 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/restore_context.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -111,12 +123,10 @@ class RecordId;
 class PlanStage {
 public:
     PlanStage(const char* typeName, ExpressionContext* expCtx)
-        : _commonStats(typeName), _opCtx(expCtx->opCtx), _expCtx(expCtx) {
+        : _commonStats(typeName, this), _opCtx(expCtx->opCtx), _expCtx(expCtx) {
         invariant(expCtx);
         if (expCtx->explain || expCtx->mayDbProfile) {
-            // Populating the field for execution time indicates that this stage should time each
-            // call to work().
-            _commonStats.executionTimeMillis.emplace(0);
+            markShouldCollectTimingInfo();
         }
     }
 
@@ -156,22 +166,19 @@ public:
         //
         // Full yield request semantics:
         //
+        // If the storage engine aborts the storage-level transaction with WriteConflictException or
+        // TemporarilyUnavailableException, then an execution stage that interfaces with storage is
+        // responsible for catching this exception. After catching the exception, it suspends its
+        // state in such a way that will allow it to retry the storage-level operation on the next
+        // work() call. Then it populates the out parameter of work(...) with WorkingSet::INVALID_ID
+        // and returns NEED_YIELD to its parent.
+        //
         // Each stage that receives a NEED_YIELD from a child must propagate the NEED_YIELD up
         // and perform no work.
         //
-        // If a yield is requested due to a WriteConflict, the out parameter of work(...) should
-        // be populated with WorkingSet::INVALID_ID. If it is illegal to yield, a
-        // WriteConflictException will be thrown.
+        // The NEED_YIELD is handled at the level of the PlanExecutor, either by re-throwing the
+        // WCE/TUE or by resetting transaction state.
         //
-        // A yield-requesting stage populates the out parameter of work(...) with a WSID that
-        // refers to a WSM with a Fetcher*. If it is illegal to yield, this is ignored. This
-        // difference in behavior can be removed once SERVER-16051 is resolved.
-        //
-        // The plan executor is responsible for yielding and, if requested, paging in the data
-        // upon receipt of a NEED_YIELD. The plan executor does NOT free the WSID of the
-        // requested fetch. The stage that requested the fetch holds the WSID of the loc it
-        // wants fetched. On the next call to work() that stage can assume a fetch was performed
-        // on the WSM that the held WSID refers to.
         NEED_YIELD,
     };
 
@@ -321,7 +328,7 @@ public:
      * Creates plan stats tree which has the same topology as the original execution tree,
      * but has a separate lifetime.
      */
-    virtual std::unique_ptr<PlanStageStats> getStats() = 0;
+    virtual std::unique_ptr<mongo::PlanStageStats> getStats() = 0;
 
     /**
      * Get the CommonStats for this stage. The pointer is *not* owned by the caller.
@@ -330,7 +337,7 @@ public:
      * It must not exist past the stage. If you need the stats to outlive the stage,
      * use the getStats(...) method above.
      */
-    const CommonStats* getCommonStats() const {
+    const mongo::CommonStats* getCommonStats() const {
         return &_commonStats;
     }
 
@@ -349,8 +356,14 @@ public:
      * execution has started.
      */
     void markShouldCollectTimingInfo() {
-        invariant(!_commonStats.executionTimeMillis || *_commonStats.executionTimeMillis == 0);
-        _commonStats.executionTimeMillis.emplace(0);
+        invariant(durationCount<Microseconds>(_commonStats.executionTime.executionTimeEstimate) ==
+                  0);
+
+        if (internalMeasureQueryExecutionTimeInNanoseconds.load()) {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kNanos;
+        } else {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kMillis;
+        }
     }
 
 protected:
@@ -403,15 +416,26 @@ protected:
      * stage. May return boost::none if it is not necessary to collect timing info.
      */
     boost::optional<ScopedTimer> getOptTimer() {
-        if (_commonStats.executionTimeMillis) {
-            return {{getClock(), _commonStats.executionTimeMillis.get_ptr()}};
+        if (_opCtx && _commonStats.executionTime.precision != QueryExecTimerPrecision::kNoTiming) {
+            if (MONGO_likely(_commonStats.executionTime.precision ==
+                             QueryExecTimerPrecision::kMillis)) {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    _opCtx->getServiceContext()->getFastClockSource());
+            } else {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    _opCtx->getServiceContext()->getTickSource());
+            }
         }
 
         return boost::none;
     }
 
     Children _children;
-    CommonStats _commonStats;
+    mongo::CommonStats _commonStats;
 
 private:
     OperationContext* _opCtx;

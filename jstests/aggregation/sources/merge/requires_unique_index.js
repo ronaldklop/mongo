@@ -5,11 +5,10 @@
 // Note that this test does *not* use the drop shell helper but instead runs the drop command
 // manually. This is to avoid implicit creation and sharding of the $merge target collections in the
 // passthrough suites.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode,
-                                                      // assertMergeFailsWithoutUniqueIndex.
+import {
+    assertMergeFailsWithoutUniqueIndex,
+    withEachMergeMode
+} from "jstests/aggregation/extras/merge_helpers.js";
 
 const testDB = db.getSiblingDB("merge_requires_unique_index");
 assert.commandWorked(testDB.dropDatabase());
@@ -309,7 +308,7 @@ function dropWithoutImplicitRecreate(coll) {
             ],
             cursor: {}
         }),
-                                     [50905, 51132]);
+                                     [50905, 51132, 51185]);
     });
 }());
 
@@ -343,8 +342,8 @@ function dropWithoutImplicitRecreate(coll) {
             }
         }
     ]));
-    assert.docEq(target.findOne({"a.b": "hi", proofOfUpdate: "PROOF"}),
-                 {_id: "TARGET", a: {b: "hi"}, proofOfUpdate: "PROOF"});
+    assert.docEq({_id: "TARGET", a: {b: "hi"}, proofOfUpdate: "PROOF"},
+                 target.findOne({"a.b": "hi", proofOfUpdate: "PROOF"}));
 }());
 
 // Test that a unique index that is sparse can still be used.
@@ -360,5 +359,4 @@ function dropWithoutImplicitRecreate(coll) {
     assert.doesNotThrow(() => source.aggregate([{
         $merge: {into: target.getName(), whenMatched: "replace", whenNotMatched: "insert", on: "a"}
     }]));
-}());
 }());

@@ -11,11 +11,13 @@
  * 7.  Try to create a new connection to the shut down primary and expect an error
  *
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
-load("jstests/libs/write_concern_util.js");  // for stopReplicationOnSecondaries,
-                                             // restartReplicationOnSecondaries
+// restartReplicationOnSecondaries
 var name = "shutdown_primary";
 
 var replTest = new ReplSetTest({name: name, nodes: 3});
@@ -43,7 +45,7 @@ assert.commandWorked(testDB.foo.insert({x: 3}));
 
 jsTestLog("Shutting down primary in a parallel shell");
 var awaitShell = startParallelShell(function() {
-    db.adminCommand({shutdown: 1, timeoutSecs: 60});
+    db.adminCommand({shutdown: 1, timeoutSecs: 200});
 }, primary.port);
 
 jsTestLog("Resuming replication.");
@@ -64,4 +66,3 @@ assert.soonNoExcept(function() {
 }, "expected primary node to shut down and not be connectable");
 
 replTest.stopSet();
-})();

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional/optional.hpp>
+#include <string>
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
@@ -45,7 +46,6 @@ namespace mongo {
 class TestingDurableHistoryPin : public DurableHistoryPin {
 public:
     std::string getName() override;
-
     boost::optional<Timestamp> calculatePin(OperationContext* opCtx) override;
 };
 }  // namespace mongo

@@ -1,7 +1,7 @@
 /**
  * Utilities for testing retryable writes.
  */
-var RetryableWritesUtil = (function() {
+export var RetryableWritesUtil = (function() {
     /**
      * Returns true if the error code is retryable, assuming the command is idempotent.
      *
@@ -27,24 +27,21 @@ var RetryableWritesUtil = (function() {
         });
     }
 
-    const kRetryableWriteCommands =
-        new Set(["delete", "findandmodify", "findAndModify", "insert", "update"]);
+    const kRetryableWriteCommands = new Set([
+        "delete",
+        "findandmodify",
+        "findAndModify",
+        "insert",
+        "update",
+        "testInternalTransactions",
+        "bulkWrite"
+    ]);
 
     /**
      * Returns true if the command name is that of a retryable write command.
      */
     function isRetryableWriteCmdName(cmdName) {
         return kRetryableWriteCommands.has(cmdName);
-    }
-
-    const kStorageEnginesWithoutDocumentLocking = new Set(["ephemeralForTest"]);
-
-    /**
-     * Returns true if the given storage engine supports retryable writes (i.e. supports
-     * document-level locking).
-     */
-    function storageEngineSupportsRetryableWrites(storageEngineName) {
-        return !kStorageEnginesWithoutDocumentLocking.has(storageEngineName);
     }
 
     /**
@@ -73,12 +70,75 @@ var RetryableWritesUtil = (function() {
                       tojson(secondaryRecord) + " to be the same for lsid: " + tojson(lsid));
     }
 
+    /**
+     * Runs the provided retriable command nTimes. This assumes that the the provided conn
+     * was started with `retryWrites: false` to mimic the retry functionality manually.
+     */
+    function runRetryableWrite(conn, command, expectedErrorCode = ErrorCodes.OK, nTimes = 2) {
+        var res;
+        for (var i = 0; i < nTimes; i++) {
+            jsTestLog("Executing command: " + tojson(command) + "\nIteration: " + i +
+                      "\nExpected Code: " + expectedErrorCode);
+            res = conn.runCommand(command);
+        }
+        if (expectedErrorCode === ErrorCodes.OK) {
+            assert.commandWorked(res);
+        } else {
+            assert.commandFailedWithCode(res, expectedErrorCode);
+        }
+        return res;
+    }
+
+    function isFailedToSatisfyPrimaryReadPreferenceError(res) {
+        const kReplicaSetMonitorError =
+            /Could not find host matching read preference.*mode:.*primary/;
+        if (res.hasOwnProperty("errmsg")) {
+            return res.errmsg.match(kReplicaSetMonitorError);
+        }
+        if (res.hasOwnProperty("message")) {
+            return res.message.match(kReplicaSetMonitorError);
+        }
+        if (res.hasOwnProperty("writeErrors")) {
+            for (let writeError of res.writeErrors) {
+                if (writeError.errmsg.match(kReplicaSetMonitorError)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function retryOnRetryableCode(fn, prefix) {
+        let ret;
+        assert.soon(() => {
+            try {
+                ret = fn();
+                return true;
+            } catch (e) {
+                if (RetryableWritesUtil.isRetryableCode(e.code)) {
+                    print(prefix + ", err: " + tojson(e));
+                    return false;
+                }
+                throw e;
+            }
+        });
+        return ret;
+    }
+
+    function runCommandWithRetries(conn, cmd) {
+        return retryOnRetryableCode(() => assert.commandWorked(conn.runCommand(cmd)),
+                                    "Retry interrupt: runCommand(" + tojson(cmd) + ")");
+    }
+
     return {
         isRetryableCode,
         errmsgContainsRetryableCodeName,
         isRetryableWriteCmdName,
-        storageEngineSupportsRetryableWrites,
         checkTransactionTable,
         assertSameRecordOnBothConnections,
+        runRetryableWrite,
+        isFailedToSatisfyPrimaryReadPreferenceError,
+        retryOnRetryableCode,
+        runCommandWithRetries
     };
 })();

@@ -1,9 +1,7 @@
 // Tests that the $merge aggregation stage is resilient to chunk migrations in both the source and
 // output collection during execution.
-(function() {
-'use strict';
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode.
+import {withEachMergeMode} from "jstests/aggregation/extras/merge_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2, rs: {nodes: 1}});
 
@@ -12,10 +10,18 @@ const sourceColl = mongosDB["source"];
 const targetColl = mongosDB["target"];
 
 function setAggHang(mode) {
-    assert.commandWorked(st.shard0.adminCommand(
-        {configureFailPoint: "hangBeforeDocumentSourceCursorLoadBatch", mode: mode}));
-    assert.commandWorked(st.shard1.adminCommand(
-        {configureFailPoint: "hangBeforeDocumentSourceCursorLoadBatch", mode: mode}));
+    // Match on the output namespace to avoid hanging the sharding metadata refresh aggregation when
+    // shard0 is a config shard.
+    assert.commandWorked(st.shard0.adminCommand({
+        configureFailPoint: "hangBeforeDocumentSourceCursorLoadBatch",
+        mode: mode,
+        data: {nss: "merge_with_chunk_migrations.source"}
+    }));
+    assert.commandWorked(st.shard1.adminCommand({
+        configureFailPoint: "hangBeforeDocumentSourceCursorLoadBatch",
+        mode: mode,
+        data: {nss: "merge_with_chunk_migrations.source"}
+    }));
 }
 
 function runMergeWithMode(whenMatchedMode, whenNotMatchedMode, shardedColl) {
@@ -146,4 +152,3 @@ withEachMergeMode(({whenMatchedMode, whenNotMatchedMode}) => {
 });
 
 st.stop();
-})();

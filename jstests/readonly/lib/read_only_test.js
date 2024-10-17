@@ -1,8 +1,7 @@
-var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+export var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
 
 (function() {
-"use strict";
-
 StandaloneFixture = function() {};
 
 StandaloneFixture.prototype.runLoadPhase = function runLoadPhase(test) {
@@ -54,28 +53,25 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
     const docs = [{_id: 1}];
     let shardIdentities = [];
     let readOnlyShards = [];
-    let operationTimes = [];
 
     for (let i = 0; i < this.nShards; ++i) {
         let primary = this.st["rs" + i].getPrimary();
         shardIdentities.push(
             primary.getDB("admin").getCollection("system.version").findOne({_id: "shardIdentity"}));
         assert.neq(null, shardIdentities[i]);
-        // Get operation time so the read only shard recover all the info.
-        operationTimes.push(
-            assert
-                .commandWorked(primary.getDB('_temporary_db')
-                                   .runCommand({insert: '_temporary_coll' + i, documents: docs}))
-                .operationTime);
+        assert.commandWorked(primary.getDB('_temporary_db').runCommand({
+            insert: '_temporary_coll' + i,
+            documents: docs,
+            writeConcern: {w: "majority"}
+        }));
     }
 
-    this.st.stopAllShards({noCleanData: true, restart: true, skipValidations: true});
+    this.st.stopAllShards({noCleanData: true, restart: true, skipValidation: true});
 
     jsTest.log("Restarting shards as read only standalone instances...");
     for (let i = 0; i < this.nShards; ++i) {
         let dbPath = this.dbPaths[i];
         let port = this.ports[i];
-        let operationTime = operationTimes[i];
 
         jsTestLog("Renaming local.system collection on shard " + i);
 
@@ -83,7 +79,8 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
             MongoRunner.runMongod({port: port, dbpath: dbPath, noReplSet: true, noCleanData: true});
         // Rename the local.system collection to prevent problems with replset configurations.
         tempMongod.getDB('local').getCollection('system').renameCollection('_system');
-        MongoRunner.stopMongod(tempMongod, {noCleanData: true, skipValidations: true, wait: true});
+        MongoRunner.stopMongod(
+            tempMongod, null, {noCleanData: true, skipValidation: true, wait: true});
 
         let shardIdentity = shardIdentities[i];
         let host = this.hosts[i];
@@ -109,7 +106,6 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
             queryableBackupMode: "",
             restart: true,
             shardsvr: "",
-            setParameter: {recoverToOplogTimestamp: tojson({timestamp: operationTime})}
         }));
     }
 
@@ -128,14 +124,15 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
         let port = this.ports[i];
 
         // Stop the read only shards.
-        MongoRunner.stopMongod(readOnlyShards[i],
-                               {noCleanData: true, skipValidations: true, wait: true});
+        MongoRunner.stopMongod(
+            readOnlyShards[i], null, {noCleanData: true, skipValidation: true, wait: true});
 
         // Run a temporary mongod to rename the local.system collection.
         let tempMongod =
             MongoRunner.runMongod({port: port, dbpath: dbPath, noReplSet: true, noCleanData: true});
         tempMongod.getDB('local').getCollection('_system').renameCollection('system', true);
-        MongoRunner.stopMongod(tempMongod, {noCleanData: true, skipValidations: true, wait: true});
+        MongoRunner.stopMongod(
+            tempMongod, null, {noCleanData: true, skipValidation: true, wait: true});
 
         let shardIdentity = shardIdentities[i];
         let host = this.hosts[i];

@@ -1,25 +1,11 @@
 // Tests for the $lookup stage with a sub-pipeline.
-(function() {
-"use strict";
 
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode and anyEq.
-
-const testName = "lookup_subpipeline";
+import {anyEq, assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.lookUp;
 const from = db.from;
 const thirdColl = db.thirdColl;
 const fourthColl = db.fourthColl;
-
-function generateNestedPipeline(foreignCollName, numLevels) {
-    let pipeline = [{"$lookup": {pipeline: [], from: foreignCollName, as: "same"}}];
-
-    for (let level = 1; level < numLevels; level++) {
-        pipeline = [{"$lookup": {pipeline: pipeline, from: foreignCollName, as: "same"}}];
-    }
-
-    return pipeline;
-}
 
 // Helper for testing that pipeline returns correct set of results.
 function testPipeline(pipeline, expectedResult, collection) {
@@ -97,6 +83,17 @@ expectedResults = [
             }
         ]
     }
+];
+testPipeline(pipeline, expectedResults, coll);
+
+// Basic non-equi theta join via $group.
+pipeline =
+    [{$lookup: {from: "from", pipeline: [{$group: {_id: "$_id", avg: {$avg: "$_id"}}}], as: "c"}}];
+
+expectedResults = [
+    {"_id": 1, x: 1, "c": [{"_id": 1, "avg": 1}, {"_id": 2, "avg": 2}, {"_id": 3, "avg": 3}]},
+    {"_id": 2, x: 2, "c": [{"_id": 1, "avg": 1}, {"_id": 2, "avg": 2}, {"_id": 3, "avg": 3}]},
+    {"_id": 3, x: 3, "c": [{"_id": 1, "avg": 1}, {"_id": 2, "avg": 2}, {"_id": 3, "avg": 3}]},
 ];
 testPipeline(pipeline, expectedResults, coll);
 
@@ -411,6 +408,16 @@ expectedResults = [
 ];
 testPipeline(pipeline, expectedResults, coll);
 
+// Test that empty subpipeline optimizes correctly with following $match.
+pipeline = [
+    {$match: {_id: 1}},
+    {$lookup: {from: "from", pipeline: [], as: "as"}},
+    {$unwind: "$as"},
+    {$match: {"as._id": {$gt: 2}}}
+];
+expectedResults = [{_id: 1, x: 1, as: {_id: 3}}];
+testPipeline(pipeline, expectedResults, coll);
+
 // Comparison where a 'let' variable references an array.
 coll.drop();
 assert.commandWorked(coll.insert({x: [1, 2, 3]}));
@@ -555,41 +562,9 @@ expectedResults = [{
 }];
 testPipeline(pipeline, expectedResults, coll);
 
-// Deeply nested $lookup pipeline. Confirm that we can execute an aggregation with nested
-// $lookup sub-pipelines up to the maximum depth, but not beyond.
-let nestedPipeline = generateNestedPipeline("lookup", 20);
-assert.commandWorked(
-    coll.getDB().runCommand({aggregate: coll.getName(), pipeline: nestedPipeline, cursor: {}}));
-
-nestedPipeline = generateNestedPipeline("lookup", 21);
-assertErrorCode(coll, nestedPipeline, ErrorCodes.MaxSubPipelineDepthExceeded);
-
-// Confirm that maximum $lookup sub-pipeline depth is respected when aggregating views whose
-// combined nesting depth exceeds the limit.
-nestedPipeline = generateNestedPipeline("lookup", 10);
-coll.getDB().view1.drop();
-assert.commandWorked(
-    coll.getDB().runCommand({create: "view1", viewOn: "lookup", pipeline: nestedPipeline}));
-
-nestedPipeline = generateNestedPipeline("view1", 10);
-coll.getDB().view2.drop();
-assert.commandWorked(
-    coll.getDB().runCommand({create: "view2", viewOn: "view1", pipeline: nestedPipeline}));
-
-// Confirm that a composite sub-pipeline depth of 20 is allowed.
-assert.commandWorked(coll.getDB().runCommand({aggregate: "view2", pipeline: [], cursor: {}}));
-
-const pipelineWhichExceedsNestingLimit = generateNestedPipeline("view2", 1);
-coll.getDB().view3.drop();
-assert.commandWorked(coll.getDB().runCommand(
-    {create: "view3", viewOn: "view2", pipeline: pipelineWhichExceedsNestingLimit}));
-
 //
 // Error cases.
 //
-
-// Confirm that a composite sub-pipeline depth greater than 20 fails.
-assertErrorCode(coll.getDB().view3, [], ErrorCodes.MaxSubPipelineDepthExceeded);
 
 // 'pipeline' and 'let' must be of expected type.
 assertErrorCode(coll, [{$lookup: {pipeline: 1, from: "from", as: "as"}}], ErrorCodes.TypeMismatch);
@@ -598,4 +573,3 @@ assertErrorCode(
     coll, [{$lookup: {let : 1, pipeline: [], from: "from", as: "as"}}], ErrorCodes.FailedToParse);
 assertErrorCode(
     coll, [{$lookup: {let : [], pipeline: [], from: "from", as: "as"}}], ErrorCodes.FailedToParse);
-}());

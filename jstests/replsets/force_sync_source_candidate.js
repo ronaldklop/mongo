@@ -3,11 +3,8 @@
  *
  * @tags: [requires_replication]
  */
-
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const failpointName = "forceSyncSourceCandidate";
 
@@ -24,9 +21,9 @@ function getDataObj(syncSource) {
     return {hostAndPort: syncSource.host};
 }
 
-setFailPoint(nodes[1], failpointName, getDataObj(nodes[0]));
-setFailPoint(nodes[2], failpointName, getDataObj(nodes[1]));
-setFailPoint(nodes[3], failpointName, getDataObj(nodes[2]));
+configureFailPoint(nodes[1], failpointName, getDataObj(nodes[0]));
+configureFailPoint(nodes[2], failpointName, getDataObj(nodes[1]));
+configureFailPoint(nodes[3], failpointName, getDataObj(nodes[2]));
 
 rst.initiate();
 const primary = rst.getPrimary();
@@ -36,4 +33,3 @@ rst.awaitSyncSource(nodes[2], nodes[1]);
 rst.awaitSyncSource(nodes[3], nodes[2]);
 
 rst.stopSet();
-})();

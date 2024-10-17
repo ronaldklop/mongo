@@ -7,11 +7,16 @@
 // sharded collection with one chunk on both shards.
 //
 // @tags: [requires_sharding, uses_transactions, uses_multi_shard_transaction]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    assertNoSuchTransactionOnAllShards,
+    disableStaleVersionAndSnapshotRetriesWithinTransactions,
+    enableStaleVersionAndSnapshotRetriesWithinTransactions,
+    kSnapshotErrors,
+    setFailCommandOnShards,
+    unsetFailCommandOnEachShard,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -50,6 +55,7 @@ function runTest(st, collName, numShardsToError, errorCode, isSharded) {
     for (let commandTestCase of kCommandTestCases) {
         const commandName = commandTestCase.name;
         const commandBody = commandTestCase.command;
+        const failCommandOptions = {namespace: ns, errorCode, failCommands: [commandName]};
 
         if (isSharded && commandName === "distinct") {
             // Distinct isn't allowed on sharded collections in a multi-document transaction.
@@ -61,7 +67,7 @@ function runTest(st, collName, numShardsToError, errorCode, isSharded) {
         // Retry on a single error.
         //
 
-        setFailCommandOnShards(st, {times: 1}, [commandName], errorCode, numShardsToError);
+        setFailCommandOnShards(st, {times: 1}, failCommandOptions, numShardsToError);
 
         session.startTransaction({readConcern: {level: "snapshot"}});
         assert.commandWorked(sessionDB.runCommand(commandBody));
@@ -79,7 +85,7 @@ function runTest(st, collName, numShardsToError, errorCode, isSharded) {
         // Retry on multiple errors.
         //
 
-        setFailCommandOnShards(st, {times: 3}, [commandName], errorCode, numShardsToError);
+        setFailCommandOnShards(st, {times: 3}, failCommandOptions, numShardsToError);
 
         session.startTransaction({readConcern: {level: "snapshot"}});
         assert.commandWorked(sessionDB.runCommand(commandBody));
@@ -97,7 +103,7 @@ function runTest(st, collName, numShardsToError, errorCode, isSharded) {
         // Exhaust retry attempts.
         //
 
-        setFailCommandOnShards(st, "alwaysOn", [commandName], errorCode, numShardsToError);
+        setFailCommandOnShards(st, "alwaysOn", failCommandOptions, numShardsToError);
 
         session.startTransaction({readConcern: {level: "snapshot"}});
         const res = assert.commandFailedWithCode(sessionDB.runCommand(commandBody), errorCode);
@@ -113,15 +119,16 @@ function runTest(st, collName, numShardsToError, errorCode, isSharded) {
     }
 }
 
-const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+const st = new ShardingTest({shards: 2, mongos: 1});
 
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 jsTestLog("Unsharded transaction");
 
 assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 5}, {writeConcern: {w: "majority"}}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 for (let errorCode of kSnapshotErrors) {
     runTest(st, collName, 1, errorCode, false /* isSharded */);
@@ -129,8 +136,6 @@ for (let errorCode of kSnapshotErrors) {
 
 // Enable sharding and set up 2 chunks, [minKey, 10), [10, maxKey), each with one document
 // (includes the document already inserted).
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -168,4 +173,3 @@ for (let errorCode of kSnapshotErrors) {
 disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 st.stop();
-})();

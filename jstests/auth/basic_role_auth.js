@@ -3,6 +3,8 @@
  * environment. This file covers all types of operations except commands.
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 /**
  * Data structure that contains all the users that are going to be used in the tests.
  * The structure is as follows:
@@ -434,6 +436,7 @@ var TESTS = [
         test: function(conn) {
             var testDB = conn.getDB('test');
             assert.eq(1, testDB.auth('rw', AUTH_INFO.test.rw.pwd));
+            testDB.logout();
             assert.eq(1, testDB.auth('ro', AUTH_INFO.test.ro.pwd));
             testOps(testDB, READ_PERM);
 

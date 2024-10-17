@@ -7,18 +7,18 @@
  * @tags: [requires_sharding]
  */
 
-(function() {
-'use strict';
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/libs/fixture_helpers.js");  // For isMongos.
-
-function runTest(m, failPointName) {
+function runTest(m, failPointName, altFailPointName) {
     var db = m.getDB("foo");
     var admin = m.getDB("admin");
 
     admin.createUser({user: 'admin', pwd: 'password', roles: jsTest.adminUserRoles});
     admin.auth('admin', 'password');
-    db.createUser({user: 'reader', pwd: 'reader', roles: [{db: 'foo', role: 'read'}]});
+    const logReader = {db: 'admin', role: 'clusterMonitor'};
+    db.createUser({user: 'reader', pwd: 'reader', roles: [{db: 'foo', role: 'read'}, logReader]});
     db.createUser({user: 'otherReader', pwd: 'otherReader', roles: [{db: 'foo', role: 'read'}]});
     admin.createRole({
         role: 'opAdmin',
@@ -64,7 +64,7 @@ function runTest(m, failPointName) {
 
     jsTestLog("Starting long-running operation");
     db.auth('reader', 'reader');
-    assert.commandWorked(db.adminCommand({configureFailPoint: failPointName, mode: "alwaysOn"}));
+    const fp = configureFailPoint(m, failPointName);
     var s1 = startParallelShell(queryAsReader, m.port);
     jsTestLog("Finding ops in $currentOp output");
     var o = [];
@@ -90,7 +90,8 @@ function runTest(m, failPointName) {
     var start = new Date();
     db.auth('reader', 'reader');
     assert.commandWorked(db.killOp(o[0]));
-    assert.commandWorked(db.adminCommand({configureFailPoint: failPointName, mode: "off"}));
+    checkLog.contains(db, '"msg":"Successful killOp"');
+    fp.off();
 
     jsTestLog("Waiting for ops to terminate");
     var exitCode = s1({checkExitSuccess: false});
@@ -104,7 +105,7 @@ function runTest(m, failPointName) {
     assert.lt(diff, 30000, "Start: " + start + "; end: " + end + "; diff: " + diff);
 
     jsTestLog("Starting a second long-running operation");
-    assert.commandWorked(db.adminCommand({configureFailPoint: failPointName, mode: "alwaysOn"}));
+    const fp2 = configureFailPoint(m, failPointName);
     var s2 = startParallelShell(queryAsReader, m.port);
     jsTestLog("Finding ops in $currentOp output");
     var o2 = [];
@@ -128,16 +129,16 @@ function runTest(m, failPointName) {
     assert.eq([], ops());
 
     jsTestLog("Checking that an administrative user can kill others' operations");
-    var start = new Date();
+    start = new Date();
     assert.commandWorked(db.killOp(o2[0]));
-    assert.commandWorked(db.adminCommand({configureFailPoint: failPointName, mode: "off"}));
+    fp2.off();
     jsTestLog("Waiting for ops to terminate");
-    var exitCode = s2({checkExitSuccess: false});
+    exitCode = s2({checkExitSuccess: false});
     assert.neq(
         0, exitCode, "expected shell to exit abnormally due to JS execution being terminated");
 
-    var end = new Date();
-    var diff = end - start;
+    end = new Date();
+    diff = end - start;
     assert.lt(diff, 30000, "Start: " + start + "; end: " + end + "; diff: " + diff);
 }
 
@@ -150,4 +151,3 @@ var st = new ShardingTest({shards: 1, keyFile: 'jstests/libs/key1'});
 // setYieldAlllocksHang failpoint.
 runTest(st.s, "waitInFindBeforeMakingBatch");
 st.stop();
-})();

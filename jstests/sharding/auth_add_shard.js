@@ -1,8 +1,14 @@
 // SERVER-5124
 // The puporse of this test is to test authentication when adding/removing a shard. The test sets
 // up a sharded system, then adds/removes a shard.
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
+
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
 // login method to login into the database
 function login(userObj) {
@@ -55,12 +61,10 @@ assert.commandWorked(addShardRes);
 
 // Add some data
 var db = mongos.getDB("foo");
+assert.commandWorked(
+    admin.runCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
+
 var collA = mongos.getCollection("foo.bar");
-
-// enable sharding on a collection
-assert.commandWorked(admin.runCommand({enableSharding: "" + collA.getDB()}));
-st.ensurePrimaryShard("foo", st.shard0.shardName);
-
 assert.commandWorked(admin.runCommand({shardCollection: "" + collA, key: {_id: 1}}));
 
 // add data to the sharded collection
@@ -70,8 +74,9 @@ for (var i = 0; i < 4; i++) {
 }
 
 // move a chunk
-assert.commandWorked(
-    admin.runCommand({moveChunk: "foo.bar", find: {_id: 1}, to: addShardRes.shardAdded}));
+// TODO (SERVER-60767): remove _waitForDelete param; removeShard() will sync on range deletion.
+assert.commandWorked(admin.runCommand(
+    {moveChunk: "foo.bar", find: {_id: 1}, to: addShardRes.shardAdded, _waitForDelete: true}));
 
 // verify the chunk was moved
 admin.runCommand({flushRouterConfig: 1});
@@ -84,19 +89,24 @@ st.startBalancer();
 
 //--------------- Test 3 --------------------
 // now drain the shard
-assert.commandWorked(admin.runCommand({removeShard: rst.getURL()}));
+removeShard(st, rst.getURL());
 
-// give it some time to drain
+// create user directly on new shard to allow direct reads from config.migrationCoordinators
+rst.getPrimary()
+    .getDB(adminUser.db)
+    .createUser({user: adminUser.username, pwd: adminUser.password, roles: jsTest.adminUserRoles});
+rst.getPrimary().getDB(adminUser.db).auth(adminUser.username, adminUser.password);
+
+// wait until migration coordinator is finished
 assert.soon(function() {
-    var result = admin.runCommand({removeShard: rst.getURL()});
-    printjson(result);
+    let migrationCoordinatorDocs =
+        rst.getPrimary().getDB('config').migrationCoordinators.find().toArray();
 
-    return result.ok && result.state == "completed";
-}, "failed to drain shard completely", 5 * 60 * 1000);
+    return migrationCoordinatorDocs.length === 0;
+}, "failed to remove migration coordinator", 5 * 60 * 1000);
 
 assert.eq(1, st.config.shards.count(), "removed server still appears in count");
 
 rst.stopSet();
 
 st.stop();
-})();

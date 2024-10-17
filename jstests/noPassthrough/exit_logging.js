@@ -1,12 +1,12 @@
 /**
  * Tests that various forms of normal and abnormal shutdown write to the log files as expected.
  * @tags: [
- *   live_record_incompatible,
  *   requires_sharding,
+ *   incompatible_aubsan,
  * ]
  */
 
-(function() {
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function makeShutdownByCrashFn(crashHow) {
     return function(conn) {
@@ -59,22 +59,17 @@ function runAllTests(launcher) {
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('fault'),
                         makeRegExMatchFn(/Invalid access at address[\s\S]*printStackTrace/),
-                        -SIGSEGV);
+                        SIGSEGV);
 
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('abort'),
                         makeRegExMatchFn(/Got signal[\s\S]*printStackTrace/),
-                        -SIGABRT);
+                        SIGABRT);
 }
 
 if (_isWindows()) {
     print("SKIPPING TEST ON WINDOWS");
-    return;
-}
-
-if (_isAddressSanitizerActive()) {
-    print("SKIPPING TEST ON ADDRESS SANITIZER BUILD");
-    return;
+    quit();
 }
 
 (function testMongod() {
@@ -82,9 +77,7 @@ if (_isAddressSanitizerActive()) {
 
     runAllTests({
         start: function(opts) {
-            var actualOpts = {nojournal: ""};
-            Object.extend(actualOpts, opts);
-            return MongoRunner.runMongod(actualOpts);
+            return MongoRunner.runMongod(opts);
         },
 
         stop: MongoRunner.stopMongod
@@ -94,7 +87,10 @@ if (_isAddressSanitizerActive()) {
 (function testMongos() {
     print("********************\nTesting exit logging in mongos\n********************");
 
-    var st = new ShardingTest({shards: 1});
+    var st = new ShardingTest({
+        shards: 1,
+        configOptions: {setParameter: {transactionLifetimeLimitSeconds: 10}},
+    });
     var mongosLauncher = {
         start: function(opts) {
             var actualOpts = {configdb: st._configDB};
@@ -107,5 +103,4 @@ if (_isAddressSanitizerActive()) {
 
     runAllTests(mongosLauncher);
     st.stop();
-}());
 }());

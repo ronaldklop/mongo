@@ -44,12 +44,15 @@ using PlanNodeId = uint32_t;
 static constexpr PlanNodeId kEmptyPlanNodeId = 0u;
 
 /**
- * These map to implementations of the PlanStage interface, all of which live in db/exec/
+ * These map to implementations of the PlanStage interface, all of which live in db/exec/. These
+ * stage types are shared between Classic and SBE.
  */
 enum StageType {
     STAGE_AND_HASH,
     STAGE_AND_SORTED,
+    STAGE_BATCHED_DELETE,
     STAGE_CACHED_PLAN,
+
     STAGE_COLLSCAN,
 
     // A virtual scan stage that simulates a collection scan and doesn't depend on underlying
@@ -71,8 +74,6 @@ enum StageType {
     // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
     STAGE_DISTINCT_SCAN,
 
-    STAGE_ENSURE_SORTED,
-
     STAGE_EOF,
 
     STAGE_FETCH,
@@ -85,7 +86,7 @@ enum StageType {
 
     STAGE_IXSCAN,
     STAGE_LIMIT,
-
+    STAGE_MATCH,
     STAGE_MOCK,
 
     // Implements iterating over one or more RecordStore::Cursor.
@@ -101,7 +102,9 @@ enum StageType {
 
     STAGE_QUEUED_DATA,
     STAGE_RECORD_STORE_FAST_COUNT,
+    STAGE_REPLACE_ROOT,
     STAGE_RETURN_KEY,
+    STAGE_SAMPLE_FROM_TIMESERIES_BUCKET,
     STAGE_SHARDING_FILTER,
     STAGE_SKIP,
 
@@ -110,18 +113,39 @@ enum StageType {
     STAGE_SORT_KEY_GENERATOR,
 
     STAGE_SORT_MERGE,
+
+    STAGE_SPOOL,
+
     STAGE_SUBPLAN,
 
     // Stages for running text search.
     STAGE_TEXT_OR,
     STAGE_TEXT_MATCH,
 
+    // Stage for modifying bucket documents in a time-series bucket collection.
+    STAGE_TIMESERIES_MODIFY,
+
     // Stage for choosing between two alternate plans based on an initial trial period.
     STAGE_TRIAL,
 
     STAGE_UNKNOWN,
 
+    // Stage for 'UnpackTimeseriesBucket' which is only used for $sample on a time-series bucket
+    // collection.
+    STAGE_UNPACK_SAMPLED_TS_BUCKET,
+
+    STAGE_UNWIND,
     STAGE_UPDATE,
+
+    // Stages for DocumentSources.
+    STAGE_GROUP,
+    STAGE_EQ_LOOKUP,
+    STAGE_EQ_LOOKUP_UNWIND,
+    STAGE_SEARCH,
+    STAGE_WINDOW,
+    STAGE_SENTINEL,
+    // Stage for the DocumentSource to unpack timeseries buckets.
+    STAGE_UNPACK_TS_BUCKET,
 };
 
 inline bool isProjectionStageType(StageType stageType) {
@@ -146,4 +170,10 @@ inline bool isSortStageType(StageType stageType) {
 }
 
 StringData stageTypeToString(StageType stageType);
+
+/**
+ * Returns the explain() stage type string for a STAGE_COLLSCAN stage that is performing a clustered
+ * collection scan in SBE, to match Classic's explain() output.
+ */
+StringData clusteredCollectionScanSbeToString();
 }  // namespace mongo

@@ -4,10 +4,8 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/aggregation/extras/utils.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 1});
 replTest.startSet();
@@ -56,4 +54,3 @@ assert.commandWorked(
     primary.adminCommand({configureFailPoint: 'WTSetOldestTSToStableTS', mode: 'off'}));
 
 replTest.stopSet();
-}());

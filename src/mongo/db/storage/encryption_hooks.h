@@ -29,10 +29,16 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/jsobj.h"
 
 namespace boost {
@@ -94,7 +100,7 @@ public:
                                   uint8_t* out,
                                   size_t outLen,
                                   size_t* resultLen,
-                                  boost::optional<std::string> dbName);
+                                  boost::optional<DatabaseName> dbName);
 
     /**
      * Transform temporary data that has been spilled to disk back into readable form. If dbName
@@ -108,7 +114,7 @@ public:
                                     uint8_t* out,
                                     size_t outLen,
                                     size_t* resultLen,
-                                    boost::optional<std::string> dbName);
+                                    boost::optional<DatabaseName> dbName);
 
     /**
      * Inform the encryption storage system to prepare its data such that its files can be copied

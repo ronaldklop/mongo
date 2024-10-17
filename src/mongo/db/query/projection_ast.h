@@ -29,12 +29,32 @@
 
 #pragma once
 
+#include <algorithm>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <iterator>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/copyable_match_expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/projection_ast_visitor.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace projection_ast {
@@ -121,7 +141,7 @@ public:
     MatchExpressionASTNode(const MatchExpressionASTNode& other)
         : ASTNode{other}, _matchExpr{other._matchExpr} {}
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<MatchExpressionASTNode>(*this);
     }
 
@@ -141,14 +161,36 @@ private:
     CopyableMatchExpression _matchExpr;
 };
 
+/*
+ * This node behaves as a map from field name to child in a projection. Internally, we hold a vector
+ * of field names until the size reaches 100, where we switch to a map type for faster searching. We
+ * behave this way to avoid the overhead of a map for small queries, where the linear search is
+ * faster. Note that we do not go back to using a vector if the size drops below 100 due to
+ * removeChild() calls.
+ */
 class ProjectionPathASTNode final : public ASTNode {
 public:
-    ProjectionPathASTNode() {}
+    using FieldToChildMap = absl::flat_hash_map<std::string, ASTNode*>;
 
-    ProjectionPathASTNode(ASTNodeVector children, std::vector<std::string> fieldNames)
-        : ASTNode(std::move(children)), _fieldNames(std::move(fieldNames)) {
-        invariant(_children.size() == _fieldNames.size());
-    }
+    ProjectionPathASTNode() = default;
+
+    ProjectionPathASTNode(const ProjectionPathASTNode& other)
+        : ASTNode(other),
+          _fieldNames(other._fieldNames),
+          _fieldToChildMap(cloneMap(other._fieldToChildMap)) {}
+
+    ProjectionPathASTNode(ProjectionPathASTNode&& other) = default;
+
+    ~ProjectionPathASTNode() override = default;
+
+    ProjectionPathASTNode& operator=(const ProjectionPathASTNode& other) = delete;
+
+    ProjectionPathASTNode& operator=(ProjectionPathASTNode&& other) = delete;
+
+    // Threshold of number of children for when this class internally begins to use a map structure
+    // for efficient lookup. This was chosen by finding the crossover point where a linear search
+    // becomes worse than map lookups. Most queries are small enough to never reach this threshold.
+    static constexpr size_t kUseMapThreshold = 100;
 
     void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
         visitor->visit(this);
@@ -158,23 +200,59 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
-        return std::make_unique<ProjectionPathASTNode>(*this);
+    std::unique_ptr<ASTNode> clone() const final {
+        auto cloneNode = std::make_unique<ProjectionPathASTNode>(*this);
+        if (_fieldToChildMap) {
+            // Change the addresses in the new map to point to the cloned children.
+            for (size_t i = 0; i < _fieldNames.size(); ++i) {
+                cloneNode->_fieldToChildMap->insert_or_assign(_fieldNames.at(i),
+                                                              cloneNode->_children.at(i).get());
+            }
+        }
+        return cloneNode;
     }
 
     ASTNode* getChild(StringData fieldName) const {
-        invariant(_fieldNames.size() == _children.size());
-        for (size_t i = 0; i < _fieldNames.size(); ++i) {
-            if (_fieldNames[i] == fieldName) {
-                return _children[i].get();
+        tassert(7858000,
+                "Expected the same number of field names as children, and either not using the "
+                "internal field name to child map or the map should have the same size.",
+                _fieldNames.size() == _children.size() &&
+                    (!_fieldToChildMap || _fieldToChildMap->size() == _children.size()));
+
+        // Use the map if available. Otherwise linearly search through the vector.
+        if (_fieldToChildMap) {
+            auto it = _fieldToChildMap->find(fieldName.toString());
+            if (it == _fieldToChildMap->end()) {
+                return nullptr;
             }
+            return it->second;
+        } else {
+            for (size_t i = 0; i < _fieldNames.size(); ++i) {
+                if (_fieldNames[i] == fieldName) {
+                    return _children[i].get();
+                }
+            }
+            return nullptr;
         }
-        return nullptr;
     }
 
     void addChild(StringData fieldName, std::unique_ptr<ASTNode> node) {
+        auto rawPtrNode = node.get();
         addChildToInternalVector(std::move(node));
         _fieldNames.push_back(fieldName.toString());
+
+        if (_fieldToChildMap) {
+            _fieldToChildMap->emplace(fieldName.toString(), rawPtrNode);
+        } else if (!_fieldToChildMap && _fieldNames.size() >= kUseMapThreshold) {
+            // Start using the map, so we can perform getChild lookups faster.
+            _fieldToChildMap = std::make_unique<FieldToChildMap>();
+
+            for (size_t i = 0; i < _fieldNames.size(); i++) {
+                const auto& field = _fieldNames.at(i);
+                const auto rawPtrChild = _children.at(i).get();
+                _fieldToChildMap->emplace(field, rawPtrChild);
+            }
+        }
     }
 
     /**
@@ -186,6 +264,8 @@ public:
             it != _fieldNames.end()) {
             _children.erase(_children.begin() + std::distance(_fieldNames.begin(), it));
             _fieldNames.erase(it);
+            if (_fieldToChildMap)
+                _fieldToChildMap->erase(fieldName.toString());
             return true;
         }
 
@@ -197,8 +277,18 @@ public:
     }
 
 private:
+    static std::unique_ptr<FieldToChildMap> cloneMap(const std::unique_ptr<FieldToChildMap>& p) {
+        if (p) {
+            return std::make_unique<FieldToChildMap>(*p);
+        }
+        return {};
+    }
+
     // Names associated with the child nodes. Must be same size as _children.
     std::vector<std::string> _fieldNames;
+    // Field names to child map, used for quick lookup of children when our size is greater than
+    // kUseMapThreshold.
+    std::unique_ptr<FieldToChildMap> _fieldToChildMap;
 };
 
 class ProjectionPositionalASTNode final : public ASTNode {
@@ -216,7 +306,7 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<ProjectionPositionalASTNode>(*this);
     }
 };
@@ -233,7 +323,7 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<ProjectionSliceASTNode>(*this);
     }
 
@@ -265,7 +355,7 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<ProjectionElemMatchASTNode>(*this);
     }
 };
@@ -275,13 +365,20 @@ public:
     ExpressionASTNode(boost::intrusive_ptr<Expression> expr) : _expr(expr) {}
     ExpressionASTNode(const ExpressionASTNode& other) : ASTNode(other) {
         BSONObjBuilder bob;
-        bob << "" << other._expr->serialize(false);
+        bob << "" << other._expr->serialize();
 
         // TODO SERVER-31003: add a clone() method to Expression.
-        boost::intrusive_ptr<Expression> clonedExpr =
-            Expression::parseOperand(other._expr->getExpressionContext(),
-                                     bob.obj().firstElement(),
-                                     other._expr->getExpressionContext()->variablesParseState);
+        // Temporary stop expression counters while processing the cloned expression.
+        auto otherCtx = other._expr->getExpressionContext();
+        auto activeCounting = otherCtx->expressionCountersAreActive();
+        if (activeCounting) {
+            otherCtx->enabledCounters = false;
+        }
+        boost::intrusive_ptr<Expression> clonedExpr = Expression::parseOperand(
+            otherCtx, bob.obj().firstElement(), otherCtx->variablesParseState);
+        if (activeCounting) {
+            otherCtx->enabledCounters = true;
+        }
         _expr = clonedExpr;
     }
 
@@ -293,7 +390,7 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<ExpressionASTNode>(*this);
     }
 
@@ -303,6 +400,10 @@ public:
 
     boost::intrusive_ptr<Expression> expression() const {
         return _expr;
+    }
+
+    void optimize() {
+        _expr = _expr->optimize();
     }
 
 private:
@@ -321,7 +422,7 @@ public:
         visitor->visit(this);
     }
 
-    std::unique_ptr<ASTNode> clone() const override final {
+    std::unique_ptr<ASTNode> clone() const final {
         return std::make_unique<BooleanConstantASTNode>(*this);
     }
 

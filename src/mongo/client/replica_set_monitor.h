@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/client/replica_set_monitor_interface.h"
@@ -63,9 +64,8 @@ public:
     static std::shared_ptr<ReplicaSetMonitor> createIfNeeded(const MongoURI& uri);
 
     /**
-     * gets a cached Monitor per name. If the monitor is not found and createFromSeed is false,
-     * it will return none. If createFromSeed is true, it will try to look up the last known
-     * servers list for this set and will create a new monitor using that as the seed list.
+     * gets a cached Monitor per name. The getter method returns nullptr if there is no monitor
+     * registered for the particular replica set.
      */
     static std::shared_ptr<ReplicaSetMonitor> get(const std::string& name);
 
@@ -99,7 +99,7 @@ public:
     static void shutdown();
 
 protected:
-    explicit ReplicaSetMonitor(const std::function<void()> cleanupCallback);
+    explicit ReplicaSetMonitor(std::function<void()> cleanupCallback);
 
 private:
     /**

@@ -26,11 +26,18 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/duration.h"
 
 namespace {
@@ -42,7 +49,7 @@ static const Seconds kMinMaxStaleness = ReadPreferenceSetting::kMinimalMaxStalen
 ReadPreferenceSetting parse(const BSONObj& rpsObj) {
     const auto swRps = ReadPreferenceSetting::fromInnerBSON(rpsObj);
     ASSERT_OK(swRps.getStatus());
-    return std::move(swRps.getValue());
+    return swRps.getValue();
 }
 
 void checkParse(const BSONObj& rpsObj, const ReadPreferenceSetting& expected) {
@@ -112,13 +119,13 @@ TEST(ReadPreferenceSetting, ParseHedgingMode) {
     ASSERT_TRUE(rps.pref == ReadPreference::PrimaryOnly);
     ASSERT_FALSE(rps.hedgingMode.has_value());
 
-    // Implicit opt-in for readPreference mode "nearest".
+    // Implicit opt-in for readPreference mode "nearest" should no longer default to hedging mode
+    // enabled.
     rpsObj = BSON("mode"
                   << "nearest");
     rps = parse(rpsObj);
     ASSERT_TRUE(rps.pref == ReadPreference::Nearest);
-    ASSERT_TRUE(rps.hedgingMode.has_value());
-    ASSERT_TRUE(rps.hedgingMode->getEnabled());
+    ASSERT_FALSE(rps.hedgingMode.has_value());
 
     // Default hedging mode.
     rpsObj = BSON("mode"
@@ -154,6 +161,23 @@ TEST(ReadPreferenceSetting, ParseHedgingMode) {
     ASSERT_TRUE(rps.pref == ReadPreference::PrimaryOnly);
     ASSERT_TRUE(rps.hedgingMode.has_value());
     ASSERT_FALSE(rps.hedgingMode->getEnabled());
+}
+
+TEST(ReadPreferenceSetting, ParseIsPretargeted) {
+    // No $_isPretargeted.
+    auto rpsObj = BSON("mode"
+                       << "primary");
+    auto rps = parse(rpsObj);
+    ASSERT_TRUE(rps.pref == ReadPreference::PrimaryOnly);
+    ASSERT_FALSE(rps.isPretargeted);
+
+    // $_isPretargeted true.
+    rpsObj = BSON("mode"
+                  << "secondary"
+                  << "$_isPretargeted" << true);
+    rps = parse(rpsObj);
+    ASSERT_TRUE(rps.pref == ReadPreference::SecondaryOnly);
+    ASSERT_TRUE(rps.isPretargeted);
 }
 
 void checkParseFails(const BSONObj& rpsObj) {
@@ -194,6 +218,13 @@ TEST(ReadPreferenceSetting, NonEquality) {
     auto unexpected3 =
         ReadPreferenceSetting(ReadPreference::Nearest, tagSet, kMinMaxStaleness, HedgingMode());
     ASSERT_FALSE(rps.equals(unexpected3));
+
+    auto unexpected4 = ReadPreferenceSetting(ReadPreference::PrimaryOnly,
+                                             tagSet,
+                                             kMinMaxStaleness,
+                                             boost::none,
+                                             true /* isPretargeted */);
+    ASSERT_FALSE(rps.equals(unexpected4));
 }
 
 TEST(ReadPreferenceSetting, ParseInvalid) {
@@ -251,10 +282,23 @@ TEST(ReadPreferenceSetting, ParseInvalid) {
                                   << "hedge" << BSONObj()),
                              ErrorCodes::InvalidOptions);
 
-    checkParseContainerFailsWithError(BSON("$query" << BSON("pang"
-                                                            << "pong")
-                                                    << "$readPreference" << 2),
+    checkParseContainerFailsWithError(BSON("abc" << BSON("pang"
+                                                         << "pong")
+                                                 << "$readPreference" << 2),
                                       ErrorCodes::TypeMismatch);
+
+    // $_isPretargeted false.
+    checkParseFailsWithError(BSON("mode"
+                                  << "nearest"
+                                  << "$_isPretargeted" << false),
+                             ErrorCodes::InvalidOptions);
+
+    // $_isPretargeted wrong type.
+    checkParseFailsWithError(BSON("mode"
+                                  << "primaryPreferred"
+                                  << "$_isPretargeted"
+                                  << "foo"),
+                             ErrorCodes::TypeMismatch);
 }
 
 void checkRoundtrip(const ReadPreferenceSetting& rps) {
@@ -294,6 +338,30 @@ TEST(ReadPreferenceSetting, Roundtrip) {
                                                                    << "bar"))),
                                          kMinMaxStaleness,
                                          hedgingMode));
+
+    checkRoundtrip(ReadPreferenceSetting(ReadPreference::SecondaryPreferred,
+                                         TagSet(),
+                                         kMinMaxStaleness,
+                                         boost::none,
+                                         true /* isPretargeted */));
 }
+
+// Verify TagSet isFlags work correctly
+TEST(TagSet, TestFlags) {
+    TagSet tsPrimary = TagSet::primaryOnly();
+    ASSERT_TRUE(tsPrimary.isPrimaryOnly());
+    ASSERT_FALSE(tsPrimary.isMatchAnyNode());
+
+    TagSet tsMatchAny;
+    ASSERT_FALSE(tsMatchAny.isPrimaryOnly());
+    ASSERT_TRUE(tsMatchAny.isMatchAnyNode());
+    ASSERT_FALSE(tsMatchAny == TagSet::primaryOnly());
+
+    TagSet tsSomething(BSON_ARRAY(BSON("x" << 1)));
+    ASSERT_FALSE(tsSomething.isPrimaryOnly());
+    ASSERT_FALSE(tsSomething.isMatchAnyNode());
+    ASSERT_FALSE(tsSomething == TagSet::primaryOnly());
+}
+
 
 }  // namespace

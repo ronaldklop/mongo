@@ -29,8 +29,27 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl_index_build_state.h"
+#include "mongo/db/resumable_index_builds_gen.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -71,8 +90,8 @@ public:
      */
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
-        std::string dbName,
-        CollectionUUID collectionUUID,
+        const DatabaseName& dbName,
+        const UUID& collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
         IndexBuildProtocol protocol,
@@ -85,11 +104,16 @@ public:
      */
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> resumeIndexBuild(
         OperationContext* opCtx,
-        std::string dbName,
-        CollectionUUID collectionUUID,
+        const DatabaseName& dbName,
+        const UUID& collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
         const ResumeIndexInfo& resumeInfo) override;
+
+    Status voteAbortIndexBuild(OperationContext* opCtx,
+                               const UUID& buildUUID,
+                               const HostAndPort& hostAndPort,
+                               StringData reason) override;
 
     Status voteCommitIndexBuild(OperationContext* opCtx,
                                 const UUID& buildUUID,
@@ -139,23 +163,21 @@ private:
     void _refreshReplStateFromPersisted(OperationContext* opCtx, const UUID& buildUUID);
 
     /**
-     * Process voteCommitIndexBuild command's response.
-     */
-    bool _checkVoteCommitIndexCmdSucceeded(const BSONObj& response, const UUID& indexBuildUUID);
-
-    /**
      * Signals index builder to commit.
      */
     void _sendCommitQuorumSatisfiedSignal(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState);
 
 
-    void _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
+    bool _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
 
 
     bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _signalPrimaryForAbortAndWaitForExternalAbort(OperationContext* opCtx,
+                                                       ReplIndexBuildState* replState) override;
 
     void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
@@ -169,8 +191,8 @@ private:
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> _startIndexBuild(
         OperationContext* opCtx,
-        std::string dbName,
-        CollectionUUID collectionUUID,
+        const DatabaseName& dbName,
+        const UUID& collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
         IndexBuildProtocol protocol,
@@ -181,8 +203,7 @@ private:
     ThreadPool _threadPool;
 
     // Manages _numActiveIndexBuilds and _indexBuildFinished.
-    mutable Mutex _throttlingMutex =
-        MONGO_MAKE_LATCH("IndexBuildsCoordinatorMongod::_throttlingMutex");
+    mutable stdx::mutex _throttlingMutex;
 
     // Protected by _mutex.
     int _numActiveIndexBuilds = 0;

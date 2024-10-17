@@ -27,19 +27,35 @@
  *    it in the license file.
  */
 
+
 #include "mongo/db/query/expression_index.h"
 
-#include <iostream>
+#include <algorithm>
+#include <memory>
+#include <s2cellid.h>
+#include <s2region.h>
+#include <s2regioncoverer.h>
+#include <set>
+#include <string>
 #include <unordered_set>
+#include <utility>
 
-#include "mongo/db/geo/geoconstants.h"
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/hasher.h"
-#include "mongo/db/index/expression_params.h"
 #include "mongo/db/query/expression_index_knobs_gen.h"
-#include "third_party/s2/s2cellid.h"
-#include "third_party/s2/s2region.h"
-#include "third_party/s2/s2regioncoverer.h"
+#include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -72,7 +88,7 @@ std::vector<GeoHash> ExpressionMapping::get2dCovering(const R2Region& region,
                                                       const BSONObj& indexInfoObj,
                                                       int maxCoveringCells) {
     auto result = GeoHashConverter::createFromDoc(indexInfoObj);
-    verify(result.isOK());  // We validated the parameters when creating the index.
+    MONGO_verify(result.isOK());  // We validated the parameters when creating the index.
 
     const auto bits = result.getValue()->getBits();
     R2RegionCoverer coverer(std::move(result.getValue()));
@@ -175,8 +191,10 @@ void ExpressionMapping::S2CellIdsToIntervals(const std::vector<S2CellId>& interv
     // Make sure that our intervals don't overlap each other and are ordered correctly.
     // This perhaps should only be done in debug mode.
     if (!oilOut->isValidFor(1)) {
-        std::cout << "check your assumptions! OIL = " << oilOut->toString() << std::endl;
-        verify(0);
+        LOGV2(6029801,
+              "invalid OrderedIntervalList",
+              "orderedIntervalList"_attr = oilOut->toString(false));
+        MONGO_UNREACHABLE;
     }
 }
 
@@ -222,8 +240,10 @@ void ExpressionMapping::S2CellIdsToIntervalsWithParents(const std::vector<S2Cell
     // Make sure that our intervals don't overlap each other and are ordered correctly.
     // This perhaps should only be done in debug mode.
     if (!oilOut->isValidFor(1)) {
-        std::cout << "check your assumptions! OIL = " << oilOut->toString() << std::endl;
-        verify(0);
+        LOGV2(6029802,
+              "invalid OrderedIntervalList",
+              "orderedIntervalList"_attr = oilOut->toString(false));
+        MONGO_UNREACHABLE;
     }
 }
 

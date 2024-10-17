@@ -2,14 +2,24 @@
  * Tests that the coordinateCommitTransaction command falls back to recovering the decision from
  * the local participant.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *    # TODO (SERVER-88125): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ *   uses_multi_shard_transaction,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    checkWriteConcernTimedOut,
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries,
+} from "jstests/libs/write_concern_util.js";
+import {
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 // The test modifies config.transactions, which must be done outside of a session.
 TestData.disableImplicitSessions = true;
@@ -185,12 +195,26 @@ const waitForCommitTransactionToComplete = function(coordinatorRs, lsid, txnNumb
     });
 };
 
-let st =
-    new ShardingTest({shards: 2, rs: {nodes: 2}, mongos: 2, other: {mongosOptions: {verbose: 3}}});
+let st = new ShardingTest({
+    shards: 2,
+    rs: {nodes: 2},
+    rsOptions: {
+        setParameter: {
+            // Set this to match the value of transactionLifetimeLimitSeconds to avoid transition
+            // failure due to not being able to acquire the lock quickly enough.
+            maxTransactionLockRequestTimeoutMillis: TestData.transactionLifetimeLimitSeconds * 1000
+        }
+    },
+    mongos: 2,
+    other: {mongosOptions: {verbose: 3}}
+});
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.name);
+assert.commandWorked(st.s0.adminCommand({enableSharding: 'test', primaryShard: st.shard0.name}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: 'test.user', middle: {x: 0}}));
 assert.commandWorked(
@@ -204,6 +228,12 @@ const lsid = {
     id: UUID()
 };
 let txnNumber = 0;
+
+// Force refresh of dbVersion now to avoid conflicting locks with test transactions.
+assert.commandWorked(st.shard0.adminCommand({_flushRoutingTableCacheUpdates: 'test.user'}));
+assert.commandWorked(st.shard1.adminCommand({_flushRoutingTableCacheUpdates: 'test.user'}));
+assert.commandWorked(st.shard0.adminCommand({_flushDatabaseCacheUpdates: 'test'}));
+assert.commandWorked(st.shard1.adminCommand({_flushDatabaseCacheUpdates: 'test'}));
 
 //
 // Generic test cases that are agnostic as to the transaction type
@@ -278,7 +308,8 @@ assert.commandFailedWithCode(sendCommitViaOriginalMongos(lsid, txnNumber, recove
 
 const recoveryShardReplSetTest = st.rs1;
 
-stopReplicationOnSecondaries(recoveryShardReplSetTest);
+stopReplicationOnSecondaries(recoveryShardReplSetTest,
+                             false /* changeReplicaSetDefaultWCToLocal */);
 
 // Do a write on the recovery node to bump the recovery node's system last OpTime.
 recoveryShardReplSetTest.getPrimary().getDB("dummy").getCollection("dummy").insert({dummy: 1});
@@ -308,7 +339,8 @@ assert.commandWorked(sendCommitViaOriginalMongos(lsid, txnNumber, recoveryToken)
 
 const recoveryShardReplSetTest = st.rs1;
 
-stopReplicationOnSecondaries(recoveryShardReplSetTest);
+stopReplicationOnSecondaries(recoveryShardReplSetTest,
+                             false /* changeReplicaSetDefaultWCToLocal */);
 
 // Do a write on the recovery node to bump the recovery node's system last OpTime.
 recoveryShardReplSetTest.getPrimary().getDB("dummy").getCollection("dummy").insert({dummy: 1});
@@ -568,4 +600,3 @@ assert.commandWorked(sendCommitViaRecoveryMongos(lsid, txnNumber, recoveryToken)
 })();
 
 st.stop();
-})();

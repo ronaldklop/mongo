@@ -27,13 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
-#include "mongo/platform/basic.h"
+#include <mutex>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace {
@@ -66,7 +76,7 @@ BaseCloner::BaseCloner(StringData clonerName,
 
 Status BaseCloner::run() {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _active = true;
     }
     try {
@@ -79,7 +89,7 @@ Status BaseCloner::run() {
         setSyncFailedStatus(e.toStatus());
     }
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _active = false;
         if (!_status.isOK()) {
             return _status;
@@ -89,8 +99,6 @@ Status BaseCloner::run() {
     if (!_sharedData->getStatus(lk).isOK()) {
         LOGV2_OPTIONS(21065,
                       {getLogComponent()},
-                      "Failing data clone because of failure outside data clone: "
-                      "{error}",
                       "Failing data clone because of failure outside data clone",
                       "error"_attr = _sharedData->getStatus(lk));
     }
@@ -105,7 +113,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
     LOGV2_DEBUG_OPTIONS(21069,
                         1,
                         {getLogComponent()},
-                        "Cloner {cloner} running stage {stage}",
                         "Cloner running stage",
                         "cloner"_attr = getClonerName(),
                         "stage"_attr = stage->getName());
@@ -117,7 +124,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
         [&](const BSONObj& data) {
             LOGV2_OPTIONS(21070,
                           {getLogComponent()},
-                          "Cloner {cloner} hanging before running stage {stage}",
                           "Cloner hanging before running stage",
                           "cloner"_attr = getClonerName(),
                           "stage"_attr = stage->getName());
@@ -131,7 +137,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
         [&](const BSONObj& data) {
             LOGV2_OPTIONS(21071,
                           {getLogComponent()},
-                          "Cloner {cloner} hanging after running stage {stage}",
                           "Cloner hanging after running stage",
                           "cloner"_attr = getClonerName(),
                           "stage"_attr = stage->getName());
@@ -143,7 +148,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
     LOGV2_DEBUG_OPTIONS(21072,
                         1,
                         {getLogComponent()},
-                        "Cloner {cloner} finished running stage {stage}",
                         "Cloner finished running stage",
                         "cloner"_attr = getClonerName(),
                         "stage"_attr = stage->getName());
@@ -167,7 +171,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
                     [&](const BSONObj& data) {
                         LOGV2_OPTIONS(21074,
                                       {getLogComponent()},
-                                      "Cloner {cloner} hanging before retrying stage {stage}",
                                       "Cloner hanging before retrying stage",
                                       "cloner"_attr = getClonerName(),
                                       "stage"_attr = stage->getName());
@@ -179,8 +182,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
                     isThisStageFailPoint);
                 LOGV2_OPTIONS(21075,
                               {getLogComponent()},
-                              "Sync process retrying {cloner} stage {stage} due to "
-                              "{error}",
                               "Sync process retrying cloner stage due to error",
                               "cloner"_attr = getClonerName(),
                               "stage"_attr = stage->getName(),
@@ -194,8 +195,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
             if (!stage->isTransientError(lastError)) {
                 LOGV2_OPTIONS(21077,
                               {getLogComponent()},
-                              "Non-retryable error occurred during cloner "
-                              "{cloner} stage {stage}: {error}",
                               "Non-retryable error occurred during cloner stage",
                               "cloner"_attr = getClonerName(),
                               "stage"_attr = stage->getName(),
@@ -205,8 +204,6 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
             LOGV2_DEBUG_OPTIONS(21078,
                                 1,
                                 {getLogComponent()},
-                                "Transient error occurred during cloner "
-                                "{cloner} stage {stage}: {error}",
                                 "Transient error occurred during cloner stage",
                                 "cloner"_attr = getClonerName(),
                                 "stage"_attr = stage->getName(),
@@ -218,7 +215,7 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
 std::pair<Future<void>, TaskExecutor::EventHandle> BaseCloner::runOnExecutorEvent(
     TaskExecutor* executor) {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         invariant(!_active && !_startedAsync);
         _startedAsync = true;
     }
@@ -229,7 +226,7 @@ std::pair<Future<void>, TaskExecutor::EventHandle> BaseCloner::runOnExecutorEven
     auto callback = [this](const TaskExecutor::CallbackArgs& args) mutable {
         if (!args.status.isOK()) {
             {
-                stdx::lock_guard<Latch> lk(_mutex);
+                stdx::lock_guard<stdx::mutex> lk(_mutex);
                 _startedAsync = false;
             }
             // The _promise can run the error callback on this thread, so we must not hold the lock
@@ -239,7 +236,7 @@ std::pair<Future<void>, TaskExecutor::EventHandle> BaseCloner::runOnExecutorEven
         }
         _promise.setWith([this] {
             Status status = run();
-            stdx::lock_guard<Latch> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
             _startedAsync = false;
             return status;
         });
@@ -265,6 +262,8 @@ void BaseCloner::setStopAfterStage_forTest(std::string stage) {
 
 BaseCloner::AfterStageBehavior BaseCloner::runStages() {
     AfterStageBehavior afterStageBehavior = kContinueNormally;
+    if (_stopAfterStage == "preStage")
+        return kSkipRemainingStages;
     for (auto* stage : getStages()) {
         {
             stdx::lock_guard<ReplSyncSharedData> lk(*_sharedData);
@@ -281,7 +280,7 @@ BaseCloner::AfterStageBehavior BaseCloner::runStages() {
 void BaseCloner::setSyncFailedStatus(Status status) {
     invariant(!status.isOK());
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _status = status;
     }
     stdx::lock_guard<ReplSyncSharedData> lk(*_sharedData);

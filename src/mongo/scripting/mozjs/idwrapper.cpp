@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <js/Id.h>
+#include <js/String.h>
 
-#include "mongo/scripting/mozjs/idwrapper.h"
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/scripting/mozjs/exception.h"
+#include "mongo/scripting/mozjs/idwrapper.h"
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
 #include "mongo/util/assert_util.h"
 
@@ -47,10 +50,10 @@ std::string IdWrapper::toString() const {
 }
 
 StringData IdWrapper::toStringData(JSStringWrapper* jsstr) const {
-    if (JSID_IS_STRING(_value)) {
-        *jsstr = JSStringWrapper(_context, JSID_TO_STRING(_value));
-    } else if (JSID_IS_INT(_value)) {
-        *jsstr = JSStringWrapper(JSID_TO_INT(_value));
+    if (_value.isString()) {
+        *jsstr = JSStringWrapper(_context, _value.toString());
+    } else if (_value.isInt()) {
+        *jsstr = JSStringWrapper(_value.toInt());
     } else {
         throwCurrentJSException(_context,
                                 ErrorCodes::TypeMismatch,
@@ -61,9 +64,9 @@ StringData IdWrapper::toStringData(JSStringWrapper* jsstr) const {
 }
 
 uint32_t IdWrapper::toInt32() const {
-    uassert(ErrorCodes::TypeMismatch, "Cannot toInt32() non-integer jsid", JSID_IS_INT(_value));
+    uassert(ErrorCodes::TypeMismatch, "Cannot toInt32() non-integer jsid", _value.isInt());
 
-    return JSID_TO_INT(_value);
+    return _value.toInt();
 }
 
 void IdWrapper::toValue(JS::MutableHandleValue value) const {
@@ -73,7 +76,7 @@ void IdWrapper::toValue(JS::MutableHandleValue value) const {
     }
 
     if (isString()) {
-        auto str = JSID_TO_STRING(_value);
+        auto str = _value.toString();
         value.setString(str);
         return;
     }
@@ -87,10 +90,10 @@ bool IdWrapper::equals(StringData sd) const {
 
 bool IdWrapper::equalsAscii(StringData sd) const {
     if (isString()) {
-        auto str = JSID_TO_STRING(_value);
+        auto str = _value.toString();
 
         if (!str) {
-            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JSID_TO_STRING");
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to id.toString()");
         }
 
         bool matched;
@@ -110,11 +113,11 @@ bool IdWrapper::equalsAscii(StringData sd) const {
 }
 
 bool IdWrapper::isInt() const {
-    return JSID_IS_INT(_value);
+    return _value.isInt();
 }
 
 bool IdWrapper::isString() const {
-    return JSID_IS_STRING(_value);
+    return _value.isString();
 }
 
 }  // namespace mozjs

@@ -27,20 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/tenant_all_database_cloner.h"
 #include "mongo/db/repl/tenant_cloner_test_fixture.h"
-#include "mongo/db/service_context_test_fixture.h"
-#include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace repl {
@@ -163,7 +172,7 @@ TEST_F(TenantAllDatabaseClonerTest, DatabaseStats) {
     _clock.advance(Minutes(1));
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
 
@@ -312,7 +321,7 @@ TEST_F(TenantAllDatabaseClonerTest, ListCollectionsRemoteUnreachableBeforeMajori
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_NOT_OK(cloner->run());
     });
 
@@ -340,7 +349,7 @@ TEST_F(TenantAllDatabaseClonerTest, ListDatabasesRecordsCorrectOperationTime) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
 
@@ -361,7 +370,8 @@ TEST_F(TenantAllDatabaseClonerTest, ListDatabasesRecordsCorrectOperationTime) {
 TEST_F(TenantAllDatabaseClonerTest, TenantDatabasesAlreadyExist) {
     // Test that cloner should fail if tenant databases already exist on the recipient prior to
     // starting cloning phase of the migration.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
+    ASSERT_OK(createCollection(NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll"),
+                               CollectionOptions()));
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbA + "'}, {name:'" + _tenantDbAAB + "'}]}";
@@ -374,18 +384,37 @@ TEST_F(TenantAllDatabaseClonerTest, TenantDatabasesAlreadyExist) {
 }
 
 TEST_F(TenantAllDatabaseClonerTest, ResumingFromLastClonedDb) {
-    // Test that all databases cloner correctly resume from the last cloned database.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbAAB, "coll"), CollectionOptions()));
+    // Test that all databases cloner correctly resumes from the last cloned database.
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
+    ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
+    ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
+
+    long long sizeOfDbA = 0;
+    {
+        // Insert some documents into both collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), nssDbA, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), nssDbAAb, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+
+        auto swSizeofDbA = storage->getCollectionSize(opCtx.get(), nssDbA);
+        ASSERT_OK(swSizeofDbA.getStatus());
+        sizeOfDbA = swSizeofDbA.getValue();
+    }
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbA + "'}, {name:'" + _tenantDbAAB + "'}]}";
     _mockServer->setCommandReply("listDatabases", fromjson(listDatabasesReply));
     _mockServer->setCommandReply("find", createFindResponse());
+    _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
-    cloner->setStopAfterStage_forTest("listExistingDatabases");
+    cloner->setStopAfterStage_forTest("initializeStatsStage");
 
     ASSERT_OK(cloner->run());
 
@@ -393,23 +422,42 @@ TEST_F(TenantAllDatabaseClonerTest, ResumingFromLastClonedDb) {
     ASSERT_EQUALS(1u, databases.size());
     ASSERT_EQUALS(_tenantDbAAB, databases[0]);
 
-    ASSERT_EQUALS(1, cloner->getStats().databasesClonedBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(1, stats.databasesClonedBeforeFailover);
+
+    ASSERT_EQUALS(sizeOfDbA, stats.approxTotalBytesCopied);
+    ASSERT_LESS_THAN(stats.approxTotalBytesCopied, stats.approxTotalDataSize);
 }
 
 TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllGreater) {
     // Test that we correctly resume from next database compared greater than the last cloned
     // database if the last cloned database is dropped. This tests the case when all databases in
     // the latest listDatabases result are compared greater than the last cloned database.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
+
+    long long size = 0;
+    {
+        // Insert document into the collection.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), nssDbA, {BSON("_id" << 0 << "a_field" << 1001), Timestamp(0)}, 0));
+        auto swSize = storage->getCollectionSize(opCtx.get(), nssDbA);
+        ASSERT_OK(swSize.getStatus());
+        size = swSize.getValue();
+    }
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbAAB + "'}, {name:'" + _tenantDbABC + "'}]}";
     _mockServer->setCommandReply("listDatabases", fromjson(listDatabasesReply));
     _mockServer->setCommandReply("find", createFindResponse());
+    _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
-    cloner->setStopAfterStage_forTest("listExistingDatabases");
+    cloner->setStopAfterStage_forTest("initializeStatsStage");
 
     ASSERT_OK(cloner->run());
 
@@ -418,7 +466,10 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllGreater) {
     ASSERT_EQUALS(_tenantDbAAB, databases[0]);
     ASSERT_EQUALS(_tenantDbABC, databases[1]);
 
-    ASSERT_EQUALS(1, cloner->getStats().databasesClonedBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(1, stats.databasesClonedBeforeFailover);
+    ASSERT_EQUALS(size, stats.approxTotalBytesCopied);
+    ASSERT_LESS_THAN(stats.approxTotalBytesCopied, stats.approxTotalDataSize);
 }
 
 TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_SomeGreater) {
@@ -426,17 +477,44 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_SomeGreater) {
     // database if the last cloned database is dropped. This tests the case when some but not all
     // databases in the latest listDatabases result are compared greater than the last cloned
     // database.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbAAB, "coll"), CollectionOptions()));
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
+    ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
+    ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
+
+    long long size = 0;
+    {
+        // Insert some documents into both collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), nssDbA, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          nssDbAAb,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "hello"),
+                                           Timestamp(0)},
+                                          0));
+
+        auto swSizeDbA = storage->getCollectionSize(opCtx.get(), nssDbA);
+        ASSERT_OK(swSizeDbA.getStatus());
+        size = swSizeDbA.getValue();
+
+        auto swSizeDbAAb = storage->getCollectionSize(opCtx.get(), nssDbAAb);
+        ASSERT_OK(swSizeDbAAb.getStatus());
+        size += swSizeDbAAb.getValue();
+    }
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbA + "'}, {name:'" + _tenantDbABC + "'}]}";
     _mockServer->setCommandReply("listDatabases", fromjson(listDatabasesReply));
     _mockServer->setCommandReply("find", createFindResponse());
+    _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
-    cloner->setStopAfterStage_forTest("listExistingDatabases");
+    cloner->setStopAfterStage_forTest("initializeStatsStage");
 
     ASSERT_OK(cloner->run());
 
@@ -444,25 +522,67 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_SomeGreater) {
     ASSERT_EQUALS(1u, databases.size());
     ASSERT_EQUALS(_tenantDbABC, databases[0]);
 
+    auto stats = cloner->getStats();
     ASSERT_EQUALS(2, cloner->getStats().databasesClonedBeforeFailover);
+    ASSERT_EQUALS(size, stats.approxTotalBytesCopied);
+    ASSERT_LESS_THAN(stats.approxTotalBytesCopied, stats.approxTotalDataSize);
 }
 
 TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllLess) {
     // Test that we correctly resume from next database compared greater than the last cloned
     // database if the last cloned database is dropped. This tests the case when all databases in
     // the latest listDatabases result are compared less than the last cloned database.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbAAB, "coll"), CollectionOptions()));
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbABC, "coll"), CollectionOptions()));
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
+    auto nssDbABC = NamespaceString::createNamespaceString_forTest(_tenantDbABC, "coll");
+
+    ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
+    ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
+    ASSERT_OK(createCollection(nssDbABC, CollectionOptions()));
+
+    long long size = 0;
+    {
+        // Insert some documents into all three collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), nssDbA, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          nssDbAAb,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "hello"),
+                                           Timestamp(0)},
+                                          0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          nssDbABC,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "goodbye"),
+                                           Timestamp(0)},
+                                          0));
+
+        auto swSizeDbA = storage->getCollectionSize(opCtx.get(), nssDbA);
+        ASSERT_OK(swSizeDbA.getStatus());
+        size = swSizeDbA.getValue();
+
+        auto swSizeDbAAb = storage->getCollectionSize(opCtx.get(), nssDbAAb);
+        ASSERT_OK(swSizeDbAAb.getStatus());
+        size += swSizeDbAAb.getValue();
+
+        auto swSizeDbABC = storage->getCollectionSize(opCtx.get(), nssDbABC);
+        ASSERT_OK(swSizeDbABC.getStatus());
+        size += swSizeDbABC.getValue();
+    }
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbA + "'}, {name:'" + _tenantDbAAB + "'}]}";
     _mockServer->setCommandReply("listDatabases", fromjson(listDatabasesReply));
     _mockServer->setCommandReply("find", createFindResponse());
+    _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
-    cloner->setStopAfterStage_forTest("listExistingDatabases");
+    cloner->setStopAfterStage_forTest("initializeStatsStage");
 
     ASSERT_OK(cloner->run());
 
@@ -470,7 +590,10 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllLess) {
     auto databases = getDatabasesFromCloner(cloner.get());
     ASSERT_EQUALS(0u, databases.size());
 
-    ASSERT_EQUALS(3, cloner->getStats().databasesClonedBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(3, stats.databasesClonedBeforeFailover);
+    ASSERT_EQUALS(size, stats.approxTotalBytesCopied);
+    ASSERT_EQUALS(stats.approxTotalBytesCopied, stats.approxTotalDataSize);
 }
 
 }  // namespace repl

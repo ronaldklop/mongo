@@ -16,14 +16,21 @@
  * If we did not wait, the latter would get a write conflict when writing to the txn table because
  * it's reading from time 7 and doesn't see the write from time 9.
  *
- * @tags: [uses_transactions, uses_prepare_transaction, uses_parallel_shell]
+ * @tags: [
+ *  # The test runs commands that are not allowed with security token: endSession,
+ *  # prepareTransaction.
+ *  not_allowed_with_signed_security_token,
+ *  uses_transactions,
+ *  uses_prepare_transaction,
+ *  uses_parallel_shell,
+ *  # 'setDefaultRWConcern' is not supposed to be run on shard nodes.
+ *  command_not_supported_in_serverless,
+ * ]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/parallel_shell_helpers.js");  // for funWithArgs().
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
 
 /**
  * Launches a parallel shell to start a new transaction on the session with the given lsid. It
@@ -102,43 +109,56 @@ const collName = jsTestName();
 const testDB = db.getSiblingDB(dbName);
 
 testDB.runCommand({drop: collName});
-assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
-const session = testDB.getMongo().startSession();
-const sessionDb = session.getDatabase(dbName);
-const sessionColl = sessionDb.getCollection(collName);
-const lsid = session.getSessionId();
+try {
+    // The default WC is majority and this test can't satisfy majority writes.
+    assert.commandWorked(testDB.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+    assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
-// Start and prepare a transaction, txn0.
-session.startTransaction();
-assert.commandWorked(sessionColl.insert({y: "prepare_insert"}));
-const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
+    const session = testDB.getMongo().startSession();
+    const sessionDb = session.getDatabase(dbName);
+    const sessionColl = sessionDb.getCollection(collName);
+    const lsid = session.getSessionId();
 
-// Launch a concurrent transaction, txn1, which should block behind the active prepared
-// transaction.
-const awaitTxnShell = runConcurrentTransactionOnSession(dbName, collName, lsid);
+    // Start and prepare a transaction, txn0.
+    session.startTransaction();
+    assert.commandWorked(sessionColl.insert({y: "prepare_insert"}));
+    const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
 
-// Try to create a collection, which reserves an oplog slot. This oplog slot should be after the
-// prepare oplog entry because we have already successfully prepared txn0 and returned a
-// prepareTimestamp.
-const awaitWriteShell = runConcurrentCollectionCreate(dbName, "newColl");
+    // Launch a concurrent transaction, txn1, which should block behind the active prepared
+    // transaction.
+    const awaitTxnShell = runConcurrentTransactionOnSession(dbName, collName, lsid);
 
-// Commit the original transaction - this should allow the parallel shell with txn1 to continue
-// and start a new transaction.
-// Note that we are not using PrepareHelpers.commitTransaction because it calls
-// commitTransaction twice, and the second call races with txn1.
-assert.commandWorked(session.getDatabase('admin').adminCommand(
-    {commitTransaction: 1, commitTimestamp: prepareTimestamp}));
+    // Try to create a collection, which reserves an oplog slot. This oplog slot should be after the
+    // prepare oplog entry because we have already successfully prepared txn0 and returned a
+    // prepareTimestamp.
+    const awaitWriteShell = runConcurrentCollectionCreate(dbName, "newColl");
 
-// Release this failpoint so that the createCollection command can finish.
-assert.commandWorked(db.adminCommand(
-    {configureFailPoint: "hangAndFailAfterCreateCollectionReservesOpTime", mode: "off"}));
+    // Commit the original transaction - this should allow the parallel shell with txn1 to continue
+    // and start a new transaction.
+    // Note that we are not using PrepareHelpers.commitTransaction because it calls
+    // commitTransaction twice, and the second call races with txn1.
+    assert.commandWorked(session.getDatabase('admin').adminCommand(
+        {commitTransaction: 1, commitTimestamp: prepareTimestamp}));
 
-// txn1 should be able to commit without getting a WriteConflictError.
-awaitTxnShell();
+    // Release this failpoint so that the createCollection command can finish.
+    assert.commandWorked(db.adminCommand(
+        {configureFailPoint: "hangAndFailAfterCreateCollectionReservesOpTime", mode: "off"}));
 
-// createCollection command fails with the expected error code, 51267.
-awaitWriteShell();
+    // txn1 should be able to commit without getting a WriteConflictError.
+    awaitTxnShell();
 
-session.endSession();
-}());
+    // createCollection command fails with the expected error code, 51267.
+    awaitWriteShell();
+
+    session.endSession();
+} finally {
+    // Unsetting CWWC is not allowed, so explicitly restore the default write concern to be majority
+    // by setting CWWC to {w: majority}.
+    assert.commandWorked(testDB.adminCommand({
+        setDefaultRWConcern: 1,
+        defaultWriteConcern: {w: "majority"},
+        writeConcern: {w: "majority"}
+    }));
+}

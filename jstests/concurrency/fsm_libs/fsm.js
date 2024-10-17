@@ -1,6 +1,10 @@
-'use strict';
+import {
+    withTxnAndAutoRetry
+} from "jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js";
+import {ShardTransitionUtil} from "jstests/libs/shard_transition_util.js";
+import {TransactionsUtil} from "jstests/libs/transactions_util.js";
 
-var fsm = (function() {
+export var fsm = (function() {
     const kIsRunningInsideTransaction = Symbol('isRunningInsideTransaction');
 
     function forceRunningOutsideTransaction(data) {
@@ -26,12 +30,14 @@ var fsm = (function() {
     //                    { stateName: { nextState1: probability,
     //                                   nextState2: ... } }
     // args.iterations = number of iterations to run the FSM for
-    function runFSM(args) {
+    // args.errorLatch = the latch that a thread count downs when it errors.
+    // args.numThreads = total number of threads running.
+    async function runFSM(args) {
         if (TestData.runInsideTransaction) {
             let overridePath = "jstests/libs/override_methods/";
-            load(overridePath + "check_for_operation_not_supported_in_transaction.js");
-            load("jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js");
-            load("jstests/libs/transactions_util.js");
+            await import(overridePath + "check_for_operation_not_supported_in_transaction.js");
+            await import("jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js");
+            await import("jstests/libs/transactions_util.js");
         }
         var currentState = args.startState;
 
@@ -72,16 +78,24 @@ var fsm = (function() {
             };
 
             const makeReplSetConnWithExistingSession = (connStrList, replSetName) => {
-                const conn = makeNewConnWithExistingSession(`mongodb://${
-                    connStrList.join(',')}/?appName=tid:${args.tid}&replicaSet=${replSetName}`);
-
-                return conn;
+                let connStr = `mongodb://${connStrList.join(',')}/?appName=tid:${
+                    args.tid}&replicaSet=${replSetName}`;
+                if (jsTestOptions().shellGRPC) {
+                    connStr += "&grpc=false";
+                }
+                return makeNewConnWithExistingSession(connStr);
             };
+
+            // Config shard conn strings do not use gRPC.
+            const kNonGrpcConnStr = (connStr) => jsTestOptions().shellGRPC
+                ? `mongodb://${connStr}/?grpc=false`
+                : `mongodb://${connStr}`;
 
             connCache =
                 {mongos: [], config: [], shards: {}, rsConns: {config: undefined, shards: {}}};
             connCache.mongos = args.cluster.mongos.map(makeNewConnWithExistingSession);
-            connCache.config = args.cluster.config.map(makeNewConnWithExistingSession);
+            connCache.config = args.cluster.config.map(connStr => kNonGrpcConnStr(connStr))
+                                   .map(makeNewConnWithExistingSession);
             connCache.rsConns.config = makeReplSetConnWithExistingSession(
                 args.cluster.config, getReplSetName(connCache.config[0]));
 
@@ -93,14 +107,19 @@ var fsm = (function() {
             var shardNames = Object.keys(args.cluster.shards);
 
             shardNames.forEach(name => {
-                connCache.shards[name] =
-                    args.cluster.shards[name].map(makeNewConnWithExistingSession);
+                connCache.shards[name] = args.cluster.shards[name]
+                                             .map(connStr => kNonGrpcConnStr(connStr))
+                                             .map(makeNewConnWithExistingSession);
                 connCache.rsConns.shards[name] = makeReplSetConnWithExistingSession(
                     args.cluster.shards[name], getReplSetName(connCache.shards[name][0]));
             });
         }
 
         for (var i = 0; i < args.iterations; ++i) {
+            if (args.errorLatch.getCount() < args.numThreads) {
+                break;
+            }
+
             var fn = args.states[currentState];
 
             assert.eq('function', typeof fn, 'states.' + currentState + ' is not a function');
@@ -114,8 +133,30 @@ var fsm = (function() {
                     withTxnAndAutoRetry(args.db.getSession(), () => {
                         data = TransactionsUtil.deepCopyObject({}, args.data);
                         data[kIsRunningInsideTransaction] = true;
-                        fn.call(data, args.db, args.collName, connCache);
-                    });
+
+                        // The state function is given a Proxy object to the connection cache which
+                        // intercepts property accesses (e.g. `connCacheProxy.rsConns`) and causes
+                        // the state function to fall back to being called outside of
+                        // withTxnAndAutoRetry() as if an operation within the transaction had
+                        // failed with OperationNotSupportedInTransaction or InvalidOptions. Usage
+                        // of the connection cache isn't compatible with
+                        // `TestData.runInsideTransaction === true`. This is because the
+                        // withTxnAndAutoRetry() function isn't aware of transactions started
+                        // directly on replica set shards or the config server replica set to
+                        // automatically commit them and leaked transactions would stall the test
+                        // indefinitely.
+                        let connCacheProxy;
+                        if (connCache !== undefined) {
+                            connCacheProxy = new Proxy(connCache, {
+                                get: function(target, prop, receiver) {
+                                    forceRunningOutsideTransaction(data);
+                                    return target[prop];
+                                }
+                            });
+                        }
+
+                        fn.call(data, args.db, args.collName, connCacheProxy);
+                    }, {retryOnKilledSession: args.data.retryOnKilledSession});
                     delete data[kIsRunningInsideTransaction];
                     args.data = data;
                 } catch (e) {
@@ -128,11 +169,22 @@ var fsm = (function() {
 
                     fn.call(args.data, args.db, args.collName, connCache);
                 }
+            } else if (TestData.shardsAddedRemoved) {
+                // Some state functions choose a specific shard for a command and may fail with
+                // ShardNotFound if the shard list changes during execution. Retry on the assumption
+                // a different shard will be chosen on the retry or soon the config server will
+                // become a shard again.
+                ShardTransitionUtil.retryOnShardTransitionErrors(() => {
+                    fn.call(args.data, args.db, args.collName, connCache);
+                });
             } else {
                 fn.call(args.data, args.db, args.collName, connCache);
             }
 
-            var nextState = getWeightedRandomChoice(args.transitions[currentState], Random.rand());
+            assert(args.transitions.hasOwnProperty(currentState),
+                   `No transitions defined for state: ${currentState}`);
+            const nextState =
+                getWeightedRandomChoice(args.transitions[currentState], Random.rand());
             currentState = nextState;
         }
 

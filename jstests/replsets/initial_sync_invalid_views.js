@@ -2,8 +2,7 @@
 // causing a secondary to crash in the initial sync of a replicate set in the case that invalid
 // views were present. This test ensures that crashes no longer occur in those circumstances.
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "initial_sync_invalid_views";
 let replSet = new ReplSetTest({name: name, nodes: 1});
@@ -40,4 +39,3 @@ replSet.awaitSecondaryNodes(200 * 1000);
 TestData.skipValidationOnInvalidViewDefinitions = true;
 
 replSet.stopSet();
-})();

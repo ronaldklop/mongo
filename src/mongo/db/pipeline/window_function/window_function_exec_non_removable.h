@@ -29,22 +29,30 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+#include <variant>
+
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
 /**
  * An executor that specifically handles document-based window types which accumulate values with no
- * need to remove old ones. The 'WindowFunc' parameter must expose a 'process()' and corresponding
- * 'getValue()' method to get the accumulation result.
+ * need to remove old ones.
  *
  * Only the upper bound is needed as the lower bound is always considered to be unbounded.
  */
-template <class WindowFunc>
 class WindowFunctionExecNonRemovable final : public WindowFunctionExec {
 public:
     /**
@@ -57,10 +65,11 @@ public:
      */
     WindowFunctionExecNonRemovable(PartitionIterator* iter,
                                    boost::intrusive_ptr<Expression> input,
-                                   boost::intrusive_ptr<WindowFunc> function,
-                                   WindowBounds::Bound<int> upperDocumentBound)
-        : WindowFunctionExec(
-              PartitionAccessor(iter, PartitionAccessor::Policy::kDefaultSequential)),
+                                   boost::intrusive_ptr<AccumulatorState> function,
+                                   WindowBounds::Bound<int> upperDocumentBound,
+                                   MemoryUsageTracker::Impl* memTracker)
+        : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kDefaultSequential),
+                             memTracker),
           _input(std::move(input)),
           _function(std::move(function)),
           _upperDocumentBound(upperDocumentBound){};
@@ -68,20 +77,21 @@ public:
     Value getNext() final {
         if (!_initialized) {
             initialize();
-        } else if (!stdx::holds_alternative<WindowBounds::Unbounded>(_upperDocumentBound)) {
+        } else if (!holds_alternative<WindowBounds::Unbounded>(_upperDocumentBound)) {
             // Right-unbounded windows will accumulate all values on the first pass during
             // initialization.
             auto upperIndex = [&]() {
-                if (stdx::holds_alternative<WindowBounds::Current>(_upperDocumentBound))
+                if (holds_alternative<WindowBounds::Current>(_upperDocumentBound))
                     return 0;
                 else
-                    return stdx::get<int>(_upperDocumentBound);
+                    return get<int>(_upperDocumentBound);
             }();
 
-            if (auto doc = (this->_iter)[upperIndex])
+            if (auto doc = (this->_iter)[upperIndex]) {
                 _function->process(
                     _input->evaluate(*doc, &_input->getExpressionContext()->variables), false);
-            else {
+                _memTracker->set(_function->getMemUsage());
+            } else {
                 // Upper bound is out of range, but may be because it's off of the end of the
                 // partition. For instance, for bounds [unbounded, -1] we won't be able to
                 // access the upper bound until the second call to getNext().
@@ -91,18 +101,15 @@ public:
         return _function->getValue(false);
     }
 
-    size_t getApproximateSize() const final {
-        return _function->getMemUsage();
-    }
-
     void reset() final {
         _initialized = false;
         _function->reset();
+        _memTracker->set(0);
     }
 
 private:
     boost::intrusive_ptr<Expression> _input;
-    boost::intrusive_ptr<WindowFunc> _function;
+    boost::intrusive_ptr<AccumulatorState> _function;
     WindowBounds::Bound<int> _upperDocumentBound;
 
     // In one of two states: either the initial window has not been populated or we are sliding and
@@ -111,13 +118,12 @@ private:
 
     void initialize() {
         auto needMore = [&](int index) {
-            return stdx::visit(
-                visit_helper::Overloaded{
-                    [&](const WindowBounds::Unbounded&) { return true; },
-                    [&](const WindowBounds::Current&) { return index == 0; },
-                    [&](const int& n) { return index <= n; },
-                },
-                _upperDocumentBound);
+            return visit(OverloadedVisitor{
+                             [&](const WindowBounds::Unbounded&) { return true; },
+                             [&](const WindowBounds::Current&) { return index == 0; },
+                             [&](const int& n) { return index <= n; },
+                         },
+                         _upperDocumentBound);
         };
 
         _initialized = true;
@@ -125,6 +131,7 @@ private:
             if (auto doc = (this->_iter)[i]) {
                 _function->process(
                     _input->evaluate(*doc, &_input->getExpressionContext()->variables), false);
+                _memTracker->set(_function->getMemUsage());
             } else {
                 // Already reached the end of partition for the first value to compute.
                 break;

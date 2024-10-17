@@ -2,19 +2,18 @@
  * Tests readConcern level snapshot outside of transactions.
  *
  * @tags: [
- *   requires_fcv_47,
- *   requires_find_command,
  *   requires_majority_read_concern,
  *   requires_persistence,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/global_snapshot_reads_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {SnapshotReadsTest} from "jstests/libs/global_snapshot_reads_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const nodeOptions = {
     // Set a large snapshot window of 10 minutes for the test.
@@ -37,7 +36,7 @@ let shardingScenarios = {
         setUp: function() {
             const st = new ShardingTest({
                 mongos: 1,
-                config: 1,
+                config: TestData.configShard ? undefined : 1,
                 shards: {rs0: {nodes: 2}},
                 other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
@@ -55,7 +54,7 @@ let shardingScenarios = {
                     rs2: {nodes: 2},
                 },
                 mongos: 1,
-                config: 1,
+                config: TestData.configShard ? undefined : 1,
                 other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
             setUpAllScenarios(st);
@@ -99,7 +98,7 @@ let shardingScenarios = {
                     rs2: {nodes: 2},
                 },
                 mongos: 1,
-                config: 1,
+                config: TestData.configShard ? undefined : 1,
                 other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
             setUpAllScenarios(st);
@@ -147,6 +146,16 @@ for (let [scenarioName, scenario] of Object.entries(shardingScenarios)) {
             }
         }
 
+        // TODO SERVER-77915: remove once 8.0 becomes last-lts
+        if (!FeatureFlagUtil.isPresentAndEnabled(st.s, "TrackUnshardedCollectionsUponCreation") &&
+            collName == unshardedCollName) {
+            // Skip testing with untracked unsharded collections because reads at a point-in-time
+            // earlier than the latest catalog change (including index DDL) will throw conflicts.
+            jsTestLog('Skip unsharded collection scenario');
+            st.stop();
+            return;
+        }
+
         // Pass the same DB handle as "primaryDB" and "secondaryDB" params; the test functions will
         // send readPreference to mongos to target primary/secondary shard servers.
         let db = st.s.getDB(dbName);
@@ -167,4 +176,3 @@ for (let [scenarioName, scenario] of Object.entries(shardingScenarios)) {
         st.stop();
     });
 }
-})();

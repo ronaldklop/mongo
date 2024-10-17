@@ -27,29 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <string>
+#include <vector>
+
+#ifndef _WIN32
 #include <malloc.h>
 #include <procfs.h>
-#include <stdio.h>
-#include <string>
 #include <sys/lgrp_user.h>
 #include <sys/mman.h>
 #include <sys/systeminfo.h>
 #include <sys/utsname.h>
-#include <unistd.h>
-#include <vector>
+#endif
 
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -68,15 +77,17 @@ static std::string readLineFromFile(const char* fname) {
 struct ProcPsinfo {
     ProcPsinfo() {
         FILE* f = fopen("/proc/self/psinfo", "r");
-        massert(16846,
-                str::stream() << "couldn't open \"/proc/self/psinfo\": " << errnoWithDescription(),
-                f);
+        if (!f) {
+            auto ec = lastSystemError();
+            msgasserted(16846,
+                        str::stream()
+                            << "couldn't open \"/proc/self/psinfo\": " << errorMessage(ec));
+        }
         size_t num = fread(&psinfo, sizeof(psinfo), 1, f);
-        int err = errno;
+        auto ec = lastSystemError();
         fclose(f);
         massert(16847,
-                str::stream() << "couldn't read from \"/proc/self/psinfo\": "
-                              << errnoWithDescription(err),
+                str::stream() << "couldn't read from \"/proc/self/psinfo\": " << errorMessage(ec),
                 num == 1);
     }
     psinfo_t psinfo;
@@ -85,15 +96,16 @@ struct ProcPsinfo {
 struct ProcUsage {
     ProcUsage() {
         FILE* f = fopen("/proc/self/usage", "r");
-        massert(16848,
-                str::stream() << "couldn't open \"/proc/self/usage\": " << errnoWithDescription(),
-                f);
+        if (!f) {
+            auto ec = lastSystemError();
+            msgasserted(
+                16848, str::stream() << "couldn't open \"/proc/self/usage\": " << errorMessage(ec));
+        }
         size_t num = fread(&prusage, sizeof(prusage), 1, f);
-        int err = errno;
+        auto ec = lastSystemError();
         fclose(f);
         massert(16849,
-                str::stream() << "couldn't read from \"/proc/self/usage\": "
-                              << errnoWithDescription(err),
+                str::stream() << "couldn't read from \"/proc/self/usage\": " << errorMessage(ec),
                 num == 1);
     }
     prusage_t prusage;
@@ -127,6 +139,33 @@ int ProcessInfo::getResidentSize() {
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
     ProcUsage p;
     info.appendNumber("page_faults", static_cast<long long>(p.prusage.pr_majf));
+}
+
+bool checkNumaEnabled() {
+    lgrp_cookie_t cookie = lgrp_init(LGRP_VIEW_OS);
+
+    if (cookie == LGRP_COOKIE_NONE) {
+        auto ec = lastSystemError();
+        LOGV2_WARNING(23362,
+                      "lgrp_init failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errorMessage(ec));
+        return false;
+    }
+
+    ON_BLOCK_EXIT([&] { lgrp_fini(cookie); });
+
+    int groups = lgrp_nlgrps(cookie);
+
+    if (groups == -1) {
+        auto ec = lastSystemError();
+        LOGV2_WARNING(23363,
+                      "lgrp_nlgrps failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errorMessage(ec));
+        return false;
+    }
+
+    // NUMA machines have more then 1 locality group
+    return groups > 1;
 }
 
 /**
@@ -196,31 +235,6 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     bExtra.append("numPages", static_cast<int>(sysconf(_SC_PHYS_PAGES)));
     bExtra.append("maxOpenFiles", static_cast<int>(sysconf(_SC_OPEN_MAX)));
     _extraStats = bExtra.obj();
-}
-
-bool ProcessInfo::checkNumaEnabled() {
-    lgrp_cookie_t cookie = lgrp_init(LGRP_VIEW_OS);
-
-    if (cookie == LGRP_COOKIE_NONE) {
-        LOGV2_WARNING(23362,
-                      "lgrp_init failed: {errnoWithDescription}",
-                      "errnoWithDescription"_attr = errnoWithDescription());
-        return false;
-    }
-
-    ON_BLOCK_EXIT([&] { lgrp_fini(cookie); });
-
-    int groups = lgrp_nlgrps(cookie);
-
-    if (groups == -1) {
-        LOGV2_WARNING(23363,
-                      "lgrp_nlgrps failed: {errnoWithDescription}",
-                      "errnoWithDescription"_attr = errnoWithDescription());
-        return false;
-    }
-
-    // NUMA machines have more then 1 locality group
-    return groups > 1;
 }
 
 }  // namespace mongo

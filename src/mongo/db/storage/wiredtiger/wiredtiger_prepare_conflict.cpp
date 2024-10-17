@@ -27,19 +27,31 @@
  *    it in the license file.
  */
 
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include <wiredtiger.h>
+
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
-
-#include "mongo/logv2/log.h"
-#include "mongo/util/fail_point.h"
 
 namespace mongo {
-
-// When set, simulates WT_PREPARE_CONFLICT returned from WiredTiger API calls.
-MONGO_FAIL_POINT_DEFINE(WTPrepareConflictForReads);
 
 MONGO_FAIL_POINT_DEFINE(WTSkipPrepareConflictRetries);
 
@@ -56,5 +68,73 @@ void wiredTigerPrepareConflictLog(int attempts) {
 void wiredTigerPrepareConflictFailPointLog() {
     LOGV2(22380, "WTPrintPrepareConflictLog fail point enabled.");
 }
+
+int wiredTigerPrepareConflictRetrySlow(OperationContext* opCtx,
+                                       RecoveryUnit& ru,
+                                       std::function<int()> func) {
+    int attempts = 1;
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
+    wiredTigerPrepareConflictLog(attempts);
+
+    if (!ru.getBlockingAllowed()) {
+        throwWriteConflictException(
+            str::stream() << "Hit a prepare conflict when in a non-blocking state. Timestamped: "
+                          << ru.isTimestamped());
+    }
+
+    // If we return from this function, we have either returned successfully or we've returned an
+    // error other than WT_PREPARE_CONFLICT. Reset PrepareConflictTracker accordingly.
+    ON_BLOCK_EXIT([opCtx] {
+        PrepareConflictTracker::get(opCtx).endPrepareConflict(
+            *opCtx->getServiceContext()->getTickSource());
+    });
+    PrepareConflictTracker::get(opCtx).beginPrepareConflict(
+        *opCtx->getServiceContext()->getTickSource());
+
+    auto client = opCtx->getClient();
+    if (client->isFromSystemConnection()) {
+        // System (internal) connections that hit a prepare conflict should be killable to prevent
+        // deadlocks with prepared transactions on replica set step up and step down.
+        stdx::lock_guard<Client> lk(*client);
+        invariant(client->canKillSystemOperationInStepdown(lk));
+    }
+
+    // It is contradictory to be running into a prepare conflict when we are ignoring interruptions,
+    // particularly when running code inside an
+    // OperationContext::runWithoutInterruptionExceptAtGlobalShutdown block. Operations executed in
+    // this way are expected to be set to ignore prepare conflicts.
+    invariant(!opCtx->isIgnoringInterrupts());
+
+    if (MONGO_unlikely(WTPrintPrepareConflictLog.shouldFail())) {
+        wiredTigerPrepareConflictFailPointLog();
+    }
+
+    if (MONGO_unlikely(WTSkipPrepareConflictRetries.shouldFail())) {
+        // Callers of wiredTigerPrepareConflictRetry() should eventually call wtRCToStatus() via
+        // invariantWTOK() and have the WT_ROLLBACK error bubble up as a WriteConflictException.
+        // Enabling the "skipWriteConflictRetries" failpoint in conjunction with the
+        // "WTSkipPrepareConflictRetries" failpoint prevents the higher layers from retrying the
+        // entire operation.
+        return WT_ROLLBACK;
+    }
+
+    auto& recoveryUnit = WiredTigerRecoveryUnit::get(ru);
+    while (true) {
+        attempts++;
+        auto lastCount = recoveryUnit.getSessionCache()->getPrepareCommitOrAbortCount();
+        int ret = WT_READ_CHECK(func());
+
+        if (ret != WT_PREPARE_CONFLICT)
+            return ret;
+        PrepareConflictTracker::get(opCtx).updatePrepareConflict(
+            *opCtx->getServiceContext()->getTickSource());
+        wiredTigerPrepareConflictLog(attempts);
+
+        // Wait on the session cache to signal that a unit of work has been committed or aborted.
+        recoveryUnit.getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(*opCtx,
+                                                                                   lastCount);
+    }
+}
+
 
 }  // namespace mongo

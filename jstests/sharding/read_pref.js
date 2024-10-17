@@ -7,27 +7,19 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var PRI_TAG = {dc: 'ny'};
 var SEC_TAGS = [{dc: 'sf', s: "1"}, {dc: 'ma', s: "2"}, {dc: 'eu', s: "3"}, {dc: 'jp', s: "4"}];
 var NODES = SEC_TAGS.length + 1;
 
-var doTest = function(useDollarQuerySyntax) {
+var doTest = function() {
     var st = new ShardingTest({shards: {rs0: {nodes: NODES, oplogSize: 10, useHostName: true}}});
     var replTest = st.rs0;
     var primaryNode = replTest.getPrimary();
-
-    // The $-prefixed query syntax is only legal for compatibility mode reads, not for the
-    // find/getMore commands.
-    if (useDollarQuerySyntax && st.s.getDB("test").getMongo().useReadCommands()) {
-        st.stop();
-        return;
-    }
 
     var setupConf = function() {
         var replConf = primaryNode.getDB('local').system.replset.findOne();
@@ -107,19 +99,7 @@ var doTest = function(useDollarQuerySyntax) {
     });
 
     var getExplain = function(readPrefMode, readPrefTags) {
-        if (useDollarQuerySyntax) {
-            var readPrefObj = {mode: readPrefMode};
-
-            if (readPrefTags) {
-                readPrefObj.tags = readPrefTags;
-            }
-
-            return coll.find({$query: {}, $readPreference: readPrefObj, $explain: true})
-                .limit(-1)
-                .next();
-        } else {
-            return coll.find().readPref(readPrefMode, readPrefTags).explain("executionStats");
-        }
+        return coll.find().readPref(readPrefMode, readPrefTags).explain("executionStats");
     };
 
     var getExplainServer = function(explain) {
@@ -175,10 +155,14 @@ var doTest = function(useDollarQuerySyntax) {
     assert.eq(replTest.getPrimary().name, explainServer);
     assert.eq(1, explain.executionStats.nReturned);
 
+    // TODO (SERVER-83433): Add back the test coverage for running db hash check and validation
+    // on replica set that is fsync locked and has replica set endpoint enabled.
+    const stopOpts = {skipValidation: replTest.isReplicaSetEndpointActive()};
+
     // Kill all members except one
     var stoppedNodes = [];
     for (var x = 0; x < NODES - 1; x++) {
-        replTest.stop(x);
+        replTest.stop(x, null, stopOpts);
         stoppedNodes.push(replTest.nodes[x]);
     }
 
@@ -202,9 +186,7 @@ var doTest = function(useDollarQuerySyntax) {
         getExplain("primary");
     });
 
-    st.stop();
+    st.stop(stopOpts);
 };
 
-doTest(false);
-doTest(true);
-})();
+doTest();

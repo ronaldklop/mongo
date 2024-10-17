@@ -27,12 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/catalog/type_changelog.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/time_support.h"
 
 namespace {
@@ -64,7 +68,8 @@ TEST(ChangeLogType, Valid) {
     ASSERT_EQUALS(logEntry.getClientAddr(), "192.168.0.189:51128");
     ASSERT_EQUALS(logEntry.getTime(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_EQUALS(logEntry.getWhat(), "split");
-    ASSERT_EQUALS(logEntry.getNS(), "test.test");
+    ASSERT_EQUALS(logEntry.getNS(),
+                  NamespaceString::createNamespaceString_forTest(boost::none, "test.test"));
     ASSERT_BSONOBJ_EQ(logEntry.getDetails(),
                       BSON("dummy"
                            << "info"));
@@ -188,7 +193,8 @@ TEST(ChangeLogType, MissingShard) {
     ASSERT_EQUALS(logEntry.getClientAddr(), "192.168.0.189:51128");
     ASSERT_EQUALS(logEntry.getTime(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_EQUALS(logEntry.getWhat(), "split");
-    ASSERT_EQUALS(logEntry.getNS(), "test.test");
+    ASSERT_EQUALS(logEntry.getNS(),
+                  NamespaceString::createNamespaceString_forTest(boost::none, "test.test"));
     ASSERT_BSONOBJ_EQ(logEntry.getDetails(),
                       BSON("dummy"
                            << "info"));

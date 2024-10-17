@@ -8,11 +8,9 @@
  * we ensure that the disconnected secondary is able to update its commit point from the initial
  * syncing node via heartbeats.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -118,15 +116,21 @@ assert.eq(1, rs.compareOpTimes(thirdCommitPointSecondary, secondCommitPointSecon
 hangBeforeCompletingOplogFetching.off();
 hangBeforeFinish.wait();
 
-// Verify that the initial sync node receives the commit point from the primary via oplog fetching.
+// Verify that the initial sync node receives the commit point from the primary, either via oplog
+// fetching or by a heartbeat. This will usually happen via oplog fetching but in some cases it is
+// possible that the OplogFetcher shuts down before this ever happens. See SERVER-76695 for details.
 // We only assert that it is greater than or equal to the second commit point because it is possible
 // for the commit point to not yet be advanced by the primary when we fetch the oplog entry.
-const commitPointInitialSyncNode = getLastCommittedOpTime(initialSyncNode);
-assert.gte(
-    rs.compareOpTimes(commitPointInitialSyncNode, secondCommitPointPrimary),
-    0,
-    `commit point on initial sync node should be at least as up-to-date as the second commit point: ${
-        tojson(commitPointInitialSyncNode)}`);
+assert.soon(() => {
+    const commitPointInitialSyncNode = getLastCommittedOpTime(initialSyncNode);
+    // compareOpTimes will throw an error if given an invalid opTime, and if the
+    // node has not yet advanced its opTime it will still have the default one,
+    // which is invalid.
+    if (!globalThis.rs.isValidOpTime(commitPointInitialSyncNode)) {
+        return false;
+    }
+    return rs.compareOpTimes(commitPointInitialSyncNode, secondCommitPointPrimary) >= 0;
+}, `commit point on initial sync node should be at least as up-to-date as the second commit point`);
 
 // Verify that the non-voting secondary has received the updated commit point via heartbeats from
 // the initial sync node.
@@ -143,4 +147,3 @@ hangBeforeFinish.off();
 waitForState(initialSyncNode, ReplSetTest.State.SECONDARY);
 
 rst.stopSet();
-})();

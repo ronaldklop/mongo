@@ -4,26 +4,30 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    checkWriteConcernTimedOut,
+    restartServerReplication,
+    stopServerReplication
+} from "jstests/libs/write_concern_util.js";
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
-
-const clusterInFCV44 = jsTestOptions().mongosBinVersion != 'last-lts';
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const dbName = "test";
 const collName = "transient_txn_error_labels_with_write_concern";
 
 // We are testing coordinateCommitTransaction, which requires the nodes to be started with
 // --shardsvr.
-const st = new ShardingTest(
-    {config: 1, mongos: 1, shards: {rs0: {nodes: [{}, {rsConfig: {priority: 0}}]}}});
+const st = new ShardingTest({
+    config: TestData.configShard ? undefined : 1,
+    mongos: 1,
+    shards: {rs0: {nodes: [{}, {rsConfig: {priority: 0}}]}}
+});
 const rst = st.rs0;
 
 const primary = rst.getPrimary();
-const secondary = rst.getSecondary();
 assert.eq(primary, rst.nodes[0]);
 const testDB = primary.getDB(dbName);
 
@@ -82,30 +86,26 @@ function runNoSuchTransactionTests(cmd, cmdName) {
     assert(!res.hasOwnProperty("writeConcernError"), res);
     assert.eq(res["errorLabels"], ["TransientTransactionError"], res);
 
-    // Failpoint failTransactionNoopWrite doesn't exist in mongo versions <= 4.4
-    if (clusterInFCV44) {
-        jsTest.log(
-            "If the noop write for NoSuchTransaction cannot occur, the error is not transient");
+    jsTest.log("If the noop write for NoSuchTransaction cannot occur, the error is not transient");
 
-        const failpoint = configureFailPoint(primary, "failTransactionNoopWrite");
+    const failpoint = configureFailPoint(primary, "failTransactionNoopWrite");
 
-        // The server will attempt to perform a noop write, since the command returns
-        // NoSuchTransaction. The noop write will time out because of the failpoint.
-        // This should not be a TransientTransactionError, since the server has not successfully
-        // replicated a write to confirm that it is primary.
-        // Use a txnNumber that is one higher than the server has tracked.
-        res = sessionDb.adminCommand(Object.assign(Object.assign({}, cmd), {
-            txnNumber: NumberLong(session.getTxnNumber_forTesting() + 1),
-            autocommit: false,
-            writeConcern: writeConcernMajority,
-            maxTimeMS: 1000
-        }));
+    // The server will attempt to perform a noop write, since the command returns
+    // NoSuchTransaction. The noop write will time out because of the failpoint.
+    // This should not be a TransientTransactionError, since the server has not successfully
+    // replicated a write to confirm that it is primary.
+    // Use a txnNumber that is one higher than the server has tracked.
+    res = sessionDb.adminCommand(Object.assign(Object.assign({}, cmd), {
+        txnNumber: NumberLong(session.getTxnNumber_forTesting() + 1),
+        autocommit: false,
+        writeConcern: writeConcernMajority,
+        maxTimeMS: 1000
+    }));
 
-        failpoint.off();
+    failpoint.off();
 
-        assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
-        assert(!res.hasOwnProperty("errorLabels"));
-    }
+    assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
+    assert(!res.hasOwnProperty("errorLabels"));
 
     rst.awaitReplication();
 }
@@ -118,4 +118,3 @@ runNoSuchTransactionTests({coordinateCommitTransaction: 1, participants: []},
 session.endSession();
 
 st.stop();
-}());

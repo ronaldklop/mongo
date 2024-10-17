@@ -27,11 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/read_write_concern_provenance.h"
-
-#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,7 +44,7 @@ void ReadWriteConcernProvenance::setSource(boost::optional<Source> source) & {
     ReadWriteConcernProvenanceBase::setSource(std::move(source));
 }
 
-ReadWriteConcernProvenance ReadWriteConcernProvenance::parse(const IDLParserErrorContext& ctxt,
+ReadWriteConcernProvenance ReadWriteConcernProvenance::parse(const IDLParserContext& ctxt,
                                                              const BSONObj& bsonObject) {
     return ReadWriteConcernProvenance(ReadWriteConcernProvenanceBase::parse(ctxt, bsonObject));
 }

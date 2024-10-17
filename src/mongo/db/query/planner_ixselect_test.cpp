@@ -33,23 +33,49 @@
 
 #include "mongo/db/query/planner_ixselect.h"
 
+#include <algorithm>
+#include <memory>
+#include <set>
+#include <type_traits>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+// IWYU pragma: no_include "boost/container/detail/flat_tree.hpp"
+#include <boost/container/flat_set.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/index_path_projection.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index/wildcard_key_generator.h"
-#include "mongo/db/json.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/index_tag.h"
-#include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/text.h"
-#include <memory>
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 using namespace mongo;
 
 namespace {
-
-constexpr CollatorInterface* kSimpleCollator = nullptr;
 
 using std::string;
 using std::unique_ptr;
@@ -63,6 +89,20 @@ unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
     StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
     ASSERT_TRUE(status.isOK());
     return std::move(status.getValue());
+}
+
+using FieldIter = RelevantFieldIndexMap::iterator;
+string toString(FieldIter begin, FieldIter end) {
+    str::stream ss;
+    ss << "[";
+    for (FieldIter i = begin; i != end; i++) {
+        if (i != begin) {
+            ss << " ";
+        }
+        ss << i->first;
+    }
+    ss << "]";
+    return ss;
 }
 
 /**
@@ -88,10 +128,13 @@ string toString(Iter begin, Iter end) {
  * to QueryPlannerIXSelect::getFields()
  * Results are compared with expected fields (parsed from expectedFieldsStr)
  */
-void testGetFields(const char* query, const char* prefix, const char* expectedFieldsStr) {
+void testGetFields(const char* query,
+                   const char* prefix,
+                   const char* expectedFieldsStr,
+                   bool sparseSupported = true) {
     BSONObj obj = fromjson(query);
     unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
-    stdx::unordered_set<string> fields;
+    RelevantFieldIndexMap fields;
     QueryPlannerIXSelect::getFields(expr.get(), prefix, &fields);
 
     // Verify results
@@ -99,7 +142,7 @@ void testGetFields(const char* query, const char* prefix, const char* expectedFi
     vector<string> expectedFields = StringSplitter::split(expectedFieldsStr, ",");
     for (vector<string>::const_iterator i = expectedFields.begin(); i != expectedFields.end();
          i++) {
-        if (fields.find(*i) == fields.end()) {
+        if (fields[*i].isSparse != sparseSupported) {
             str::stream ss;
             ss << "getFields(query=" << query << ", prefix=" << prefix << "): unable to find " << *i
                << " in result: " << toString(fields.begin(), fields.end());
@@ -157,6 +200,12 @@ TEST(QueryPlannerIXSelectTest, GetFieldsNegation) {
 TEST(QueryPlannerIXSelectTest, GetFieldsArrayNegation) {
     testGetFields("{a: {$elemMatch: {b: {$ne: 1}}}}", "", "a.b");
     testGetFields("{a: {$all: [{$elemMatch: {b: {$ne: 1}}}]}}", "", "a.b");
+}
+
+TEST(QueryPlannerIXSelectTest, GetFieldsInternalExpr) {
+    testGetFields("{$expr: {$lt: ['$a', 'r']}}", "", "", false /* sparse supported */);
+    testGetFields("{$expr: {$eq: ['$a', null]}}", "", "", false /* sparse supported */);
+    testGetFields("{$expr: {$eq: ['$a', 1]}}", "", "", false /* sparse supported */);
 }
 
 /**
@@ -220,13 +269,18 @@ void testRateIndices(const char* query,
                      const CollatorInterface* collator,
                      const vector<IndexEntry>& indices,
                      const char* expectedPathsStr,
-                     const std::set<size_t>& expectedIndices) {
+                     const std::set<size_t>& expectedIndices,
+                     bool mustUseIndexedPlan = false) {
     // Parse and rate query. Some of the nodes in the rated tree
     // will be tagged after the rating process.
     BSONObj obj = fromjson(query);
     unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
 
-    QueryPlannerIXSelect::rateIndices(expr.get(), prefix, indices, collator);
+    QueryPlannerIXSelect::QueryContext queryContext;
+    queryContext.collator = collator;
+    queryContext.elemMatchContext = QueryPlannerIXSelect::ElemMatchContext{};
+    queryContext.mustUseIndexedPlan = mustUseIndexedPlan;
+    QueryPlannerIXSelect::rateIndices(expr.get(), prefix, indices, queryContext);
 
     // Retrieve a list of paths and a set of indices embedded in
     // tagged nodes.
@@ -1153,25 +1207,6 @@ TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseTextIndexSuffix) {
         "{a: {$_internalExprEq: 1}}", "", kSimpleCollator, indices, "a", expectedIndices);
 }
 
-TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseSparseIndexWithComparisonToNull) {
-    auto entry = buildSimpleIndexEntry(BSON("a" << 1));
-    entry.sparse = true;
-    std::vector<IndexEntry> indices;
-    indices.push_back(entry);
-    std::set<size_t> expectedIndices = {0};
-    testRateIndices(
-        "{a: {$_internalExprEq: null}}", "", kSimpleCollator, indices, "a", expectedIndices);
-}
-
-TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseSparseIndexWithComparisonToNonNull) {
-    auto entry = buildSimpleIndexEntry(BSON("a" << 1));
-    entry.sparse = true;
-    std::vector<IndexEntry> indices;
-    indices.push_back(entry);
-    std::set<size_t> expectedIndices = {0};
-    testRateIndices(
-        "{a: {$_internalExprEq: 1}}", "", kSimpleCollator, indices, "a", expectedIndices);
-}
 TEST(QueryPlannerIXSelectTest, NotEqualsNullCanUseIndex) {
     auto entry = buildSimpleIndexEntry(BSON("a" << 1));
     std::set<size_t> expectedIndices = {0};
@@ -1329,6 +1364,115 @@ TEST(QueryPlannerIXSelectTest, HashedSparseIndexShouldBeRelevantForExistsTrue) {
     testRateIndices("{a: {$exists: true}}", "", kSimpleCollator, {entry}, "a", expectedIndices);
 }
 
+TEST(QueryPlannerIXSelectTest,
+     CannotUseIndexWithNotSimpleCollatorForRegexFilterWithSimpleCollator) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    CollatorInterfaceMock notSimpleCollator(CollatorInterfaceMock::MockType::kReverseString);
+    index.collator = &notSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {};
+    testRateIndices(
+        "{a: { $regex: \"^John\"}}", "", kSimpleCollator, indices, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest,
+     CannotUseIndexWithNotSimpleCollatorForRegexFilterWithNotSimpleCollator) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    CollatorInterfaceMock notSimpleCollator(CollatorInterfaceMock::MockType::kReverseString);
+    index.collator = &notSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {};
+    testRateIndices(
+        "{a: { $regex: \"^John\"}}", "", &notSimpleCollator, indices, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, CanUseIndexWithSimpleCollatorForRegexFilterWithSimpleCollator) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    index.collator = kSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices(
+        "{a: { $regex: \"^John\"}}", "", kSimpleCollator, indices, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, CanUseIndexWithSimpleCollatorForRegexFilterWithNotSimpleCollator) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    CollatorInterfaceMock notSimpleCollator(CollatorInterfaceMock::MockType::kReverseString);
+    index.collator = kSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices(
+        "{a: { $regex: \"^John\"}}", "", &notSimpleCollator, indices, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, UsesIndexIfRequiredByTheQuery) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    CollatorInterfaceMock notSimpleCollator(CollatorInterfaceMock::MockType::kReverseString);
+    index.collator = &notSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices("{a: { $regex: \"^John\"}}",
+                    "",
+                    &notSimpleCollator,
+                    indices,
+                    "a",
+                    expectedIndices,
+                    true /* must use index */);
+}
+
+TEST(QueryPlannerIXSelectTest, CanUseIndexWithSimpleCollatorForNonPrefixRegexFilter) {
+    auto index = buildSimpleIndexEntry(BSON("a" << 1));
+    index.collator = kSimpleCollator;
+    std::vector<IndexEntry> indices;
+    indices.push_back(index);
+    std::set<size_t> expectedIndices = {0};
+    testRateIndices("{a: { $regex: \"John\"}}", "", kSimpleCollator, indices, "a", expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, GeoPredicateCanOnlyUse2dsphereIndex) {
+    std::vector<IndexEntry> indices;
+    auto btreeEntry = buildSimpleIndexEntry(BSON("loc" << 1));
+    auto twodSphereEntry = buildSimpleIndexEntry(BSON("loc"
+                                                      << "2dsphere"));
+    indices.push_back(btreeEntry);
+    indices.push_back(twodSphereEntry);
+    std::set<size_t> expectedIndices = {1};
+    testRateIndices(R"({loc: {$geoWithin: {$geometry: {type: 'Polygon',
+                      coordinates: [[[0,0],[0,1],[1,0],[0,0]]]}}}})",
+                    "",
+                    kSimpleCollator,
+                    indices,
+                    "loc",
+                    expectedIndices);
+}
+
+TEST(QueryPlannerIXSelectTest, GeoPredicateWithNotCanOnlyUse2dsphereIndex) {
+    std::vector<IndexEntry> indices;
+    auto btreeEntry = buildSimpleIndexEntry(BSON("loc" << 1));
+    auto twodSphereEntry = buildSimpleIndexEntry(BSON("loc"
+                                                      << "2dsphere"));
+    indices.push_back(btreeEntry);
+    indices.push_back(twodSphereEntry);
+    // This query gets parsed to {$not: {$and: {$geoWithin: <>}}} and then tags
+    // the 2dsphere index as relevant. If the $and is optimized away ({$not: {$geoWithin: <>}}),
+    // that tagging is skipped.
+    // TODO SERVER-92427: The tagging behavior should be made consistent so that this query has no
+    // expectedIndices.
+    std::set<size_t> expectedIndices = {1};
+    testRateIndices(R"({loc: {$not: {$geoWithin: {$geometry: {type: 'Polygon',
+                      coordinates: [[[0,0],[0,1],[1,0],[0,0]]]}}}}})",
+                    "",
+                    kSimpleCollator,
+                    indices,
+                    "loc",
+                    expectedIndices);
+}
+
 /*
  * Will compare 'keyPatterns' with 'entries'. As part of comparing, it will sort both of them.
  */
@@ -1357,18 +1501,17 @@ TEST(QueryPlannerIXSelectTest, ExpandWildcardIndices) {
     const auto indexEntry = makeIndexEntry(BSON("$**" << 1), {});
 
     // Case where no fields are specified.
-    std::vector<IndexEntry> result =
-        QueryPlannerIXSelect::expandIndexes(stdx::unordered_set<string>(), {indexEntry.first});
+    std::vector<IndexEntry> result = QueryPlannerIXSelect::expandIndexes({}, {indexEntry.first});
     ASSERT_TRUE(result.empty());
 
-    stdx::unordered_set<string> fields = {"fieldA", "fieldB"};
+    RelevantFieldIndexMap fields = {{"fieldA", {true}}, {"fieldB", {true}}};
 
     result = QueryPlannerIXSelect::expandIndexes(fields, {indexEntry.first});
     std::vector<BSONObj> expectedKeyPatterns = {BSON("fieldA" << 1), BSON("fieldB" << 1)};
     ASSERT_TRUE(indexEntryKeyPatternsMatch(&expectedKeyPatterns, &result));
 
     const auto wildcardIndexWithSubpath = makeIndexEntry(BSON("a.b.$**" << 1), {});
-    fields = {"a.b", "a.b.c", "a.d"};
+    fields = {{"a.b", {true}}, {"a.b.c", {true}}, {"a.d", {true}}};
     result = QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexWithSubpath.first});
     expectedKeyPatterns = {BSON("a.b" << 1), BSON("a.b.c" << 1)};
     ASSERT_TRUE(indexEntryKeyPatternsMatch(&expectedKeyPatterns, &result));
@@ -1380,7 +1523,8 @@ TEST(QueryPlannerIXSelectTest, ExpandWildcardIndicesInPresenceOfOtherIndices) {
     auto bIndexEntry = makeIndexEntry(BSON("fieldB" << 1), {});
     auto abIndexEntry = makeIndexEntry(BSON("fieldA" << 1 << "fieldB" << 1), {});
 
-    const stdx::unordered_set<string> fields = {"fieldA", "fieldB", "fieldC"};
+    const RelevantFieldIndexMap fields = {
+        {"fieldA", {true}}, {"fieldB", {true}}, {"fieldC", {true}}};
     std::vector<BSONObj> expectedKeyPatterns = {
         BSON("fieldA" << 1), BSON("fieldA" << 1), BSON("fieldB" << 1), BSON("fieldC" << 1)};
 
@@ -1418,7 +1562,7 @@ TEST(QueryPlannerIXSelectTest, ExpandWildcardIndicesInPresenceOfOtherIndices) {
 
 TEST(QueryPlannerIXSelectTest, ExpandedIndexEntriesAreCorrectlyMarkedAsMultikeyOrNonMultikey) {
     auto wildcardIndexEntry = makeIndexEntry(BSON("$**" << 1), {}, {FieldRef{"a"}});
-    const stdx::unordered_set<string> fields = {"a.b", "c.d"};
+    RelevantFieldIndexMap fields = {{"a.b", {true}}, {"c.d", {true}}};
     std::vector<BSONObj> expectedKeyPatterns = {BSON("a.b" << 1), BSON("c.d" << 1)};
 
     auto result = QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1442,7 +1586,7 @@ TEST(QueryPlannerIXSelectTest, ExpandedIndexEntriesAreCorrectlyMarkedAsMultikeyO
 TEST(QueryPlannerIXSelectTest, WildcardIndexExpansionExcludesIdField) {
     const auto indexEntry = makeIndexEntry(BSON("$**" << 1), {});
 
-    stdx::unordered_set<string> fields = {"_id", "abc", "def"};
+    RelevantFieldIndexMap fields = {{"_id", {true}}, {"abc", {true}}, {"def", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {indexEntry.first});
@@ -1454,7 +1598,7 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesExpandedEntryHasCorrectProperties)
     auto wildcardIndexEntry = makeIndexEntry(BSON("$**" << 1), {});
     wildcardIndexEntry.first.identifier = IndexEntry::Identifier("someIndex");
 
-    stdx::unordered_set<string> fields = {"abc", "def"};
+    RelevantFieldIndexMap fields = {{"abc", {true}}, {"def", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1484,7 +1628,11 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesExpandedEntryHasCorrectProperties)
 TEST(QueryPlannerIXSelectTest, WildcardIndicesExcludeNonMatchingKeySubpath) {
     auto wildcardIndexEntry = makeIndexEntry(BSON("subpath.$**" << 1), {});
 
-    stdx::unordered_set<string> fields = {"abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1500,7 +1648,11 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesExcludeNonMatchingPathsWithInclusi
                        {},
                        BSON("wildcardProjection" << BSON("abc" << 1 << "subpath.abc" << 1)));
 
-    stdx::unordered_set<string> fields = {"abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1515,7 +1667,11 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesExcludeNonMatchingPathsWithExclusi
                        {},
                        BSON("wildcardProjection" << BSON("abc" << 0 << "subpath.abc" << 0)));
 
-    stdx::unordered_set<string> fields = {"abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1531,8 +1687,12 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesWithInclusionProjectionAllowIdExcl
         {},
         BSON("wildcardProjection" << BSON("_id" << 0 << "abc" << 1 << "subpath.abc" << 1)));
 
-    stdx::unordered_set<string> fields = {
-        "_id", "abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"_id", {true}},
+                                    {"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1547,8 +1707,12 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesWithInclusionProjectionAllowIdIncl
         {},
         BSON("wildcardProjection" << BSON("_id" << 1 << "abc" << 1 << "subpath.abc" << 1)));
 
-    stdx::unordered_set<string> fields = {
-        "_id", "abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"_id", {true}},
+                                    {"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1564,8 +1728,12 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesWithExclusionProjectionAllowIdIncl
         {},
         BSON("wildcardProjection" << BSON("_id" << 1 << "abc" << 0 << "subpath.abc" << 0)));
 
-    stdx::unordered_set<string> fields = {
-        "_id", "abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"_id", {true}},
+                                    {"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
@@ -1578,13 +1746,51 @@ TEST(QueryPlannerIXSelectTest, WildcardIndicesIncludeMatchingInternalNodes) {
     auto wildcardIndexEntry = makeIndexEntry(
         BSON("$**" << 1), {}, {}, BSON("wildcardProjection" << BSON("_id" << 1 << "subpath" << 1)));
 
-    stdx::unordered_set<string> fields = {
-        "_id", "abc", "def", "subpath.abc", "subpath.def", "subpath"};
+    RelevantFieldIndexMap fields = {{"_id", {true}},
+                                    {"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
 
     std::vector<IndexEntry> result =
         QueryPlannerIXSelect::expandIndexes(fields, {wildcardIndexEntry.first});
     std::vector<BSONObj> expectedKeyPatterns = {
         BSON("_id" << 1), BSON("subpath.abc" << 1), BSON("subpath.def" << 1), BSON("subpath" << 1)};
+    ASSERT_TRUE(indexEntryKeyPatternsMatch(&expectedKeyPatterns, &result));
+}
+
+TEST(QueryPlannerIXSelectTest, SparseIndexCannotBeUsedInALookup) {
+    auto wildcardIndexEntry = makeIndexEntry(
+        BSON("$**" << 1), {}, {}, BSON("wildcardProjection" << BSON("_id" << 1 << "subpath" << 1)));
+    IndexEntry sparseIndex(BSON("abc" << 1),
+                           INDEX_BTREE,
+                           IndexDescriptor::kLatestIndexVersion,
+                           false,
+                           {},    /* multiKeyPaths */
+                           {},    /* multiKeyPathSet */
+                           true,  /* sparse */
+                           false, /* unique */
+                           CoreIndexInfo::Identifier("test_foo"),
+                           nullptr,
+                           {},
+                           nullptr,
+                           nullptr);
+
+    RelevantFieldIndexMap fields = {{"_id", {true}},
+                                    {"abc", {true}},
+                                    {"def", {true}},
+                                    {"subpath.abc", {true}},
+                                    {"subpath.def", {true}},
+                                    {"subpath", {true}}};
+
+    std::vector<IndexEntry> result =
+        QueryPlannerIXSelect::expandIndexes(fields,
+                                            {wildcardIndexEntry.first, sparseIndex},
+                                            false /* hintedIndexBson */,
+                                            true /* inLookup */);
+    // Sparse indexes and wildcard indexes cannot be used for the inner side of a $lookup.
+    std::vector<BSONObj> expectedKeyPatterns;
     ASSERT_TRUE(indexEntryKeyPatternsMatch(&expectedKeyPatterns, &result));
 }
 

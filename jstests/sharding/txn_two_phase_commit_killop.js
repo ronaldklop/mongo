@@ -6,10 +6,11 @@
  * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
 
-(function() {
-'use strict';
-
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    getCoordinatorFailpoints,
+    waitForFailpoint
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -52,8 +53,8 @@ const setUp = function() {
     // shard0: [-inf, 0)
     // shard1: [0, 10)
     // shard2: [10, +inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: coordinator.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: coordinator.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -104,7 +105,8 @@ const testCommitProtocol = function(shouldCommit, failpointData) {
     // Turn on failpoint to make the coordinator hang at a the specified point.
     assert.commandWorked(coordinator.adminCommand({
         configureFailPoint: failpointData.failpoint,
-        mode: {skip: (failpointData.skip ? failpointData.skip : 0)},
+        mode: "alwaysOn",
+        data: failpointData.data ? failpointData.data : {}
     }));
 
     // Run commitTransaction through a parallel shell.
@@ -126,7 +128,17 @@ const testCommitProtocol = function(shouldCommit, failpointData) {
         coordinatorOpsToKill = coordinator.getDB("admin")
                                    .aggregate([
                                        {$currentOp: {'allUsers': true, 'idleConnections': true}},
-                                       {$match: {desc: "TransactionCoordinator"}}
+                                       {
+                                           $match: {
+                                               $and: [
+                                                   {desc: "TransactionCoordinator"},
+                                                   // Filter out the prepareTransaction op on the
+                                                   // coordinator itself since killing it would
+                                                   // cause the transaction to abort.
+                                                   {"command.prepareTransaction": {$exists: false}}
+                                               ]
+                                           }
+                                       }
                                    ])
                                    .toArray();
 
@@ -160,7 +172,9 @@ const testCommitProtocol = function(shouldCommit, failpointData) {
     awaitResult();
 
     // If deleting the coordinator doc was not robust to killOp, the document would still exist.
-    assert.eq(0, coordinator.getDB("config").getCollection("transaction_coordinators").count());
+    // Deletion is done asynchronously, so we might have to wait.
+    assert.soon(
+        () => coordinator.getDB("config").getCollection("transaction_coordinators").count() == 0);
 
     // Check that the transaction committed or aborted as expected.
     if (!shouldCommit) {
@@ -190,4 +204,3 @@ failpointDataArr.forEach(function(failpointData) {
 });
 
 st.stop();
-})();

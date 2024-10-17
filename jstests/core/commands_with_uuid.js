@@ -3,14 +3,16 @@
  * collection.
  *
  * @tags: [
- *    requires_fastcount,
- *    requires_fcv_49,
- *    incompatible_with_embedded,
+ *   requires_fastcount,
+ *   # Commands using UUIDs are not compatible with name-based auth.
+ *   tenant_migration_incompatible,
+ *   # Runs listCollections and asserts on the output.
+ *   assumes_no_implicit_index_creation,
+ *   assumes_stable_collection_uuid,
  * ]
  */
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
-(function() {
-'use strict';
 const mainCollName = 'main_coll';
 const subCollName = 'sub_coll';
 const kOtherDbName = 'commands_with_uuid_db';
@@ -23,15 +25,12 @@ assert.commandWorked(db.runCommand({create: subCollName}));
 let collectionInfos = db.getCollectionInfos({name: mainCollName});
 let uuid = collectionInfos[0].info.uuid;
 if (uuid == null) {
-    return;
+    quit();
 }
 
 // No support for UUIDs on mongos.
-const hello = db.runCommand("hello");
-assert.commandWorked(hello);
-const isMongos = (hello.msg === "isdbgrid");
-if (isMongos) {
-    return;
+if (FixtureHelpers.isMongos(db)) {
+    quit();
 }
 
 assert.commandWorked(db.runCommand({insert: mainCollName, documents: [{fooField: 'FOO'}]}));
@@ -105,4 +104,3 @@ for (cmd of [{count: uuid}, {distinct: uuid, key: "a"}, {find: uuid}, {listIndex
     assert.commandFailedWithCode(
         db.runCommand(cmd), ErrorCodes.NamespaceNotFound, "command: " + tojson(cmd));
 }
-}());

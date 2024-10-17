@@ -27,19 +27,51 @@
 
 global:
     cpp_namespace: mongo
+    cpp_includes:
+      - "mongo/db/s/sharding_runtime_d_params.h"
 
 server_parameters:
+    chunkMigrationConcurrency:
+        description: >-
+          The number of threads doing insertions on the recipient during a chunk migration and
+          also the number of _migrateClone requests that the recipient sends to the source in parallel.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: chunkMigrationConcurrency
+        validator:
+          callback: validateChunkMigrationConcurrency
+        default: 1
+        redact: false
+
+    chunkMigrationFetcherMaxBufferedSizeBytesPerThread:
+        description: >-
+          Maximum size of buffered documents that the chunk migration cloner will keep per
+          thread. A value of 0 means there will be no limit. The minimum size is the maximum
+          BSON size limit.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: chunkMigrationFetcherMaxBufferedSizeBytesPerThread
+        validator:
+          callback: validateChunkMigrationFetcherMaxBufferedSizeBytesPerThread
+        default:
+          expr: 4 * BSONObjMaxInternalSize
+        redact: false
+
     rangeDeleterBatchSize:
         description: >-
           The maximum number of documents in each batch to delete during the cleanup stage of chunk
-          migration (or the cleanupOrphaned command). A value of 0 indicates that the system chooses
-          the default value (128).
+          migration (or the cleanupOrphaned command). Between each batch, secondaryThrottle and
+          rangeDeleterBatchDelayMS will apply.
+
+          A value of 0 indicates that the system chooses the default value (INT_MAX).
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: rangeDeleterBatchSize
         validator:
           gte: 0
-        default: 128
+        default:
+          expr: std::numeric_limits<int>::max()
+        redact: false
 
     rangeDeleterBatchDelayMS:
         description: >-
@@ -51,6 +83,31 @@ server_parameters:
         validator:
           gte: 0
         default: 20
+        redact: false
+
+    rangeDeleterHighPriority:
+        description:
+            "By default, this parameter is set to 'false' meaning that range deletions have a
+            lower priority than user operations. Setting this parameter to true prioritizes
+            range deletions over user operations."
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: rangeDeleterHighPriority
+        default: false
+        redact: false
+
+    receiveChunkWaitForRangeDeleterTimeoutMS:
+        description: >-
+          Maximum amount of time for which the start of a new chunk migration request may be deferred,
+          while pending range deletions that overlap with the request get completed/canceled.
+          If overlapping range deletions are still present upon timeout expiration, the request is aborted.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: drainOverlappingRangeDeletionsOnStartTimeoutMS
+        validator:
+          gte: 0
+        default: 10000
+        redact: false
 
     migrateCloneInsertionBatchSize:
         description: >-
@@ -64,6 +121,7 @@ server_parameters:
         validator:
           gte: 0
         default: 0
+        redact: false
 
     migrateCloneInsertionBatchDelayMS:
         description: >-
@@ -76,6 +134,7 @@ server_parameters:
         validator:
           gte: 0
         default: 0
+        redact: false
 
     migrationLockAcquisitionMaxWaitMS:
         description: 'How long to wait to acquire collection lock for migration related operations.'
@@ -83,13 +142,29 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: migrationLockAcquisitionMaxWaitMS
         default: 500
+        redact: false
+
+    maxCatchUpPercentageBeforeBlockingWrites:
+        description: >-
+          The maximum percentage of untrasferred chunk mods at the end of a catch up iteration
+          that may be deferred to the next phase of the migration protocol
+          (where new writes get blocked).
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: maxCatchUpPercentageBeforeBlockingWrites
+        validator:
+          gte: 0
+          lte: 100
+        default: 10
+        redact: false
 
     orphanCleanupDelaySecs:
-        description: 'How long to wait before starting cleanup of an emigrated chunk range.'
+        description: How long to wait before starting cleanup of an emigrated chunk range.
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: orphanCleanupDelaySecs
         default: 900
+        redact: false
 
     disableResumableRangeDeleter:
         description: >-
@@ -100,29 +175,15 @@ server_parameters:
         cpp_vartype: AtomicWord<bool>
         cpp_varname : disableResumableRangeDeleter
         default: false
+        redact: false
 
-    enableShardedIndexConsistencyCheck:
+    persistedChunkCacheUpdateMaxBatchSize:
         description: >-
-          Enable the periodic sharded index consistency check on the config server's primary.
-          The count of sharded collections with inconsistent indexes is exposed via the
-          'shardedIndexConsistency' section in the serverStatus output.
+          Maximum batch size used for updating shard persisted chunk cache.
         set_at: [startup, runtime]
-        cpp_vartype: AtomicWord<bool>
-        cpp_varname: enableShardedIndexConsistencyCheck
-        default: true
-
-    shardedIndexConsistencyCheckIntervalMS:
-        description: 'Time interval in milliseconds between subsequent index checks.'
-        set_at: [startup]
-        cpp_vartype: int
-        cpp_varname: shardedIndexConsistencyCheckIntervalMS
-        default: 600000
-
-    coordinateCommitReturnImmediatelyAfterPersistingDecision:
-        description: >-
-          Whether the transaction coordinator should return the decision as soon as the
-          the decision is made durable.
-        set_at: [startup, runtime]
-        cpp_vartype: AtomicWord<bool>
-        cpp_varname: coordinateCommitReturnImmediatelyAfterPersistingDecision
-        default: true
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: persistedChunkCacheUpdateMaxBatchSize
+        validator:
+          gte: 1
+        default: 1000
+        redact: false

@@ -2,13 +2,11 @@
  * Test that election handoff works correctly in the case where a node is caught up with primary's
  * lastApplied but is not immediately electable. (See SERVER-53612)
  */
-
-(function() {
-"use strict";
-load("jstests/replsets/libs/election_handoff.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ElectionHandoffTest} from "jstests/replsets/libs/election_handoff.js";
 
 const testName = jsTestName();
-const rst = ReplSetTest({name: testName, nodes: 2});
+const rst = new ReplSetTest({name: testName, nodes: 2});
 rst.startSet();
 
 // Make sure there are no election timeouts firing for the duration of the test. This helps
@@ -29,4 +27,3 @@ ElectionHandoffTest.testElectionHandoff(
     rst, 0, 1, {stepDownPeriodSecs: 30, secondaryCatchUpPeriodSecs: 30});
 
 rst.stopSet();
-})();

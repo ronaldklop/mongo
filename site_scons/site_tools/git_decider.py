@@ -20,8 +20,8 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 
-def generate(env, **kwargs):
 
+def generate(env, **kwargs):
     # Grab the existing decider functions out of the environment
     # so we can invoke them when we can't use Git.
     base_decider = env.decide_target

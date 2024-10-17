@@ -7,12 +7,12 @@
  *     do_not_wrap_aggregations_in_facets,
  *     assumes_read_preference_unchanged,
  *     assumes_read_concern_unchanged,
- *     assumes_against_mongod_not_mongos
+ *     assumes_against_mongod_not_mongos,
+ *     does_not_support_repeated_reads,
+ *     # Multi clients run concurrently and may modify the serverStatus metrices read in this test.
+ *     multi_clients_incompatible,
  * ]
  */
-(function() {
-"use strict";
-
 const testDB = db.getSiblingDB("union_with_query_stats");
 testDB.dropDatabase();
 
@@ -52,5 +52,4 @@ for (let idx = 0; idx < collData.length; idx++) {
     assert.eq(output, expectedOutput);
     assert.eq(expectedOutput.length,
               testDB.serverStatus().metrics.queryExecutor.scannedObjects - prevScannedObjects);
-})();
 })();

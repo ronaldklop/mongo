@@ -3,12 +3,11 @@
 // If the optional query is not given, mongos will wrongly use the command
 // BSONObj itself as the query to target shards, which could return wrong
 // shards if the shard key happens to be one of the fields in the command object.
-(function() {
-'use strict';
+// @tags: [requires_scripting]
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({shards: 2});
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 
 var db = s.getDB("test");
 var res;
@@ -25,7 +24,6 @@ for (var i = 0; i < 50; i++) {
     db.foo.insert({count: "" + i});  // chunk ["", MaxKey]
 }
 
-var theOtherShard = s.getOther(s.getPrimaryShard("test")).name;
 s.printShardingStatus();
 
 // Count documents on both shards
@@ -44,7 +42,7 @@ db.foo.drop();
 // Shard key is the same with command name.
 s.shardColl("foo", {mapReduce: 1}, {mapReduce: ""});
 
-for (var i = 0; i < 50; i++) {
+for (let i = 0; i < 50; i++) {
     db.foo.insert({mapReduce: i});       // to the chunk including number
     db.foo.insert({mapReduce: "" + i});  // to the chunk including string
 }
@@ -63,4 +61,3 @@ res = db.foo.runCommand({mapReduce: "foo", map: m, reduce: r, out: {inline: 1}})
 assert.eq(res.results[0].value, 100);
 
 s.stop();
-})();

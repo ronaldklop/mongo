@@ -29,12 +29,28 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_index_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -54,12 +70,14 @@ struct CountScanParams {
         invariant(descriptor);
     }
 
-    CountScanParams(OperationContext* opCtx, const IndexDescriptor* descriptor)
+    CountScanParams(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    const IndexDescriptor* descriptor)
         : CountScanParams(descriptor,
                           descriptor->indexName(),
                           descriptor->keyPattern(),
-                          descriptor->getEntry()->getMultikeyPaths(opCtx),
-                          descriptor->getEntry()->isMultikey()) {}
+                          descriptor->getEntry()->getMultikeyPaths(opCtx, collection),
+                          descriptor->getEntry()->isMultikey(opCtx, collection)) {}
 
     const IndexDescriptor* indexDescriptor;
     std::string name;
@@ -77,18 +95,17 @@ struct CountScanParams {
 };
 
 /**
- * Used by the count command. Scans an index from a start key to an end key. Creates a
- * WorkingSetMember for each matching index key in RID_AND_OBJ state. It has a null record id and an
- * empty object with a null snapshot id rather than real data. Returning real data is unnecessary
- * since all we need is the count.
+ * Used when don't need to return the actual records from the index or the collection (e.g. count
+ * command and some cases of aggregation).
  *
- * Only created through the getExecutorCount() path, as count is the only operation that doesn't
- * care about its data.
+ * Scans an index from a start key to an end key. Creates a WorkingSetMember for each matching index
+ * key in RID_AND_OBJ state. It has a null record id and an empty object with a null snapshot id
+ * rather than real data. Returning real data is unnecessary since all we need is the count.
  */
 class CountScan final : public RequiresIndexStage {
 public:
     CountScan(ExpressionContext* expCtx,
-              const CollectionPtr& collection,
+              VariantCollectionPtrOrAcquisition collection,
               CountScanParams params,
               WorkingSet* workingSet);
 

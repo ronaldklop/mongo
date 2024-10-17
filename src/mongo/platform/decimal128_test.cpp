@@ -30,13 +30,17 @@
 #include "mongo/platform/decimal128.h"
 
 #include <array>
+#include <cfloat>
 #include <cmath>
+#include <fmt/format.h>
+#include <limits>
 #include <memory>
 #include <string>
-#include <utility>
 
-#include "mongo/config.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -73,41 +77,41 @@ TEST(Decimal128Test, TestConstructor) {
         TEST_CTOR_COMMON_(vn, HIGH64, LOW64)      \
     }
 
-    TEST_CTOR(int8_t{0}, posHigh, 0);  // +0E+0
-    TEST_CTOR(Lim<int8_t>::lowest(), negHigh, uint64_t{1} << 7);
-    TEST_CTOR(Lim<int8_t>::max(), posHigh, (uint64_t{1} << 7) - 1);
-    TEST_CTOR(int8_t{5}, posHigh, 0x5);
+    TEST_CTOR(int8_t{0}, posHigh, 0);                                // NOLINT
+    TEST_CTOR(Lim<int8_t>::lowest(), negHigh, uint64_t{1} << 7);     // NOLINT
+    TEST_CTOR(Lim<int8_t>::max(), posHigh, (uint64_t{1} << 7) - 1);  // NOLINT
+    TEST_CTOR(int8_t{5}, posHigh, 0x5);                              // NOLINT
 
-    TEST_CTOR(uint8_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint8_t>::max(), posHigh, (uint64_t{1} << 8) - 1);
-    TEST_CTOR(uint8_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint8_t{0}, posHigh, 0);                                // NOLINT
+    TEST_CTOR(Lim<uint8_t>::max(), posHigh, (uint64_t{1} << 8) - 1);  // NOLINT
+    TEST_CTOR(uint8_t{5}, posHigh, 0x5);                              // NOLINT
 
-    TEST_CTOR(int16_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int16_t>::lowest(), negHigh, uint64_t{1} << 15);
-    TEST_CTOR(Lim<int16_t>::max(), posHigh, (uint64_t{1} << 15) - 1);
-    TEST_CTOR(int16_t{5}, posHigh, 0x5);
+    TEST_CTOR(int16_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int16_t>::lowest(), negHigh, uint64_t{1} << 15);     // NOLINT
+    TEST_CTOR(Lim<int16_t>::max(), posHigh, (uint64_t{1} << 15) - 1);  // NOLINT
+    TEST_CTOR(int16_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint16_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint16_t>::max(), posHigh, (uint64_t{1} << 16) - 1);
-    TEST_CTOR(uint16_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint16_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<uint16_t>::max(), posHigh, (uint64_t{1} << 16) - 1);  // NOLINT
+    TEST_CTOR(uint16_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(int32_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int32_t>::lowest(), negHigh, uint64_t{1} << 31);
-    TEST_CTOR(Lim<int32_t>::max(), posHigh, (uint64_t{1} << 31) - 1);
-    TEST_CTOR(int32_t{5}, posHigh, 0x5);
+    TEST_CTOR(int32_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int32_t>::lowest(), negHigh, uint64_t{1} << 31);     // NOLINT
+    TEST_CTOR(Lim<int32_t>::max(), posHigh, (uint64_t{1} << 31) - 1);  // NOLINT
+    TEST_CTOR(int32_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint32_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint32_t>::max(), posHigh, (uint64_t{1} << 32) - 1);
-    TEST_CTOR(uint32_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint32_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<uint32_t>::max(), posHigh, (uint64_t{1} << 32) - 1);  // NOLINT
+    TEST_CTOR(uint32_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(int64_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int64_t>::lowest(), negHigh, uint64_t{1} << 63);
-    TEST_CTOR(Lim<int64_t>::max(), posHigh, (uint64_t{1} << 63) - 1);
-    TEST_CTOR(int64_t{5}, posHigh, 0x5);
+    TEST_CTOR(int64_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int64_t>::lowest(), negHigh, uint64_t{1} << 63);     // NOLINT
+    TEST_CTOR(Lim<int64_t>::max(), posHigh, (uint64_t{1} << 63) - 1);  // NOLINT
+    TEST_CTOR(int64_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint64_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint64_t>::max(), posHigh, Lim<uint64_t>::max());
-    TEST_CTOR(uint64_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint64_t{0}, posHigh, 0);                              // NOLINT
+    TEST_CTOR(Lim<uint64_t>::max(), posHigh, Lim<uint64_t>::max());  // NOLINT
+    TEST_CTOR(uint64_t{5}, posHigh, 0x5);                            // NOLINT
 
 #undef TEST_CTOR_COMMON_
 #undef TEST_CTOR
@@ -291,6 +295,14 @@ TEST(Decimal128Test, TestStringConstructorNaN) {
     uint64_t lowBytes = 0x0000000000000000;
     ASSERT_EQUALS(val.high64, highBytes);
     ASSERT_EQUALS(val.low64, lowBytes);
+}
+
+TEST(Decimal128Test, TestStringConstructorInvalidCases) {
+    for (auto in : {"", "-", "+", ".", "e", "1e", "1e-", "1e+", ".e", ".e-", ".e+"}) {
+        uint32_t flags = 0;
+        Decimal128{in, &flags};
+        ASSERT(Decimal128::hasFlag(flags, Decimal128::SignalingFlag::kInvalid)) << "in=" << in;
+    }
 }
 
 TEST(Decimal128Test, TestLiteral) {
@@ -1195,6 +1207,158 @@ TEST(Decimal128Test, TestDecimal128Quantize) {
         Decimal128 result = val.quantize(Decimal128::kNormalizedZero, Decimal128::kRoundTowardZero);
         ASSERT_EQUALS(result.getValue().low64, expected.getValue().low64);
         ASSERT_EQUALS(result.getValue().high64, expected.getValue().high64);
+    }
+}
+
+struct RoundingModeInfo {
+    Decimal128::RoundingMode mode;
+    StringData name;
+};
+
+static constexpr std::array<RoundingModeInfo, 5> roundingModes{
+    {{Decimal128::kRoundTiesToEven, "kRoundTiesToEven"_sd},
+     {Decimal128::kRoundTowardNegative, "kRoundTowardNegative"_sd},
+     {Decimal128::kRoundTowardPositive, "kRoundTowardPositive"_sd},
+     {Decimal128::kRoundTowardZero, "kRoundTowardZero"_sd},
+     {Decimal128::kRoundTiesToAway, "kRoundTiesToAway"_sd}}};
+
+void assertRoundingTestCase(const Decimal128& actual,
+                            const Decimal128& expected,
+                            StringData roundingModeName,
+                            int testCaseLineNumber) {
+    auto const& actualVal = actual.getValue();
+    auto const& expectedVal = expected.getValue();
+
+    if (actualVal.low64 != expectedVal.low64 || actualVal.high64 != expectedVal.high64) {
+        FAIL(str::stream() << "Rounding test case defined on line " << testCaseLineNumber
+                           << " failed. Rounding mode: " << roundingModeName << ". "
+                           << "Expected: {" << fmt::format("0x{:016X}", expectedVal.low64) << ", "
+                           << fmt::format("0x{:016X}", expectedVal.high64) << "}. Actual: {"
+                           << fmt::format("0x{:016X}", actualVal.low64) << ", "
+                           << fmt::format("0x{:016X}", actualVal.high64) << "}");
+    }
+}
+
+TEST(Decimal128Test, TestDecimal128RoundingFractionalValues) {
+    auto d = [](auto x) {
+        return Decimal128{x};
+    };
+
+    // 'pBig' is the largest positive integer value where Decimal128 can represent pBig + 0.1
+    // without losing precision.
+    auto pBig = d(std::string(33, '9'));
+    auto nBig = -pBig;
+
+    auto pBigPlus1 = pBig.add(d(1));
+    auto nBigMinus1 = nBig.add(d(-1));
+
+    // 'epsilon' is the smallest positive value where Decimal128 can represent 1.0 + epsilon
+    // without losing precision.
+    auto epsilon = d("1E-33");
+
+    struct TestCase {
+        int lineNumber;
+        Decimal128 val;
+        Decimal128 expected[5];
+    };
+
+    std::array<TestCase, 36> cases = {{
+        {__LINE__, d(0.5).add(d("-1E-34")), {d(0), d(0), d(1), d(0), d(0)}},
+        {__LINE__, d(0.5), {d(0), d(0), d(1), d(0), d(1)}},
+        {__LINE__, d(0.5).add(d("1E-34")), {d(1), d(0), d(1), d(0), d(1)}},
+        {__LINE__, d(1.5).add(-epsilon), {d(1), d(1), d(2), d(1), d(1)}},
+        {__LINE__, d(1.5), {d(2), d(1), d(2), d(1), d(2)}},
+        {__LINE__, d(1.5).add(epsilon), {d(2), d(1), d(2), d(1), d(2)}},
+        {__LINE__, d(2.5).add(-epsilon), {d(2), d(2), d(3), d(2), d(2)}},
+        {__LINE__, d(2.5), {d(2), d(2), d(3), d(2), d(3)}},
+        {__LINE__, d(2.5).add(epsilon), {d(3), d(2), d(3), d(2), d(3)}},
+        {__LINE__, d(3.5).add(-epsilon), {d(3), d(3), d(4), d(3), d(3)}},
+        {__LINE__, d(3.5), {d(4), d(3), d(4), d(3), d(4)}},
+        {__LINE__, d(3.5).add(epsilon), {d(4), d(3), d(4), d(3), d(4)}},
+        {__LINE__, d(9.5).add(-epsilon), {d(9), d(9), d(10), d(9), d(9)}},
+        {__LINE__, d(9.5), {d(10), d(9), d(10), d(9), d(10)}},
+        {__LINE__, d(9.5).add(epsilon), {d(10), d(9), d(10), d(9), d(10)}},
+        {__LINE__, d(-0.5).add(d("1E-34")), {d(-0.0), d(-1), d(-0.0), d(-0.0), d(-0.0)}},
+        {__LINE__, d(-0.5), {d(-0.0), d(-1), d(-0.0), d(-0.0), d(-1)}},
+        {__LINE__, d(-0.5).add(d("-1E-34")), {d(-1), d(-1), d(-0.0), d(-0.0), d(-1)}},
+        {__LINE__, d(-1.5).add(epsilon), {d(-1), d(-2), d(-1), d(-1), d(-1)}},
+        {__LINE__, d(-1.5), {d(-2), d(-2), d(-1), d(-1), d(-2)}},
+        {__LINE__, d(-1.5).add(-epsilon), {d(-2), d(-2), d(-1), d(-1), d(-2)}},
+        {__LINE__, d(-2.5).add(epsilon), {d(-2), d(-3), d(-2), d(-2), d(-2)}},
+        {__LINE__, d(-2.5), {d(-2), d(-3), d(-2), d(-2), d(-3)}},
+        {__LINE__, d(-2.5).add(-epsilon), {d(-3), d(-3), d(-2), d(-2), d(-3)}},
+        {__LINE__, d(-3.5).add(epsilon), {d(-3), d(-4), d(-3), d(-3), d(-3)}},
+        {__LINE__, d(-3.5), {d(-4), d(-4), d(-3), d(-3), d(-4)}},
+        {__LINE__, d(-3.5).add(-epsilon), {d(-4), d(-4), d(-3), d(-3), d(-4)}},
+        {__LINE__, d(-9.5).add(epsilon), {d(-9), d(-10), d(-9), d(-9), d(-9)}},
+        {__LINE__, d(-9.5), {d(-10), d(-10), d(-9), d(-9), d(-10)}},
+        {__LINE__, d(-9.5).add(-epsilon), {d(-10), d(-10), d(-9), d(-9), d(-10)}},
+        {__LINE__, pBig.add(d("0.4")), {pBig, pBig, pBigPlus1, pBig, pBig}},
+        {__LINE__, pBig.add(d("0.5")), {pBigPlus1, pBig, pBigPlus1, pBig, pBigPlus1}},
+        {__LINE__, pBig.add(d("0.6")), {pBigPlus1, pBig, pBigPlus1, pBig, pBigPlus1}},
+        {__LINE__, nBig.add(d("-0.4")), {nBig, nBigMinus1, nBig, nBig, nBig}},
+        {__LINE__, nBig.add(d("-0.5")), {nBigMinus1, nBigMinus1, nBig, nBig, nBigMinus1}},
+        {__LINE__, nBig.add(d("-0.6")), {nBigMinus1, nBigMinus1, nBig, nBig, nBigMinus1}},
+    }};
+
+    for (auto testCase : cases) {
+        for (size_t i = 0; i < roundingModes.size(); ++i) {
+            auto actual = testCase.val.round(roundingModes[i].mode);
+            assertRoundingTestCase(
+                actual, testCase.expected[i], roundingModes[i].name, testCase.lineNumber);
+        }
+    }
+}
+
+TEST(Decimal128Test, TestDecimal128RoundingIntegerValues) {
+    struct TestCase {
+        int lineNumber;
+        Decimal128 val;
+    };
+
+    std::array<TestCase, 16> cases = {{{__LINE__, Decimal128{"0"}},
+                                       {__LINE__, Decimal128{"1"}},
+                                       {__LINE__, Decimal128{"2"}},
+                                       {__LINE__, Decimal128{"3"}},
+                                       {__LINE__, Decimal128{"4"}},
+                                       {__LINE__, Decimal128{DBL_MAX}},
+                                       {__LINE__, Decimal128{std::string(34, '9')}},
+                                       {__LINE__, Decimal128{"-0"}},
+                                       {__LINE__, Decimal128{"-1"}},
+                                       {__LINE__, Decimal128{"-2"}},
+                                       {__LINE__, Decimal128{"-3"}},
+                                       {__LINE__, Decimal128{"-4"}},
+                                       {__LINE__, Decimal128{-DBL_MAX}},
+                                       {__LINE__, Decimal128{"-" + std::string(34, '9')}},
+                                       {__LINE__, Decimal128::kLargestPositive},
+                                       {__LINE__, Decimal128::kLargestNegative}}};
+
+    for (auto testCase : cases) {
+        for (size_t i = 0; i < roundingModes.size(); ++i) {
+            auto actual = testCase.val.round(roundingModes[i].mode);
+            auto const& expected = testCase.val;
+            assertRoundingTestCase(actual, expected, roundingModes[i].name, testCase.lineNumber);
+        }
+    }
+}
+
+TEST(Decimal128Test, TestDecimal128RoundingInfinityAndNan) {
+    struct TestCase {
+        int lineNumber;
+        Decimal128 val;
+    };
+
+    std::array<TestCase, 4> cases = {{{__LINE__, Decimal128::kPositiveInfinity},
+                                      {__LINE__, Decimal128::kNegativeInfinity},
+                                      {__LINE__, Decimal128::kPositiveNaN},
+                                      {__LINE__, Decimal128::kNegativeNaN}}};
+
+    for (auto testCase : cases) {
+        for (size_t i = 0; i < roundingModes.size(); ++i) {
+            auto actual = testCase.val.round(roundingModes[i].mode);
+            auto const& expected = testCase.val;
+            assertRoundingTestCase(actual, expected, roundingModes[i].name, testCase.lineNumber);
+        }
     }
 }
 

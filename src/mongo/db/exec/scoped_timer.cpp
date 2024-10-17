@@ -27,19 +27,49 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/scoped_timer.h"
-#include "mongo/util/clock_source.h"
+
+#include "mongo/platform/compiler.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
+ScopedTimer::ScopedTimer(Nanoseconds* counter, TickSource* ts)
+    : _counter(counter), _tickSource(ts), _clockSource(nullptr), _startTS(ts->getTicks()) {}
 
-ScopedTimer::ScopedTimer(ClockSource* cs, long long* counter)
-    : _clock(cs), _counter(counter), _start(cs->now()) {}
+ScopedTimer::ScopedTimer(Nanoseconds* counter, ClockSource* cs)
+    : _counter(counter), _tickSource(nullptr), _clockSource(cs), _startCS(cs->now()) {}
 
 ScopedTimer::~ScopedTimer() {
-    long long elapsed = durationCount<Milliseconds>(_clock->now() - _start);
-    *_counter += elapsed;
+    if (MONGO_likely(_clockSource)) {
+        *_counter += Nanoseconds{
+            (durationCount<Milliseconds>(_clockSource->now() - _startCS) * 1000 * 1000)};
+        return;
+    }
+    if (_tickSource) {
+        *_counter += _tickSource->ticksTo<Nanoseconds>(_tickSource->getTicks() - _startTS);
+    }
 }
 
+TimeElapsedBuilderScopedTimer::TimeElapsedBuilderScopedTimer(ClockSource* clockSource,
+                                                             StringData description,
+                                                             BSONObjBuilder* builder)
+    : _clockSource(clockSource),
+      _description(description),
+      _beginTime(clockSource->now()),
+      _builder(builder) {}
+
+TimeElapsedBuilderScopedTimer::~TimeElapsedBuilderScopedTimer() {
+    mongo::Milliseconds elapsedTime = _clockSource->now() - _beginTime;
+    _builder->append(_description, elapsedTime.toString());
+}
+
+boost::optional<TimeElapsedBuilderScopedTimer> createTimeElapsedBuilderScopedTimer(
+    ClockSource* clockSource, StringData description, BSONObjBuilder* builder) {
+    if (builder == nullptr) {
+        return boost::none;
+    }
+    return boost::optional<TimeElapsedBuilderScopedTimer>(
+        boost::in_place_init, clockSource, description, builder);
+}
 }  // namespace mongo

@@ -27,18 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <map>
 
-#include "mongo/db/clientcursor.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/tenant_cloner_test_fixture.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
-#include "mongo/db/service_context_test_fixture.h"
-#include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -72,7 +89,7 @@ protected:
         _storageInterface.insertDocumentsFn = [this](OperationContext* opCtx,
                                                      const NamespaceStringOrUUID& nsOrUUID,
                                                      const std::vector<InsertStatement>& ops) {
-            const auto collInfo = &_collections[nsOrUUID.nss().get()];
+            const auto collInfo = &_collections[nsOrUUID.nss()];
             collInfo->numDocsInserted += ops.size();
             return Status::OK();
         };
@@ -169,9 +186,9 @@ TEST_F(TenantDatabaseClonerTest, ListCollections) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "a"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[1].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
 }
 
@@ -212,9 +229,9 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsAllowsExtraneousFields) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "a"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "a"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid1), collections[0].second.toBSON());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[1].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid2), collections[1].second.toBSON());
 }
 
@@ -403,7 +420,7 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsRemoteUnreachableBeforeMajorityF
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_NOT_OK(cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -444,7 +461,7 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsRecordsCorrectOperationTime) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -459,8 +476,8 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsRecordsCorrectOperationTime) {
 TEST_F(TenantDatabaseClonerTest, FirstCollectionListIndexesFailed) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const std::vector<BSONObj> sourceInfos = {BSON("name"
                                                    << "a"
                                                    << "type"
@@ -494,8 +511,8 @@ TEST_F(TenantDatabaseClonerTest, FirstCollectionListIndexesFailed) {
 TEST_F(TenantDatabaseClonerTest, CreateCollections) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const std::vector<BSONObj> sourceInfos = {BSON("name"
                                                    << "a"
                                                    << "type"
@@ -522,11 +539,11 @@ TEST_F(TenantDatabaseClonerTest, CreateCollections) {
 
     ASSERT_EQUALS(2U, _collections.size());
 
-    auto collInfo = _collections[NamespaceString{_dbName, "a"}];
+    auto collInfo = _collections[NamespaceString::createNamespaceString_forTest(_dbName, "a")];
     ASSERT(collInfo.collCreated);
     ASSERT_EQUALS(0, collInfo.numDocsInserted);
 
-    collInfo = _collections[NamespaceString{_dbName, "b"}];
+    collInfo = _collections[NamespaceString::createNamespaceString_forTest(_dbName, "b")];
     ASSERT(collInfo.collCreated);
     ASSERT_EQUALS(0, collInfo.numDocsInserted);
 }
@@ -534,8 +551,8 @@ TEST_F(TenantDatabaseClonerTest, CreateCollections) {
 TEST_F(TenantDatabaseClonerTest, DatabaseAndCollectionStats) {
     auto uuid1 = UUID::gen();
     auto uuid2 = UUID::gen();
-    const BSONObj idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                         << "_id_");
+    const BSONObj idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     const BSONObj extraIndexSpec = BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
                                             << "_extra_");
     const std::vector<BSONObj> sourceInfos = {BSON("name"
@@ -574,7 +591,7 @@ TEST_F(TenantDatabaseClonerTest, DatabaseAndCollectionStats) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -641,7 +658,8 @@ TEST_F(TenantDatabaseClonerTest, TenantCollectionsAlreadyExist) {
 
     CollectionOptions options;
     options.uuid = uuid;
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "a"), options));
+    ASSERT_OK(
+        createCollection(NamespaceString::createNamespaceString_forTest(_dbName, "a"), options));
 
     auto cloner = makeDatabaseCloner();
     cloner->setStopAfterStage_forTest("listExistingCollections");
@@ -666,13 +684,35 @@ TEST_F(TenantDatabaseClonerTest, ResumingFromLastClonedCollection) {
     uuid.push_back(UUID::gen());
     std::sort(uuid.begin(), uuid.end());
 
+    auto aNss = NamespaceString::createNamespaceString_forTest(_dbName, "a");
+    auto bNss = NamespaceString::createNamespaceString_forTest(_dbName, "b");
     CollectionOptions options;
     options.uuid = uuid[0];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "a"), options));
+    ASSERT_OK(createCollection(aNss, options));
     options.uuid = uuid[1];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "b"), options));
+    ASSERT_OK(createCollection(bNss, options));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    long long sizeOfOneCollection = 0;
+    {
+        // Insert documents into collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), aNss, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          bNss,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "hello"),
+                                           Timestamp(0)},
+                                          0));
+
+        auto swSize = storage->getCollectionSize(opCtx.get(), aNss);
+        ASSERT_OK(swSize.getStatus());
+        sizeOfOneCollection = swSize.getValue();
+    }
+
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("listExistingCollections");
 
@@ -698,10 +738,12 @@ TEST_F(TenantDatabaseClonerTest, ResumingFromLastClonedCollection) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(1U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[1]), collections[0].second.toBSON());
 
-    ASSERT_EQUALS(1, cloner->getStats().clonedCollectionsBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(1, stats.clonedCollectionsBeforeFailover);
+    ASSERT_EQUALS(sizeOfOneCollection, stats.approxTotalBytesCopied);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllGreater) {
@@ -715,11 +757,26 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllGreater) {
     uuid.push_back(UUID::gen());
     std::sort(uuid.begin(), uuid.end());
 
+    auto aNss = NamespaceString::createNamespaceString_forTest(_dbName, "a");
     CollectionOptions options;
     options.uuid = uuid[0];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "a"), options));
+    ASSERT_OK(createCollection(aNss, options));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    long long sizeANss = 0;
+    {
+        // Insert documents into collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), aNss, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+
+        auto swSize = storage->getCollectionSize(opCtx.get(), aNss);
+        ASSERT_OK(swSize.getStatus());
+        sizeANss = swSize.getValue();
+    }
+
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("listExistingCollections");
 
@@ -745,12 +802,14 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllGreater) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "b"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "b"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[1]), collections[0].second.toBSON());
-    ASSERT_EQ(NamespaceString(_dbName, "c"), collections[1].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "c"), collections[1].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[2]), collections[1].second.toBSON());
 
-    ASSERT_EQUALS(1, cloner->getStats().clonedCollectionsBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(1, stats.clonedCollectionsBeforeFailover);
+    ASSERT_EQUALS(sizeANss, stats.approxTotalBytesCopied);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_SomeGreater) {
@@ -764,13 +823,39 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_SomeGreater) {
     uuid.push_back(UUID::gen());
     std::sort(uuid.begin(), uuid.end());
 
+    auto aNss = NamespaceString::createNamespaceString_forTest(_dbName, "a");
+    auto bNss = NamespaceString::createNamespaceString_forTest(_dbName, "b");
     CollectionOptions options;
     options.uuid = uuid[0];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "a"), options));
+    ASSERT_OK(createCollection(aNss, options));
     options.uuid = uuid[1];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "b"), options));
+    ASSERT_OK(createCollection(bNss, options));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    long long ANssBNssSize = 0;
+    {
+        // Insert some documents into both collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), aNss, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          bNss,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "hello"),
+                                           Timestamp(0)},
+                                          0));
+
+        auto swSizeANss = storage->getCollectionSize(opCtx.get(), aNss);
+        ASSERT_OK(swSizeANss.getStatus());
+        ANssBNssSize = swSizeANss.getValue();
+
+        auto swSizeBNss = storage->getCollectionSize(opCtx.get(), bNss);
+        ASSERT_OK(swSizeBNss.getStatus());
+        ANssBNssSize += swSizeBNss.getValue();
+    }
+
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("listExistingCollections");
 
@@ -796,10 +881,12 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_SomeGreater) {
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(1U, collections.size());
-    ASSERT_EQ(NamespaceString(_dbName, "c"), collections[0].first);
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest(_dbName, "c"), collections[0].first);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << uuid[2]), collections[0].second.toBSON());
 
-    ASSERT_EQUALS(2, cloner->getStats().clonedCollectionsBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(2, stats.clonedCollectionsBeforeFailover);
+    ASSERT_EQUALS(ANssBNssSize, stats.approxTotalBytesCopied);
 }
 
 TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllLess) {
@@ -813,15 +900,52 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllLess) {
     uuid.push_back(UUID::gen());
     std::sort(uuid.begin(), uuid.end());
 
+    auto aNss = NamespaceString::createNamespaceString_forTest(_dbName, "a");
+    auto bNss = NamespaceString::createNamespaceString_forTest(_dbName, "b");
+    auto cNss = NamespaceString::createNamespaceString_forTest(_dbName, "c");
     CollectionOptions options;
     options.uuid = uuid[0];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "a"), options));
+    ASSERT_OK(createCollection(aNss, options));
     options.uuid = uuid[1];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "b"), options));
+    ASSERT_OK(createCollection(bNss, options));
     options.uuid = uuid[2];
-    ASSERT_OK(createCollection(NamespaceString(_dbName, "c"), options));
+    ASSERT_OK(createCollection(cNss, options));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    long long sizeOfAllColls = 0;
+    {
+        // Insert some documents into all three collections.
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+
+        ASSERT_OK(storage->insertDocument(
+            opCtx.get(), aNss, {BSON("_id" << 0 << "a" << 1001), Timestamp(0)}, 0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          bNss,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "hello"),
+                                           Timestamp(0)},
+                                          0));
+        ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                          cNss,
+                                          {BSON("_id" << 0 << "a"
+                                                      << "goodbye"),
+                                           Timestamp(0)},
+                                          0));
+
+        auto swSizeANss = storage->getCollectionSize(opCtx.get(), aNss);
+        ASSERT_OK(swSizeANss.getStatus());
+        sizeOfAllColls = swSizeANss.getValue();
+
+        auto swSizeBNss = storage->getCollectionSize(opCtx.get(), bNss);
+        ASSERT_OK(swSizeBNss.getStatus());
+        sizeOfAllColls += swSizeBNss.getValue();
+
+        auto swSizeCNss = storage->getCollectionSize(opCtx.get(), cNss);
+        ASSERT_OK(swSizeCNss.getStatus());
+        sizeOfAllColls += swSizeCNss.getValue();
+    }
+
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("listExistingCollections");
 
@@ -849,7 +973,9 @@ TEST_F(TenantDatabaseClonerTest, LastClonedCollectionDeleted_AllLess) {
     // Nothing to clone.
     ASSERT_EQUALS(0U, collections.size());
 
-    ASSERT_EQUALS(3, cloner->getStats().clonedCollectionsBeforeFailover);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(3, stats.clonedCollectionsBeforeFailover);
+    ASSERT_EQUALS(sizeOfAllColls, stats.approxTotalBytesCopied);
 }
 
 }  // namespace repl

@@ -32,6 +32,7 @@
 #include <memory>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
@@ -71,6 +72,11 @@ public:
      * This function will noop if the MirrorMaestro is currently being initialized or shutdown.
      */
     static void tryMirrorRequest(OperationContext* opCtx) noexcept;
+
+    /**
+     * Runs custom logic as part of receiving a mirrored operation.
+     */
+    static void onReceiveMirroredRead(OperationContext* opCtx) noexcept;
 
     static constexpr auto kServerStatusSectionName = "mirroredReads"_sd;
 };

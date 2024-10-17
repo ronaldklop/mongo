@@ -27,11 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <type_traits>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/pipeline/accumulator_js_reduce.h"
+#include "mongo/db/pipeline/javascript_execution.h"
 #include "mongo/db/pipeline/make_js_function.h"
+#include "mongo/db/pipeline/map_reduce_options_gen.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -40,11 +56,11 @@ REGISTER_ACCUMULATOR(_internalJsReduce, AccumulatorInternalJsReduce::parseIntern
 AccumulationExpression AccumulatorInternalJsReduce::parseInternalJsReduce(
     ExpressionContext* const expCtx, BSONElement elem, VariablesParseState vps) {
     uassert(31326,
-            str::stream() << kAccumulatorName << " requires a document argument, but found "
-                          << elem.type(),
+            str::stream() << kName << " requires a document argument, but found " << elem.type(),
             elem.type() == BSONType::Object);
     BSONObj obj = elem.embeddedObject();
 
+    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     std::string funcSource;
     boost::intrusive_ptr<Expression> argument;
 
@@ -55,17 +71,17 @@ AccumulationExpression AccumulatorInternalJsReduce::parseInternalJsReduce(
             argument = Expression::parseOperand(expCtx, element, vps);
         } else {
             uasserted(31243,
-                      str::stream() << "Invalid argument specified to " << kAccumulatorName << ": "
+                      str::stream() << "Invalid argument specified to " << kName << ": "
                                     << element.toString());
         }
     }
     uassert(31245,
-            str::stream() << kAccumulatorName
-                          << " requires 'eval' argument, recieved input: " << obj.toString(false),
+            str::stream() << kName
+                          << " requires 'eval' argument, received input: " << obj.toString(false),
             !funcSource.empty());
     uassert(31349,
-            str::stream() << kAccumulatorName
-                          << " requires 'data' argument, recieved input: " << obj.toString(false),
+            str::stream() << kName
+                          << " requires 'data' argument, received input: " << obj.toString(false),
             argument);
 
     auto factory = [expCtx, funcSource = funcSource]() {
@@ -73,13 +89,16 @@ AccumulationExpression AccumulatorInternalJsReduce::parseInternalJsReduce(
     };
 
     auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
-    return {std::move(initializer), std::move(argument), std::move(factory)};
+    return {std::move(initializer),
+            std::move(argument),
+            std::move(factory),
+            AccumulatorInternalJsReduce::kName};
 }
 
 std::string AccumulatorInternalJsReduce::parseReduceFunction(BSONElement func) {
     uassert(
         31244,
-        str::stream() << kAccumulatorName
+        str::stream() << kName
                       << " requires the 'eval' argument to be of type string, or code but found "
                       << func.type(),
         func.type() == BSONType::String || func.type() == BSONType::Code);
@@ -91,7 +110,7 @@ void AccumulatorInternalJsReduce::processInternal(const Value& input, bool mergi
         return;
     }
     uassert(31242,
-            str::stream() << kAccumulatorName << " requires a document argument, but found "
+            str::stream() << kName << " requires a document argument, but found "
                           << input.getType(),
             input.getType() == BSONType::Object);
     Document data = input.getDocument();
@@ -102,14 +121,14 @@ void AccumulatorInternalJsReduce::processInternal(const Value& input, bool mergi
 
     uassert(
         31251,
-        str::stream() << kAccumulatorName
+        str::stream() << kName
                       << " requires the 'data' argument to have a 'k' and 'v' field. Instead found"
                       << data.toString(),
         data.computeSize() == 2ull && !kField.missing() && !vField.missing());
 
     _key = kField;
 
-    _memUsageBytes += vField.getApproximateSize();
+    _memUsageTracker.add(vField.getApproximateSize());
     _values.push_back(std::move(vField));
 }
 
@@ -117,47 +136,52 @@ Value AccumulatorInternalJsReduce::getValue(bool toBeMerged) {
     if (_values.size() < 1) {
         return Value{};
     }
-
-    const auto keySize = _key.getApproximateSize();
-
     Value result;
-    // Keep reducing until we have exactly one value.
-    while (true) {
-        BSONArrayBuilder bsonValues;
-        size_t numLeft = _values.size();
-        for (; numLeft > 0; numLeft--) {
-            Value val = _values[numLeft - 1];
+    if (mrSingleReduceOptimizationEnabled && _values.size() == 1) {
+        // This optimization existed in the old Pre-4.4 MapReduce implementation. If the flag is
+        // set, then we should replicate the optimization. See SERVER-68766 for more details.
+        result = std::move(_values[0]);
+    } else {
+        const auto keySize = _key.getApproximateSize();
 
-            // Do not insert if doing so would exceed the the maximum allowed BSONObj size.
-            if (bsonValues.len() + keySize + val.getApproximateSize() > BSONObjMaxUserSize) {
-                // If we have reached the threshold for maximum allowed BSONObj size and only have a
-                // single value then no progress will be made on reduce. We must fail when this
-                // scenario is encountered.
-                size_t numNextReduce = _values.size() - numLeft;
-                uassert(31392, "Value too large to reduce", numNextReduce > 1);
-                break;
+        // Keep reducing until we have exactly one value.
+        while (true) {
+            BSONArrayBuilder bsonValues;
+            size_t numLeft = _values.size();
+            for (; numLeft > 0; numLeft--) {
+                Value val = _values[numLeft - 1];
+
+                // Do not insert if doing so would exceed the the maximum allowed BSONObj size.
+                if (bsonValues.len() + keySize + val.getApproximateSize() > BSONObjMaxUserSize) {
+                    // If we have reached the threshold for maximum allowed BSONObj size and only
+                    // have a single value then no progress will be made on reduce. We must fail
+                    // when this scenario is encountered.
+                    size_t numNextReduce = _values.size() - numLeft;
+                    uassert(31392, "Value too large to reduce", numNextReduce > 1);
+                    break;
+                }
+                bsonValues << val;
             }
-            bsonValues << val;
-        }
 
-        auto expCtx = getExpressionContext();
-        auto reduceFunc = makeJsFunc(expCtx, _funcSource);
+            auto expCtx = getExpressionContext();
+            auto reduceFunc = makeJsFunc(expCtx, _funcSource);
 
-        // Function signature: reduce(key, values).
-        BSONObj params = BSON_ARRAY(_key << bsonValues.arr());
-        // For reduce, the key and values are both passed as 'params' so there's no need to set
-        // 'this'.
-        BSONObj thisObj;
-        Value reduceResult =
-            expCtx->getJsExecWithScope()->callFunction(reduceFunc, params, thisObj);
-        if (numLeft == 0) {
-            result = reduceResult;
-            break;
-        } else {
-            // Remove all values which have been reduced.
-            _values.resize(numLeft);
-            // Include most recent result in the set of values to be reduced.
-            _values.push_back(reduceResult);
+            // Function signature: reduce(key, values).
+            BSONObj params = BSON_ARRAY(_key << bsonValues.arr());
+            // For reduce, the key and values are both passed as 'params' so there's no need to set
+            // 'this'.
+            BSONObj thisObj;
+            Value reduceResult =
+                expCtx->getJsExecWithScope()->callFunction(reduceFunc, params, thisObj);
+            if (numLeft == 0) {
+                result = reduceResult;
+                break;
+            } else {
+                // Remove all values which have been reduced.
+                _values.resize(numLeft);
+                // Include most recent result in the set of values to be reduced.
+                _values.push_back(reduceResult);
+            }
         }
     }
 
@@ -165,7 +189,7 @@ Value AccumulatorInternalJsReduce::getValue(bool toBeMerged) {
     if (toBeMerged) {
         MutableDocument output;
         output.addField("k", _key);
-        output.addField("v", result);
+        output.addField("v", std::move(result));
         return Value(output.freeze());
     } else {
         return result;
@@ -180,15 +204,16 @@ boost::intrusive_ptr<AccumulatorState> AccumulatorInternalJsReduce::create(
 
 void AccumulatorInternalJsReduce::reset() {
     _values.clear();
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _key = Value{};
 }
 
 // Returns this accumulator serialized as a Value along with the reduce function.
 Document AccumulatorInternalJsReduce::serialize(boost::intrusive_ptr<Expression> initializer,
                                                 boost::intrusive_ptr<Expression> argument,
-                                                bool explain) const {
-    return DOC(getOpName() << DOC("data" << argument->serialize(explain) << "eval" << _funcSource));
+                                                const SerializationOptions& options) const {
+    return DOC(kName << DOC("data" << argument->serialize(options) << "eval"
+                                   << options.serializeLiteral(_funcSource)));
 }
 
 REGISTER_ACCUMULATOR(accumulator, AccumulatorJs::parse);
@@ -226,23 +251,25 @@ std::string parseFunction(StringData fieldName,
 
 Document AccumulatorJs::serialize(boost::intrusive_ptr<Expression> initializer,
                                   boost::intrusive_ptr<Expression> argument,
-                                  bool explain) const {
+                                  const SerializationOptions& options) const {
     MutableDocument args;
-    args.addField("init", Value(_init));
-    args.addField("initArgs", Value(initializer->serialize(explain)));
-    args.addField("accumulate", Value(_accumulate));
-    args.addField("accumulateArgs", Value(argument->serialize(explain)));
-    args.addField("merge", Value(_merge));
+
+    args.addField("init", options.serializeLiteral(_init));
+    args.addField("initArgs", initializer->serialize(options));
+    args.addField("accumulate", options.serializeLiteral(_accumulate));
+    args.addField("accumulateArgs", argument->serialize(options));
+    args.addField("merge", options.serializeLiteral(_merge));
     if (_finalize) {
-        args.addField("finalize", Value(*_finalize));
+        args.addField("finalize", options.serializeLiteral(*_finalize));
     }
     args.addField("lang", Value("js"_sd));
-    return DOC(getOpName() << args.freeze());
+    return DOC(kName << args.freeze());
 }
 
 AccumulationExpression AccumulatorJs::parse(ExpressionContext* const expCtx,
                                             BSONElement elem,
                                             VariablesParseState vps) {
+    expCtx->hasServerSideJs.accumulator = true;
     /*
      * {$accumulator: {
      *   init: <code>,
@@ -263,6 +290,7 @@ AccumulationExpression AccumulatorJs::parse(ExpressionContext* const expCtx,
             elem.type() == BSONType::Object);
     BSONObj obj = elem.embeddedObject();
 
+    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     std::string init, accumulate, merge;
     boost::optional<std::string> finalize;
     boost::intrusive_ptr<Expression> initArgs, accumulateArgs;
@@ -314,7 +342,8 @@ AccumulationExpression AccumulatorJs::parse(ExpressionContext* const expCtx,
                     finalize = std::move(finalize)]() {
         return new AccumulatorJs(expCtx, init, accumulate, merge, finalize);
     };
-    return {std::move(initArgs), std::move(accumulateArgs), std::move(factory)};
+    return {
+        std::move(initArgs), std::move(accumulateArgs), std::move(factory), AccumulatorJs::kName};
 }
 
 Value AccumulatorJs::getValue(bool toBeMerged) {
@@ -347,13 +376,11 @@ Value AccumulatorJs::getValue(bool toBeMerged) {
 }
 
 void AccumulatorJs::resetMemUsageBytes() {
-    _memUsageBytes = sizeof(*this) + _init.capacity() + _accumulate.capacity() + _merge.capacity();
+    _memUsageTracker.set(sizeof(*this) + _init.capacity() + _accumulate.capacity() +
+                         _merge.capacity());
     if (_finalize) {
-        _memUsageBytes += _finalize->capacity();
+        _memUsageTracker.add(_finalize->capacity());
     }
-}
-void AccumulatorJs::incrementMemUsageBytes(size_t bytes) {
-    _memUsageBytes += bytes;
 }
 
 void AccumulatorJs::startNewGroup(Value const& input) {
@@ -381,7 +408,7 @@ void AccumulatorJs::startNewGroup(Value const& input) {
 
     // getApproximateSize includes sizeof(Value), but we already counted that in resetMemUsageBytes
     // as part of sizeof(*this).
-    incrementMemUsageBytes(_state->getApproximateSize() - sizeof(Value));
+    _memUsageTracker.add(_state->getApproximateSize() - sizeof(Value));
 }
 
 void AccumulatorJs::reset() {
@@ -408,8 +435,8 @@ void AccumulatorJs::processInternal(const Value& input, bool merging) {
 
     // getApproximateSize includes sizeof(Value), but we already counted that in resetMemUsageBytes
     // as part of sizeof(*this).
-    incrementMemUsageBytes(input.getApproximateSize() - sizeof(Value) +
-                           sizeof(std::pair<Value, bool>));
+    _memUsageTracker.add(input.getApproximateSize() - sizeof(Value) +
+                         sizeof(std::pair<Value, bool>));
 }
 
 void AccumulatorJs::reduceMemoryConsumptionIfAble() {
@@ -491,7 +518,7 @@ void AccumulatorJs::reduceMemoryConsumptionIfAble() {
     _pendingCalls.clear();
 
     resetMemUsageBytes();
-    incrementMemUsageBytes(_state->getApproximateSize());
+    _memUsageTracker.add(_state->getApproximateSize());
 }
 
 }  // namespace mongo

@@ -27,13 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <cstdint>
+#include <utility>
+#include <variant>
 
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
 namespace {
@@ -56,7 +66,7 @@ MigrationSecondaryThrottleOptions MigrationSecondaryThrottleOptions::create(
 MigrationSecondaryThrottleOptions MigrationSecondaryThrottleOptions::createWithWriteConcern(
     const WriteConcernOptions& writeConcern) {
     // Optimize on write concern, which makes no difference
-    if (writeConcern.wNumNodes <= 1 && writeConcern.wMode.empty()) {
+    if (holds_alternative<int64_t>(writeConcern.w) && get<int64_t>(writeConcern.w) <= 1) {
         return MigrationSecondaryThrottleOptions(kOff, boost::none);
     }
 
@@ -109,7 +119,7 @@ StatusWith<MigrationSecondaryThrottleOptions> MigrationSecondaryThrottleOptions:
         writeConcernBSON = writeConcernElem.Obj().getOwned();
     }
 
-    invariant(writeConcernBSON.is_initialized());
+    invariant(writeConcernBSON.has_value());
 
     // Make sure the write concern parses correctly
     auto sw = WriteConcernOptions::parse(*writeConcernBSON);

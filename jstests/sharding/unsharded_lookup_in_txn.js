@@ -1,15 +1,18 @@
 /**
  * Test that $lookup within a sharded transaction reads from the correct snapshot.
- * @tags: [requires_find_command, requires_sharding, uses_multi_shard_transaction,
- *         uses_transactions]
+ * @tags: [
+ *   requires_sharding,
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const st = new ShardingTest({shards: 2, mongos: 1});
-const kDBName = "unsharded_lookup_in_txn";
 
 let session = st.s.startSession();
 let sessionDB = session.getDatabase("unsharded_lookup_in_txn");
@@ -17,8 +20,8 @@ let sessionDB = session.getDatabase("unsharded_lookup_in_txn");
 const shardedColl = sessionDB.sharded;
 const unshardedColl = sessionDB.unsharded;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: sessionDB.getName()}));
-st.ensurePrimaryShard(sessionDB.getName(), st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: sessionDB.getName(), primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(
     st.s.adminCommand({shardCollection: shardedColl.getFullName(), key: {_id: 1}}));
@@ -44,6 +47,13 @@ const pipeline = [{
 const kBatchSize = 2;
 
 const testLookupDoesNotSeeDocumentsOutsideSnapshot = function() {
+    // TODO SERVER-88936 Remove this check once allow additional participants is enabled on last-lts
+    const additionalTxnParticipantsAllowed =
+        FeatureFlagUtil.isPresentAndEnabled(st.s.getDB('admin'), "AllowAdditionalParticipants");
+    if (!additionalTxnParticipantsAllowed) {
+        return;
+    }
+
     unshardedColl.drop();
     // Insert some stuff into the unsharded collection.
     const kUnshardedCollOriginalSize = 10;
@@ -94,4 +104,3 @@ flushRoutersAndRefreshShardMetadata(st, {ns: shardedColl.getFullName()});
 testLookupDoesNotSeeDocumentsOutsideSnapshot();
 
 st.stop();
-})();

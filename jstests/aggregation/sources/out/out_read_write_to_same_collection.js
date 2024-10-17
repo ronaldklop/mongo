@@ -2,10 +2,11 @@
 //
 // This test assumes that collections are not implicitly sharded, since $out is prohibited if the
 // output collection is sharded.
-// @tags: [assumes_unsharded_collection]
-(function() {
-"use strict";
-
+// @tags: [
+//   assumes_unsharded_collection,
+//   # Asserts on the number of indexes.
+//   assumes_no_implicit_index_creation,
+// ]
 const coll = db.out_read_write_to_same_collection;
 coll.drop();
 assert.commandWorked(coll.insert(
@@ -46,4 +47,3 @@ const indexMetadata =
 assert.eq(indexMetadata, [{_id: 1}, {total: 1}]);
 
 coll.drop();
-}());

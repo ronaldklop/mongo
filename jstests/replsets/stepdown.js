@@ -9,8 +9,8 @@
  * @tags: [requires_fsync]
  */
 
-load("jstests/replsets/libs/election_metrics.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {verifyServerStatusChange} from "jstests/replsets/libs/election_metrics.js";
 
 // We are bypassing collection validation because this test runs "shutdown" command so the server is
 // expected to be down when MongoRunner.stopMongod is called.
@@ -25,6 +25,10 @@ var nodes = replTest.startSet();
 replTest.initiate();
 replTest.waitForState(nodes[0], ReplSetTest.State.PRIMARY);
 var primary = replTest.getPrimary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // do a write
 print("\ndo a write");
@@ -196,8 +200,6 @@ try {
                              newServerStatus.metrics.commands.replSetStepDownWithForce,
                              "failed",
                              1);
-} catch (e) {
-    throw e;
 } finally {
     unlockNodes(lockedNodes);
 }

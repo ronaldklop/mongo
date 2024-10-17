@@ -6,23 +6,19 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
-(function() {
-'use strict';
 
-var st = new ShardingTest({shards: 4, chunkSize: 1});
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-// Double the balancer interval to produce fewer migrations per unit time so that the test does not
-// run out of stale shard version retries.
-st._configServers.forEach((conn) => {
-    conn.adminCommand({
-        configureFailPoint: 'overrideBalanceRoundInterval',
-        mode: 'alwaysOn',
-        data: {intervalMs: 2000}
-    });
+var st = new ShardingTest({
+    shards: 4,
+    chunkSize: 1,
+    // Double the balancer interval to produce fewer migrations per unit time.
+    // Ensures that the test does not run out of stale shard version retries.
+    other: {configOptions: {setParameter: {balancerMigrationsThrottlingMs: 2000}}}
 });
 
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'TestDB'}));
-st.ensurePrimaryShard('TestDB', st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: 'TestDB', primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'TestDB.TestColl', key: {Counter: 1}}));
 
 var db = st.s0.getDB('TestDB');
@@ -105,4 +101,3 @@ while (docsInserted < numDocs) {
 checkDocuments();
 
 st.stop();
-})();

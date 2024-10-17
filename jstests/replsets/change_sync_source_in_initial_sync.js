@@ -4,10 +4,8 @@
  *
  */
 
-(function() {
-"use strict";
-
-load('jstests/libs/fail_point_util.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "change_sync_source_in_initial_sync";
 const dbName = testName;
@@ -40,11 +38,16 @@ const initialSyncNode = rst.add({
 rst.reInitiate();
 rst.waitForState(initialSyncNode, ReplSetTest.State.STARTUP_2);
 
+let failedInitialSyncAttempts;
+
 // Wait for the initial syncing node to choose a sync source.
 assert.soon(function() {
     const res = assert.commandWorked(initialSyncNode.adminCommand({"replSetGetStatus": 1}));
-    return primary.name === res.syncSourceHost &&
-        res.initialSyncStatus.failedInitialSyncAttempts === 0;
+    // failedInitialSyncAttempts can be > 0 due to transient network errors in our testing
+    // environment.
+    failedInitialSyncAttempts =
+        res.initialSyncStatus ? res.initialSyncStatus.failedInitialSyncAttempts : 0;
+    return primary.name === res.syncSourceHost;
 });
 assert.commandWorked(
     initialSyncNode.adminCommand({configureFailPoint: "forceSyncSourceCandidate", mode: "off"}));
@@ -61,10 +64,9 @@ assert.commandWorked(initialSyncNode.adminCommand(
 hangBeforeFinishInitialSync.wait();
 let res = assert.commandWorked(initialSyncNode.adminCommand({"replSetGetStatus": 1}));
 assert.eq(secondary.name, res.syncSourceHost, res);
-assert.eq(1, res.initialSyncStatus.failedInitialSyncAttempts);
+assert.eq(failedInitialSyncAttempts + 1, res.initialSyncStatus.failedInitialSyncAttempts);
 assert.eq(2, res.initialSyncStatus.initialSyncAttempts.length);
 hangBeforeFinishInitialSync.off();
 
 rst.awaitSecondaryNodes();
 rst.stopSet();
-})();

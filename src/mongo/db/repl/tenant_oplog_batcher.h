@@ -29,13 +29,23 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/abstract_async_component.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -50,6 +60,11 @@ struct TenantOplogEntry {
     // If this entry is a transaction commit or applyOps, the index within the
     // TenantOplogBatch::expansions array containing the oplog entries it expands to.
     int expansionsEntry = -1;
+    // When the fetched donor oplog entry represents modifications to internal collections
+    // (i.e, collections in admin/config DBs), shard merge protocol skips applying those oplog
+    // entries. In those cases, we set this field to 'true' to indicate that the tenant oplog
+    // applier can skip writing no-op entries for this oplog entry.
+    bool ignore = false;
 };
 
 struct TenantOplogBatch {
@@ -73,12 +88,13 @@ public:
         size_t ops = 0;
     };
 
-    TenantOplogBatcher(const std::string& tenantId,
+    TenantOplogBatcher(const UUID& migrationUuid,
                        RandomAccessOplogBuffer* oplogBuffer,
                        std::shared_ptr<executor::TaskExecutor> executor,
-                       const Timestamp resumeBatchingTs);
+                       Timestamp resumeBatchingTs,
+                       OpTime beginApplyingAfterOpTime);
 
-    virtual ~TenantOplogBatcher();
+    ~TenantOplogBatcher() override;
 
     /**
      * Returns a future for the next oplog batch. Client must not ask for another batch until
@@ -91,21 +107,23 @@ private:
 
     StatusWith<TenantOplogBatch> _readNextBatch(BatchLimits limits);
 
+    bool _mustProcessIndividually(const OplogEntry& entry);
+
     void _consume(OperationContext* opCtx);
 
     void _pushEntry(OperationContext* opCtx, TenantOplogBatch* batch, OplogEntry&& op);
 
-    Status _doStartup_inlock() noexcept final;
+    void _doStartup(WithLock) final;
 
-    void _doShutdown_inlock() noexcept final;
+    void _doShutdown(WithLock) noexcept final;
 
     void _preJoin() noexcept final {}
 
-    Mutex* _getMutex() noexcept final {
+    stdx::mutex* _getMutex() noexcept final {
         return &_mutex;
     }
 
-    Mutex _mutex = MONGO_MAKE_LATCH("TenantOplogBatcher::_mutex");
+    stdx::mutex _mutex;
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
     //
@@ -118,6 +136,7 @@ private:
     bool _batchRequested = false;                       // (M)
     std::shared_ptr<executor::TaskExecutor> _executor;  // (R)
     const Timestamp _resumeBatchingTs;                  // (R)
+    const OpTime _beginApplyingAfterOpTime;             // (R)
 };
 
 }  // namespace repl

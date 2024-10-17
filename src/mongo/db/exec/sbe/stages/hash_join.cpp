@@ -27,11 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/hash_join.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -43,8 +53,10 @@ HashJoinStage::HashJoinStage(std::unique_ptr<PlanStage> outer,
                              value::SlotVector innerCond,
                              value::SlotVector innerProjects,
                              boost::optional<value::SlotId> collatorSlot,
-                             PlanNodeId planNodeId)
-    : PlanStage("hj"_sd, planNodeId),
+                             PlanYieldPolicy* yieldPolicy,
+                             PlanNodeId planNodeId,
+                             bool participateInTrialRunTracking)
+    : PlanStage("hj"_sd, yieldPolicy, planNodeId, participateInTrialRunTracking),
       _outerCond(std::move(outerCond)),
       _outerProjects(std::move(outerProjects)),
       _innerCond(std::move(innerCond)),
@@ -67,7 +79,9 @@ std::unique_ptr<PlanStage> HashJoinStage::clone() const {
                                            _innerCond,
                                            _innerProjects,
                                            _collatorSlot,
-                                           _commonStats.nodeId);
+                                           _yieldPolicy,
+                                           _commonStats.nodeId,
+                                           participateInTrialRunTracking());
 }
 
 void HashJoinStage::prepare(CompileCtx& ctx) {
@@ -112,20 +126,13 @@ void HashJoinStage::prepare(CompileCtx& ctx) {
     }
 
     _probeKey.resize(_inInnerKeyAccessors.size());
-
-    _compiled = true;
 }
 
 value::SlotAccessor* HashJoinStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
-    if (_compiled) {
-        if (auto it = _outOuterAccessors.find(slot); it != _outOuterAccessors.end()) {
-            return it->second;
-        }
-
-        return _children[1]->getAccessor(ctx, slot);
+    if (auto it = _outOuterAccessors.find(slot); it != _outOuterAccessors.end()) {
+        return it->second;
     }
-
-    return ctx.getAccessor(slot);
+    return _children[1]->getAccessor(ctx, slot);
 }
 
 void HashJoinStage::open(bool reOpen) {
@@ -152,14 +159,14 @@ void HashJoinStage::open(bool reOpen) {
         size_t idx = 0;
         // Copy keys in order to do the lookup.
         for (auto& p : _inOuterKeyAccessors) {
-            auto [tag, val] = p->copyOrMoveValue();
+            auto [tag, val] = p->getCopyOfValue();
             key.reset(idx++, true, tag, val);
         }
 
         idx = 0;
         // Copy projects.
         for (auto& p : _inOuterProjectAccessors) {
-            auto [tag, val] = p->copyOrMoveValue();
+            auto [tag, val] = p->getCopyOfValue();
             project.reset(idx++, true, tag, val);
         }
 
@@ -176,6 +183,7 @@ void HashJoinStage::open(bool reOpen) {
 
 PlanState HashJoinStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
+    checkForInterruptAndYield(_opCtx);
 
     if (_htIt != _htItEnd) {
         ++_htIt;
@@ -210,7 +218,7 @@ PlanState HashJoinStage::getNext() {
 void HashJoinStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _children[1]->close();
     _ht = boost::none;
 }
@@ -289,6 +297,16 @@ std::vector<DebugPrinter::Block> HashJoinStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     return ret;
+}
+
+size_t HashJoinStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_outerCond);
+    size += size_estimator::estimate(_outerProjects);
+    size += size_estimator::estimate(_innerCond);
+    size += size_estimator::estimate(_innerProjects);
+    return size;
 }
 }  // namespace sbe
 }  // namespace mongo

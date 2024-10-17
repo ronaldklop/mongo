@@ -27,16 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr.hpp>
+#include <iterator>
+#include <list>
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_plan_cache_stats.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 REGISTER_DOCUMENT_SOURCE(planCacheStats,
                          DocumentSourcePlanCacheStats::LiteParsed::parse,
                          DocumentSourcePlanCacheStats::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
+                         AllowedWithApiStrict::kNeverInVersion1);
 
 boost::intrusive_ptr<DocumentSource> DocumentSourcePlanCacheStats::createFromBson(
     BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -45,29 +56,48 @@ boost::intrusive_ptr<DocumentSource> DocumentSourcePlanCacheStats::createFromBso
                           << " value must be an object. Found: " << typeName(spec.type()),
             spec.type() == BSONType::Object);
 
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << kStageName
-                          << " parameters object must be empty. Found: " << typeName(spec.type()),
-            spec.embeddedObject().isEmpty());
-
-    return new DocumentSourcePlanCacheStats(pExpCtx);
+    bool allHosts = false;
+    BSONObjIterator specIt(spec.embeddedObject());
+    if (specIt.more()) {
+        BSONElement e = specIt.next();
+        auto fieldName = e.fieldNameStringData();
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << kStageName
+                              << " parameters object may contain only 'allHosts' field. Found: "
+                              << fieldName,
+                fieldName == "allHosts");
+        allHosts = e.Bool();
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << kStageName << " parameters object may contain at most one field.",
+                !specIt.more());
+    }
+    if (allHosts) {
+        uassert(4503200,
+                "$planCacheStats stage supports allHosts parameter only for sharded clusters",
+                pExpCtx->fromRouter || pExpCtx->inRouter);
+    }
+    return new DocumentSourcePlanCacheStats(pExpCtx, allHosts);
 }
 
 DocumentSourcePlanCacheStats::DocumentSourcePlanCacheStats(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(kStageName, expCtx) {}
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, bool allHosts)
+    : DocumentSource(kStageName, expCtx), _allHosts(allHosts) {}
 
-void DocumentSourcePlanCacheStats::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
-        array.push_back(Value{
-            Document{{kStageName,
-                      Document{{"match"_sd,
-                                _absorbedMatch ? Value{_absorbedMatch->getQuery()} : Value{}}}}}});
+void DocumentSourcePlanCacheStats::serializeToArray(std::vector<Value>& array,
+                                                    const SerializationOptions& opts) const {
+    if (opts.verbosity) {
+        tassert(7513100,
+                "$planCacheStats is not equipped to serialize in explain mode with redaction on",
+                !opts.transformIdentifiers &&
+                    opts.literalPolicy == LiteralSerializationPolicy::kUnchanged);
+        array.push_back(Value{Document{
+            {kStageName,
+             Document{{"match"_sd, _absorbedMatch ? Value{_absorbedMatch->getQuery()} : Value{}},
+                      {"allHosts"_sd, _allHosts}}}}});
     } else {
-        array.push_back(Value{Document{{kStageName, Document{}}}});
+        array.push_back(Value{Document{{kStageName, Document{{"allHosts"_sd, _allHosts}}}}});
         if (_absorbedMatch) {
-            _absorbedMatch->serializeToArray(array);
+            _absorbedMatch->serializeToArray(array, opts);
         }
     }
 }
@@ -108,7 +138,7 @@ DocumentSource::GetNextResult DocumentSourcePlanCacheStats::doGetNext() {
     if (_hostAndPort.empty()) {
         _hostAndPort = pExpCtx->mongoProcessInterface->getHostAndPort(pExpCtx->opCtx);
         uassert(31386,
-                "Aggregation request specified 'fromMongos' but unable to retrieve host name "
+                "Aggregation request specified 'fromRouter' but unable to retrieve host name "
                 "for $planCacheStats pipeline stage.",
                 !_hostAndPort.empty());
     }
@@ -116,11 +146,11 @@ DocumentSource::GetNextResult DocumentSourcePlanCacheStats::doGetNext() {
 
     // If we're returning results to mongos, then additionally augment each plan cache entry with
     // the shard name, for the node from which we're collecting plan cache information.
-    if (pExpCtx->fromMongos) {
+    if (pExpCtx->fromRouter) {
         if (_shardName.empty()) {
             _shardName = pExpCtx->mongoProcessInterface->getShardName(pExpCtx->opCtx);
             uassert(31385,
-                    "Aggregation request specified 'fromMongos' but unable to retrieve shard name "
+                    "Aggregation request specified 'fromRouter' but unable to retrieve shard name "
                     "for $planCacheStats pipeline stage.",
                     !_shardName.empty());
         }
